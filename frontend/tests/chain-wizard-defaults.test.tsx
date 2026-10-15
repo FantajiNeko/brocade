@@ -10,12 +10,13 @@ import { defaultHopWire, defaultHopWireForListener, seedHopIn, seedHops, type Fo
 import type { HopDial, Rule } from '../src/api';
 
 describe('建链向导协议默认值', () => {
-  it('默认开启所有接入协议并填入 AnyTLS 连接复用参数', () => {
+  it('默认开启通用接入协议，并让专用的 MTProxy 保持可选', () => {
     expect(NEW_CHAIN_PROTOCOL_DEFAULTS).toEqual({
       vless: true,
       vlessEncryption: false,
       anytls: true,
       hysteria2: true,
+      mtproto: false,
     });
 
     const wires = newChainWires({
@@ -35,6 +36,7 @@ describe('建链向导协议默认值', () => {
       port: 30000,
       hop: { start: 30000, end: 30099 },
     });
+    expect(wires.mtproto).toBeNull();
   });
 
   it('关闭的协议不会偷偷写入创建请求', () => {
@@ -46,7 +48,26 @@ describe('建链向导协议默认值', () => {
       hy2Start: 30000,
       hy2End: 30099,
     });
-    expect(wires).toEqual({ vless: { kind: 'vless-reality' }, anytls: null, hysteria2: null });
+    expect(wires).toEqual({ vless: { kind: 'vless-reality' }, anytls: null, hysteria2: null, mtproto: null });
+  });
+
+  it('MTProxy 可独立启用并使用建链端口', () => {
+    const wires = newChainWires({
+      vless: false,
+      anytls: false,
+      hysteria2: false,
+      mtproto: true,
+      mtprotoPort: 28812,
+      anytlsPort: 14443,
+      hy2Start: 30000,
+      hy2End: 30099,
+    });
+    expect(wires).toEqual({
+      vless: null,
+      anytls: null,
+      hysteria2: null,
+      mtproto: { port: 28812 },
+    });
   });
 
   it('展开卡片编辑的 Padding 和 Hysteria 带宽进入对应协议，而不影响其他协议', () => {
@@ -98,6 +119,7 @@ it('可单独启用 VLESS Encryption，默认 13800 或使用配置的分配端�
     vless: false,
     anytls: false,
     hysteria2: false,
+    mtproto: false,
     vlessEncryption: true,
     anytlsPort: 14443,
     hy2Start: 30000,
@@ -107,6 +129,7 @@ it('可单独启用 VLESS Encryption，默认 13800 或使用配置的分配端�
     vless: null,
     anytls: null,
     hysteria2: null,
+    mtproto: null,
     vless_encryption: { port: 13800 },
   });
   expect(newChainWires({ ...options, vlessEncryptionPort: 49002 }).vless_encryption).toEqual({ port: 49002 });

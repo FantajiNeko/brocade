@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { NodeAgentStateItem, NodeTrafficView } from '../src/api';
+import type { NodeAgentStateItem, NodeTrafficView, UsageNodeSeries } from '../src/api';
 
 let exactBytes: typeof import('../src/panes/nodes').exactBytes;
 let trafficCalibrationBytes: typeof import('../src/panes/nodes').trafficCalibrationBytes;
 let TrafficAccountingCard: typeof import('../src/panes/nodes').TrafficAccountingCard;
+let usageRoleTimeline: typeof import('../src/panes/nodes').usageRoleTimeline;
 
 beforeAll(async () => {
   vi.stubGlobal(
@@ -16,7 +17,8 @@ beforeAll(async () => {
       removeEventListener: vi.fn(),
     })),
   );
-  ({ exactBytes, trafficCalibrationBytes, TrafficAccountingCard } = await import('../src/panes/nodes'));
+  ({ exactBytes, trafficCalibrationBytes, TrafficAccountingCard, usageRoleTimeline } =
+    await import('../src/panes/nodes'));
 });
 
 afterEach(() => {
@@ -33,6 +35,7 @@ const view: NodeTrafficView = {
       cycle_kind: 'monthly',
       reset_month: null,
       reset_day: 1,
+      quota_bytes: null,
       period_start_unix_secs: 1_788_192_000,
       period_end_unix_secs: 1_790_870_400,
       rx_bytes: '1099511627776',
@@ -50,6 +53,45 @@ const view: NodeTrafficView = {
 };
 
 describe('node traffic accounting values', () => {
+  it('uses real forwarding duration rather than the access 30-second cadence', () => {
+    const source: UsageNodeSeries = {
+      node_id: 'n1',
+      month_user_uplink_bytes: 0,
+      month_user_downlink_bytes: 0,
+      month_relay_uplink_bytes: 0,
+      month_relay_downlink_bytes: 0,
+      month_has_gap: false,
+      buckets: [],
+      forwarding: [
+        {
+          window_start: '2026-10-14T10:00:00Z',
+          window_end: '2026-10-14T10:00:15Z',
+          uplink_bytes: 15,
+          downlink_bytes: 30,
+          has_gap: false,
+        },
+        {
+          window_start: '2026-10-14T10:00:15Z',
+          window_end: '2026-10-14T10:01:00Z',
+          uplink_bytes: 45,
+          downlink_bytes: 90,
+          has_gap: false,
+        },
+        {
+          window_start: '2026-10-14T10:01:00Z',
+          window_end: '2026-10-14T10:01:15Z',
+          uplink_bytes: 15,
+          downlink_bytes: 30,
+          has_gap: true,
+        },
+      ],
+    };
+    const start = Date.parse('2026-10-14T10:00:00Z') / 1000;
+    const result = usageRoleTimeline(source, start, start + 90);
+    expect(result.forwarding).toEqual([24, 24, null]);
+    expect(result.forwardingTimes).toEqual([start + 15, start + 60, start + 75]);
+    expect(result.forwardingStarts).toEqual([start, start + 15, start + 60]);
+  });
   it('converts human IEC calibration input to exact byte strings', () => {
     expect(trafficCalibrationBytes('1.5', 'GiB')).toBe('1610612736');
     expect(trafficCalibrationBytes('2', 'TiB')).toBe('2199023255552');
@@ -106,6 +148,7 @@ describe('node traffic accounting values', () => {
       cycle_kind: 'yearly',
       reset_month: 2,
       reset_day: 29,
+      quota_bytes: null,
       calibrated_total_bytes: '1610612736',
     });
   });

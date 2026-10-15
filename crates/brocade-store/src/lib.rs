@@ -11,6 +11,7 @@ mod deployment;
 mod distribution;
 mod draft;
 mod egress_dns;
+mod forwarding;
 mod grant_automation;
 mod grant_probe;
 mod host_tuning;
@@ -40,12 +41,12 @@ mod vpngate;
 mod xray_release;
 
 pub use admin::{
-    AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult, AdminLoginRequest,
-    AdminLoginResult, AdminOperator, AdminRole, AdminSessionAuthentication, AuthenticatedAdmin,
-    AuthenticatedUser, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, IssuedAdminSession,
-    IssuedAdminToken, IssuedUserDirectLogin, IssuedUserLogin, ResetAdminPasswordResult,
-    SetUserPasswordRequest, SetUserPasswordResult, SystemInitRequest, SystemInitResult,
-    UserDirectLoginRequest, ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
+    tenant_in_scope, AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult,
+    AdminLoginRequest, AdminLoginResult, AdminOperator, AdminRole, AdminSessionAuthentication,
+    AuthenticatedAdmin, AuthenticatedUser, ChangeAdminPasswordRequest, CreateAdminOperatorRequest,
+    IssuedAdminSession, IssuedAdminToken, IssuedUserDirectLogin, IssuedUserLogin,
+    ResetAdminPasswordResult, SetUserPasswordRequest, SetUserPasswordResult, SystemInitRequest,
+    SystemInitResult, UserDirectLoginRequest, ADMIN_SESSION_TTL_SECONDS, PUBLIC_OPERATOR_ID,
 };
 pub use agent::public_route_ip;
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
@@ -62,10 +63,12 @@ pub use brocade_deployment::protocol::{
     DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
     DeploymentWaveConfirmationRequest, DeploymentWaveConfirmationResult, E2eExitVerdict, E2eProbe,
     E2eProbeHysteria2, E2eProbeReality, E2eProbeRequest, E2eProbeResult, E2eProbeStatus,
-    E2eProbeTarget, E2eProbeTargetList, HopLinkList, HopLinkSample, HopLinkView, HostFacts,
-    IsolateDeploymentTargetRequest, IsolateNodeRequest, LinkHealth, LinkHealthRequest,
-    LinkHealthResult, LinkProbe, LinkProbeRequest, LinkProbeResult, LinkProbeStatus,
-    LoadReportRequest, LoadReportResult, LoadSample, NodeDesiredDeployment,
+    E2eProbeTarget, E2eProbeTargetList, ForwardingDesiredState, ForwardingProtocol,
+    ForwardingReconcileReport, ForwardingRuleDesired, ForwardingUsageCounter,
+    ForwardingUsageReportRequest, ForwardingUsageReportResult, HopLinkList, HopLinkSample,
+    HopLinkView, HostFacts, IsolateDeploymentTargetRequest, IsolateNodeRequest, LinkHealth,
+    LinkHealthRequest, LinkHealthResult, LinkProbe, LinkProbeRequest, LinkProbeResult,
+    LinkProbeStatus, LoadReportRequest, LoadReportResult, LoadSample, NodeDesiredDeployment,
     NodeIsolationCommandResult, NodeLoadList, NodeLoadView, NodePingProbeLatestList,
     NodePingProbeLatestView, NodePingProbeList, NodePingProbeView, PhantunBinaries,
     PingProbeFamily, PingProbeFamilyLatest, PingProbeFamilySeries, PingProbeKind, PingProbePoint,
@@ -75,15 +78,15 @@ pub use brocade_deployment::protocol::{
     ReportedNodeState, RouteIpReport, TargetApplyResult, TargetConvergenceReport,
     UpdateRealtimeTelemetryPolicyRequest, UsageCounter, UsageDailyRow, UsageMonthlySummary,
     UsageMonthlyViewRow, UsageNodeBucket, UsageNodeSeries, UsageNodeSeriesList, UsageReportRequest,
-    UsageReportResult, UsageSample, UsageSampleList, VpngateAdmissionDecision,
-    VpngateAdmissionPolicy, VpngateCandidate, VpngateCountryPolicy, VpngateDesiredPool,
-    VpngateDesiredState, VpngateIpIntelligenceAssignment, VpngateIpIntelligenceFailure,
-    VpngateIpIntelligenceObservation, VpngateIpIntelligenceReport, VpngateIpNetwork,
-    VpngateIpProvider, VpngateIpScore, VpngateManualSwitchCommand, VpngateManualSwitchResult,
-    VpngateManualSwitchStatus, VpngateNetworkType, VpngatePoolReport, VpngateProbeAssignment,
-    VpngateProbeMode, VpngateProbeReport, VpngateProbeSample, VpngateProbeStatus,
-    VpngateProviderRiskRule, VpngateReconcileReport, VpngateRiskDecisionPolicy, VpngateTransport,
-    XrayReleaseOffer, XrayReleaseOutcome, XrayReleaseReport,
+    UsageReportResult, UsageSample, UsageSampleList, UserTrafficHistory, UserTrafficHistoryNode,
+    UserTrafficHistorySeries, VpngateAdmissionDecision, VpngateAdmissionPolicy, VpngateCandidate,
+    VpngateCountryPolicy, VpngateDesiredPool, VpngateDesiredState, VpngateIpIntelligenceAssignment,
+    VpngateIpIntelligenceFailure, VpngateIpIntelligenceObservation, VpngateIpIntelligenceReport,
+    VpngateIpNetwork, VpngateIpProvider, VpngateIpScore, VpngateManualSwitchCommand,
+    VpngateManualSwitchResult, VpngateManualSwitchStatus, VpngateNetworkType, VpngatePoolReport,
+    VpngateProbeAssignment, VpngateProbeMode, VpngateProbeReport, VpngateProbeSample,
+    VpngateProbeStatus, VpngateProviderRiskRule, VpngateReconcileReport, VpngateRiskDecisionPolicy,
+    VpngateTransport, XrayReleaseOffer, XrayReleaseOutcome, XrayReleaseReport,
 };
 pub use brocade_deployment::protocol::{
     HostNetworkTuning, DEFAULT_NIC_GRO_FLUSH_TIMEOUT_NS, DEFAULT_NIC_NAPI_DEFER_HARD_IRQS,
@@ -134,6 +137,11 @@ pub use credentials::{
 };
 pub use distribution::DistributionSettings;
 pub use draft::{ApplyDraftResult, DraftPreview, ModelOp};
+pub use forwarding::{
+    ForwardingEntitlementView, ForwardingEntitlementWrite, ForwardingOverview, ForwardingRuleView,
+    ForwardingRuleWrite, DEFAULT_FORWARDING_MAX_RULES, DEFAULT_FORWARDING_PORT_END,
+    DEFAULT_FORWARDING_PORT_START,
+};
 pub use grant_automation::{
     GrantAutomationOutcome, GrantAutomationStatus, GRANTS_AUTOMATION_ACTOR,
 };
@@ -177,14 +185,19 @@ pub use quota::{QuotaEnforcementOutcome, QuotaEnforcementPlan, QuotaGrantChange,
 pub use settings::{SettingsSnapshot, UpdateSettingsResult};
 pub use subscription_client::{ClientConfigCommitResult, ClientConfigCommitStatus};
 pub use traffic::{
+    MachineTrafficAccuracy, MachineTrafficBand, MachineTrafficBandBasis, MachineTrafficConfidence,
+    MachineTrafficDay, MachineTrafficModelNode, MachineTrafficModelView, MachineTrafficUser,
     NodeTrafficCycleKind, NodeTrafficItem, NodeTrafficView, UpdateNodeTrafficRequest,
+    MACHINE_TRAFFIC_FORECAST_RETENTION_DAYS,
 };
 pub use tunnel_probe::{
-    ClaimedTunnelProbe, TunnelProbeCompletion, TunnelProbeHealth, TunnelProbeJobStatus,
-    TunnelProbeList, TunnelProbeListItem, TunnelProbePhase, TunnelProbePoint, TunnelProbePolicy,
-    TunnelProbeResultStatus, TunnelProbeRun, TunnelProbeSource, TunnelProbeSummary,
-    TunnelProbeTrigger, TunnelProbeView, UpdateTunnelProbePolicy, TUNNEL_PROBE_RETENTION_DAYS,
+    ClaimedTunnelProbe, TunnelProbeCompletion, TunnelProbeHealth, TunnelProbeHealthReason,
+    TunnelProbeJobStatus, TunnelProbeList, TunnelProbeListItem, TunnelProbePhase, TunnelProbePoint,
+    TunnelProbePolicy, TunnelProbeResultStatus, TunnelProbeRun, TunnelProbeSource,
+    TunnelProbeSummary, TunnelProbeTrigger, TunnelProbeView, UpdateTunnelProbePolicy,
+    TUNNEL_PROBE_RETENTION_DAYS,
 };
+pub use usage::{UserRealtimeTarget, UserTrafficHistoryScope};
 pub use user_presence::{
     UserOnlineSourceAccess, UserOnlineSourceHistory, UserOnlineSourceView, UserPresenceList,
     UserPresenceState, UserPresenceView, USER_ONLINE_SOURCE_HISTORY_LIMIT,

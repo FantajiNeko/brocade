@@ -18,6 +18,7 @@ const DeployPane = lazy(() => import('./deploy').then(module => ({ default: modu
 const UsersPane = lazy(() => import('./users').then(module => ({ default: module.UsersPane })));
 const PasswordPane = lazy(() => import('./password').then(module => ({ default: module.PasswordPane })));
 const UsagePane = lazy(() => import('./usage').then(module => ({ default: module.UsagePane })));
+const CapacityPane = lazy(() => import('./capacity').then(module => ({ default: module.CapacityPane })));
 const SettingsPane = lazy(() => import('./settings').then(module => ({ default: module.SettingsPane })));
 const InspectPane = lazy(() => import('./inspect').then(module => ({ default: module.InspectPane })));
 const ChainsPane = lazy(() => import('./chains').then(module => ({ default: module.ChainsPane })));
@@ -75,6 +76,8 @@ function paneLoadingProps(paneKey: string, data: Record<string, unknown> = {}, b
       return { variant: 'users', sheeted: bare, userDetail: page === 'user' };
     case 'tab:usage':
       return { variant: 'usage' };
+    case 'tab:capacity':
+      return { variant: 'panel' };
     case 'tab:settings':
       return { variant: 'settings' };
     case 'tab:deploy':
@@ -87,7 +90,7 @@ function paneLoadingProps(paneKey: string, data: Record<string, unknown> = {}, b
 }
 
 export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
-  const { initial } = useSession();
+  const { initial, who } = useSession();
   let content: ReactNode;
   switch (win.key) {
     case 'tab:nodes':
@@ -107,6 +110,9 @@ export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
       break;
     case 'tab:usage':
       content = <UsagePane />;
+      break;
+    case 'tab:capacity':
+      content = <CapacityPane canEdit={who.role === 'system-admin'} />;
       break;
     case 'tab:settings':
       content = <SettingsPane />;

@@ -11,6 +11,7 @@ pub mod mask;
 pub mod notifications;
 pub mod performance;
 pub mod realtime;
+pub mod socket_activation;
 pub mod tunnel_probe;
 pub mod vpngate;
 mod warp;

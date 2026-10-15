@@ -549,6 +549,7 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 encryption,
                 flow,
                 transport,
+                final_mask,
                 ..
             } => {
                 if !vless_encryption_is_valid(encryption) {
@@ -576,35 +577,145 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                         "VLESS flow 只支持 xtls-rprx-vision 或 xtls-rprx-vision-udp443",
                     ));
                 }
-                if let ExternalVlessTransport::Xhttp(xhttp) = transport {
-                    if flow.as_deref().is_some_and(|flow| !flow.is_empty()) {
-                        diagnostics.push(Diagnostic::error(
-                            "external-outbound.xhttp-flow-conflict",
-                            &at,
-                            "外部 VLESS 使用 XHTTP 时不能启用 Vision flow；请清空 Flow 或改回 RAW/TCP",
-                        ));
-                    }
-                    validate_external_xhttp_fields(
-                        diagnostics,
+                if !matches!(transport, ExternalVlessTransport::Raw)
+                    && flow.as_deref().is_some_and(|flow| !flow.is_empty())
+                {
+                    let code = match transport {
+                        ExternalVlessTransport::Websocket(_) => {
+                            "external-outbound.websocket-flow-conflict"
+                        }
+                        ExternalVlessTransport::Xhttp(_) => "external-outbound.xhttp-flow-conflict",
+                        _ => "external-outbound.transport-flow-conflict",
+                    };
+                    diagnostics.push(Diagnostic::error(
+                        code,
                         &at,
-                        XhttpFieldCodes {
-                            path: "external-outbound.xhttp-path",
-                            host: "external-outbound.xhttp-host",
-                            mux: "external-outbound.xhttp-mux-range",
-                        },
-                        &xhttp.path,
-                        xhttp.host.as_deref(),
-                        xhttp.mux,
-                    );
-                    if let Some(download) = &xhttp.download {
-                        if xhttp.mode == XhttpMode::StreamOne {
+                        "外部 VLESS 只有 RAW/TCP 可以启用 Vision flow；请清空 Flow 或改回 RAW/TCP",
+                    ));
+                }
+                if matches!(&outbound.security, ExternalOutboundSecurity::Reality { .. })
+                    && !matches!(
+                        transport,
+                        ExternalVlessTransport::Raw
+                            | ExternalVlessTransport::Grpc(_)
+                            | ExternalVlessTransport::Xhttp(_)
+                    )
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.reality-transport",
+                        &at,
+                        "当前 Xray 的 REALITY 只支持 RAW/TCP、gRPC 和 XHTTP",
+                    ));
+                }
+                if final_mask.as_ref().is_some_and(|value| !value.is_object()) {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.finalmask",
+                        &at,
+                        "Finalmask 必须是 JSON 对象",
+                    ));
+                }
+                match transport {
+                    ExternalVlessTransport::Raw => {}
+                    ExternalVlessTransport::Kcp(kcp) => {
+                        if kcp.mtu.is_some_and(|mtu| mtu < 21) {
                             diagnostics.push(Diagnostic::error(
-                                "external-outbound.xhttp-download-stream-one",
+                                "external-outbound.kcp-mtu",
                                 &at,
-                                "外部 VLESS 配置了独立下载，但 stream-one 将上下行放在同一个请求中；请改用 auto 或 stream-up",
+                                "mKCP MTU 不能小于 21",
                             ));
                         }
-                        validate_external_xhttp_download(diagnostics, &at, download);
+                        if kcp.tti.is_some_and(|tti| !(10..=1000).contains(&tti)) {
+                            diagnostics.push(Diagnostic::error(
+                                "external-outbound.kcp-tti",
+                                &at,
+                                "mKCP TTI 必须在 10–1000 毫秒之间",
+                            ));
+                        }
+                    }
+                    ExternalVlessTransport::Websocket(websocket) => {
+                        validate_external_websocket_fields(diagnostics, &at, websocket);
+                    }
+                    ExternalVlessTransport::Http(http) => {
+                        validate_external_http_fields(
+                            diagnostics,
+                            &at,
+                            "external-outbound.http-path",
+                            "external-outbound.http-host",
+                            &http.path,
+                            http.host.as_deref(),
+                            "HTTP/2",
+                        );
+                    }
+                    ExternalVlessTransport::Grpc(grpc) => {
+                        if grpc.service_name.trim().is_empty()
+                            || grpc.service_name.chars().any(char::is_whitespace)
+                        {
+                            diagnostics.push(Diagnostic::error(
+                                "external-outbound.grpc-service-name",
+                                &at,
+                                "gRPC Service Name 不能为空或包含空白",
+                            ));
+                        }
+                        if grpc
+                            .authority
+                            .as_deref()
+                            .is_some_and(|authority| authority.chars().any(char::is_whitespace))
+                        {
+                            diagnostics.push(Diagnostic::error(
+                                "external-outbound.grpc-authority",
+                                &at,
+                                "gRPC Authority 不能包含空白",
+                            ));
+                        }
+                        if grpc.mode == crate::model::ExternalVlessGrpcMode::Guna {
+                            diagnostics.push(Diagnostic::error(
+                                "external-outbound.grpc-guna-unsupported",
+                                &at,
+                                "当前内置 Xray 已移除 gRPC guna 模式，不能把它静默替换成 gun",
+                            ));
+                        }
+                    }
+                    ExternalVlessTransport::HttpUpgrade(http_upgrade) => {
+                        validate_external_http_fields(
+                            diagnostics,
+                            &at,
+                            "external-outbound.httpupgrade-path",
+                            "external-outbound.httpupgrade-host",
+                            &http_upgrade.path,
+                            http_upgrade.host.as_deref(),
+                            "HTTPUpgrade",
+                        );
+                    }
+                    ExternalVlessTransport::Xhttp(xhttp) => {
+                        validate_external_xhttp_fields(
+                            diagnostics,
+                            &at,
+                            XhttpFieldCodes {
+                                path: "external-outbound.xhttp-path",
+                                host: "external-outbound.xhttp-host",
+                                mux: "external-outbound.xhttp-mux-range",
+                            },
+                            &xhttp.path,
+                            xhttp.host.as_deref(),
+                            xhttp.mux,
+                        );
+                        if xhttp.extra.as_ref().is_some_and(|value| !value.is_object()) {
+                            diagnostics.push(Diagnostic::error(
+                                "external-outbound.xhttp-extra",
+                                &at,
+                                "XHTTP extra 必须是 JSON 对象",
+                            ));
+                        }
+                        if let Some(download) = &xhttp.download {
+                            if xhttp.mode == XhttpMode::StreamOne {
+                                diagnostics.push(Diagnostic::error(
+                                    "external-outbound.xhttp-download-stream-one",
+                                    &at,
+                                    "外部 VLESS 配置了独立下载，但 stream-one 将上下行放在同一个请求中；请改用 auto 或 stream-up",
+                                ));
+                            }
+                            validate_external_xhttp_download(diagnostics, &at, download);
+                        }
                     }
                 }
             }
@@ -1030,6 +1141,10 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
             ExternalOutboundSecurity::Tls {
                 server_name,
                 fingerprint,
+                alpn,
+                pinned_peer_cert_sha256,
+                verify_peer_cert_by_name,
+                ..
             } => {
                 if server_name.trim().is_empty() || fingerprint.trim().is_empty() {
                     diagnostics.push(Diagnostic::error(
@@ -1038,6 +1153,22 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                         "TLS 的 SNI 和指纹不能为空",
                     ));
                 }
+                if alpn
+                    .iter()
+                    .any(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.tls-alpn",
+                        &at,
+                        "TLS ALPN 不能是空白或包含空白",
+                    ));
+                }
+                validate_external_tls_extensions(
+                    pinned_peer_cert_sha256.as_deref(),
+                    verify_peer_cert_by_name.as_deref(),
+                    &at,
+                    diagnostics,
+                );
             }
             // Every field is required; kept as an if inside the arm, matching the shape of the Tls
             // arm above. clippy would rather lift the condition into a match guard, but that buries
@@ -1048,6 +1179,9 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 public_key,
                 short_id,
                 fingerprint,
+                mldsa65_verify,
+                spider_x,
+                ..
             } => {
                 validate_external_reality(
                     server_name,
@@ -1055,6 +1189,22 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     short_id,
                     fingerprint,
                     &at,
+                    diagnostics,
+                );
+                if spider_x
+                    .as_deref()
+                    .is_some_and(|value| !value.starts_with('/'))
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "external-outbound.reality-spider-x",
+                        &at,
+                        "REALITY Spider X 必须以 / 开头",
+                    ));
+                }
+                validate_external_reality_extensions(
+                    mldsa65_verify.as_deref(),
+                    &at,
+                    "external-outbound.reality-mldsa65-verify",
                     diagnostics,
                 );
             }
@@ -1112,6 +1262,51 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                 ));
             }
         }
+    }
+}
+
+fn validate_external_websocket_fields(
+    diagnostics: &mut Vec<Diagnostic>,
+    at: &str,
+    websocket: &crate::model::ExternalVlessWebsocket,
+) {
+    validate_external_http_fields(
+        diagnostics,
+        at,
+        "external-outbound.websocket-path",
+        "external-outbound.websocket-host",
+        &websocket.path,
+        websocket.host.as_deref(),
+        "WebSocket",
+    );
+}
+
+fn validate_external_http_fields(
+    diagnostics: &mut Vec<Diagnostic>,
+    at: &str,
+    path_code: &'static str,
+    host_code: &'static str,
+    path: &str,
+    host: Option<&str>,
+    label: &str,
+) {
+    if !path.starts_with('/')
+        || path
+            .chars()
+            .any(|character| character.is_whitespace() || character == '#')
+    {
+        diagnostics.push(Diagnostic::error(
+            path_code,
+            at,
+            format!("{label} 路径必须以 / 开头，且不能包含空白或 #"),
+        ));
+    }
+    if host.is_some_and(|host| host.trim().is_empty() || host.chars().any(char::is_whitespace)) {
+        diagnostics.push(Diagnostic::error(
+            host_code,
+            at,
+            format!("{label} Host 不能是空白或包含空白；不需要覆盖时请留空"),
+        ));
     }
 }
 
@@ -1198,6 +1393,10 @@ fn validate_external_xhttp_download(
         ExternalOutboundSecurity::Tls {
             server_name,
             fingerprint,
+            alpn,
+            pinned_peer_cert_sha256,
+            verify_peer_cert_by_name,
+            ..
         } => {
             if server_name.trim().is_empty() || fingerprint.trim().is_empty() {
                 diagnostics.push(Diagnostic::error(
@@ -1206,12 +1405,31 @@ fn validate_external_xhttp_download(
                     "XHTTP 独立下载 TLS 的 SNI 和指纹不能为空",
                 ));
             }
+            if alpn
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
+            {
+                diagnostics.push(Diagnostic::error(
+                    "external-outbound.xhttp-download-tls-alpn",
+                    at,
+                    "XHTTP 独立下载 TLS ALPN 不能是空白或包含空白",
+                ));
+            }
+            validate_external_tls_extensions(
+                pinned_peer_cert_sha256.as_deref(),
+                verify_peer_cert_by_name.as_deref(),
+                at,
+                diagnostics,
+            );
         }
         ExternalOutboundSecurity::Reality {
             server_name,
             public_key,
             short_id,
             fingerprint,
+            mldsa65_verify,
+            spider_x,
+            ..
         } => {
             validate_external_reality(
                 server_name,
@@ -1221,7 +1439,86 @@ fn validate_external_xhttp_download(
                 at,
                 diagnostics,
             );
+            if spider_x
+                .as_deref()
+                .is_some_and(|value| !value.starts_with('/'))
+            {
+                diagnostics.push(Diagnostic::error(
+                    "external-outbound.xhttp-download-reality-spider-x",
+                    at,
+                    "XHTTP 独立下载 REALITY Spider X 必须以 / 开头",
+                ));
+            }
+            validate_external_reality_extensions(
+                mldsa65_verify.as_deref(),
+                at,
+                "external-outbound.xhttp-download-reality-mldsa65-verify",
+                diagnostics,
+            );
         }
+    }
+}
+
+fn validate_external_tls_extensions(
+    pinned_peer_cert_sha256: Option<&str>,
+    verify_peer_cert_by_name: Option<&str>,
+    at: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if pinned_peer_cert_sha256.is_some_and(|pins| {
+        let mut saw_pin = false;
+        let valid = pins.split(',').all(|pin| {
+            let compact = pin.trim().replace(':', "");
+            if compact.is_empty() {
+                return true;
+            }
+            saw_pin = true;
+            compact.len() == 64 && compact.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        !valid || !saw_pin
+    }) {
+        diagnostics.push(Diagnostic::error(
+            "external-outbound.tls-pinned-peer-cert-sha256",
+            at,
+            "TLS 证书钉扎必须是逗号分隔的 32 字节 SHA-256 十六进制值",
+        ));
+    }
+    if verify_peer_cert_by_name.is_some_and(|names| {
+        let mut saw_name = false;
+        let valid = names.split(',').all(|name| {
+            let name = name.trim();
+            if name.is_empty() {
+                return true;
+            }
+            saw_name = true;
+            !name.chars().any(char::is_whitespace)
+        });
+        !valid || !saw_name
+    }) {
+        diagnostics.push(Diagnostic::error(
+            "external-outbound.tls-verify-peer-cert-by-name",
+            at,
+            "TLS 证书名称必须是逗号分隔、且不含空白的名称",
+        ));
+    }
+}
+
+fn validate_external_reality_extensions(
+    mldsa65_verify: Option<&str>,
+    at: &str,
+    code: &'static str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if mldsa65_verify.is_some_and(|verify| {
+        general_purpose::URL_SAFE_NO_PAD
+            .decode(verify)
+            .map_or(true, |decoded| decoded.len() != 1952)
+    }) {
+        diagnostics.push(Diagnostic::error(
+            code,
+            at,
+            "REALITY ML-DSA-65 校验键必须是 base64url（无填充）编码的 1952 字节公钥",
+        ));
     }
 }
 
@@ -3492,6 +3789,7 @@ fn validate_fronts(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnostic
                     "VPN Gate 配置由节点 Agent 持有，不能直接下发给客户端；请先发布一个使用该池出站的内部接入点，再把该接入点加入链式代理",
                 ));
             }
+            validate_external_front_projection(&front.id, outbound, diagnostics);
         }
     }
 
@@ -3648,6 +3946,98 @@ fn validate_fronts(sys: &SystemIr, app: &AppIr, diagnostics: &mut Vec<Diagnostic
                 FrontRouteStatus::Pending => {}
             }
         }
+    }
+}
+
+fn validate_external_front_projection(
+    front_id: &str,
+    outbound: &crate::model::ExternalOutbound,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let at = format!("{front_id}/{}", outbound.id);
+    if let ExternalOutboundProtocol::Vless {
+        final_mask,
+        transport,
+        ..
+    } = &outbound.protocol
+    {
+        if final_mask.is_some() {
+            diagnostics.push(Diagnostic::error(
+                "front.external-vless-finalmask",
+                &at,
+                "Mihomo 前置配置不能表达 Xray Finalmask；不能在客户端订阅中静默丢弃",
+            ));
+        }
+        match transport {
+            ExternalVlessTransport::Kcp(_) => diagnostics.push(Diagnostic::error(
+                "front.external-vless-kcp",
+                &at,
+                "Mihomo 的 VLESS 不支持 mKCP；该隧道只能用于 Brocade 节点出站",
+            )),
+            ExternalVlessTransport::Grpc(grpc)
+                if grpc.mode != crate::model::ExternalVlessGrpcMode::Gun
+                    || grpc
+                        .authority
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty()) =>
+            {
+                diagnostics.push(Diagnostic::error(
+                    "front.external-vless-grpc-options",
+                    &at,
+                    "Mihomo 前置配置不能表达 Xray gRPC multi/guna 或 Authority；不能静默降级",
+                ));
+            }
+            ExternalVlessTransport::Xhttp(xhttp) => {
+                if xhttp
+                    .extra
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|extra| !extra.is_empty())
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "front.external-vless-xhttp-extra",
+                        &at,
+                        "XHTTP extra 含有未投影到 Mihomo 的原始字段；不能在客户端订阅中静默丢弃",
+                    ));
+                }
+                if let Some(download) = &xhttp.download {
+                    validate_external_front_security(&at, &download.security, diagnostics);
+                }
+            }
+            _ => {}
+        }
+    }
+    validate_external_front_security(&at, &outbound.security, diagnostics);
+}
+
+fn validate_external_front_security(
+    at: &str,
+    security: &ExternalOutboundSecurity,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match security {
+        ExternalOutboundSecurity::Tls {
+            pinned_peer_cert_sha256: Some(pins),
+            ..
+        } if pins.split(',').filter(|pin| !pin.trim().is_empty()).count() > 1 => {
+            diagnostics.push(Diagnostic::error(
+                "front.external-tls-multiple-pins",
+                at,
+                "Mihomo 前置配置只能表达一个证书 SHA-256，不能静默丢弃其余证书钉扎",
+            ));
+        }
+        ExternalOutboundSecurity::Reality {
+            mldsa65_verify,
+            spider_x,
+            ..
+        } if mldsa65_verify.is_some() || spider_x.is_some() => {
+            diagnostics.push(Diagnostic::error(
+                "front.external-reality-extensions",
+                at,
+                "Mihomo 前置配置不能表达 Xray REALITY 的 pqv/spx；该隧道只能用于 Brocade 节点出站",
+            ));
+        }
+        _ => {}
     }
 }
 

@@ -18,7 +18,7 @@ use brocade_core::model::{
     VPNGATE_DEFAULT_MIN_DOWNLOAD_BPS,
 };
 use ipnet::Ipv4Net;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{Result, StoreError};
@@ -348,44 +348,134 @@ fn decode_stored_snapshot(mut snapshot: Value, revision: u64) -> Result<ModelSna
     Ok(snapshot)
 }
 
-/// Historical snapshots remain fully compilable, but their proxy credentials must not turn the
-/// JSONB history table into a plaintext secret archive. The model's tagged protocol enum places
-/// the shared credential at `protocol.v.credential`; only that narrowly identified field is
-/// transformed, leaving ordinary ids and labels untouched. Managed WARP and VPN Gate outbounds
-/// intentionally have no resource-level credential.
+/// Historical snapshots remain fully compilable, but proxy secrets must not turn the JSONB
+/// history table into a plaintext archive. Besides the shared credential, VLESS has extensible
+/// Finalmask and XHTTP option trees with upstream-defined symmetric-key fields, so that complete
+/// option document receives its own authenticated envelope. Ordinary ids and labels stay
+/// queryable. Managed WARP and VPN Gate outbounds intentionally have no resource-level credential.
 pub(crate) fn seal_snapshot_external_credentials(snapshot: &mut Value) -> Result<()> {
+    seal_snapshot_vless_options(snapshot)?;
     transform_snapshot_external_credentials(snapshot, |context, credential| {
         crate::secrets::seal(context, credential)
     })
 }
 
 pub(crate) fn open_snapshot_external_credentials(snapshot: &mut Value) -> Result<()> {
+    open_snapshot_vless_options(snapshot)?;
     transform_snapshot_external_credentials(snapshot, |context, credential| {
         crate::secrets::open(context, credential)
     })
+}
+
+fn seal_snapshot_vless_options(snapshot: &mut Value) -> Result<()> {
+    let Some(outbounds) = snapshot_external_outbounds_mut(snapshot)? else {
+        return Ok(());
+    };
+    for outbound in outbounds {
+        if outbound.pointer("/protocol/t").and_then(Value::as_str) != Some("vless") {
+            continue;
+        }
+        let (tenant, id) = external_snapshot_identity(outbound)?;
+        let protocol = outbound
+            .pointer_mut("/protocol/v")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                invalid_error(format!(
+                    "external outbound snapshot {tenant}/{id} is missing VLESS options"
+                ))
+            })?;
+        let credential = protocol.remove("credential").ok_or_else(|| {
+            invalid_error(format!(
+                "external outbound snapshot {tenant}/{id} is missing credential"
+            ))
+        })?;
+        let plaintext = serde_json::to_string(protocol)?;
+        let sealed = crate::secrets::seal(
+            &crate::secrets::external_outbound_options_context(&tenant, &id),
+            &plaintext,
+        )?;
+        protocol.clear();
+        protocol.insert("credential".to_owned(), credential);
+        protocol.insert("options_sealed".to_owned(), Value::String(sealed));
+    }
+    Ok(())
+}
+
+fn open_snapshot_vless_options(snapshot: &mut Value) -> Result<()> {
+    let Some(outbounds) = snapshot_external_outbounds_mut(snapshot)? else {
+        return Ok(());
+    };
+    for outbound in outbounds {
+        if outbound.pointer("/protocol/t").and_then(Value::as_str) != Some("vless") {
+            continue;
+        }
+        let (tenant, id) = external_snapshot_identity(outbound)?;
+        let protocol = outbound
+            .pointer_mut("/protocol/v")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                invalid_error(format!(
+                    "external outbound snapshot {tenant}/{id} is missing VLESS options"
+                ))
+            })?;
+        let Some(sealed) = protocol
+            .remove("options_sealed")
+            .and_then(|value| value.as_str().map(str::to_owned))
+        else {
+            // Compatibility with snapshots written before the option envelope was introduced.
+            continue;
+        };
+        let credential = protocol.remove("credential").ok_or_else(|| {
+            invalid_error(format!(
+                "external outbound snapshot {tenant}/{id} is missing credential"
+            ))
+        })?;
+        let plaintext = crate::secrets::open(
+            &crate::secrets::external_outbound_options_context(&tenant, &id),
+            &sealed,
+        )?;
+        let mut options = serde_json::from_str::<serde_json::Map<String, Value>>(&plaintext)
+            .map_err(StoreError::from)?;
+        options.insert("credential".to_owned(), credential);
+        *protocol = options;
+    }
+    Ok(())
+}
+
+fn snapshot_external_outbounds_mut(snapshot: &mut Value) -> Result<Option<&mut Vec<Value>>> {
+    let Some(value) = snapshot.get_mut("external_outbounds") else {
+        // Compatibility with snapshots written before externally managed outbounds existed.
+        return Ok(None);
+    };
+    value
+        .as_array_mut()
+        .map(Some)
+        .ok_or_else(|| invalid_error("snapshot external_outbounds is not an array"))
+}
+
+fn external_snapshot_identity(outbound: &Value) -> Result<(String, String)> {
+    let tenant = outbound
+        .get("tenant")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_error("external outbound snapshot is missing tenant"))?
+        .to_owned();
+    let id = outbound
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_error("external outbound snapshot is missing id"))?
+        .to_owned();
+    Ok((tenant, id))
 }
 
 fn transform_snapshot_external_credentials(
     snapshot: &mut Value,
     transform: impl Fn(&str, &str) -> Result<String>,
 ) -> Result<()> {
-    let Some(outbounds) = snapshot
-        .get_mut("external_outbounds")
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(outbounds) = snapshot_external_outbounds_mut(snapshot)? else {
         return Ok(());
     };
     for outbound in outbounds {
-        let tenant = outbound
-            .get("tenant")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_error("external outbound snapshot is missing tenant"))?
-            .to_owned();
-        let id = outbound
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_error("external outbound snapshot is missing id"))?
-            .to_owned();
+        let (tenant, id) = external_snapshot_identity(outbound)?;
         if let Some(credential) = outbound
             .pointer("/protocol/v/credential")
             .and_then(Value::as_str)
@@ -912,7 +1002,12 @@ fn external_outbound_from_row(
             &text(row, "credential_sealed")?,
         )?
     };
-    let options = row.try_get::<Value, _>("protocol_options")?;
+    let options = open_external_outbound_protocol_options(
+        &tenant,
+        &id,
+        &stored_protocol,
+        row.try_get::<Value, _>("protocol_options")?,
+    )?;
     let protocol = match stored_protocol.as_str() {
         "anytls" => ExternalOutboundProtocol::Anytls { credential },
         "vless" => ExternalOutboundProtocol::Vless {
@@ -944,6 +1039,10 @@ fn external_outbound_from_row(
                         "external_outbounds.protocol_options.transport 无效（{tenant}/{id}）：{error}"
                     ))
                 })?,
+            final_mask: options
+                .get("final_mask")
+                .filter(|value| !value.is_null())
+                .cloned(),
         },
         "shadowsocks2022" => ExternalOutboundProtocol::Shadowsocks2022 {
             credential,
@@ -1076,6 +1175,47 @@ fn external_outbound_from_row(
         security,
         bindings,
     })
+}
+
+/// VLESS owns upstream-extensible JSON whose current fields already include symmetric keys.
+/// Store the complete option document as one authenticated ciphertext so newly added Xray fields
+/// cannot accidentally become plaintext columns. Older rows remain readable and are upgraded the
+/// next time the outbound is saved.
+pub(crate) fn seal_external_outbound_protocol_options(
+    tenant: &str,
+    id: &str,
+    protocol: &str,
+    options: Value,
+) -> Result<Value> {
+    if protocol != "vless" {
+        return Ok(options);
+    }
+    let plaintext = serde_json::to_string(&options)?;
+    let sealed = crate::secrets::seal(
+        &crate::secrets::external_outbound_options_context(tenant, id),
+        &plaintext,
+    )?;
+    Ok(json!({ "brocade_sealed": sealed }))
+}
+
+pub(crate) fn open_external_outbound_protocol_options(
+    tenant: &str,
+    id: &str,
+    protocol: &str,
+    options: Value,
+) -> Result<Value> {
+    if protocol != "vless" {
+        return Ok(options);
+    }
+    let Some(sealed) = options.get("brocade_sealed").and_then(Value::as_str) else {
+        // Compatibility with rows written before the VLESS option envelope was introduced.
+        return Ok(options);
+    };
+    let plaintext = crate::secrets::open(
+        &crate::secrets::external_outbound_options_context(tenant, id),
+        sealed,
+    )?;
+    serde_json::from_str(&plaintext).map_err(StoreError::from)
 }
 
 async fn load_external_outbound_bindings(

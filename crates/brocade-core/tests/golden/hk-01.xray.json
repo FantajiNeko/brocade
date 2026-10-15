@@ -289,6 +289,14 @@
   },
   "outbounds": [
     {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP",
+        "ipsBlocked": []
+      },
+      "tag": "out:forward"
+    },
+    {
       "protocol": "vless",
       "settings": {
         "vnext": [

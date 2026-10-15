@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	stdnet "net"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +15,54 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 )
+
+func TestSpliceAccountsSmallTransfersBeforeConnectionCloses(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux splice")
+	}
+	readerConn, input := tcpConnPair(t)
+	writerConn, output := tcpConnPair(t)
+	defer readerConn.Close()
+	defer input.Close()
+	defer writerConn.Close()
+	defer output.Close()
+	input.SetDeadline(time.Now().Add(5 * time.Second))
+	output.SetDeadline(time.Now().Add(5 * time.Second))
+	inbound := &session.Inbound{Conn: writerConn}
+	inbound.CanSpliceCopy.Store(session.SpliceCopyDirect)
+	outbound := &session.Outbound{}
+	outbound.CanSpliceCopy.Store(session.SpliceCopyDirect)
+	ctx := session.ContextWithInbound(context.Background(), inbound)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{outbound})
+	counter := new(spliceTestCounter)
+	writer := &dispatcher.SizeStatWriter{Counter: counter, Writer: buf.NewWriter(writerConn)}
+	done := make(chan error, 1)
+	go func() {
+		done <- CopyRawConnIfExist(ctx, readerConn, writerConn, writer,
+			signal.CancelAfterInactivity(ctx, func() {}, time.Minute), nil)
+	}()
+	payload := bytes.Repeat([]byte{7}, 2048)
+	if _, err := input.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(output, make([]byte, len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for counter.Value() != int64(len(payload)) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if counter.Value() != int64(len(payload)) {
+		t.Fatal("small live transfer remained unaccounted")
+	}
+	input.CloseWrite()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if counter.Value() != int64(len(payload)) {
+		t.Fatal("EOF double-counted transferred bytes")
+	}
+}
 
 type spliceTestCounter struct {
 	value atomic.Int64

@@ -131,7 +131,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inbound.User = user
 	inbound.CanSpliceCopy.Store(session.SpliceCopyDisabled)
 	userPolicy := s.policyManager.ForLevel(user.Level)
-	conn, stopAccounting := accountConnection(
+	conn, stopAccounting, err := accountConnection(
 		s.statsManager,
 		s.onlineTracker,
 		userPolicy,
@@ -139,6 +139,9 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		inbound.Source.Address.String(),
 		conn,
 	)
+	if err != nil {
+		return errors.New("mtproto: cannot initialize user accounting").Base(err)
+	}
 	defer stopAccounting()
 	inbound.Conn = conn
 
@@ -254,23 +257,30 @@ func accountConnection(
 	email string,
 	sourceIP string,
 	conn stat.Connection,
-) (stat.Connection, func()) {
+) (stat.Connection, func(), error) {
 	if manager == nil || email == "" {
-		return conn, func() {}
+		return conn, func() {}, nil
 	}
 
 	var uplinkCounter, downlinkCounter featurestats.Counter
+	var err error
 	if userPolicy.Stats.UserUplink {
-		uplinkCounter, _ = featurestats.GetOrRegisterCounter(
+		uplinkCounter, err = featurestats.GetOrRegisterCounter(
 			manager,
 			"user>>>"+email+">>>traffic>>>uplink",
 		)
+		if err != nil {
+			return conn, func() {}, err
+		}
 	}
 	if userPolicy.Stats.UserDownlink {
-		downlinkCounter, _ = featurestats.GetOrRegisterCounter(
+		downlinkCounter, err = featurestats.GetOrRegisterCounter(
 			manager,
 			"user>>>"+email+">>>traffic>>>downlink",
 		)
+		if err != nil {
+			return conn, func() {}, err
+		}
 	}
 	if uplinkCounter != nil || downlinkCounter != nil {
 		conn = &stat.CounterConnection{
@@ -281,21 +291,21 @@ func accountConnection(
 	}
 
 	if !userPolicy.Stats.UserOnline || sourceIP == "" {
-		return conn, func() {}
+		return conn, func() {}, nil
 	}
 	if onlineTracker != nil {
-		return conn, onlineTracker.observe(manager, email, sourceIP)
+		return conn, onlineTracker.observe(manager, email, sourceIP), nil
 	}
 	online, _ := featurestats.GetOrRegisterOnlineMap(manager, "user>>>"+email+">>>online")
 	if online == nil {
-		return conn, func() {}
+		return conn, func() {}, nil
 	}
 	if protocols, ok := online.(featurestats.ProtocolOnlineMap); ok {
 		protocols.AddIPWithProtocol(sourceIP, protocolName)
-		return conn, func() { protocols.RemoveIPWithProtocol(sourceIP, protocolName) }
+		return conn, func() { protocols.RemoveIPWithProtocol(sourceIP, protocolName) }, nil
 	}
 	online.AddIP(sourceIP)
-	return conn, func() { online.RemoveIP(sourceIP) }
+	return conn, func() { online.RemoveIP(sourceIP) }, nil
 }
 
 // Telegram encrypts the complete 64-byte initialization payload before sending its first 56

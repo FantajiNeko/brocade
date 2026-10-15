@@ -2158,6 +2158,7 @@ mod tests {
             address: "vendor.example".to_owned(),
             port: 443,
             protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
                 credential: "vendor-user".to_owned(),
                 encryption: "none".to_owned(),
                 flow: None,

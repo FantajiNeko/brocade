@@ -12,20 +12,22 @@ use brocade_core::{
         Accept, Action, AnyTls, AnyTlsMasquerade, AppView, CertificateTrack, Chain, DestMatch, Dns,
         DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution,
         EgressDnsTransport, ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
-        ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn, HopMux, HopPool, HopWire,
-        Hysteria2, HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
-        Ingress, IngressWires, IpFamily, ModelSettings, ModelSnapshot, MtProto, Network, Node,
-        NodeEgressDnsPolicy, OverlaySettings, Reality, RealityClientPolicy, RealityFallbackLimits,
-        RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User,
-        WireGuardKeys, Xhttp, XhttpMode, XhttpTuning, XhttpXmuxRange,
+        ExternalVlessGrpc, ExternalVlessGrpcMode, ExternalVlessHttp, ExternalVlessHttpUpgrade,
+        ExternalVlessKcp, ExternalVlessTransport, ExternalVlessWebsocket, ExternalVlessXhttp,
+        ExternalVlessXhttpDownload, ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn,
+        HopMux, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion,
+        HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily, ModelSettings,
+        ModelSnapshot, MtProto, Network, Node, NodeEgressDnsPolicy, OverlaySettings, Reality,
+        RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySite, RealityXhttp,
+        Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp, XhttpMode, XhttpTuning,
+        XhttpXmuxRange,
     },
     physical::node::{project_node, reality_fallback_limits},
     Level,
 };
 
 use ipnet::Ipv4Net;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[test]
 fn a_pure_ingress_node_uses_its_assigned_self_signed_track() {
@@ -139,12 +141,15 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             address: "edge.vendor.example".to_owned(),
             port: 443,
             protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
                 credential: "external-uuid".to_owned(),
                 encryption: "none".to_owned(),
                 flow: Some("xtls-rprx-vision".to_owned()),
                 transport: ExternalVlessTransport::Raw,
             },
             security: ExternalOutboundSecurity::Reality {
+                mldsa65_verify: None,
+                spider_x: None,
                 server_name: "www.example.com".to_owned(),
                 public_key: "reality-public-key".to_owned(),
                 short_id: "0123abcd".to_owned(),
@@ -159,10 +164,12 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             address: "upload.vendor.example".to_owned(),
             port: 443,
             protocol: ExternalOutboundProtocol::Vless {
+                final_mask: Some(json!({})),
                 credential: "external-xhttp-uuid".to_owned(),
                 encryption: "none".to_owned(),
                 flow: None,
                 transport: ExternalVlessTransport::Xhttp(ExternalVlessXhttp {
+                    extra: Some(json!({ "noSSEHeader": true })),
                     path: "/external-xhttp".to_owned(),
                     host: Some("upload-http.vendor.example".to_owned()),
                     mux: Some(4),
@@ -171,6 +178,10 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                         address: "download.vendor.example".to_owned(),
                         port: 8443,
                         security: ExternalOutboundSecurity::Tls {
+                            alpn: Vec::new(),
+                            ech_config_list: None,
+                            pinned_peer_cert_sha256: None,
+                            verify_peer_cert_by_name: None,
                             server_name: "download.vendor.example".to_owned(),
                             fingerprint: "chrome".to_owned(),
                         },
@@ -182,6 +193,8 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 }),
             },
             security: ExternalOutboundSecurity::Reality {
+                mldsa65_verify: None,
+                spider_x: None,
                 server_name: "www.example.com".to_owned(),
                 public_key: "reality-public-key".to_owned(),
                 short_id: "0123abcd".to_owned(),
@@ -203,6 +216,137 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            id: "custom-7777-7777".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "WebSocket 边缘".to_owned(),
+            address: "ws.vendor.example".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "external-websocket-uuid".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Websocket(ExternalVlessWebsocket {
+                    path: "/external-websocket?ed=2048".to_owned(),
+                    host: Some("ws-host.vendor.example".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
+                ech_config_list: Some("ech-config-list".to_owned()),
+                pinned_peer_cert_sha256: Some("00".repeat(32)),
+                verify_peer_cert_by_name: Some("cert.vendor.example".to_owned()),
+                server_name: "ws-sni.vendor.example".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-8888-8888".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "mKCP 边缘".to_owned(),
+            address: "kcp.vendor.example".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "external-kcp-uuid".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Kcp(ExternalVlessKcp {
+                    mtu: Some(1200),
+                    tti: Some(50),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "kcp.vendor.example".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-9999-9999".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "HTTP/2 边缘".to_owned(),
+            address: "h2.vendor.example".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "external-http-uuid".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Http(ExternalVlessHttp {
+                    path: "/legacy-h2".to_owned(),
+                    host: Some("h2-host.vendor.example".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "h2.vendor.example".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-aaaa-aaaa".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "gRPC 边缘".to_owned(),
+            address: "grpc.vendor.example".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "external-grpc-uuid".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Grpc(ExternalVlessGrpc {
+                    service_name: "Brocade.Edge".to_owned(),
+                    mode: ExternalVlessGrpcMode::Multi,
+                    authority: Some("grpc-authority.vendor.example".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "grpc.vendor.example".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-bbbb-bbbb".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "HTTPUpgrade 边缘".to_owned(),
+            address: "upgrade.vendor.example".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "external-httpupgrade-uuid".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::HttpUpgrade(ExternalVlessHttpUpgrade {
+                    path: "/upgrade".to_owned(),
+                    host: Some("upgrade-host.vendor.example".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "upgrade.vendor.example".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
             id: "custom-4444-4444".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "HTTP CONNECT 边缘".to_owned(),
@@ -213,6 +357,10 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 credential: String::new(),
             },
             security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
                 server_name: "http.vendor.example".to_owned(),
                 fingerprint: "chrome".to_owned(),
             },
@@ -288,6 +436,36 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                         },
                     },
                     Rule {
+                        dest_match: DestMatch::DomainSuffix(vec!["websocket.example".to_owned()]),
+                        action: Action::Proxy {
+                            outbound: "custom-7777-7777".to_owned(),
+                        },
+                    },
+                    Rule {
+                        dest_match: DestMatch::DomainSuffix(vec!["kcp.example".to_owned()]),
+                        action: Action::Proxy {
+                            outbound: "custom-8888-8888".to_owned(),
+                        },
+                    },
+                    Rule {
+                        dest_match: DestMatch::DomainSuffix(vec!["h2.example".to_owned()]),
+                        action: Action::Proxy {
+                            outbound: "custom-9999-9999".to_owned(),
+                        },
+                    },
+                    Rule {
+                        dest_match: DestMatch::DomainSuffix(vec!["grpc.example".to_owned()]),
+                        action: Action::Proxy {
+                            outbound: "custom-aaaa-aaaa".to_owned(),
+                        },
+                    },
+                    Rule {
+                        dest_match: DestMatch::DomainSuffix(vec!["upgrade.example".to_owned()]),
+                        action: Action::Proxy {
+                            outbound: "custom-bbbb-bbbb".to_owned(),
+                        },
+                    },
+                    Rule {
                         dest_match: DestMatch::DomainSuffix(vec!["wireguard.example".to_owned()]),
                         action: Action::Proxy {
                             outbound: "custom-6666-6666".to_owned(),
@@ -347,11 +525,16 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
         xhttp["streamSettings"]["xhttpSettings"]["mode"],
         "stream-up"
     );
+    assert_eq!(xhttp["streamSettings"]["finalmask"], json!({}));
     assert_eq!(
-        xhttp["streamSettings"]["xhttpSettings"]["xmux"]["maxConcurrency"],
+        xhttp["streamSettings"]["xhttpSettings"]["extra"]["noSSEHeader"],
+        true
+    );
+    assert_eq!(
+        xhttp["streamSettings"]["xhttpSettings"]["extra"]["xmux"]["maxConcurrency"],
         4
     );
-    let download = &xhttp["streamSettings"]["xhttpSettings"]["downloadSettings"];
+    let download = &xhttp["streamSettings"]["xhttpSettings"]["extra"]["downloadSettings"];
     assert_eq!(download["address"], "download.vendor.example");
     assert_eq!(download["port"], 8443);
     assert_eq!(download["network"], "xhttp");
@@ -363,6 +546,69 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
     assert_eq!(socks["settings"]["user"], "proxy-user");
     assert_eq!(socks["settings"]["pass"], "proxy-password");
     assert_eq!(socks["streamSettings"]["security"], "none");
+    let websocket = outbound(&hk, "out:external/custom-7777-7777");
+    assert_eq!(websocket["protocol"], "vless");
+    assert_eq!(websocket["streamSettings"]["network"], "ws");
+    assert_eq!(
+        websocket["streamSettings"]["wsSettings"]["path"],
+        "/external-websocket?ed=2048"
+    );
+    assert_eq!(
+        websocket["streamSettings"]["wsSettings"]["host"],
+        "ws-host.vendor.example"
+    );
+    assert_eq!(websocket["streamSettings"]["security"], "tls");
+    assert_eq!(
+        websocket["streamSettings"]["tlsSettings"]["serverName"],
+        "ws-sni.vendor.example"
+    );
+    assert_eq!(
+        websocket["streamSettings"]["tlsSettings"]["alpn"],
+        json!(["h2", "http/1.1"])
+    );
+    assert_eq!(
+        websocket["streamSettings"]["tlsSettings"]["echConfigList"],
+        "ech-config-list"
+    );
+    assert_eq!(
+        websocket["streamSettings"]["tlsSettings"]["pinnedPeerCertSha256"],
+        "00".repeat(32)
+    );
+    assert_eq!(
+        websocket["streamSettings"]["tlsSettings"]["verifyPeerCertByName"],
+        "cert.vendor.example"
+    );
+    let kcp = outbound(&hk, "out:external/custom-8888-8888");
+    assert_eq!(kcp["streamSettings"]["network"], "kcp");
+    assert_eq!(kcp["streamSettings"]["kcpSettings"]["mtu"], 1200);
+    assert_eq!(kcp["streamSettings"]["kcpSettings"]["tti"], 50);
+    let legacy_http = outbound(&hk, "out:external/custom-9999-9999");
+    assert_eq!(legacy_http["streamSettings"]["network"], "xhttp");
+    assert_eq!(
+        legacy_http["streamSettings"]["xhttpSettings"]["mode"],
+        "stream-one"
+    );
+    assert_eq!(
+        legacy_http["streamSettings"]["xhttpSettings"]["extra"]["noGRPCHeader"],
+        true
+    );
+    let grpc = outbound(&hk, "out:external/custom-aaaa-aaaa");
+    assert_eq!(grpc["streamSettings"]["network"], "grpc");
+    assert_eq!(
+        grpc["streamSettings"]["grpcSettings"]["serviceName"],
+        "Brocade.Edge"
+    );
+    assert_eq!(grpc["streamSettings"]["grpcSettings"]["multiMode"], true);
+    assert_eq!(
+        grpc["streamSettings"]["grpcSettings"]["authority"],
+        "grpc-authority.vendor.example"
+    );
+    let http_upgrade = outbound(&hk, "out:external/custom-bbbb-bbbb");
+    assert_eq!(http_upgrade["streamSettings"]["network"], "httpupgrade");
+    assert_eq!(
+        http_upgrade["streamSettings"]["httpupgradeSettings"]["path"],
+        "/upgrade"
+    );
     let http = outbound(&hk, "out:external/custom-4444-4444");
     assert_eq!(http["protocol"], "http");
     assert!(http["settings"].get("user").is_none());
@@ -2406,6 +2652,7 @@ fn project_node_merges_xray_structure_from_all_app_views() {
     assert_eq!(
         tags(value["outbounds"].as_array().unwrap()),
         [
+            "out:forward",
             "out:relay/c-relay>sg",
             "out:egress",
             "out:block",
@@ -2507,6 +2754,7 @@ fn xray_tags_are_namespaced_by_app() {
     assert_eq!(
         tags(dialer["outbounds"].as_array().unwrap()),
         [
+            "out:forward",
             "out:a/c>sg",
             "out:b/c>sg",
             "out:reality-guard",
@@ -3744,6 +3992,10 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
                 credential: "anytls-password".to_owned(),
             },
             ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
                 server_name: "edge.example.com".to_owned(),
                 fingerprint: "chrome".to_owned(),
             },
@@ -3751,6 +4003,7 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
         ),
         (
             ExternalOutboundProtocol::Vless {
+                final_mask: None,
                 credential: "2d2304da-f114-4574-8d44-625afdb1db5c".to_owned(),
                 encryption: encryption.clone(),
                 flow: None,

@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, type ReactNode } from 'react';
 import {
+  ApiError,
   fetchConsoleBootstrap,
   fetchSessionWhoami,
   loginAdmin,
@@ -16,17 +17,91 @@ export interface Session {
 const Ctx = createContext<Session | null>(null);
 
 export const SESSION_KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
+const SESSION_REVISION_KEY = 'brocade.session-revision';
+const reloadForIdentityChange = () => window.location.reload();
 
-export function SessionProvider({ value, children }: { value: Session; children: ReactNode }) {
+/** Notify other open tabs after this tab replaces the shared HttpOnly session cookie. */
+export function announceSessionChange() {
+  try {
+    localStorage.setItem(SESSION_REVISION_KEY, `${Date.now()}:${Math.random()}`);
+  } catch {
+    // Storage can be disabled by browser policy. Focus/visibility verification remains the
+    // fallback, and a successful login must never be turned into an error by this hint channel.
+  }
+}
+
+function sameSessionIdentity(expected: Whoami, current: Whoami) {
+  return (
+    expected.operator_id === current.operator_id &&
+    expected.role === current.role &&
+    expected.tenant_scope === current.tenant_scope &&
+    expected.masked_assets === current.masked_assets &&
+    expected.self_user?.tenant_id === current.self_user?.tenant_id &&
+    expected.self_user?.user_id === current.self_user?.user_id
+  );
+}
+
+export function SessionProvider({
+  value,
+  children,
+  onIdentityChange = reloadForIdentityChange,
+}: {
+  value: Session;
+  children: ReactNode;
+  onIdentityChange?: () => void;
+}) {
   useEffect(() => {
+    let checking = false;
+    let disposed = false;
+    let changed = false;
+
+    // The session cookie is shared between tabs while React Query and this context are not. Check
+    // the authoritative identity whenever a tab becomes active (and periodically while it stays
+    // open); otherwise a tab can keep rendering the previous visitor after another tab logs in as
+    // an administrator, or send administrator-shaped requests with a newly installed user cookie.
+    const verifyIdentity = async () => {
+      if (checking || changed) return;
+      checking = true;
+      try {
+        const current = await fetchSessionWhoami();
+        if (!disposed && !sameSessionIdentity(value.who, current)) {
+          changed = true;
+          onIdentityChange();
+        }
+      } catch (error) {
+        // Network failures are transient. An invalid/expired shared cookie is an identity change
+        // and must return through bootstrap so the page cannot retain privileged cached data.
+        if (!disposed && error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          changed = true;
+          onIdentityChange();
+        }
+      } finally {
+        checking = false;
+      }
+    };
+    const onFocus = () => void verifyIdentity();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void verifyIdentity();
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === SESSION_REVISION_KEY) void verifyIdentity();
+    };
+
     // An open console is an active session even when its current page has no polling query. The
     // server throttles durable expiry updates, so this lightweight identity read cannot turn into
-    // an unbounded write rate. A transient network failure must not be mistaken for a logout.
-    const timer = window.setInterval(() => {
-      void fetchSessionWhoami().catch(() => undefined);
-    }, SESSION_KEEPALIVE_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [value.who.operator_id]);
+    // an unbounded write rate.
+    const timer = window.setInterval(() => void verifyIdentity(), SESSION_KEEPALIVE_INTERVAL_MS);
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, [onIdentityChange, value.who]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
@@ -44,6 +119,9 @@ export const PUBLIC_ID = 'public';
 /** 表示未登录的公开访客，而非已登录的操作者。顶栏只为其保留「机器」和「项目」。 */
 export const isPublic = (who: Whoami) => who.operator_id === PUBLIC_ID;
 export const isVisitor = (who: Whoami) => isPublic(who) || who.role === 'user';
+
+export const canViewUserRealtimeTraffic = (who: Whoami) =>
+  !isPublic(who) && (who.role === 'system-admin' || who.role === 'tenant-admin');
 
 /* 该标签页中已执行退出的标记：设置后不再自动登录为 public，否则退出后的下一帧
    会回到访客视角，无法显示登录表单。使用 sessionStorage 而非 localStorage：

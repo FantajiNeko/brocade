@@ -128,7 +128,15 @@ func GetOrRegisterCounter(m Manager, name string) (Counter, error) {
 		return counter, nil
 	}
 
-	return m.RegisterCounter(name)
+	counter, err := m.RegisterCounter(name)
+	if err != nil {
+		// Concurrent first connections may register the same label after GetCounter. Returning
+		// nil here would let callers serve that entire connection without accounting.
+		if existing := m.GetCounter(name); existing != nil {
+			return existing, nil
+		}
+	}
+	return counter, err
 }
 
 // GetOrRegisterOnlineMap tries to get the OnlineMap first. If not exist, it then tries to create a new OnlineMap.

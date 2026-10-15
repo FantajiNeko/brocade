@@ -20,6 +20,8 @@ pub const TUNNEL_PROBE_LEASE_SECS: i32 = 30;
 const MAX_DUE_PER_TICK: i64 = 32;
 const PRUNE_BATCH: i64 = 5_000;
 const SCHEDULER_ADVISORY_LOCK: i64 = 0x4252_4f43_5052_4f42;
+/// A sampled Serving run whose first byte takes longer than this degrades the tunnel.
+const SLOW_TTFB_MS: u32 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -29,6 +31,43 @@ pub enum TunnelProbeHealth {
     Down,
     Paused,
     Unknown,
+}
+
+/// The branch of [`health_of`] that decided a tunnel's health, with the inputs it compared.
+/// Clients word it from these values, so the rule and its threshold exist only in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum TunnelProbeHealthReason {
+    /// No policy, or a disabled one.
+    NotScheduled,
+    /// Scheduled, but no finished Serving run within the last seven days.
+    NoSamples,
+    /// The newest Serving run finished more than three intervals ago.
+    Stale {
+        latest_finished_at_unix_secs: Option<i64>,
+    },
+    /// The newest `count` Serving runs all failed; `latest` is the newest result.
+    ConsecutiveFailures {
+        count: u32,
+        latest: Option<TunnelProbeResultStatus>,
+    },
+    /// The newest Serving run failed after a success.
+    LatestFailed {
+        result: Option<TunnelProbeResultStatus>,
+    },
+    /// Fewer than 80% of the sampled runs succeeded.
+    LowSuccessRate { succeeded: u32, samples: u32 },
+    /// A sampled run exceeded the first-byte threshold.
+    Slow {
+        max_ttfb_ms: u32,
+        threshold_ms: u32,
+        samples: u32,
+    },
+    /// Every sampled run succeeded within the first-byte threshold.
+    Healthy {
+        max_ttfb_ms: Option<u32>,
+        samples: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -168,6 +207,8 @@ pub struct TunnelProbeListItem {
     pub supported: bool,
     pub unsupported_reason: Option<String>,
     pub health: TunnelProbeHealth,
+    /// Absent when the tunnel cannot be probed from the Console; `unsupported_reason` says why.
+    pub health_reason: Option<TunnelProbeHealthReason>,
     pub policy: Option<TunnelProbePolicy>,
     pub latest_run: Option<TunnelProbeRun>,
 }
@@ -189,6 +230,12 @@ pub struct TunnelProbeSummary {
     pub p50_ms: Option<u32>,
     pub p95_ms: Option<u32>,
     pub failures: u64,
+    /// `failures` split by result; the three always add up to it.
+    pub timeouts: u64,
+    pub connect_failures: u64,
+    pub target_failures: u64,
+    /// Distinct exit addresses reported by successful runs in the window.
+    pub exit_ips: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -203,7 +250,11 @@ pub struct TunnelProbePoint {
 pub struct TunnelProbeView {
     pub item: TunnelProbeListItem,
     pub retention_days: u32,
+    /// The first-byte threshold [`health_of`] applies, for drawing it beside the samples.
+    pub slow_ttfb_ms: u32,
     pub summary: TunnelProbeSummary,
+    /// Width of the time buckets `points` was sampled from; each point is one bucket's run.
+    pub bucket_secs: u32,
     pub points: Vec<TunnelProbePoint>,
     pub recent_runs: Vec<TunnelProbeRun>,
 }
@@ -460,6 +511,7 @@ fn apply_serving_target(item: &mut TunnelProbeListItem, outbound: Option<&Extern
         item.unsupported_reason =
             Some("尚未进入 Serving；发布后才能启用定时监测或拨测 Serving".to_owned());
         item.health = TunnelProbeHealth::Unknown;
+        item.health_reason = None;
         return;
     };
     item.name.clone_from(&outbound.name);
@@ -476,54 +528,98 @@ fn apply_serving_target(item: &mut TunnelProbeListItem, outbound: Option<&Extern
     });
     if !item.supported {
         item.health = TunnelProbeHealth::Unknown;
+        item.health_reason = None;
     }
 }
 
+/// Health from the newest sampled Serving runs (newest first: at most five, all within seven
+/// days), together with the branch that decided it.
 fn health_of(
     policy: Option<&TunnelProbePolicy>,
     recent: &[TunnelProbeRun],
     now_unix_secs: i64,
-) -> TunnelProbeHealth {
-    let Some(policy) = policy else {
-        return TunnelProbeHealth::Paused;
+) -> (TunnelProbeHealth, TunnelProbeHealthReason) {
+    // Counts come from at most five samples; saturating keeps the conversion total.
+    let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+    let Some(policy) = policy.filter(|policy| policy.enabled) else {
+        return (
+            TunnelProbeHealth::Paused,
+            TunnelProbeHealthReason::NotScheduled,
+        );
     };
-    if !policy.enabled {
-        return TunnelProbeHealth::Paused;
-    }
     let Some(latest) = recent.first() else {
-        return TunnelProbeHealth::Unknown;
+        return (
+            TunnelProbeHealth::Unknown,
+            TunnelProbeHealthReason::NoSamples,
+        );
     };
     let stale_after = i64::from(policy.interval_secs.saturating_mul(3));
     if latest
         .finished_at_unix_secs
         .is_none_or(|finished| now_unix_secs.saturating_sub(finished) > stale_after)
     {
-        return TunnelProbeHealth::Unknown;
+        return (
+            TunnelProbeHealth::Unknown,
+            TunnelProbeHealthReason::Stale {
+                latest_finished_at_unix_secs: latest.finished_at_unix_secs,
+            },
+        );
     }
 
     let succeeded = recent
         .iter()
         .filter(|run| run.result == Some(TunnelProbeResultStatus::Ok))
         .count();
-    let latest_failed = latest.result != Some(TunnelProbeResultStatus::Ok);
     let consecutive_failures = recent
         .iter()
         .take_while(|run| run.result != Some(TunnelProbeResultStatus::Ok))
         .count();
     if consecutive_failures >= 2 {
-        return TunnelProbeHealth::Down;
+        return (
+            TunnelProbeHealth::Down,
+            TunnelProbeHealthReason::ConsecutiveFailures {
+                count: count(consecutive_failures),
+                latest: latest.result,
+            },
+        );
+    }
+    let samples = count(recent.len());
+    if latest.result != Some(TunnelProbeResultStatus::Ok) {
+        return (
+            TunnelProbeHealth::Degraded,
+            TunnelProbeHealthReason::LatestFailed {
+                result: latest.result,
+            },
+        );
     }
     let success_rate = succeeded as f64 / recent.len() as f64;
-    let slow = recent
-        .iter()
-        .filter_map(|run| run.ttfb_ms)
-        .max()
-        .is_some_and(|ttfb| ttfb > 300);
-    if latest_failed || success_rate < 0.8 || slow {
-        TunnelProbeHealth::Degraded
-    } else {
-        TunnelProbeHealth::Healthy
+    if success_rate < 0.8 {
+        return (
+            TunnelProbeHealth::Degraded,
+            TunnelProbeHealthReason::LowSuccessRate {
+                succeeded: count(succeeded),
+                samples,
+            },
+        );
     }
+    let max_ttfb_ms = recent.iter().filter_map(|run| run.ttfb_ms).max();
+    if let Some(max_ttfb_ms) = max_ttfb_ms.filter(|ttfb| *ttfb > SLOW_TTFB_MS) {
+        return (
+            TunnelProbeHealth::Degraded,
+            TunnelProbeHealthReason::Slow {
+                max_ttfb_ms,
+                threshold_ms: SLOW_TTFB_MS,
+                samples,
+            },
+        );
+    }
+    (
+        TunnelProbeHealth::Healthy,
+        TunnelProbeHealthReason::Healthy {
+            max_ttfb_ms,
+            samples,
+        },
+    )
 }
 
 fn list_item_from_row(
@@ -540,6 +636,12 @@ fn list_item_from_row(
         .transpose()?;
     let protocol: String = row.try_get("item_protocol")?;
     let supported = protocol != "warp";
+    let (health, health_reason) = if supported {
+        let (health, reason) = health_of(policy.as_ref(), recent, now_unix_secs);
+        (health, Some(reason))
+    } else {
+        (TunnelProbeHealth::Unknown, None)
+    };
     Ok(TunnelProbeListItem {
         tenant_id,
         outbound_id,
@@ -548,11 +650,8 @@ fn list_item_from_row(
         supported,
         unsupported_reason: (!supported)
             .then(|| "Console 拨测暂不支持 WARP：需要独立的 Console 身份".to_owned()),
-        health: if supported {
-            health_of(policy.as_ref(), recent, now_unix_secs)
-        } else {
-            TunnelProbeHealth::Unknown
-        },
+        health,
+        health_reason,
         policy,
         latest_run,
     })
@@ -747,6 +846,7 @@ async fn detail_item(
             unsupported_reason: (!supported)
                 .then(|| "Console 拨测暂不支持 WARP：需要独立的 Console 身份".to_owned()),
             health: TunnelProbeHealth::Paused,
+            health_reason: Some(TunnelProbeHealthReason::NotScheduled),
             policy: None,
             latest_run: Some(latest),
         });
@@ -803,6 +903,10 @@ pub async fn detail(
     let summary = sqlx::query(
         "SELECT count(*)::bigint AS total,
                 count(*) FILTER (WHERE result = 'ok')::bigint AS succeeded,
+                count(*) FILTER (WHERE result = 'timeout')::bigint AS timeouts,
+                count(*) FILTER (WHERE result = 'connect-failed')::bigint AS connect_failures,
+                count(*) FILTER (WHERE result = 'target-failed')::bigint AS target_failures,
+                count(DISTINCT exit_ip) FILTER (WHERE result = 'ok')::bigint AS exit_ips,
                 percentile_disc(0.5) WITHIN GROUP (ORDER BY ttfb_ms)
                     FILTER (WHERE result = 'ok') AS p50_ms,
                 percentile_disc(0.95) WITHIN GROUP (ORDER BY ttfb_ms)
@@ -820,7 +924,7 @@ pub async fn detail(
     .await?;
     let total = i64_to_u64("tunnel probe total", summary.try_get("total")?)?;
     let succeeded = i64_to_u64("tunnel probe succeeded", summary.try_get("succeeded")?)?;
-    let bucket_secs = i32::try_from((window_secs / 240).max(60)).unwrap_or(60);
+    let bucket_secs = (window_secs / 240).max(60);
     let point_rows = sqlx::query(
         "SELECT run_id, finished_at_unix_secs, result, ttfb_ms FROM (
              SELECT id AS run_id, extract(epoch FROM finished_at)::bigint AS finished_at_unix_secs,
@@ -842,7 +946,7 @@ pub async fn detail(
     .bind(&tenant_id)
     .bind(&outbound_id)
     .bind(i32::try_from(window_secs).unwrap_or(7 * 86_400))
-    .bind(bucket_secs)
+    .bind(i32::try_from(bucket_secs).unwrap_or(60))
     .fetch_all(pool)
     .await?;
     let points = point_rows
@@ -885,6 +989,7 @@ pub async fn detail(
     Ok(TunnelProbeView {
         item,
         retention_days: TUNNEL_PROBE_RETENTION_DAYS,
+        slow_ttfb_ms: SLOW_TTFB_MS,
         summary: TunnelProbeSummary {
             window_secs,
             total,
@@ -899,7 +1004,18 @@ pub async fn detail(
                 .map(|value| i32_to_u32("tunnel probe p95", value))
                 .transpose()?,
             failures: total.saturating_sub(succeeded),
+            timeouts: i64_to_u64("tunnel probe timeouts", summary.try_get("timeouts")?)?,
+            connect_failures: i64_to_u64(
+                "tunnel probe connect failures",
+                summary.try_get("connect_failures")?,
+            )?,
+            target_failures: i64_to_u64(
+                "tunnel probe target failures",
+                summary.try_get("target_failures")?,
+            )?,
+            exit_ips: i64_to_u64("tunnel probe exit ips", summary.try_get("exit_ips")?)?,
         },
+        bucket_secs,
         points,
         recent_runs,
     })
@@ -1730,7 +1846,12 @@ mod tests {
                 &[run(TunnelProbeResultStatus::Timeout, None, 1_490)],
                 now,
             ),
-            TunnelProbeHealth::Degraded
+            (
+                TunnelProbeHealth::Degraded,
+                TunnelProbeHealthReason::LatestFailed {
+                    result: Some(TunnelProbeResultStatus::Timeout)
+                }
+            )
         );
         assert_eq!(
             health_of(
@@ -1740,7 +1861,8 @@ mod tests {
                     run(TunnelProbeResultStatus::Ok, Some(80), 1_200)
                 ],
                 now,
-            ),
+            )
+            .0,
             TunnelProbeHealth::Degraded
         );
         assert_eq!(
@@ -1753,16 +1875,38 @@ mod tests {
                 ],
                 now,
             ),
-            TunnelProbeHealth::Down
+            (
+                TunnelProbeHealth::Down,
+                TunnelProbeHealthReason::ConsecutiveFailures {
+                    count: 2,
+                    latest: Some(TunnelProbeResultStatus::Timeout)
+                }
+            )
         );
     }
 
     #[test]
     fn health_distinguishes_paused_stale_and_slow() {
-        assert_eq!(health_of(None, &[], 1_500), TunnelProbeHealth::Paused);
+        assert_eq!(
+            health_of(None, &[], 1_500),
+            (
+                TunnelProbeHealth::Paused,
+                TunnelProbeHealthReason::NotScheduled
+            )
+        );
         assert_eq!(
             health_of(Some(&policy(false)), &[], 1_500),
-            TunnelProbeHealth::Paused
+            (
+                TunnelProbeHealth::Paused,
+                TunnelProbeHealthReason::NotScheduled
+            )
+        );
+        assert_eq!(
+            health_of(Some(&policy(true)), &[], 1_500),
+            (
+                TunnelProbeHealth::Unknown,
+                TunnelProbeHealthReason::NoSamples
+            )
         );
         assert_eq!(
             health_of(
@@ -1770,7 +1914,12 @@ mod tests {
                 &[run(TunnelProbeResultStatus::Ok, Some(80), 1)],
                 2_000,
             ),
-            TunnelProbeHealth::Unknown
+            (
+                TunnelProbeHealth::Unknown,
+                TunnelProbeHealthReason::Stale {
+                    latest_finished_at_unix_secs: Some(1)
+                }
+            )
         );
         assert_eq!(
             health_of(
@@ -1778,7 +1927,64 @@ mod tests {
                 &[run(TunnelProbeResultStatus::Ok, Some(301), 1_490)],
                 1_500,
             ),
-            TunnelProbeHealth::Degraded
+            (
+                TunnelProbeHealth::Degraded,
+                TunnelProbeHealthReason::Slow {
+                    max_ttfb_ms: 301,
+                    threshold_ms: SLOW_TTFB_MS,
+                    samples: 1
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn health_reason_reports_the_deciding_inputs() {
+        // A failure that is not the newest run only lowers the success rate.
+        let mixed = [
+            run(TunnelProbeResultStatus::Ok, Some(120), 1_490),
+            run(TunnelProbeResultStatus::Timeout, None, 1_190),
+            run(TunnelProbeResultStatus::Ok, Some(140), 890),
+            run(TunnelProbeResultStatus::ConnectFailed, None, 590),
+            run(TunnelProbeResultStatus::Ok, Some(110), 290),
+        ];
+        assert_eq!(
+            health_of(Some(&policy(true)), &mixed, 1_500),
+            (
+                TunnelProbeHealth::Degraded,
+                TunnelProbeHealthReason::LowSuccessRate {
+                    succeeded: 3,
+                    samples: 5
+                }
+            )
+        );
+        let healthy = [
+            run(TunnelProbeResultStatus::Ok, Some(120), 1_490),
+            run(TunnelProbeResultStatus::Ok, Some(300), 1_190),
+        ];
+        assert_eq!(
+            health_of(Some(&policy(true)), &healthy, 1_500),
+            (
+                TunnelProbeHealth::Healthy,
+                TunnelProbeHealthReason::Healthy {
+                    max_ttfb_ms: Some(300),
+                    samples: 2
+                }
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(TunnelProbeHealthReason::Slow {
+                max_ttfb_ms: 491,
+                threshold_ms: 300,
+                samples: 1
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "slow",
+                "max_ttfb_ms": 491,
+                "threshold_ms": 300,
+                "samples": 1
+            })
         );
     }
 

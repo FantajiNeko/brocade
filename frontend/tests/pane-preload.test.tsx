@@ -8,7 +8,7 @@ describe('removed links page', () => {
   });
 
   it('preserves the remaining observation and configuration pages', () => {
-    for (const page of ['nodes', 'chains', 'usage', 'settings', 'topo']) {
+    for (const page of ['nodes', 'chains', 'usage', 'capacity', 'settings', 'topo']) {
       expect(initialPaneFromHash(`#/${page}`)).toBe(page);
     }
   });

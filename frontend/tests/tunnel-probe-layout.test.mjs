@@ -5,14 +5,19 @@ import test from 'node:test';
 const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 const settings = readFileSync(new URL('../src/panes/settings.tsx', import.meta.url), 'utf8');
 
-test('tunnel probe panels collapse instead of overflowing narrow screens', () => {
+test('the tunnel detail probe panel collapses instead of overflowing narrow screens', () => {
+  // Readings, records and the policy line rearrange inside the detail container, not the viewport.
   assert.match(
     styles,
-    /@container \(max-width: 520px\)[\s\S]*?\.tunnel-probe-actions\s*\{[\s\S]*?width:\s*100%;[\s\S]*?\.tunnel-probe-phases\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/,
+    /\.tnd-body\.nd-paper-body\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) 320px;[\s\S]*?@container \(max-width: 1080px\)\s*\{\s*\.tnd-body\.nd-paper-body\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\);/,
   );
   assert.match(
     styles,
-    /\.tunnel-probe-run\s*\{[\s\S]*?grid-template-columns:\s*8px minmax\(0, 1\.2fr\) minmax\(0, 0\.8fr\) auto;[\s\S]*?@container \(max-width: 520px\)[\s\S]*?\.tunnel-probe-run\s*\{[\s\S]*?grid-template-columns:\s*8px minmax\(0, 1fr\) auto;/,
+    /\.tnd-run\s*\{[\s\S]*?grid-template-columns:\s*78px 16px 64px minmax\(0, 1fr\) auto;[\s\S]*?@container \(max-width: 700px\)[\s\S]*?\.tnd-run\s*\{\s*grid-template-columns:\s*40px 16px minmax\(0, 1fr\) auto;/,
+  );
+  assert.match(
+    styles,
+    /@container \(max-width: 700px\)[\s\S]*?\.tnd-metrics,\s*\.tnd-metrics\.is-3\s*\{\s*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?\.tnd-route\s*\{\s*flex-basis:\s*100%;/,
   );
   assert.match(styles, /\.tunnel-probe-setting-facts code\s*\{[\s\S]*?overflow-wrap:\s*anywhere;/);
   assert.match(styles, /\.tunnel-probe-settings\s*\{[\s\S]*?width:\s*100%;[\s\S]*?box-sizing:\s*border-box;/);

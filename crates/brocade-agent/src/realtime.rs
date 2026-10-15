@@ -5,12 +5,18 @@
 //! `Start`, are never spooled, and disappear if either side restarts.
 
 use std::{
-    fs, thread,
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use brocade_core::model::parse_grant_label;
 use brocade_deployment::protocol::{
-    AgentRealtimeCommand, AgentRealtimeSample, AGENT_PROTOCOL_VERSION,
+    AgentRealtimeCommand, AgentRealtimeSample, RealtimeUserTrafficRate, RealtimeUserTrafficReport,
+    RealtimeUserTrafficSelector, RealtimeUserTrafficState, AGENT_PROTOCOL_VERSION,
+    MAX_REALTIME_FORWARDING_TARGETS, MAX_REALTIME_USER_TRAFFIC_ROWS,
 };
 use tungstenite::{
     client::IntoClientRequest, protocol::WebSocketConfig, Error as WebSocketError, Message,
@@ -52,6 +58,260 @@ struct RateSampler {
     pending_gap: bool,
 }
 
+type UserTrafficCounters = BTreeMap<String, (u64, u64)>;
+
+#[derive(Default)]
+struct UserTrafficSampler {
+    previous: Option<(Instant, UserTrafficCounters)>,
+}
+
+impl UserTrafficSampler {
+    fn reset(&mut self) {
+        self.previous = None;
+    }
+
+    fn advance(
+        &mut self,
+        state_dir: &Path,
+        selector: &RealtimeUserTrafficSelector,
+        instant: Instant,
+    ) -> RealtimeUserTrafficReport {
+        if crate::serving_xray_process_in(state_dir).is_none() {
+            match crate::accounting::confirmed_stopped_counters(state_dir) {
+                Ok(Some(counters)) => {
+                    self.previous = Some((
+                        instant,
+                        counters
+                            .into_iter()
+                            .map(|counter| {
+                                (
+                                    counter.label,
+                                    (counter.uplink_bytes, counter.downlink_bytes),
+                                )
+                            })
+                            .collect(),
+                    ));
+                    let mut report = user_traffic_report(RealtimeUserTrafficState::Ready, selector);
+                    report.elapsed_millis = Some(1_000);
+                    return report;
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("realtime: stopped accounting unavailable: {error}"),
+            }
+        }
+        let current = match read_user_counters(state_dir, !selector.forwarding().is_empty()) {
+            Ok(current) => current,
+            Err(_) => {
+                self.reset();
+                return user_traffic_report(RealtimeUserTrafficState::Unavailable, selector);
+            }
+        };
+        self.advance_counters(current, selector, instant)
+    }
+
+    fn advance_counters(
+        &mut self,
+        current: UserTrafficCounters,
+        selector: &RealtimeUserTrafficSelector,
+        instant: Instant,
+    ) -> RealtimeUserTrafficReport {
+        let Some((previous_at, previous)) = self.previous.replace((instant, current.clone()))
+        else {
+            return user_traffic_report(RealtimeUserTrafficState::Warming, selector);
+        };
+        let elapsed = instant.saturating_duration_since(previous_at);
+        let Some(elapsed_millis) = u32::try_from(elapsed.as_millis()).ok() else {
+            self.reset();
+            return user_traffic_report(RealtimeUserTrafficState::Warming, selector);
+        };
+        if !(100..=60_000).contains(&elapsed_millis) {
+            self.reset();
+            return user_traffic_report(RealtimeUserTrafficState::Warming, selector);
+        }
+
+        let selected = match selector {
+            RealtimeUserTrafficSelector::All { .. } => None,
+            RealtimeUserTrafficSelector::Labels { labels, .. } => {
+                Some(labels.iter().map(String::as_str).collect::<BTreeSet<_>>())
+            }
+        };
+        let mut users = Vec::new();
+        let mut has_gap = false;
+        for (label, (uplink, downlink)) in &current {
+            let forwarding = label
+                .strip_prefix("fwd:")
+                .and_then(|id| id.parse::<i64>().ok())
+                .and_then(|id| {
+                    selector
+                        .forwarding()
+                        .iter()
+                        .find(|target| target.rule_id == id)
+                });
+            if forwarding.is_none()
+                && selected
+                    .as_ref()
+                    .is_some_and(|labels| !labels.contains(label.as_str()))
+            {
+                continue;
+            }
+            let Some((previous_uplink, previous_downlink)) = previous.get(label) else {
+                has_gap = true;
+                continue;
+            };
+            if uplink < previous_uplink || downlink < previous_downlink {
+                has_gap = true;
+                continue;
+            }
+            let identity = if let Some(target) = forwarding {
+                (
+                    target.user_id.as_str(),
+                    target.tenant_id.as_str(),
+                    None,
+                    Some(target.rule_id),
+                )
+            } else if let Some((user, tenant, ingress)) = parse_grant_label(label) {
+                (user, tenant, Some(ingress.to_owned()), None)
+            } else {
+                continue;
+            };
+            let rate = |value: u64, before: u64| {
+                u64::try_from(
+                    u128::from(value - before)
+                        .saturating_mul(1000)
+                        .checked_div(u128::from(elapsed_millis))
+                        .unwrap_or(0),
+                )
+                .unwrap_or(u64::MAX)
+            };
+            let uplink_bytes_per_sec = rate(*uplink, *previous_uplink);
+            let downlink_bytes_per_sec = rate(*downlink, *previous_downlink);
+            if matches!(selector, RealtimeUserTrafficSelector::All { .. })
+                && uplink_bytes_per_sec == 0
+                && downlink_bytes_per_sec == 0
+            {
+                continue;
+            }
+            users.push(RealtimeUserTrafficRate {
+                tenant_id: identity.1.to_owned(),
+                user_id: identity.0.to_owned(),
+                ingress_id: identity.2,
+                forwarding_rule_id: identity.3,
+                uplink_bytes_per_sec,
+                downlink_bytes_per_sec,
+            });
+        }
+        users.sort_by(|left, right| {
+            let left_total = left
+                .uplink_bytes_per_sec
+                .saturating_add(left.downlink_bytes_per_sec);
+            let right_total = right
+                .uplink_bytes_per_sec
+                .saturating_add(right.downlink_bytes_per_sec);
+            right_total.cmp(&left_total).then_with(|| {
+                (
+                    &left.tenant_id,
+                    &left.user_id,
+                    &left.ingress_id,
+                    left.forwarding_rule_id,
+                )
+                    .cmp(&(
+                        &right.tenant_id,
+                        &right.user_id,
+                        &right.ingress_id,
+                        right.forwarding_rule_id,
+                    ))
+            })
+        });
+        let truncated = users.len() > MAX_REALTIME_USER_TRAFFIC_ROWS;
+        users.truncate(MAX_REALTIME_USER_TRAFFIC_ROWS);
+        RealtimeUserTrafficReport {
+            state: RealtimeUserTrafficState::Ready,
+            all_users: matches!(selector, RealtimeUserTrafficSelector::All { .. }),
+            elapsed_millis: Some(elapsed_millis),
+            users,
+            truncated,
+            has_gap,
+            forwarding_supported: true,
+            forwarding_expected: !selector.forwarding().is_empty(),
+        }
+    }
+}
+
+fn user_traffic_report(
+    state: RealtimeUserTrafficState,
+    selector: &RealtimeUserTrafficSelector,
+) -> RealtimeUserTrafficReport {
+    RealtimeUserTrafficReport {
+        state,
+        all_users: matches!(selector, RealtimeUserTrafficSelector::All { .. }),
+        elapsed_millis: None,
+        users: Vec::new(),
+        truncated: false,
+        has_gap: false,
+        forwarding_supported: true,
+        forwarding_expected: !selector.forwarding().is_empty(),
+    }
+}
+
+fn read_user_counters(state_dir: &Path, forwarding: bool) -> Result<UserTrafficCounters, String> {
+    let content = fs::read_to_string(state_dir.join("xray.json"))
+        .map_err(|error| format!("cannot read xray config: {error}"))?;
+    let api_port = crate::xray_api_port(&content).ok_or("xray api port is absent")?;
+    let mut counters: UserTrafficCounters = crate::read_xray_usage_counters(api_port)?
+        .into_iter()
+        .filter(|counter| parse_grant_label(&counter.label).is_some())
+        .map(|counter| {
+            (
+                counter.label,
+                (counter.uplink_bytes, counter.downlink_bytes),
+            )
+        })
+        .collect();
+    if forwarding {
+        counters.extend(
+            crate::forwarding::read_counters(api_port)?
+                .into_iter()
+                .map(|(id, counters)| (format!("fwd:{id}"), counters)),
+        );
+    }
+    Ok(counters)
+}
+
+fn valid_user_traffic_selector(selector: &Option<RealtimeUserTrafficSelector>) -> bool {
+    let Some(selector) = selector else {
+        return true;
+    };
+    let forwarding = selector.forwarding();
+    if forwarding.len() > MAX_REALTIME_FORWARDING_TARGETS
+        || forwarding.iter().any(|target| {
+            target.rule_id <= 0
+                || target.tenant_id.is_empty()
+                || target.tenant_id.len() > 128
+                || target.user_id.is_empty()
+                || target.user_id.len() > 64
+        })
+        || forwarding
+            .iter()
+            .map(|t| t.rule_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != forwarding.len()
+    {
+        return false;
+    }
+    match selector {
+        RealtimeUserTrafficSelector::All { .. } => true,
+        RealtimeUserTrafficSelector::Labels { labels, .. } => {
+            (!labels.is_empty() || !forwarding.is_empty())
+                && labels.len() <= MAX_REALTIME_USER_TRAFFIC_ROWS
+                && labels.iter().all(|label| {
+                    !label.is_empty() && label.len() <= 512 && parse_grant_label(label).is_some()
+                })
+                && labels.iter().collect::<BTreeSet<_>>().len() == labels.len()
+        }
+    }
+}
+
 impl RateSampler {
     fn reset(&mut self) {
         self.previous = None;
@@ -91,9 +351,11 @@ impl RateSampler {
         let has_timing_gap = elapsed > expected_interval.saturating_mul(2);
         let sample = AgentRealtimeSample {
             diagnostics_unchanged: false,
+            mux_unchanged: false,
             reverse_health: None,
             mux: None,
             vpngate: None,
+            user_traffic: None,
             sequence: self.sequence,
             sampled_at_unix_millis: reading.sampled_at_unix_millis,
             elapsed_millis,
@@ -112,6 +374,71 @@ type HealthCache =
 type MuxCache = std::sync::Arc<std::sync::Mutex<Option<brocade_deployment::protocol::MuxReport>>>;
 pub(crate) type VpngateCache =
     std::sync::Arc<std::sync::Mutex<Option<brocade_deployment::protocol::VpngateRealtimeReport>>>;
+
+fn populate_diagnostics(
+    sample: &mut AgentRealtimeSample,
+    requested: bool,
+    due: bool,
+    health: &HealthCache,
+    mux: &MuxCache,
+    vpngate: &VpngateCache,
+    mux_baseline: &mut Option<Option<brocade_deployment::protocol::MuxReport>>,
+) -> bool {
+    if !requested || !due {
+        sample.diagnostics_unchanged = true;
+        return false;
+    }
+    sample.reverse_health = health.lock().ok().and_then(|value| value.clone());
+    let current_mux = mux.lock().ok().and_then(|value| value.clone());
+    if mux_baseline
+        .as_ref()
+        .is_some_and(|previous| same_mux_state(previous, &current_mux))
+    {
+        sample.mux_unchanged = true;
+    } else {
+        sample.mux = current_mux.clone();
+        *mux_baseline = Some(current_mux);
+    }
+    sample.vpngate = vpngate.lock().ok().and_then(|value| value.clone());
+    true
+}
+
+/// Snapshot timestamps, lease countdowns and successful keepalive counters change while the pool
+/// carries no business. They remain locally observable but do not justify retransmitting the
+/// entire worker set. Failures, topology, lifecycle events and business counters remain part of
+/// the comparison and therefore produce a new baseline immediately.
+fn same_mux_state(
+    previous: &Option<brocade_deployment::protocol::MuxReport>,
+    current: &Option<brocade_deployment::protocol::MuxReport>,
+) -> bool {
+    match (previous, current) {
+        (None, None) => true,
+        (Some(previous), Some(current)) => {
+            let mut previous = previous.clone();
+            let mut current = current.clone();
+            normalize_idle_mux_fields(&mut previous);
+            normalize_idle_mux_fields(&mut current);
+            previous == current
+        }
+        _ => false,
+    }
+}
+
+fn normalize_idle_mux_fields(report: &mut brocade_deployment::protocol::MuxReport) {
+    report.sampled_at_unix_ms = 0;
+    for pool in &mut report.pools {
+        pool.probes = 0;
+        pool.acks = 0;
+    }
+    for worker in &mut report.workers {
+        worker.ack_age_ms = 0;
+        worker.rtt_ms = 0;
+        worker.probes = 0;
+        worker.acks = 0;
+        worker.lease_remaining_ms = 0;
+        worker.queue_delay_ms = 0;
+    }
+}
 
 pub(crate) fn run(options: &Options, vpngate: VpngateCache) {
     let health: HealthCache = Default::default();
@@ -140,7 +467,7 @@ pub(crate) fn run(options: &Options, vpngate: VpngateCache) {
         match connect(options) {
             Ok(socket) => {
                 backoff = INITIAL_RECONNECT;
-                if let Err(error) = serve(socket, &health, &mux, &vpngate) {
+                if let Err(error) = serve(socket, &options.state_dir, &health, &mux, &vpngate) {
                     eprintln!("realtime: connection ended: {error}");
                 }
             }
@@ -220,14 +547,17 @@ fn websocket_url(server: &str) -> Result<String, String> {
 
 fn serve(
     mut socket: WebSocket<Stream>,
+    state_dir: &Path,
     health: &HealthCache,
     mux: &MuxCache,
     vpngate: &VpngateCache,
 ) -> Result<(), String> {
-    let mut active_interval = None;
+    let mut active: Option<(Duration, bool, Option<RealtimeUserTrafficSelector>)> = None;
     let mut next_sample = Instant::now();
     let mut next_diagnostics = Instant::now();
+    let mut mux_baseline = None;
     let mut sampler = RateSampler::default();
+    let mut user_traffic_sampler = UserTrafficSampler::default();
     let mut write_pending = false;
     sampler.reset();
 
@@ -240,23 +570,51 @@ fn serve(
                 let command = serde_json::from_str::<AgentRealtimeCommand>(text.as_str())
                     .map_err(|_| "control plane sent an invalid command".to_owned())?;
                 match command {
-                    AgentRealtimeCommand::Start { interval_millis }
-                        if accepted_interval(interval_millis) =>
+                    AgentRealtimeCommand::Start {
+                        interval_millis,
+                        diagnostics,
+                        user_traffic,
+                    } if accepted_interval(interval_millis)
+                        && valid_user_traffic_selector(&user_traffic) =>
                     {
                         let interval = Duration::from_millis(u64::from(interval_millis));
-                        if active_interval != Some(interval) {
+                        if active
+                            .as_ref()
+                            .is_none_or(|(current, _, _)| *current != interval)
+                        {
                             sampler.reset();
+                            user_traffic_sampler.reset();
                             next_sample = Instant::now();
-                            next_diagnostics = Instant::now();
+                        } else if active
+                            .as_ref()
+                            .is_some_and(|(_, _, current_users)| current_users != &user_traffic)
+                        {
+                            // Adding a user watcher changes its baseline, never the existing NIC
+                            // timeline shared with the fleet header and machine observations.
+                            user_traffic_sampler.reset();
                         }
-                        active_interval = Some(interval);
+                        if diagnostics
+                            && active
+                                .as_ref()
+                                .is_none_or(|(_, current_diagnostics, _)| !current_diagnostics)
+                        {
+                            next_diagnostics = Instant::now();
+                            mux_baseline = None;
+                        } else if !diagnostics {
+                            mux_baseline = None;
+                        }
+                        active = Some((interval, diagnostics, user_traffic));
                     }
                     AgentRealtimeCommand::Start { .. } => {
-                        return Err("control plane sent an unsupported sample interval".to_owned());
+                        return Err(
+                            "control plane sent an invalid realtime sampling command".to_owned()
+                        );
                     }
                     AgentRealtimeCommand::Stop => {
-                        active_interval = None;
+                        active = None;
+                        mux_baseline = None;
                         sampler.reset();
+                        user_traffic_sampler.reset();
                     }
                 }
             }
@@ -266,7 +624,7 @@ fn serve(
             Err(error) => return Err(error.to_string()),
         }
 
-        if let Some(interval) = active_interval {
+        if let Some((interval, diagnostics, ref user_traffic_selector)) = active {
             let now = Instant::now();
             if now >= next_sample {
                 if write_pending {
@@ -274,22 +632,27 @@ fn serve(
                     // reading. The already queued sample is retained by tungstenite; the next
                     // delivered point starts a new segment rather than drawing across the loss.
                     sampler.reset();
+                    user_traffic_sampler.reset();
                 } else {
                     match read_nic(now) {
                         Ok(reading) => {
+                            let user_traffic = user_traffic_selector.as_ref().map(|selector| {
+                                user_traffic_sampler.advance(state_dir, selector, now)
+                            });
                             if let Some(mut sample) = sampler.advance(reading, interval) {
-                                if now >= next_diagnostics {
-                                    sample.reverse_health =
-                                        health.lock().ok().and_then(|value| value.clone());
-                                    sample.mux = mux.lock().ok().and_then(|value| value.clone());
-                                    sample.vpngate =
-                                        vpngate.lock().ok().and_then(|value| value.clone());
+                                sample.user_traffic = user_traffic;
+                                if populate_diagnostics(
+                                    &mut sample,
+                                    diagnostics,
+                                    now >= next_diagnostics,
+                                    health,
+                                    mux,
+                                    vpngate,
+                                    &mut mux_baseline,
+                                ) {
                                     next_diagnostics = now + DIAGNOSTICS_REFRESH;
-                                } else {
-                                    sample.diagnostics_unchanged = true;
                                 }
-                                let text = serde_json::to_string(&sample)
-                                    .map_err(|error| error.to_string())?;
+                                let text = encode_sample(&mut sample)?;
                                 write_pending = send_sample(&mut socket, text)?;
                             }
                         }
@@ -302,7 +665,7 @@ fn serve(
                 }
             }
         }
-        let sleep = match active_interval {
+        let sleep = match active {
             Some(_) => next_sample
                 .saturating_duration_since(Instant::now())
                 .min(IO_POLL),
@@ -314,9 +677,26 @@ fn serve(
     }
 }
 
-/// Tungstenite guarantees that a frame has been queued when `send` reaches `WouldBlock`.
-/// Retrying the same message would therefore duplicate it; remember only that the queue still
-/// needs flushing. Every other write error ends this socket and lets the outer backoff reconnect.
+/// Bound the combined optional reports, including a machine with many active users.
+fn encode_sample(sample: &mut AgentRealtimeSample) -> Result<String, String> {
+    let mut text = serde_json::to_string(sample).map_err(|error| error.to_string())?;
+    while text.len() > MAX_FRAME_BYTES {
+        let Some(report) = sample
+            .user_traffic
+            .as_mut()
+            .filter(|report| !report.users.is_empty())
+        else {
+            return Err("realtime sample exceeds the frame bound".to_owned());
+        };
+        report.users.truncate(report.users.len() / 2);
+        report.truncated = true;
+        text = serde_json::to_string(sample).map_err(|error| error.to_string())?;
+    }
+    Ok(text)
+}
+
+/// Tungstenite queues the frame before returning WouldBlock. Retrying send would duplicate it;
+/// remember only that flushing is pending. Other errors end the socket and trigger backoff.
 fn send_sample(socket: &mut WebSocket<Stream>, text: String) -> Result<bool, String> {
     match socket.send(Message::Text(text.into())) {
         Ok(()) => Ok(false),
@@ -372,6 +752,157 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
     use crate::options::ApplyMode;
+
+    #[test]
+    fn user_rates_use_non_resetting_deltas_and_exact_label_selection() {
+        let start = Instant::now();
+        let label = brocade_core::model::grant_label("alice", "platform", "entry");
+        let other = brocade_core::model::grant_label("bob", "platform", "entry");
+        let selector = RealtimeUserTrafficSelector::Labels {
+            forwarding: Vec::new(),
+            labels: vec![label.clone()],
+        };
+        let mut sampler = UserTrafficSampler::default();
+        let first = BTreeMap::from([(label.clone(), (100, 200)), (other.clone(), (50, 50))]);
+        assert_eq!(
+            sampler.advance_counters(first, &selector, start).state,
+            RealtimeUserTrafficState::Warming
+        );
+        let next = BTreeMap::from([(label.clone(), (2100, 6200)), (other, (5050, 5050))]);
+        let report =
+            sampler.advance_counters(next.clone(), &selector, start + Duration::from_secs(2));
+        assert_eq!(report.users.len(), 1);
+        assert_eq!(report.users[0].user_id, "alice");
+        assert_eq!(report.users[0].uplink_bytes_per_sec, 1000);
+        assert_eq!(report.users[0].downlink_bytes_per_sec, 3000);
+        assert!(!report.all_users);
+        assert!(!report.has_gap);
+        let idle = sampler.advance_counters(next, &selector, start + Duration::from_secs(3));
+        assert_eq!(idle.users[0].uplink_bytes_per_sec, 0);
+        assert_eq!(idle.users[0].downlink_bytes_per_sec, 0);
+        let reset = sampler.advance_counters(
+            BTreeMap::from([(label, (1, 1))]),
+            &selector,
+            start + Duration::from_secs(4),
+        );
+        assert!(reset.has_gap);
+        assert!(reset.users.is_empty());
+    }
+
+    #[test]
+    fn all_user_rates_omit_idle_rows_and_reject_invalid_selectors() {
+        let label = brocade_core::model::grant_label("alice", "platform", "entry");
+        let counters = BTreeMap::from([(label.clone(), (100, 200))]);
+        let mut sampler = UserTrafficSampler::default();
+        let start = Instant::now();
+        sampler.advance_counters(
+            counters.clone(),
+            &RealtimeUserTrafficSelector::All {
+                forwarding: Vec::new(),
+            },
+            start,
+        );
+        let idle = sampler.advance_counters(
+            counters,
+            &RealtimeUserTrafficSelector::All {
+                forwarding: Vec::new(),
+            },
+            start + Duration::from_secs(1),
+        );
+        assert!(idle.users.is_empty());
+        assert!(idle.all_users);
+        assert!(!valid_user_traffic_selector(&Some(
+            RealtimeUserTrafficSelector::Labels {
+                forwarding: Vec::new(),
+                labels: vec![label.clone(), label]
+            }
+        )));
+        assert!(!valid_user_traffic_selector(&Some(
+            RealtimeUserTrafficSelector::Labels {
+                forwarding: Vec::new(),
+                labels: vec!["raw-credential".to_owned()]
+            }
+        )));
+    }
+
+    #[test]
+    fn forwarding_rates_use_rule_attribution_without_rebuilding_listeners() {
+        use brocade_deployment::protocol::RealtimeForwardingTarget;
+        let target = RealtimeForwardingTarget {
+            rule_id: 7,
+            tenant_id: "platform".to_owned(),
+            user_id: "alice".to_owned(),
+        };
+        let selector = RealtimeUserTrafficSelector::Labels {
+            labels: vec![],
+            forwarding: vec![target.clone()],
+        };
+        assert!(valid_user_traffic_selector(&Some(selector.clone())));
+        let start = Instant::now();
+        let mut sampler = UserTrafficSampler::default();
+        sampler.advance_counters(
+            BTreeMap::from([
+                ("fwd:7".to_owned(), (100, 200)),
+                ("fwd:8".to_owned(), (10, 20)),
+            ]),
+            &selector,
+            start,
+        );
+        let report = sampler.advance_counters(
+            BTreeMap::from([
+                ("fwd:7".to_owned(), (2100, 6200)),
+                ("fwd:8".to_owned(), (5010, 5020)),
+            ]),
+            &selector,
+            start + Duration::from_secs(2),
+        );
+        assert!(report.forwarding_supported && report.forwarding_expected);
+        assert_eq!(report.users.len(), 1);
+        assert_eq!(report.users[0].ingress_id, None);
+        assert_eq!(report.users[0].forwarding_rule_id, Some(7));
+        assert_eq!(report.users[0].user_id, "alice");
+        assert_eq!(report.users[0].uplink_bytes_per_sec, 1000);
+        assert_eq!(report.users[0].downlink_bytes_per_sec, 3000);
+        let duplicate = RealtimeUserTrafficSelector::Labels {
+            labels: vec![],
+            forwarding: vec![target.clone(), target],
+        };
+        assert!(!valid_user_traffic_selector(&Some(duplicate)));
+    }
+
+    #[test]
+    fn large_user_reports_fit_the_wire_bound_and_mark_truncation() {
+        let mut sampler = RateSampler::default();
+        let start = Instant::now();
+        sampler.advance(reading("eth0", 1, 1, start), Duration::from_secs(1));
+        let mut sample = sampler
+            .advance(
+                reading("eth0", 2, 2, start + Duration::from_secs(1)),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        sample.user_traffic = Some(RealtimeUserTrafficReport {
+            state: RealtimeUserTrafficState::Ready,
+            all_users: true,
+            elapsed_millis: Some(1000),
+            truncated: false,
+            has_gap: false,
+            forwarding_supported: true,
+            forwarding_expected: false,
+            users: (0..MAX_REALTIME_USER_TRAFFIC_ROWS)
+                .map(|index| RealtimeUserTrafficRate {
+                    tenant_id: "t".repeat(128),
+                    user_id: format!("{index:064}"),
+                    ingress_id: Some("i".repeat(64)),
+                    forwarding_rule_id: None,
+                    uplink_bytes_per_sec: u64::MAX,
+                    downlink_bytes_per_sec: u64::MAX,
+                })
+                .collect(),
+        });
+        assert!(encode_sample(&mut sample).unwrap().len() <= MAX_FRAME_BYTES);
+        assert!(sample.user_traffic.unwrap().truncated);
+    }
 
     fn reading(interface: &str, rx: u64, tx: u64, instant: Instant) -> NicReading {
         NicReading {
@@ -444,6 +975,93 @@ mod tests {
     }
 
     #[test]
+    fn nic_only_demand_never_serializes_cached_worker_diagnostics() {
+        let health: HealthCache = Default::default();
+        let mux: MuxCache = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            brocade_deployment::protocol::MuxReport {
+                boot_id: "boot".to_owned(),
+                sequence: 1,
+                sampled_at_unix_ms: unix_millis(),
+                pools: Vec::new(),
+                workers: Vec::new(),
+                events: Vec::new(),
+            },
+        )));
+        let vpngate: VpngateCache = Default::default();
+        let mut sample = AgentRealtimeSample {
+            diagnostics_unchanged: false,
+            mux_unchanged: false,
+            reverse_health: None,
+            mux: None,
+            vpngate: None,
+            user_traffic: None,
+            sequence: 1,
+            sampled_at_unix_millis: unix_millis(),
+            elapsed_millis: 1000,
+            interface: "eth0".to_owned(),
+            rx_bytes_per_sec: 1,
+            tx_bytes_per_sec: 1,
+            has_gap: false,
+        };
+        let mut mux_baseline = None;
+
+        assert!(!populate_diagnostics(
+            &mut sample,
+            false,
+            true,
+            &health,
+            &mux,
+            &vpngate,
+            &mut mux_baseline,
+        ));
+        assert!(sample.diagnostics_unchanged);
+        assert!(sample.mux.is_none());
+
+        sample.diagnostics_unchanged = false;
+        assert!(populate_diagnostics(
+            &mut sample,
+            true,
+            true,
+            &health,
+            &mux,
+            &vpngate,
+            &mut mux_baseline,
+        ));
+        assert!(sample.mux.is_some());
+
+        let mut idle_delta = sample.clone();
+        idle_delta.mux = None;
+        idle_delta.mux_unchanged = false;
+        mux.lock().unwrap().as_mut().unwrap().sampled_at_unix_ms += 5_000;
+        assert!(populate_diagnostics(
+            &mut idle_delta,
+            true,
+            true,
+            &health,
+            &mux,
+            &vpngate,
+            &mut mux_baseline,
+        ));
+        assert!(idle_delta.mux_unchanged);
+        assert!(idle_delta.mux.is_none());
+
+        let mut state_delta = idle_delta;
+        state_delta.mux_unchanged = false;
+        mux.lock().unwrap().as_mut().unwrap().sequence += 1;
+        assert!(populate_diagnostics(
+            &mut state_delta,
+            true,
+            true,
+            &health,
+            &mux,
+            &vpngate,
+            &mut mux_baseline,
+        ));
+        assert!(!state_delta.mux_unchanged);
+        assert!(state_delta.mux.is_some());
+    }
+
+    #[test]
     #[allow(clippy::result_large_err)] // tungstenite's required handshake callback signature
     fn the_custom_agent_transport_completes_a_real_websocket_handshake() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -480,6 +1098,7 @@ mod tests {
         let socket = connect(&options).unwrap();
         serve(
             socket,
+            &options.state_dir,
             &Default::default(),
             &Default::default(),
             &Default::default(),

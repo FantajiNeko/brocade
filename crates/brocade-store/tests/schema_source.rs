@@ -1,6 +1,8 @@
 use std::{fs, path::PathBuf};
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_init.sql");
+const FORWARDING_DEFAULTS_COMPAT: &str =
+    include_str!("../../../scripts/compat-forwarding-entitlement-defaults.sql");
 const VPNGATE_STORE: &str = include_str!("../src/vpngate.rs");
 
 #[test]
@@ -37,6 +39,29 @@ fn fresh_install_host_network_tuning_matches_the_runtime_defaults() {
 #[test]
 fn fresh_install_mtproxy_port_base_matches_the_runtime_default() {
     assert!(INITIAL_SCHEMA.contains("port_mtproto_base INTEGER DEFAULT 28800 NOT NULL"));
+}
+
+#[test]
+fn fresh_and_existing_forwarding_grants_share_the_current_defaults() {
+    for expected in [
+        "listen_port_start INTEGER DEFAULT 30000 NOT NULL",
+        "listen_port_end INTEGER DEFAULT 59999 NOT NULL",
+        "max_rules INTEGER DEFAULT 100 NOT NULL",
+        "allow_private_targets BOOLEAN DEFAULT true NOT NULL",
+    ] {
+        assert!(INITIAL_SCHEMA.contains(expected), "missing {expected}");
+    }
+    for expected in [
+        "ALTER COLUMN listen_port_start SET DEFAULT 30000",
+        "ALTER COLUMN listen_port_end SET DEFAULT 59999",
+        "ALTER COLUMN max_rules SET DEFAULT 100",
+        "ALTER COLUMN allow_private_targets SET DEFAULT true",
+    ] {
+        assert!(
+            FORWARDING_DEFAULTS_COMPAT.contains(expected),
+            "missing {expected}"
+        );
+    }
 }
 
 #[test]

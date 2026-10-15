@@ -39,6 +39,7 @@ describe('访客路由权限', () => {
     [{ nav: 'settings' as const }, { nav: 'nodes' as const }],
     [{ nav: 'deploy' as const, drill: { p: 'plan' } }, { nav: 'nodes' as const }],
     [{ nav: 'password' as const }, { nav: 'nodes' as const }],
+    [{ nav: 'capacity' as const }, { nav: 'nodes' as const }],
     [{ nav: 'nodes' as const, drill: { p: 'provision' } }, { nav: 'nodes' as const }],
     [{ nav: 'nodes' as const, drill: { p: 'install', node: 'hk' } }, { nav: 'nodes' as const }],
     [{ nav: 'nodes' as const, drill: { p: 'chain', id: 'hk' } }, { nav: 'nodes' as const }],
@@ -62,6 +63,8 @@ describe('访客路由权限', () => {
 
   it('普通用户退回自己的用户页，系统管理员保留管理深链', () => {
     expect(routeForViewer({ nav: 'settings' }, viewer('user'))).toEqual({ nav: 'users' });
+    expect(routeForViewer({ nav: 'capacity' }, viewer('user'))).toEqual({ nav: 'users' });
+    expect(routeForViewer({ nav: 'capacity' }, viewer('system-admin'))).toEqual({ nav: 'capacity' });
     const provision = { nav: 'nodes' as const, drill: { p: 'provision' } };
     expect(routeForViewer(provision, viewer('system-admin'))).toEqual(provision);
   });

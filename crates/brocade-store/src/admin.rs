@@ -273,6 +273,11 @@ impl AdminContext {
         self.role == AdminRole::SystemAdmin
     }
 
+    pub fn can_view_user_realtime_traffic(&self) -> bool {
+        self.operator_id != PUBLIC_OPERATOR_ID
+            && matches!(self.role, AdminRole::SystemAdmin | AdminRole::TenantAdmin)
+    }
+
     /// Sharing a speed-test link exposes the user's deployed node credentials to its holder.
     pub fn can_manage_speedtest_subscriptions(&self) -> bool {
         matches!(self.role, AdminRole::SystemAdmin | AdminRole::TenantAdmin)
@@ -1660,7 +1665,32 @@ fn authenticated_user_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<Aut
 
 #[cfg(test)]
 mod tests {
-    use super::{tenant_in_scope, tenant_scope_like_pattern};
+    use super::{tenant_in_scope, tenant_scope_like_pattern, AdminContext, AdminRole};
+
+    #[test]
+    fn realtime_user_traffic_is_administrator_only() {
+        for role in [
+            AdminRole::User,
+            AdminRole::Readonly,
+            AdminRole::Editor,
+            AdminRole::Publisher,
+        ] {
+            assert!(
+                !AdminContext::new("operator", role, Some("platform".to_owned()))
+                    .can_view_user_realtime_traffic()
+            );
+        }
+        for role in [AdminRole::TenantAdmin, AdminRole::SystemAdmin] {
+            assert!(
+                AdminContext::new("operator", role, Some("platform".to_owned()))
+                    .can_view_user_realtime_traffic()
+            );
+            assert!(
+                !AdminContext::new("public", role, Some("platform".to_owned()))
+                    .can_view_user_realtime_traffic()
+            );
+        }
+    }
 
     #[test]
     fn tenant_scope_matches_only_path_segments() {

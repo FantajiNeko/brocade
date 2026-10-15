@@ -137,7 +137,7 @@ function LoginLayout({
           <span className="login-word">{branding.site_name}</span>
         </div>
         <LoginRoutes />
-        <div className="login-tagline">跨境网络小管家</div>
+        <div className="login-tagline">Invisible networks. Infallible control.</div>
       </aside>
       <main className="login-main">
         <div className="login-panel">

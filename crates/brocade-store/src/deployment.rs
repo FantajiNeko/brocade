@@ -16,9 +16,10 @@ use brocade_deployment::plan::{
 use brocade_deployment::protocol::{
     CreateDeploymentRequest, CreateDeploymentResult, CreateRollbackRequest,
     DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
-    DeploymentTargetDetail, DeploymentWaveConfirmationResult, IsolateDeploymentTargetRequest,
-    IsolateNodeRequest, NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult,
-    ReportedNodeState, TargetApplyResult, TargetConvergenceReport, MIN_AGENT_PROTOCOL_VERSION,
+    DeploymentTargetDetail, DeploymentWaveConfirmationResult, DeploymentWaveProgress,
+    IsolateDeploymentTargetRequest, IsolateNodeRequest, NodeDesiredDeployment,
+    NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState, TargetApplyResult,
+    TargetConvergenceReport, MIN_AGENT_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
@@ -588,6 +589,7 @@ pub async fn create_deployment(
     for target in &plan.targets {
         insert_target(&mut tx, deployment_id, target).await?;
     }
+    record_current_wave_entered_tx(&mut tx, deployment_id).await?;
 
     let result_status = if plan
         .targets
@@ -915,6 +917,7 @@ async fn insert_lifecycle_deployment_tx(
     for target in &plan.targets {
         insert_target(tx, deployment_id, target).await?;
     }
+    record_current_wave_entered_tx(tx, deployment_id).await?;
     if !plan
         .targets
         .iter()
@@ -1401,6 +1404,7 @@ async fn create_automatic_grants_deployment_locked(
     for target in &plan.targets {
         insert_target(&mut tx, deployment_id, target).await?;
     }
+    record_current_wave_entered_tx(&mut tx, deployment_id).await?;
     if !plan
         .targets
         .iter()
@@ -2024,6 +2028,26 @@ pub async fn deployment_detail(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let wave_progress = sqlx::query(
+        "SELECT wave, entered_at::text AS entered_at
+           FROM deployment_wave_progress
+          WHERE deployment_id = $1
+          ORDER BY wave",
+    )
+    .bind(deployment_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(DeploymentWaveProgress {
+            wave: u32::try_from(row.try_get::<i32, _>("wave")?).map_err(|_| {
+                StoreError::InvalidData("deployment progress wave is out of range".to_owned())
+            })?,
+            entered_at: row.try_get("entered_at")?,
+        })
+    })
+    .collect::<Result<Vec<_>>>()?;
+
     if include_content {
         attach_known_artifact_content(pool, &mut targets).await?;
     }
@@ -2051,6 +2075,7 @@ pub async fn deployment_detail(
         rollback_of_deployment_id: deployment.try_get("rollback_of_deployment_id")?,
         sync_of_deployment_id: deployment.try_get("sync_of_deployment_id")?,
         divergence_cleared_at: deployment.try_get("divergence_cleared_at")?,
+        wave_progress,
         targets,
     })
 }
@@ -2149,6 +2174,9 @@ pub async fn confirm_deployment_wave(
     .bind(&actor)
     .execute(&mut *tx)
     .await?;
+    // Existing active deployments upgraded in place may not have a progress row yet. New
+    // deployments recorded the wave when it became current; ON CONFLICT keeps that earlier time.
+    record_current_wave_entered_tx(&mut tx, deployment_id).await?;
     tx.commit().await?;
 
     Ok(DeploymentWaveConfirmationResult {
@@ -2576,6 +2604,10 @@ pub async fn claim_desired_for_node(
     )
     .await?;
     let dispatched_grants = serde_json::to_value(&grants)?;
+
+    // A node claim is not the wave start. This is only a compatibility guard for an active order
+    // created before wave progress existed; normal orders already recorded the entry transition.
+    record_current_wave_entered_tx(&mut tx, deployment_id).await?;
 
     sqlx::query(
         "UPDATE deployment_targets
@@ -5324,6 +5356,7 @@ async fn insert_rollback_deployment_tx(
     for target in &plan.targets {
         insert_target(tx, deployment_id, target).await?;
     }
+    record_current_wave_entered_tx(tx, deployment_id).await?;
 
     if status == "succeeded" {
         refresh_deployment_status(tx, deployment_id, "deferred").await?;
@@ -6610,6 +6643,9 @@ async fn refresh_deployment_status(
         crate::serving::activate_deployment_tx(tx, deployment_id).await?;
         Ok("succeeded".to_owned())
     } else {
+        // The transaction that closes the preceding wave is the authoritative point at which the
+        // next one enters the timeline. Record it before any Agent has a chance to claim work.
+        record_current_wave_entered_tx(tx, deployment_id).await?;
         sqlx::query(
             "UPDATE deployments
              SET status = 'running',
@@ -6633,6 +6669,65 @@ async fn refresh_deployment_status(
         .await?;
         Ok("running".to_owned())
     }
+}
+
+/// Persist the moment the currently open wave entered the control-plane timeline.
+///
+/// The first wave inherits the deployment creation time. Later waves use the transaction that
+/// made them current. Repeated calls are harmless and never replace the original timestamp; in
+/// particular, Agent claim/lease refreshes cannot move this time forward.
+async fn record_current_wave_entered_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "WITH current_wave AS (
+             SELECT min(dts.wave) AS wave
+               FROM deployment_targets target
+               JOIN deployment_target_state dts
+                 ON dts.deployment_id = target.deployment_id
+                AND dts.node_id = target.node_id
+              WHERE target.deployment_id = $1
+                AND target.status IN ('pending', 'dispatched', 'converging')
+         ), entry AS (
+             SELECT deployment.id AS deployment_id,
+                    current_wave.wave,
+                    CASE
+                      WHEN EXISTS (
+                          SELECT 1 FROM deployment_wave_progress progress
+                           WHERE progress.deployment_id = deployment.id
+                      ) THEN now()
+                      ELSE deployment.created_at
+                    END AS entered_at
+               FROM deployments deployment
+               JOIN current_wave ON current_wave.wave IS NOT NULL
+              WHERE deployment.id = $1
+         )
+         INSERT INTO deployment_wave_progress (deployment_id, wave, entered_at)
+         SELECT deployment_id, wave, entered_at FROM entry
+         ON CONFLICT (deployment_id, wave) DO NOTHING",
+    )
+    .bind(deployment_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE deployments deployment
+            SET started_at = first_wave.entered_at
+           FROM (
+               SELECT entered_at
+                 FROM deployment_wave_progress
+                WHERE deployment_id = $1
+                ORDER BY wave
+                LIMIT 1
+           ) first_wave
+          WHERE deployment.id = $1
+            AND deployment.started_at IS DISTINCT FROM first_wave.entered_at",
+    )
+    .bind(deployment_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Settle one report without turning an operator- or failure-halted release back into `running`.

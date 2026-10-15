@@ -16,12 +16,17 @@ fn outbound() -> ExternalOutbound {
         address: "edge.example.com".to_owned(),
         port: 443,
         protocol: ExternalOutboundProtocol::Vless {
+            final_mask: None,
             credential: "secret-uuid".to_owned(),
             encryption: "none".to_owned(),
             flow: None,
             transport: ExternalVlessTransport::Raw,
         },
         security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
             server_name: "edge.example.com".to_owned(),
             fingerprint: "chrome".to_owned(),
         },

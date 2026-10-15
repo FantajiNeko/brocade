@@ -153,11 +153,13 @@ export function PingLatencyChart({
   family,
   bounds,
   group,
+  focusedLine = null,
 }: {
   lines: PingChartLine[];
   family: PingProbeFamily;
   bounds: { startUnixSecs: number; endUnixSecs: number };
   group?: string;
+  focusedLine?: string | null;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
@@ -189,7 +191,16 @@ export function PingLatencyChart({
     const chart = chartRef.current;
     if (!chart || !enteredViewport) return;
     // An identical notMerge write would cancel the in-flight entrance sweep.
-    const sig = JSON.stringify([lines, family, bounds.startUnixSecs, bounds.endUnixSecs, group, themeName, paletteKey]);
+    const sig = JSON.stringify([
+      lines,
+      family,
+      bounds.startUnixSecs,
+      bounds.endUnixSecs,
+      group,
+      focusedLine,
+      themeName,
+      paletteKey,
+    ]);
     if (sig === lastSig.current) return;
     const css = getComputedStyle(document.documentElement);
     const cv = (name: string) => css.getPropertyValue(name).trim();
@@ -218,8 +229,11 @@ export function PingLatencyChart({
     const now = bounds.endUnixSecs * 1000;
     const firstMs = times.length > 0 ? times[0] * 1000 : start;
     const xMin = Math.min(firstMs, now - 30_000);
+    const activeLine = focusedLine && lines.some(entry => entry.name === focusedLine) ? focusedLine : null;
     const series: Array<Record<string, unknown>> = lines.map((entry, index) => {
       const color = colorOf(entry);
+      const focused = activeLine === entry.name;
+      const muted = activeLine !== null && !focused;
       return {
         name: entry.name,
         type: 'line' as const,
@@ -228,9 +242,17 @@ export function PingLatencyChart({
         showSymbol: false,
         smooth: false,
         connectNulls: false,
-        lineStyle: observeSeriesLine(color),
-        areaStyle: observeAreaStyle(color, themeName, { count: lines.length, paper: cv('--card') }),
-        itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
+        z: focused ? 3 : 2,
+        lineStyle: {
+          ...observeSeriesLine(color),
+          width: focused ? 2.5 : 1.5,
+          opacity: muted ? 0.14 : 1,
+        },
+        areaStyle: {
+          ...observeAreaStyle(color, themeName, { count: lines.length, paper: cv('--card') }),
+          opacity: muted ? 0.05 : 1,
+        },
+        itemStyle: { color, borderColor: glass, borderWidth: 1.5, opacity: muted ? 0.14 : 1 },
         emphasis: { disabled: true },
         data: observeSeriesData(
           times,
@@ -314,7 +336,7 @@ export function PingLatencyChart({
     hasRenderedData.current = true;
     lastSig.current = sig;
     if (group) echarts.connect(group);
-  }, [lines, family, bounds, group, themeName, paletteKey, enteredViewport]);
+  }, [lines, family, bounds, group, focusedLine, themeName, paletteKey, enteredViewport]);
 
   return <ObserveBrushPlot className="ping-probe-chart" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />;
 }

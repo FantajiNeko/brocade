@@ -5,6 +5,7 @@ import test from 'node:test';
 const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 const users = readFileSync(new URL('../src/panes/users.tsx', import.meta.url), 'utf8');
 const shell = readFileSync(new URL('../src/forge/shell.tsx', import.meta.url), 'utf8');
+const capacity = readFileSync(new URL('../src/panes/capacity.tsx', import.meta.url), 'utf8');
 
 test('手机端菜单留在视口内并允许纵向滚动', () => {
   assert.match(
@@ -25,18 +26,14 @@ test('手机端菜单留在视口内并允许纵向滚动', () => {
   );
 });
 
-test('隧道事实条按实际项目铺满并在窄容器换列', () => {
-  const base = styles.match(/\.tunnel-strip\s*\{[^}]+\}/)?.[0] ?? '';
-  assert.match(base, /grid-auto-flow:\s*column/);
-  assert.match(base, /grid-auto-columns:\s*minmax\(0, 1fr\)/);
-  assert.doesNotMatch(base, /repeat\(4,/);
+test('隧道连接表的长值单行省略，窄详情页头只留一层', () => {
+  const value = styles.match(/\.tnd-kv-value\s*\{[^}]+\}/)?.[0] ?? '';
+  assert.match(value, /min-width:\s*0/);
+  assert.match(value, /text-overflow:\s*ellipsis/);
+  assert.match(value, /white-space:\s*nowrap/);
   assert.match(
     styles,
-    /@container \(max-width: 620px\)[\s\S]*?\.tunnel-strip\s*\{[\s\S]*?grid-auto-flow:\s*row;[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/,
-  );
-  assert.match(
-    styles,
-    /@container \(max-width: 430px\)[\s\S]*?\.tunnel-strip\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/,
+    /@container \(max-width: 700px\)[\s\S]*?\.tnd-page\.nd-sheet > \.nd-paper > \.tnd-head\s*\{\s*grid-template-rows:\s*minmax\(58px, auto\);[\s\S]*?\.tnd-page\.nd-sheet > \.nd-paper > \.tnd-head > \.nd-acts\s*\{\s*grid-column:\s*2;\s*grid-row:\s*1;/,
   );
 });
 
@@ -47,10 +44,7 @@ test('手机端不渲染桌面面包屑或额外返回条', () => {
 });
 
 test('手机端导航栏与内容面板保留呼吸距离', () => {
-  assert.match(
-    styles,
-    /@media \(max-width: 375px\)[\s\S]*?\.forge\.narrow \.fg-brand\s*\{[\s\S]*?display:\s*none;/,
-  );
+  assert.match(styles, /@media \(max-width: 375px\)[\s\S]*?\.forge\.narrow \.fg-brand\s*\{[\s\S]*?display:\s*none;/);
   assert.match(
     styles,
     /@media \(max-width: 820px\)[\s\S]*?\.fg-facebar \.fg-nv\s*\{[\s\S]*?gap:\s*4px;[\s\S]*?padding:\s*0 6px;/,
@@ -111,7 +105,7 @@ test('用户 UUID 使用带状态反馈的紧凑复制按钮', () => {
 test('手机端图表和拓扑操作不会把关键控件推出屏幕', () => {
   assert.match(
     styles,
-    /\.usage-page\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?min-width:\s*0;[\s\S]*?\.usage-page > \*\s*\{[\s\S]*?min-width:\s*0;/,
+    /\.usage-page,\s*\.capacity-page\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?min-width:\s*0;[\s\S]*?\.usage-page > \*,\s*\.capacity-page > \*\s*\{[\s\S]*?min-width:\s*0;/,
   );
   assert.match(
     styles,
@@ -125,6 +119,30 @@ test('手机端图表和拓扑操作不会把关键控件推出屏幕', () => {
     styles,
     /\.fg-sheet \.tbl:not\(\.cards\)\s*\{[\s\S]*?width:\s*max-content;[\s\S]*?min-width:\s*100%;[\s\S]*?max-width:\s*100%;[\s\S]*?box-sizing:\s*border-box;/,
   );
+});
+
+test('手机端流量预测保留机器读数、风险和用户构成', () => {
+  // 列表正文是自己的尺寸容器：行在窄宽度下改为三层，名称与结论、跑道、已用与预计都留在行内。
+  assert.match(styles, /\.cap-body\s*\{\s*container-type:\s*inline-size;/);
+  assert.match(
+    styles,
+    /@container \(max-width: 760px\)\s*\{[^@]*?\.cap-row\s*\{[^}]*?grid-template-areas:\s*'id verdict chev'\s*'run run run'\s*'used proj \.';/,
+  );
+  // 详情上下堆叠；用户占用保留四列读数，只去掉占比条。
+  assert.match(
+    styles,
+    /@container \(max-width: 760px\)\s*\{[^@]*?\.cap-detail\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\);/,
+  );
+  assert.match(
+    styles,
+    /@container \(max-width: 760px\)\s*\{[^@]*?\.cap-user\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\) 46px 64px 64px;/,
+  );
+  // 标题栏只收起总台数，需要处理的计数保留。
+  assert.match(
+    styles,
+    /@media \(max-width: 820px\)\s*\{\s*\.cap-rd \.opt,\s*\.cap-rd \.opt \+ \.dot\s*\{\s*display:\s*none;/,
+  );
+  assert.match(capacity, /<span className="opt">/);
 });
 
 test('页面内容容器不会通过动画变换成为固定弹窗的包含块', () => {

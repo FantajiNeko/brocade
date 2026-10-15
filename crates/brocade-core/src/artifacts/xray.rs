@@ -57,6 +57,11 @@ pub const REALITY_COVER_OUTBOUND_TAG: &str = "out:reality-cover";
 /// that something other than the site is listening. `REALITY_COVER_OUTBOUND_TAG` may write a
 /// response because its traffic has already been decrypted by a local listener.
 pub const REALITY_GUARD_OUTBOUND_TAG: &str = "out:reality-guard";
+/// Default route for dynamic user forwarding inbounds. Dynamic dokodemo-door listeners have no
+/// representation in the revisioned routing table, so their unmatched traffic intentionally
+/// reaches the first outbound. Keeping that first outbound dedicated and direct prevents a node's
+/// first chain outbound from accidentally becoming the forwarding egress.
+pub const FORWARD_OUTBOUND_TAG: &str = "out:forward";
 /// The control plane's own direct outbound. Every machine has one, regardless of
 /// `egress_allowed`.
 ///
@@ -529,17 +534,21 @@ pub enum XrayOutbound {
         /// `XrayRouting::domain_strategy` uses: casing is xray's configuration syntax, so
         /// it is resolved here rather than in `format/json.rs`.
         domain_strategy: String,
-        /// Xray implicitly blocks private addresses for traffic whose original inbound is
-        /// VLESS/VMess/etc. Business egress cannot use that hidden policy: Brocade's ingress
-        /// guard already made the explicit per-ingress decision, including an intentional
-        /// `no_private = false`.
-        allow_private: bool,
+        address_policy: XrayFreedomAddressPolicy,
     },
     Blackhole {
         tag: String,
         /// Ask xray to send its small built-in HTTP 403 before closing the connection.
         http_response: bool,
     },
+}
+
+/// Omitting `ipsBlocked` uses Xray's protocol-dependent default; it does not protect dokodemo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XrayFreedomAddressPolicy {
+    Default,
+    AllowPrivate,
+    BlockPrivate,
 }
 
 /// Connection pooling on one outbound, already reduced to what xray takes.
@@ -751,7 +760,15 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             .map(|hop| hop_inbound(hop, &portal_tags)),
     );
 
-    let mut outbounds = Vec::new();
+    let mut outbounds = vec![XrayOutbound::Freedom {
+        tag: FORWARD_OUTBOUND_TAG.to_owned(),
+        send_through: None,
+        domain_strategy: domain_strategy_name(xray.domain_strategy).to_owned(),
+        // Dynamic forwarding listeners share this default outbound, so the data plane cannot
+        // express a different address policy per entitlement. The Store is the policy owner: it
+        // admits private literals only when that user/node entitlement explicitly allows them.
+        address_policy: XrayFreedomAddressPolicy::AllowPrivate,
+    }];
     // The mirror of the above for the bridge end: which dialling outbound carries the
     // tunnel, and under which tag its virtual inbound appears.
     let bridge_tags = xray
@@ -820,7 +837,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
         // and this outbound is egress. A fixed value would make one machine resolve two
         // ways, which is an unrequested difference that would not be looked for.
         domain_strategy: domain_strategy_name(xray.domain_strategy).to_owned(),
-        allow_private: false,
+        address_policy: XrayFreedomAddressPolicy::Default,
     });
 
     let mut rules = Vec::new();
@@ -1418,7 +1435,7 @@ fn egress_outbound(outbound: &XrayEgressOutboundPlan, strategy: DomainStrategy) 
         // The ingress guard is the single policy owner. In particular, a request that
         // passed an ingress with `no_private = false` must not be denied later merely
         // because a relay hop changed the immediate inbound identity to VLESS.
-        allow_private: true,
+        address_policy: XrayFreedomAddressPolicy::AllowPrivate,
     }
 }
 

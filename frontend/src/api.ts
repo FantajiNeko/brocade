@@ -429,7 +429,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 24;
+export const AGENT_PROTOCOL_VERSION = 29;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const VPNGATE_MAX_CANDIDATES = 16;
 export const VPNGATE_CONNECT_THRESHOLD_MAX_MS = 35_000;
@@ -455,12 +455,16 @@ export interface NodeVersions {
 export interface SpoolBacklog {
   observation: number;
   usage: number;
+  /** 最近一小时内等待补报的 30 秒主机指标窗口。 */
+  load?: number;
   /** 所有类型的累计总数，供旧 Console/Agent 滚动兼容。 */
   dropped: number;
   /** 新 Agent 才有；非零表示用量时间分辨率曾永久丢失。 */
   usage_dropped?: number | null;
   /** 新 Agent 才有；非零表示发布收敛证据曾被永久丢弃。 */
   observation_dropped?: number | null;
+  /** 新 Agent 才有；非零表示超过一小时队列后永久丢失的主机指标窗口。 */
+  load_dropped?: number | null;
 }
 export interface LocalReconcileReport {
   at: number;
@@ -899,7 +903,13 @@ export interface DeploymentDetail {
   rollback_of_deployment_id: number | null;
   sync_of_deployment_id: number | null;
   divergence_cleared_at: string | null;
+  wave_progress: DeploymentWaveProgress[];
   targets: DeploymentTargetDetail[];
+}
+
+export interface DeploymentWaveProgress {
+  wave: number;
+  entered_at: string;
 }
 
 export interface DeploymentCommandResult {
@@ -1110,6 +1120,109 @@ export const rotateUserUuid = (tenant: string, user: string) =>
 
 export const fetchMyUser = () => api<UserListItem>('/me/user');
 
+export type ForwardingProtocol = 'tcp' | 'udp' | 'tcp_udp';
+
+export interface ForwardingEntitlement {
+  node_id: string;
+  node_name: string;
+  public_ipv4: string | null;
+  public_ipv6: string | null;
+  enabled: boolean;
+  tcp_allowed: boolean;
+  udp_allowed: boolean;
+  listen_port_start: number;
+  listen_port_end: number;
+  max_rules: number;
+  allow_private_targets: boolean;
+  rule_count: number;
+  desired_generation: number;
+  applied_generation: number | null;
+  reconcile_status: 'pending' | 'converged' | 'error';
+  last_error: string | null;
+}
+
+export interface ForwardingRule {
+  id: number;
+  tenant_id: string;
+  user_id: string;
+  node_id: string;
+  name: string;
+  protocol: ForwardingProtocol;
+  listen_port: number;
+  target_host: string;
+  target_port: number;
+  enabled: boolean;
+  runtime_status: 'active' | 'pending' | 'error' | 'disabled';
+  uplink_bytes: number;
+  downlink_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ForwardingOverview {
+  tenant_id: string;
+  user_id: string;
+  entitlements: ForwardingEntitlement[];
+  rules: ForwardingRule[];
+}
+
+export interface ForwardingEntitlementWrite {
+  enabled: boolean;
+  tcp_allowed: boolean;
+  udp_allowed: boolean;
+  listen_port_start: number;
+  listen_port_end: number;
+  max_rules: number;
+  allow_private_targets: boolean;
+}
+
+export interface ForwardingRuleWrite {
+  node_id: string;
+  name: string;
+  protocol: ForwardingProtocol;
+  listen_port: number;
+  target_host: string;
+  target_port: number;
+  enabled: boolean;
+}
+
+const forwardingPath = (tenant: string, user: string) =>
+  `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/forwarding`;
+
+export const fetchForwardingOverview = (tenant: string, user: string) =>
+  api<ForwardingOverview>(forwardingPath(tenant, user));
+
+export const setForwardingEntitlement = (
+  tenant: string,
+  user: string,
+  node: string,
+  body: ForwardingEntitlementWrite,
+) =>
+  api<ForwardingOverview>(
+    `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/forwarding-nodes/${encodeURIComponent(node)}`,
+    '',
+    { method: 'PUT', body: JSON.stringify(body) },
+  );
+
+export const deleteForwardingEntitlement = (tenant: string, user: string, node: string) =>
+  api<ForwardingOverview>(
+    `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/forwarding-nodes/${encodeURIComponent(node)}`,
+    '',
+    { method: 'DELETE' },
+  );
+
+export const createForwardingRule = (tenant: string, user: string, body: ForwardingRuleWrite) =>
+  post<ForwardingOverview>(forwardingPath(tenant, user), body);
+
+export const updateForwardingRule = (tenant: string, user: string, ruleId: number, body: ForwardingRuleWrite) =>
+  api<ForwardingOverview>(`${forwardingPath(tenant, user)}/${ruleId}`, '', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+
+export const deleteForwardingRule = (tenant: string, user: string, ruleId: number) =>
+  api<ForwardingOverview>(`${forwardingPath(tenant, user)}/${ruleId}`, '', { method: 'DELETE' });
+
 export const updateUserProfile = (tenant: string, user: string, body: { account_type: 'formal' | 'test' }) =>
   api<UserListItem>(`/users/${tenant}/${user}/profile`, '', {
     method: 'PUT',
@@ -1266,6 +1379,18 @@ export interface TunnelProbeRun {
   cancel_requested: boolean;
 }
 
+/** The branch of the Console's health rule that decided `health`, with the values it compared.
+ * The rule and its threshold live only in the Console; clients word these values. */
+export type TunnelProbeHealthReason =
+  | { kind: 'not-scheduled' }
+  | { kind: 'no-samples' }
+  | { kind: 'stale'; latest_finished_at_unix_secs: number | null }
+  | { kind: 'consecutive-failures'; count: number; latest: TunnelProbeResultStatus | null }
+  | { kind: 'latest-failed'; result: TunnelProbeResultStatus | null }
+  | { kind: 'low-success-rate'; succeeded: number; samples: number }
+  | { kind: 'slow'; max_ttfb_ms: number; threshold_ms: number; samples: number }
+  | { kind: 'healthy'; max_ttfb_ms: number | null; samples: number };
+
 export interface TunnelProbeListItem {
   tenant_id: string;
   outbound_id: string;
@@ -1274,6 +1399,8 @@ export interface TunnelProbeListItem {
   supported: boolean;
   unsupported_reason: string | null;
   health: TunnelProbeHealth;
+  /** Absent when the Console cannot probe the tunnel; `unsupported_reason` says why. */
+  health_reason: TunnelProbeHealthReason | null;
   policy: TunnelProbePolicy | null;
   latest_run: TunnelProbeRun | null;
 }
@@ -1293,12 +1420,22 @@ export interface TunnelProbeSummary {
   p50_ms: number | null;
   p95_ms: number | null;
   failures: number;
+  /** `failures` split by result; the three add up to it. */
+  timeouts: number;
+  connect_failures: number;
+  target_failures: number;
+  /** Distinct exit addresses reported by successful runs in the window. */
+  exit_ips: number;
 }
 
 export interface TunnelProbeView {
   item: TunnelProbeListItem;
   retention_days: number;
+  /** First-byte threshold of the Console's health rule. */
+  slow_ttfb_ms: number;
   summary: TunnelProbeSummary;
+  /** Width of the time buckets `points` was sampled from; each point is one bucket's run. */
+  bucket_secs: number;
   points: {
     run_id: number;
     finished_at_unix_secs: number;
@@ -1949,6 +2086,7 @@ export type ExternalOutboundProtocol =
         encryption: string;
         flow?: string | null;
         transport: ExternalVlessTransport;
+        final_mask?: Record<string, unknown> | null;
       };
     }
   /** The legacy discriminator also carries supported classic Shadowsocks methods. */
@@ -2019,6 +2157,14 @@ export interface ExternalWarpBinding {
 
 export type ExternalVlessTransport =
   | { t: 'raw' }
+  | { t: 'kcp'; v: { mtu?: number | null; tti?: number | null } }
+  | { t: 'websocket'; v: { path: string; host?: string | null } }
+  | { t: 'http'; v: { path: string; host?: string | null } }
+  | {
+      t: 'grpc';
+      v: { service_name: string; mode?: 'gun' | 'multi' | 'guna'; authority?: string | null };
+    }
+  | { t: 'http_upgrade'; v: { path: string; host?: string | null } }
   | {
       t: 'xhttp';
       v: {
@@ -2035,15 +2181,33 @@ export type ExternalVlessTransport =
           mux?: number | null;
           mode?: XhttpMode;
         } | null;
+        extra?: Record<string, unknown> | null;
       };
     };
 
 export type ExternalOutboundSecurity =
   | { t: 'none' }
-  | { t: 'tls'; v: { server_name: string; fingerprint: string } }
+  | {
+      t: 'tls';
+      v: {
+        server_name: string;
+        fingerprint: string;
+        alpn?: string[];
+        ech_config_list?: string | null;
+        pinned_peer_cert_sha256?: string | null;
+        verify_peer_cert_by_name?: string | null;
+      };
+    }
   | {
       t: 'reality';
-      v: { server_name: string; public_key: string; short_id: string; fingerprint: string };
+      v: {
+        server_name: string;
+        public_key: string;
+        short_id: string;
+        fingerprint: string;
+        mldsa65_verify?: string | null;
+        spider_x?: string | null;
+      };
     };
 
 /** A reusable proxy managed outside the Brocade fleet. Credentials arrive redacted. */
@@ -2875,6 +3039,7 @@ export interface ConsoleSnapshot {
       name?: string;
       public_ipv4?: string | null;
       public_ipv6?: string | null;
+      api_port?: number | null;
       public_ipv4_nat?: boolean;
       public_ipv6_nat?: boolean;
       overlay?: boolean;
@@ -3037,9 +3202,21 @@ export interface UsageMonthlySummary {
   month_start: string;
   month_end: string;
   views: UsageMonthlyViewRow[];
+  forwarding?: UsageForwardingMonthlyRow[];
   /** Newer control planes always return this field. It remains optional so a newer Console UI
    * can stay usable while an older local process is still running during a rolling restart. */
   days?: UsageDailyRow[];
+}
+
+export interface UsageForwardingMonthlyRow {
+  tenant_id: string;
+  user_id: string;
+  node_id: string;
+  rule_id: number;
+  rule_name: string;
+  uplink_bytes: number;
+  downlink_bytes: number;
+  has_gap: boolean;
 }
 
 export const fetchUsageMonthly = (monthOffset: 0 | -1 = 0) =>
@@ -3063,6 +3240,15 @@ export interface UsageNodeBucket {
 export interface UsageNodeSeries {
   node_id: string;
   buckets: UsageNodeBucket[];
+  forwarding?: {
+    window_start: string;
+    window_end: string;
+    uplink_bytes: number;
+    downlink_bytes: number;
+    has_gap: boolean;
+  }[];
+  month_forwarding_uplink_bytes?: number;
+  month_forwarding_downlink_bytes?: number;
   month_user_uplink_bytes: number;
   month_user_downlink_bytes: number;
   month_relay_uplink_bytes: number;
@@ -3076,7 +3262,12 @@ export const bucketBytes = (b: UsageNodeBucket) =>
 
 /** 该机器本月转发的全部字节 */
 export const monthBytes = (s: UsageNodeSeries) =>
-  s.month_user_uplink_bytes + s.month_user_downlink_bytes + s.month_relay_uplink_bytes + s.month_relay_downlink_bytes;
+  s.month_user_uplink_bytes +
+  s.month_user_downlink_bytes +
+  s.month_relay_uplink_bytes +
+  s.month_relay_downlink_bytes +
+  (s.month_forwarding_uplink_bytes ?? 0) +
+  (s.month_forwarding_downlink_bytes ?? 0);
 
 export interface UsageNodeSeriesList {
   since: string;
@@ -3097,6 +3288,36 @@ export const fetchUsageNodeSeriesRange = (startUnixSecs: number, endUnixSecs: nu
     `/usage/node-series?start_unix_secs=${startUnixSecs}&end_unix_secs=${endUnixSecs}${node}`,
   );
 };
+
+/** 实时用户流量卡打开时读取的近 1 小时计费窗口（30 秒）。nodes 列出每台机器实际上报的窗口，
+ * 含零流量窗口——列在这里却没有对应点的窗口是空闲，不在这里的是未采集，两者不能都画成 0。
+ * series 只含有流量的窗口，points 为 [窗口结束秒, 上行字节, 下行字节]。 */
+export interface UserTrafficHistory {
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
+  nodes: {
+    node_id: string;
+    window_ends_unix_secs: number[];
+    windows?: [number, number][];
+    zero_windows?: [number, number][];
+    forwarding_windows?: [number, number][];
+  }[];
+  series: {
+    node_id: string;
+    tenant_id: string;
+    user_id: string;
+    points: [number, number, number][];
+    windows?: [number, number, number, number][];
+    forwarding?: boolean;
+    unplaced_uplink_bytes?: number;
+    unplaced_downlink_bytes?: number;
+  }[];
+}
+
+export const fetchNodeUserTrafficHistory = (nodeId: string) =>
+  api<UserTrafficHistory>(`/realtime/nodes/${encodeURIComponent(nodeId)}/user-history`);
+export const fetchUserTrafficHistory = (tenantId: string, userId: string) =>
+  api<UserTrafficHistory>(`/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}/realtime/history`);
 
 /* ── 设置 ── */
 
@@ -3342,6 +3563,7 @@ export interface NodeTrafficItem {
   cycle_kind: NodeTrafficCycleKind;
   reset_month: number | null;
   reset_day: number;
+  quota_bytes: string | null;
   period_start_unix_secs: number;
   period_end_unix_secs: number;
   /* 十进制字符串避免累计值超过 JavaScript 的安全整数后丢字节。 */
@@ -3365,6 +3587,7 @@ export interface UpdateNodeTrafficRequest {
   cycle_kind: NodeTrafficCycleKind;
   reset_month: number | null;
   reset_day: number;
+  quota_bytes: string | null;
   calibrated_total_bytes: string | null;
 }
 
@@ -3374,6 +3597,97 @@ export const saveNodeTraffic = (nodeId: string, body: UpdateNodeTrafficRequest) 
     method: 'PUT',
     body: JSON.stringify(body),
   });
+
+export type MachineTrafficConfidence = 'low' | 'medium' | 'high';
+/* P90 误差分位的来源：本机回测、全部机器回测，或历史不足时的默认值。 */
+export type MachineTrafficBandBasis = 'node' | 'fleet' | 'default';
+
+export interface MachineTrafficBand {
+  basis: MachineTrafficBandBasis;
+  /* 回测预测的天数；全部机器的历史不够长时可短于剩余天数，但不少于一半。 */
+  horizon_days: number;
+  samples: number;
+  /* 剩余部分「实际 ÷ 预测 − 1」的 90% 分位，不小于 0。 */
+  upper_error_basis_points: number;
+}
+
+/* 最近一个已结束周期里每天记录的预测，与该周期最终总量对比。 */
+export interface MachineTrafficAccuracy {
+  period_start_unix_secs: number;
+  period_end_unix_secs: number;
+  actual_bytes: string;
+  forecasts: number;
+  /* |P50 − 实际| ÷ 实际 的平均值。 */
+  p50_error_basis_points: number;
+  /* 实际总量没有超过 P90 的次数。 */
+  p90_covered: number;
+}
+
+export interface MachineTrafficUser {
+  tenant_id: string;
+  user_id: string;
+  attributed_bytes: string;
+  projected_bytes: string;
+  share_basis_points: number;
+  apps: string[];
+}
+
+/* 物理网卡账本记到某个 UTC 日的字节数。 */
+export interface MachineTrafficDay {
+  day_start_unix_secs: number;
+  bytes: string;
+}
+
+export interface MachineTrafficModelNode {
+  node_id: string;
+  tenant_id: string;
+  name: string;
+  cycle_kind: NodeTrafficCycleKind;
+  reset_month: number | null;
+  reset_day: number;
+  period_start_unix_secs: number;
+  period_end_unix_secs: number;
+  /* 截止于本期起点、与本期等长的上一窗口起点；previous_* 字段都按这个窗口统计。 */
+  previous_period_start_unix_secs: number;
+  quota_bytes: string | null;
+  used_bytes: string;
+  previous_period_bytes: string;
+  /* 剩余天数按这个日均预计：最近 28 天中记录完整的日子加权平均，每早 4 天权重减半；还没有完整的一天时为开始记账以来的平均。 */
+  daily_rate_bytes: string;
+  /* 参与日均的完整天数；0 表示按开始记账以来的平均。 */
+  rate_days: number;
+  /* 已用 + 日均 × 剩余天数。 */
+  projected_p50_bytes: string;
+  /* P50 的剩余部分按 band 的误差分位放大。 */
+  projected_p90_bytes: string;
+  band: MachineTrafficBand;
+  confidence: MachineTrafficConfidence;
+  /* 本期总量缺了只有校准才能补上的部分：记账晚于期初与校准两者较晚者，或下面的缺口可能丢了字节、把上期流量算进本期。 */
+  needs_calibration: boolean;
+  /* 本期账本中有字节的 UTC 日，按时间升序；没有字节的日子不出现。
+     无校准时合计等于 used_bytes；本期校准后总量从 calibrated_at 起以校准值为准，仍以 used_bytes 为权威。 */
+  days: MachineTrafficDay[];
+  previous_days: MachineTrafficDay[];
+  tracking_started_at_unix_secs: number | null;
+  /* 本期内最近一次校准。 */
+  calibrated_at_unix_secs: number | null;
+  /* 期初与该次校准两者较晚者之后、可能改变本期总量的最近一次缺口。前一个 UTC 日仍有上报的缺口最多丢最后几个采样，不在此列。 */
+  gap_at_unix_secs: number | null;
+  gap_reason: string | null;
+  /* 有记录预测的周期结束之前为空。 */
+  last_period_accuracy: MachineTrafficAccuracy | null;
+  users: MachineTrafficUser[];
+  unattributed_bytes: string;
+  projected_unattributed_bytes: string;
+}
+
+export interface MachineTrafficModelView {
+  generated_at_unix_secs: number;
+  attribution: 'current_topology_proportional';
+  nodes: MachineTrafficModelNode[];
+}
+
+export const fetchMachineTrafficModel = () => api<MachineTrafficModelView>('/usage/machine-model');
 
 /* Binary release orders retain audit metadata, never historical executable bytes. */
 export type BinaryComponent = 'agent' | 'xray';

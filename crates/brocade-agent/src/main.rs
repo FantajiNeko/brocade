@@ -1,8 +1,10 @@
+mod accounting;
 mod certfile;
 mod command;
 mod conntrack;
 mod conntrack_tuning;
 use brocade_probe as e2e;
+mod forwarding;
 mod fsutil;
 mod host_tuning;
 mod http;
@@ -40,7 +42,8 @@ use probe::{
 };
 use spool::{
     collect_runtime_report, collect_spool_backlog, record_local_reconcile, runtime_cycle,
-    send_runtime_report, spool_drain, spool_push, Spool, OBSERVATION_SPOOL, USAGE_SPOOL,
+    send_runtime_report, spool_drain, spool_push, Spool, FORWARDING_USAGE_SPOOL, LOAD_SPOOL,
+    OBSERVATION_SPOOL, USAGE_SPOOL,
 };
 
 use wg::{
@@ -132,7 +135,14 @@ struct UsageCursor {
     last_sequence: u64,
 }
 
+static USAGE_CURSOR_LOCK: Mutex<()> = Mutex::new(());
+
 fn reserve_usage_sequence(state_dir: &Path) -> Result<(String, u64), String> {
+    // Subscription and forwarding accounting sample on independent threads but share one Agent
+    // identity/sequence space. Serialize the read-modify-write so neither can reuse a sequence.
+    let _guard = USAGE_CURSOR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = state_dir.join(USAGE_CURSOR_FILE);
     let mut cursor = match fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str::<UsageCursor>(&text)
@@ -215,6 +225,13 @@ fn next_periodic_tick(previous_tick: Instant, interval: Duration, now: Instant) 
     } else {
         interval - remainder
     }
+}
+
+/// Active E2E rounds can take longer than their nominal interval when a node owns many chains.
+/// Measure the next deadline from completion so one overrun cannot turn probing into a permanent
+/// back-to-back workload that competes with customer traffic.
+fn next_tick_after_round(finished: Instant, interval: Duration) -> Instant {
+    finished + interval
 }
 
 /// Only slow rounds are logged; normal ten-second ticks remain quiet. Keep scheduler delay and
@@ -1247,6 +1264,30 @@ fn run_forever(options: Options) -> Result<(), String> {
         options.clone(),
         Arc::clone(&runtime_reports),
     )?;
+    spawn_spool_reporter(
+        "forwarding-usage-report",
+        FORWARDING_USAGE_SPOOL,
+        options.clone(),
+        Arc::clone(&runtime_reports),
+    )?;
+    spawn_spool_reporter(
+        "load-report",
+        LOAD_SPOOL,
+        options.clone(),
+        Arc::clone(&runtime_reports),
+    )?;
+
+    {
+        // User forwarding is operational desired state. It shares Xray's local API and counter
+        // reader with configuration convergence, so `meter` serializes listener changes, samples,
+        // and any Xray restart without coupling their network schedules.
+        let forwarding_options = options.clone();
+        let forwarding_meter = Arc::clone(&meter);
+        thread::Builder::new()
+            .name("forwarding".to_owned())
+            .spawn(move || forwarding::run_forever(forwarding_options, forwarding_meter))
+            .map_err(|error| format!("cannot spawn forwarding thread: {error}"))?;
+    }
 
     {
         // One outbound connection, idle until the control plane says somebody is watching. It is
@@ -1476,24 +1517,10 @@ fn run_forever(options: Options) -> Result<(), String> {
         // It also must not delay usage. A netlink dump on a machine with thousands of
         // connections has a measurable cost, and usage reporting drives billing, so anything
         // that can slow it runs on a separate thread.
-        // Sampling must never wait for the control plane. A load request may legally spend up to
-        // 30 seconds in an HTTP read, which used to stretch the next nominal 10-second sample and
-        // then label the mixed interval as 30 seconds. A one-slot best-effort handoff preserves
-        // the existing "do not spool stale telemetry" rule while keeping the sampling clock free.
-        let reports = Arc::new(LatestReport::<LoadReportRequest>::default());
-        let report_options = options.clone();
-        let reports_in = Arc::clone(&reports);
-        thread::Builder::new()
-            .name("load-report".to_owned())
-            .spawn(move || {
-                report_latest_forever("load", &reports_in, |report| {
-                    send_load_report(&report_options, report)
-                })
-            })
-            .map_err(|error| format!("cannot spawn load-report thread: {error}"))?;
-
+        // Sampling must never wait for the control plane. A completed 30-second window is first
+        // fsynced into the bounded load spool; the dedicated reporter above handles all network
+        // waits and ordered replay independently of this sampling clock.
         let options = options.clone();
-        let reports_out = Arc::clone(&reports);
         thread::Builder::new()
             .name("load".to_owned())
             .spawn(move || {
@@ -1504,7 +1531,13 @@ fn run_forever(options: Options) -> Result<(), String> {
                         // Durable interface accounting has its own writer. In particular, an
                         // fsync or the traffic meter's lock must never precede host sampling.
                         match build_load_report(&options) {
-                            Ok(Some(report)) => reports_out.publish(report),
+                            Ok(Some(report)) => {
+                                if let Err(error) =
+                                    spool_push(LOAD_SPOOL, &options.state_dir, &report)
+                                {
+                                    eprintln!("load: persist report: {error}");
+                                }
+                            }
                             Ok(None) => {}
                             Err(error) => eprintln!("load: {error}"),
                         }
@@ -1683,7 +1716,6 @@ fn run_forever(options: Options) -> Result<(), String> {
             .name("e2e".to_owned())
             .spawn(move || {
                 let mut settings = settings_in.wait_for_initial();
-                let mut tick = Instant::now();
                 loop {
                     settings = settings_in.latest().unwrap_or(settings);
                     each_round("e2e", || match collect_e2e_probe_report(&settings) {
@@ -1691,13 +1723,12 @@ fn run_forever(options: Options) -> Result<(), String> {
                         Ok(None) => {}
                         Err(error) => eprintln!("e2e: {error}"),
                     });
-                    let mut next_tick =
-                        next_periodic_tick(tick, settings.interval(), Instant::now());
+                    let completed_at = Instant::now();
+                    let mut next_tick = next_tick_after_round(completed_at, settings.interval());
                     while let Some(next) = settings_in.wait_for_change_until(&settings, next_tick) {
                         settings = next;
-                        next_tick = next_periodic_tick(tick, settings.interval(), Instant::now());
+                        next_tick = next_tick_after_round(completed_at, settings.interval());
                     }
-                    tick = next_tick;
                 }
             })
             .map_err(|error| format!("cannot spawn e2e thread: {error}"))?;
@@ -1926,16 +1957,17 @@ fn apply_once_inner(
                         .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 );
             }
-            // A failed sample must not block the release: updating xray's config is what
-            // the operator requested, and a failed sample costs at most one window. It is
-            // still reported rather than dropped.
-            if let Err(error) = collect_usage_report(&options) {
-                eprintln!("usage: 重启 xray 前的采集没成功：{error}");
+            // Sampling or fsync failure must not authorize destruction of an established
+            // counter namespace. An already absent process may still need recovery; it cannot
+            // provide a pre-change sample and must not be kept down by this gate.
+            if serving_xray_process_in(&options.state_dir).is_some() {
+                collect_usage_report(&options)?;
             }
             // This is deliberately after the pre-change sample and before converge_linux mutates
             // Xray or its runtime grants. A newly introduced counter has value zero at this boundary,
             // even though Xray does not expose the counter until that user first sends traffic.
             usage_activated_at_unix_secs = current_unix_secs().ok();
+            Ok(())
         };
         match options.apply_mode {
             ApplyMode::StateDir => converge_to_state_dir(&options.state_dir, &desired),
@@ -2070,11 +2102,13 @@ fn successful_apply_outcome(
 fn collect_usage_report(options: &Options) -> Result<(), String> {
     // A wg-only node has no xray workload to sample. That is not an error; the independent
     // spool reporter still delivers readings left from an earlier role or outage.
-    if options.state_dir.join("xray.json").exists()
-        && !options.state_dir.join("xray.disabled").exists()
+    if accounting::has_stopped(&options.state_dir)
+        || options.state_dir.join("xray.json").exists()
+            && !options.state_dir.join("xray.disabled").exists()
     {
         read_usage_report(&options.state_dir)
             .and_then(|report| spool_push(USAGE_SPOOL, &options.state_dir, &report))
+            .and_then(|()| accounting::collected(&options.state_dir))
     } else {
         Ok(())
     }
@@ -2134,11 +2168,9 @@ fn health_cycle(options: &Options) -> Result<(), String> {
 
 /// One host-sampling tick. Most ticks accumulate and produce nothing.
 ///
-/// Nothing here is spooled, unlike usage and observations. The spool exists so a locally
-/// established fact survives an outage: usage drives billing, and a convergence result is the
-/// only record that convergence happened. A CPU reading from five minutes ago is neither, so
-/// spooling it would add a file that can fill a disk in exchange for readings that are no longer
-/// used. A failed send drops the window, and the next one is sent 30 seconds later.
+/// The daemon persists each completed report before delivery. The queue is intentionally bounded
+/// to the most recent hour: that covers Console maintenance without turning old operational state
+/// into an unbounded accounting log. The `load-once` diagnostic command still sends synchronously.
 fn build_load_report(options: &Options) -> Result<Option<LoadReportRequest>, String> {
     let now = current_unix_secs()? as u64;
     let Some((mut sample, processes)) = load::tick(&options.state_dir, now) else {
@@ -2176,6 +2208,7 @@ fn build_load_report(options: &Options) -> Result<Option<LoadReportRequest>, Str
     };
     Ok(Some(LoadReportRequest {
         read_at_unix_secs: now as i64,
+        sent_at_unix_secs: Some(now as i64),
         btime_unix_secs: load::current_btime(),
         host: load::host_facts(&options.state_dir),
         samples: vec![sample],
@@ -2257,13 +2290,20 @@ fn load_once(options: Options) -> Result<(), String> {
 }
 
 fn read_usage_report(state_dir: &Path) -> Result<UsageReportRequest, String> {
+    if serving_xray_process_in(state_dir).is_none() {
+        return accounting::stopped_report(state_dir);
+    }
     let xray_content = fs::read_to_string(state_dir.join("xray.json"))
         .map_err(|error| format!("failed to read xray.json from state dir: {error}"))?;
     let api_port = xray_api_port(&xray_content).ok_or("xray.json does not contain api port")?;
     // Reserve and persist before touching the volatile counters. A crash may leave a harmless
     // sequence gap; reserving after the read could reuse the same id for different traffic.
     let (agent_instance_id, sequence) = reserve_usage_sequence(state_dir)?;
-    let process = xray_process_identity()?;
+    let process = xray_process_identity(state_dir)?;
+    let counter_epoch = accounting::epoch(state_dir, &process.epoch, process.pid)?;
+    let counters = read_xray_usage_counters(api_port)?;
+    accounting::sync_live_journal(state_dir, &process.epoch, process.pid)?;
+    validate_xray_sample_process(state_dir, &process)?;
     Ok(UsageReportRequest {
         agent_instance_id,
         sequence,
@@ -2271,9 +2311,10 @@ fn read_usage_report(state_dir: &Path) -> Result<UsageReportRequest, String> {
             .ok_or("xray has no active usage generation")?,
         read_at_unix_secs: current_unix_secs()?,
         xray_started_at_unix_secs: process.started_at_unix_secs,
-        xray_epoch: process.epoch,
+        xray_epoch: counter_epoch,
         route: Some(route_ip_report()),
-        counters: read_xray_usage_counters(api_port)?,
+        counters,
+        zero_windows: accounting::zero_windows(state_dir)?,
     })
 }
 
@@ -2393,7 +2434,7 @@ fn converge_linux(
     desired: &NodeDesiredDeployment,
     // The hook for step 4. A parameter rather than a direct call, because state-dir
     // mode and a lone apply-once have no reporting channel and must skip this step.
-    before_xray_restart: &mut dyn FnMut(),
+    before_xray_restart: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     create_private_dir(state_dir)?;
 
@@ -2427,7 +2468,7 @@ fn converge_linux(
     // everything since the last one is lost, and the loss is not reported anywhere; it
     // appears only as an understated bill.
     if desired.usage_generation_id.is_some() {
-        before_xray_restart();
+        before_xray_restart()?;
     }
     converge_linux_xray(state_dir, &desired.desired.xray, false)?;
     // After xray, because the ports come out of its config: applying first would exempt the
@@ -2521,22 +2562,26 @@ fn converge_linux_xray(
             // difference between the two.
             let previous = fs::read_to_string(&path).ok();
             let splice_mode_changed = xray_splice_mode_changed(state_dir, content)?;
-            write_private(&path, content)?;
-            let _ = fs::remove_file(state_dir.join("xray.disabled"));
             let api_port = xray_api_port(content).unwrap_or(10085);
             let bounded_log = state_dir.join(XRAY_BOUNDED_LOG_MARKER).exists();
 
-            // The file is already on disk, so a cold start uses the new config whichever
-            // branch runs. That is what makes the swap an optimization rather than a
-            // second source of truth: it removes a restart, and a failed swap costs only
-            // the restart it was avoiding.
-            if !force_restart && xray_running() && !splice_mode_changed && bounded_log {
+            // A successful swap commits the live checkpoint. Otherwise stage the candidate,
+            // validate it, and preserve the serving process's old file through final accounting.
+            if !force_restart
+                && serving_xray_process_in(state_dir).is_some()
+                && !splice_mode_changed
+                && bounded_log
+            {
                 if let Some(swap) = previous
                     .as_deref()
                     .and_then(|previous| hot_swap(previous, content))
                 {
                     match apply_hot_swap(state_dir, api_port, content, &swap) {
-                        Ok(()) => return Ok(()),
+                        Ok(()) => {
+                            write_private(&path, content)?;
+                            let _ = fs::remove_file(state_dir.join("xray.disabled"));
+                            return Ok(());
+                        }
                         Err(error) => {
                             // Not fatal, and deliberately not silent: a swap that keeps
                             // failing is a machine restarting on every deployment while
@@ -2546,11 +2591,17 @@ fn converge_linux_xray(
                     }
                 }
             }
-            apply_xray(&path, api_port)?;
+            // Keep the live checkpoint (especially its API port) until final accounting
+            // succeeds. A failed pre-stop sample must not leave desired bytes masquerading
+            // as the still-running process's actual configuration on the next retry.
+            let candidate = state_dir.join("xray.next.json");
+            write_private(&candidate, content)?;
+            apply_xray(&candidate, api_port)?;
+            let _ = fs::remove_file(state_dir.join("xray.disabled"));
             Ok(())
         }
         DesiredArtifact::Disabled { reason } => {
-            terminate_xray()?;
+            accounting::stop(state_dir)?;
             let _ = fs::remove_file(state_dir.join("xray.json"));
             let _ = fs::remove_file(state_dir.join(XRAY_BOUNDED_LOG_MARKER));
             let _ = fs::remove_file(state_dir.join(XRAY_SPLICE_MODE_MARKER));
@@ -2766,7 +2817,6 @@ fn kernel_tls_module_loaded() -> bool {
 }
 
 fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
-    let conf = shell_quote(&path.display().to_string());
     let content =
         fs::read_to_string(path).map_err(|error| format!("读取待启动的 xray 配置失败：{error}"))?;
     let disable_splice =
@@ -2777,8 +2827,19 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     if !ensure_kernel_tls_module() {
         warn("启动 Xray 前仍未观察到 Linux tls 内核模块；AnyTLS 将按 auto 回退");
     }
-    let launch = xray_launch_command(splice_mode, &executable, &conf);
     let state_dir = path.parent().ok_or("xray config has no state directory")?;
+    let live_path = state_dir.join("xray.json");
+    let conf = shell_quote(&live_path.display().to_string());
+    let accounting_dir = fs::canonicalize(state_dir)
+        .map_err(|error| format!("resolve accounting directory: {error}"))?;
+    let journal = shell_quote(&format!(
+        "XRAY_BROCADE_ACCOUNTING_FILE={}",
+        accounting::journal_path(&accounting_dir).display()
+    ));
+    let launch = format!(
+        "env {journal} {}",
+        xray_launch_command(splice_mode, &executable, &conf)
+    );
     let log_dir = state_dir.join("logs");
     create_private_dir(&log_dir)?;
     let log_path = log_dir.join("xray.log");
@@ -2790,7 +2851,9 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     // Waiting for that teardown before launching the replacement makes the entire wait a service
     // outage. Bound the graceful phase tightly, then kill a stuck old process; a configuration
     // restart cannot preserve its sessions in either case.
-    terminate_xray()?;
+    accounting::stop(state_dir)?;
+    write_private(&live_path, &content)?;
+    accounting::before_launch(state_dir)?;
     run_shell(&format!(
         "set -eu\n\
          nohup sh -c {pipeline} >/dev/null 2>&1 &\n\
@@ -2807,6 +2870,7 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
          cat {log} 2>/dev/null || true\n\
          exit 1"
     ))?;
+    accounting::launched(state_dir)?;
     fs::write(state_dir.join(XRAY_BOUNDED_LOG_MARKER), b"dynamic\n")
         .map_err(|error| format!("failed to record bounded xray logging: {error}"))?;
     fs::write(
@@ -3417,6 +3481,8 @@ fn parse_xray_stat_name(name: &str) -> Option<(&str, &str)> {
 /// construction: probe children last seconds and api calls last milliseconds.
 #[derive(Debug, Clone)]
 struct XrayProcessIdentity {
+    pid: libc::pid_t,
+    start_ticks: u64,
     started_at_unix_secs: i64,
     epoch: String,
 }
@@ -3465,7 +3531,7 @@ fn process_is_live(process: ProcessRef) -> bool {
 }
 
 fn xray_running() -> bool {
-    !live_processes_named("xray").is_empty()
+    serving_xray_process().is_some()
 }
 
 fn signal_processes(processes: &[ProcessRef], signal: libc::c_int) -> Result<(), String> {
@@ -3536,18 +3602,9 @@ fn terminate_processes(
     }
 }
 
-fn terminate_xray() -> Result<(), String> {
-    terminate_processes(
-        &live_processes_named("xray"),
-        XRAY_TERM_GRACE,
-        XRAY_KILL_GRACE,
-    )
-}
-
-fn xray_process_identity() -> Result<XrayProcessIdentity, String> {
-    // The serving instance is the oldest live Xray by construction. Excluding zombies before
-    // choosing the oldest matters: the leftover zombie is normally older than its replacement.
-    let process = serving_xray_process().ok_or("xray process is not running")?;
+fn xray_process_identity(state_dir: &Path) -> Result<XrayProcessIdentity, String> {
+    let process =
+        serving_xray_process_in(state_dir).ok_or("managed xray process is not running")?;
     let btime = fs::read_to_string("/proc/stat")
         .map_err(|error| format!("failed to read /proc/stat: {error}"))?
         .lines()
@@ -3567,10 +3624,29 @@ fn xray_process_identity() -> Result<XrayProcessIdentity, String> {
         .checked_add(process.start_ticks / clock_ticks)
         .ok_or("xray start time overflow")?;
     Ok(XrayProcessIdentity {
+        pid: process.pid,
+        start_ticks: process.start_ticks,
         started_at_unix_secs: i64::try_from(started)
             .map_err(|_| "xray start time is out of range".to_owned())?,
         epoch: format!("{btime}:{}", process.start_ticks),
     })
+}
+
+fn validate_xray_sample_process(
+    state_dir: &Path,
+    process: &XrayProcessIdentity,
+) -> Result<(), String> {
+    if serving_xray_process_in(state_dir)
+        != Some(ProcessRef {
+            pid: process.pid,
+            start_ticks: process.start_ticks,
+        })
+    {
+        return Err(
+            "Xray changed during accounting sample; retry without updating heads".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_proc_stat(stat: &str) -> Result<(char, u64), String> {
@@ -3648,11 +3724,69 @@ fn xray_program() -> String {
 }
 
 fn serving_xray_process() -> Option<ProcessRef> {
-    // The serving instance is the oldest live Xray by construction. Probe and API children live
-    // for seconds or milliseconds; excluding zombies before selecting keeps a stale child from
-    // becoming the reported binary identity.
+    serving_xray_process_for(None)
+}
+
+fn serving_xray_process_in(state_dir: &Path) -> Option<ProcessRef> {
+    serving_xray_process_for(Some(state_dir))
+}
+
+fn xray_config_argument(cmdline: &[u8]) -> Option<&str> {
+    let args = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>();
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if matches!(*arg, b"-config" | b"-c" | b"--config") {
+            std::str::from_utf8(args.get(index + 1)?).ok()
+        } else {
+            let arg = std::str::from_utf8(arg).ok()?;
+            arg.strip_prefix("-config=")
+                .or_else(|| arg.strip_prefix("-c="))
+        }
+    })
+}
+
+/// A temporary probe can be older than the replacement server. Its PID must never become a
+/// billing epoch or a released-binary identity; resolve the managed config, not process age alone.
+fn serving_xray_process_for(state_dir: Option<&Path>) -> Option<ProcessRef> {
+    let expected = state_dir
+        .and_then(|dir| fs::canonicalize(dir).ok())
+        .map(|dir| dir.join("xray.json"));
+    if state_dir.is_some() && expected.is_none() {
+        return None;
+    }
     live_processes_named("xray")
         .into_iter()
+        .filter(|process| {
+            let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", process.pid)) else {
+                return false;
+            };
+            let Some(config) = xray_config_argument(&cmdline) else {
+                return false;
+            };
+            let path = Path::new(config);
+            if path.file_name() != Some(std::ffi::OsStr::new("xray.json")) {
+                return false;
+            }
+            let Some(expected) = &expected else {
+                return true;
+            };
+            let actual = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                let Ok(cwd) = fs::read_link(format!("/proc/{}/cwd", process.pid)) else {
+                    return false;
+                };
+                cwd.join(path)
+            };
+            actual
+                .parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .map(|dir| dir.join("xray.json"))
+                .as_ref()
+                == Some(expected)
+        })
         .min_by_key(|process| process.start_ticks)
 }
 
@@ -4017,6 +4151,18 @@ mod tests {
         assert_eq!(
             super::next_periodic_tick(started, interval, finished),
             started + std::time::Duration::from_secs(10),
+        );
+    }
+
+    #[test]
+    fn e2e_waits_a_full_interval_after_a_slow_round_finishes() {
+        let started = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(5);
+        let finished = started + std::time::Duration::from_secs(7);
+
+        assert_eq!(
+            super::next_tick_after_round(finished, interval),
+            started + std::time::Duration::from_secs(12),
         );
     }
 

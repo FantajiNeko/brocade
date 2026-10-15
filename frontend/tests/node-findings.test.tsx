@@ -178,6 +178,24 @@ describe('durable spool-loss findings', () => {
     expect(container.textContent).toContain('不代表流量丢失');
   });
 
+  it('classifies evicted load windows separately from traffic and convergence', () => {
+    const value = node(false);
+    value.spool_backlog = {
+      observation: 0,
+      usage: 0,
+      load: 120,
+      dropped: 4,
+      usage_dropped: 0,
+      observation_dropped: 0,
+      load_dropped: 4,
+    };
+
+    const findings = runtimeFindings(value);
+    expect(findings.find(item => item.chip === '丢了 4 个指标窗口')?.tone).toBe('warn');
+    expect(findings.some(item => item.chip.includes('未分类'))).toBe(false);
+    expect(findings.some(item => item.chip.includes('条用量'))).toBe(false);
+  });
+
   it('keeps an old aggregate loss unclassified instead of inventing lost usage', () => {
     const value = node(false);
     value.spool_backlog = { observation: 0, usage: 0, dropped: 3 };

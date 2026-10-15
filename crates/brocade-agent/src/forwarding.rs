@@ -1,0 +1,963 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    net::{Ipv4Addr, TcpListener, UdpSocket},
+    path::Path,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+use brocade_core::artifacts::xray::FORWARD_OUTBOUND_TAG;
+use brocade_deployment::protocol::{
+    ForwardingDesiredState, ForwardingReconcileReport, ForwardingRuleDesired,
+    ForwardingUsageCounter, ForwardingUsageReportRequest,
+};
+
+use crate::{
+    current_unix_secs,
+    fsutil::atomic_write_private,
+    http::HttpClient,
+    next_periodic_tick,
+    options::Options,
+    reserve_usage_sequence,
+    spool::{spool_push, FORWARDING_USAGE_SPOOL},
+    xray_api_port, xray_grpc, xray_process_identity,
+};
+
+const FORWARDING_INTERVAL: Duration = Duration::from_secs(15);
+const FORWARDING_STATE_FILE: &str = "forwarding-applied.json";
+const FORWARDING_TAG_PREFIX: &str = "fwd:";
+
+pub(crate) fn run_forever(options: Options, meter: Arc<Mutex<()>>) {
+    let mut tick = Instant::now();
+    loop {
+        if let Err(error) = run_round(&options, &meter) {
+            eprintln!("forwarding: {error}");
+        }
+        let now = Instant::now();
+        tick = next_periodic_tick(tick, FORWARDING_INTERVAL, now);
+        thread::sleep(tick.saturating_duration_since(now));
+    }
+}
+
+fn run_round(options: &Options, meter: &Mutex<()>) -> Result<(), String> {
+    let client = HttpClient::new(&options.server)?;
+    let desired = fetch_desired(&client, options)?;
+    let (report, usage) = {
+        let _guard = meter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let report = reconcile(&options.state_dir, &desired);
+        let usage = collect_usage(&options.state_dir);
+        (report, usage)
+    };
+    if let Ok(usage_report) = usage {
+        spool_push(FORWARDING_USAGE_SPOOL, &options.state_dir, &usage_report)?;
+    } else if let Err(error) = usage {
+        eprintln!("forwarding usage: {error}");
+    }
+    send_reconcile(&client, options, &report)
+}
+
+fn fetch_desired(client: &HttpClient, options: &Options) -> Result<ForwardingDesiredState, String> {
+    let response = client.request("GET", "/agent/v1/forwarding/desired", &options.token, None)?;
+    if response.status != 200 {
+        return Err(format!(
+            "desired request failed: HTTP {} {}",
+            response.status, response.body
+        ));
+    }
+    serde_json::from_str(&response.body)
+        .map_err(|error| format!("decode forwarding desired state: {error}"))
+}
+
+fn send_reconcile(
+    client: &HttpClient,
+    options: &Options,
+    report: &ForwardingReconcileReport,
+) -> Result<(), String> {
+    let body = serde_json::to_string(report).map_err(|error| error.to_string())?;
+    let response = client.request(
+        "POST",
+        "/agent/v1/forwarding/reconcile",
+        &options.token,
+        Some(&body),
+    )?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "reconcile report failed: HTTP {} {}",
+            response.status, response.body
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile(state_dir: &Path, desired: &ForwardingDesiredState) -> ForwardingReconcileReport {
+    match reconcile_inner(state_dir, desired) {
+        Ok(report) => report,
+        Err(error) => {
+            let applied_rule_ids = current_forwarding_rule_ids(state_dir).unwrap_or_default();
+            ForwardingReconcileReport {
+                generation: desired.generation,
+                applied_rule_ids,
+                error: Some(error.chars().take(900).collect()),
+            }
+        }
+    }
+}
+
+fn reconcile_inner(
+    state_dir: &Path,
+    desired: &ForwardingDesiredState,
+) -> Result<ForwardingReconcileReport, String> {
+    let xray_path = state_dir.join("xray.json");
+    let content = match fs::read_to_string(&xray_path) {
+        Ok(content) if !state_dir.join("xray.disabled").exists() => content,
+        Ok(_) | Err(_) if desired.rules.is_empty() => {
+            write_state(state_dir, desired)?;
+            return Ok(ForwardingReconcileReport {
+                generation: desired.generation,
+                applied_rule_ids: Vec::new(),
+                error: None,
+            });
+        }
+        Ok(_) => return Err("Xray is disabled while forwarding rules are enabled".to_owned()),
+        Err(error) => return Err(format!("read {}: {error}", xray_path.display())),
+    };
+    let api_port = xray_api_port(&content).ok_or("xray config has no API port")?;
+    reconcile_listeners(
+        state_dir,
+        desired,
+        forwarding_outbound_is_ready(&content),
+        &mut XrayForwardingApi(api_port),
+    )
+}
+
+trait ForwardingRuntime {
+    fn inbound_tags(&mut self) -> Result<Vec<String>, String>;
+    fn remove(&mut self, tag: &str) -> Result<(), String>;
+    fn add(&mut self, rule: &ForwardingRuleDesired) -> Result<(), String>;
+    fn preflight_replacement(
+        &mut self,
+        _previous: &ForwardingRuleDesired,
+        _replacement: &ForwardingRuleDesired,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct XrayForwardingApi(u16);
+
+impl ForwardingRuntime for XrayForwardingApi {
+    fn inbound_tags(&mut self) -> Result<Vec<String>, String> {
+        xray_grpc::inbound_tags(self.0)
+    }
+
+    fn remove(&mut self, tag: &str) -> Result<(), String> {
+        xray_grpc::remove_inbound(self.0, tag)
+    }
+
+    fn add(&mut self, rule: &ForwardingRuleDesired) -> Result<(), String> {
+        xray_grpc::add_forwarding_inbound(
+            self.0,
+            &forwarding_tag(rule.id),
+            rule.protocol,
+            rule.listen_port,
+            &rule.target_host,
+            rule.target_port,
+        )
+    }
+
+    fn preflight_replacement(
+        &mut self,
+        previous: &ForwardingRuleDesired,
+        replacement: &ForwardingRuleDesired,
+    ) -> Result<(), String> {
+        preflight_forwarding_listener(previous, replacement)
+    }
+}
+
+fn preflight_forwarding_listener(
+    previous: &ForwardingRuleDesired,
+    replacement: &ForwardingRuleDesired,
+) -> Result<(), String> {
+    let port_changed = previous.listen_port != replacement.listen_port;
+    let adds_tcp = protocol_has_tcp(replacement.protocol)
+        && (port_changed || !protocol_has_tcp(previous.protocol));
+    let adds_udp = protocol_has_udp(replacement.protocol)
+        && (port_changed || !protocol_has_udp(previous.protocol));
+    let _tcp = adds_tcp
+        .then(|| TcpListener::bind((Ipv4Addr::UNSPECIFIED, replacement.listen_port)))
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "TCP port {} is unavailable: {error}",
+                replacement.listen_port
+            )
+        })?;
+    let _udp = adds_udp
+        .then(|| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, replacement.listen_port)))
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "UDP port {} is unavailable: {error}",
+                replacement.listen_port
+            )
+        })?;
+    Ok(())
+}
+
+fn protocol_has_tcp(protocol: brocade_deployment::protocol::ForwardingProtocol) -> bool {
+    matches!(
+        protocol,
+        brocade_deployment::protocol::ForwardingProtocol::Tcp
+            | brocade_deployment::protocol::ForwardingProtocol::TcpUdp
+    )
+}
+
+fn protocol_has_udp(protocol: brocade_deployment::protocol::ForwardingProtocol) -> bool {
+    matches!(
+        protocol,
+        brocade_deployment::protocol::ForwardingProtocol::Udp
+            | brocade_deployment::protocol::ForwardingProtocol::TcpUdp
+    )
+}
+
+// DNS is deliberately absent: only Xray knows the resolver and final address used by a flow.
+// The checkpoint contains only definitions we can prove are installed, including partial rounds.
+fn reconcile_listeners(
+    state_dir: &Path,
+    desired: &ForwardingDesiredState,
+    outbound_ready: bool,
+    runtime: &mut impl ForwardingRuntime,
+) -> Result<ForwardingReconcileReport, String> {
+    let mut known = read_state(state_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|state| state.rules)
+        .map(|rule| (rule.id, rule))
+        .collect::<BTreeMap<_, _>>();
+    let wanted = desired
+        .rules
+        .iter()
+        .map(|rule| (rule.id, rule))
+        .collect::<BTreeMap<_, _>>();
+    let actual = runtime
+        .inbound_tags()?
+        .into_iter()
+        .filter_map(|tag| forwarding_id(&tag).map(|id| (id, tag)))
+        .collect::<BTreeMap<_, _>>();
+    let mut remaining = actual.keys().copied().collect::<BTreeSet<_>>();
+    // The checkpoint describes definitions that are still proven to exist. Keep the previous
+    // definition until its listener has actually been removed: it is also the rollback payload
+    // if the replacement cannot be installed.
+    known.retain(|id, _| actual.contains_key(id));
+    write_checkpoint(state_dir, desired.generation, &known)?;
+    let mut errors = ReconcileErrors::default();
+    if !outbound_ready && !desired.rules.is_empty() {
+        errors.push(format!(
+            "Xray forwarding requires {FORWARD_OUTBOUND_TAG} as the first freedom outbound; publish a compatible Xray configuration first"
+        ));
+    }
+
+    // Revoke before adding anything. If the shared outbound is temporarily unsuitable, security
+    // revocations still proceed, but authorized listeners are frozen instead of being torn down.
+    // A failed operation must not block unrelated rules.
+    for (id, tag) in actual {
+        let unchanged = known
+            .get(&id)
+            .zip(wanted.get(&id))
+            .is_some_and(|(previous, desired)| previous == *desired);
+        let revoked = !wanted.contains_key(&id);
+        if revoked || (outbound_ready && !unchanged) {
+            let previous = known.get(&id).cloned();
+            if !revoked && previous.is_none() {
+                errors.push(format!(
+                    "rule {id} has no applied checkpoint; preserving its existing listener"
+                ));
+                continue;
+            }
+            if let (Some(previous), Some(replacement)) = (previous.as_ref(), wanted.get(&id)) {
+                if let Err(error) = runtime.preflight_replacement(previous, replacement) {
+                    errors.push(format!("rule {id} preflight failed: {error}"));
+                    continue;
+                }
+            }
+            match runtime.remove(&tag) {
+                Ok(()) => {
+                    remaining.remove(&id);
+                    known.remove(&id);
+                    write_checkpoint(state_dir, desired.generation, &known)?;
+
+                    if let Some(replacement) = wanted.get(&id).filter(|_| outbound_ready) {
+                        match runtime.add(replacement) {
+                            Ok(()) => {
+                                known.insert(id, (*replacement).clone());
+                                remaining.insert(id);
+                                write_checkpoint(state_dir, desired.generation, &known)?;
+                            }
+                            Err(error) => {
+                                errors.push(format!("rule {id} add failed: {error}"));
+                                if let Some(previous) = previous {
+                                    match restore_listener(runtime, &previous) {
+                                        Ok(()) => {
+                                            known.insert(id, previous);
+                                            remaining.insert(id);
+                                            write_checkpoint(
+                                                state_dir,
+                                                desired.generation,
+                                                &known,
+                                            )?;
+                                        }
+                                        Err(rollback_error) => errors.push(format!(
+                                            "rule {id} restore failed: {rollback_error}"
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => errors.push(format!("rule {id} remove failed: {error}")),
+            }
+        }
+    }
+    if outbound_ready {
+        for rule in wanted.values() {
+            if remaining.contains(&rule.id) {
+                continue;
+            }
+            known.remove(&rule.id);
+            match runtime.add(rule) {
+                Ok(()) => {
+                    known.insert(rule.id, (*rule).clone());
+                    write_checkpoint(state_dir, desired.generation, &known)?;
+                }
+                Err(error) => errors.push(format!("rule {} add failed: {error}", rule.id)),
+            }
+        }
+    }
+    let actual = runtime
+        .inbound_tags()?
+        .into_iter()
+        .filter_map(|tag| forwarding_id(&tag))
+        .collect::<BTreeSet<_>>();
+    known.retain(|id, _| actual.contains(id));
+    if actual != wanted.keys().copied().collect()
+        || wanted.iter().any(|(id, rule)| known.get(id) != Some(*rule))
+    {
+        errors.push(
+            "Xray forwarding listeners have not fully converged; retrying next round".to_owned(),
+        );
+    }
+    write_checkpoint(state_dir, desired.generation, &known)?;
+    Ok(ForwardingReconcileReport {
+        generation: desired.generation,
+        applied_rule_ids: actual.into_iter().collect(),
+        error: errors.finish(),
+    })
+}
+
+fn restore_listener(
+    runtime: &mut impl ForwardingRuntime,
+    previous: &ForwardingRuleDesired,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 0..20 {
+        match runtime.add(previous) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 19 {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "listener restore failed".to_owned()))
+}
+
+fn write_checkpoint(
+    state_dir: &Path,
+    generation: i64,
+    known: &BTreeMap<i64, ForwardingRuleDesired>,
+) -> Result<(), String> {
+    write_state(
+        state_dir,
+        &ForwardingDesiredState {
+            generation,
+            rules: known.values().cloned().collect(),
+        },
+    )
+}
+
+#[derive(Default)]
+struct ReconcileErrors {
+    messages: Vec<String>,
+    omitted: bool,
+}
+
+impl ReconcileErrors {
+    fn push(&mut self, error: String) {
+        // Eight messages of at most 384 UTF-8 bytes fit the protocol's 4096-byte bound.
+        if self.messages.len() < 8 {
+            self.messages.push(error.chars().take(96).collect());
+        } else {
+            self.omitted = true;
+        }
+    }
+
+    fn finish(mut self) -> Option<String> {
+        if self.omitted {
+            self.messages.push("additional errors omitted".to_owned());
+        }
+        (!self.messages.is_empty()).then(|| self.messages.join("; "))
+    }
+}
+
+fn forwarding_outbound_is_ready(content: &str) -> bool {
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(outbound) = config
+        .get("outbounds")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.first())
+    else {
+        return false;
+    };
+    outbound.get("tag").and_then(|v| v.as_str()) == Some(FORWARD_OUTBOUND_TAG)
+        && outbound.get("protocol").and_then(|v| v.as_str()) == Some("freedom")
+}
+
+fn current_forwarding_rule_ids(state_dir: &Path) -> Result<Vec<i64>, String> {
+    let content = fs::read_to_string(state_dir.join("xray.json"))
+        .map_err(|error| format!("read xray config: {error}"))?;
+    let api_port = xray_api_port(&content).ok_or("xray config has no API port")?;
+    Ok(xray_grpc::inbound_tags(api_port)?
+        .into_iter()
+        .filter_map(|tag| forwarding_id(&tag))
+        .collect())
+}
+
+fn collect_usage(state_dir: &Path) -> Result<ForwardingUsageReportRequest, String> {
+    let content = fs::read_to_string(state_dir.join("xray.json"))
+        .map_err(|error| format!("read xray config: {error}"))?;
+    let api_port = xray_api_port(&content).ok_or("xray config has no API port")?;
+    let process = xray_process_identity(state_dir)?;
+    let counter_epoch = crate::accounting::epoch(state_dir, &process.epoch, process.pid)?;
+    let (agent_instance_id, sequence) = reserve_usage_sequence(state_dir)?;
+    let counters = read_counters(api_port)?;
+    crate::accounting::sync_live_journal(state_dir, &process.epoch, process.pid)?;
+    crate::validate_xray_sample_process(state_dir, &process)?;
+    Ok(ForwardingUsageReportRequest {
+        agent_instance_id,
+        sequence,
+        read_at_unix_secs: current_unix_secs()?,
+        xray_epoch: counter_epoch,
+        counters: counters
+            .into_iter()
+            .map(
+                |(rule_id, (uplink_bytes, downlink_bytes))| ForwardingUsageCounter {
+                    rule_id,
+                    uplink_bytes,
+                    downlink_bytes,
+                },
+            )
+            .collect(),
+    })
+}
+
+pub(crate) fn read_counters(api_port: u16) -> Result<BTreeMap<i64, (u64, u64)>, String> {
+    let mut counters = BTreeMap::<i64, (u64, u64)>::new();
+    for stat in xray_grpc::query_stats(api_port, "inbound>>>fwd:")? {
+        let Ok(value) = u64::try_from(stat.value) else {
+            continue;
+        };
+        let Some((rule_id, direction)) = parse_stat_name(&stat.name) else {
+            continue;
+        };
+        let entry = counters.entry(rule_id).or_default();
+        match direction {
+            "uplink" => entry.0 = value,
+            "downlink" => entry.1 = value,
+            _ => {}
+        }
+    }
+    Ok(counters)
+}
+
+fn parse_stat_name(name: &str) -> Option<(i64, &str)> {
+    let parts = name.split(">>>").collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "inbound" || parts[2] != "traffic" {
+        return None;
+    }
+    let id = forwarding_id(parts[1])?;
+    matches!(parts[3], "uplink" | "downlink").then_some((id, parts[3]))
+}
+
+fn forwarding_tag(id: i64) -> String {
+    format!("{FORWARDING_TAG_PREFIX}{id}")
+}
+
+fn forwarding_id(tag: &str) -> Option<i64> {
+    tag.strip_prefix(FORWARDING_TAG_PREFIX)?.parse().ok()
+}
+
+fn read_state(state_dir: &Path) -> Result<ForwardingDesiredState, String> {
+    let content = fs::read_to_string(state_dir.join(FORWARDING_STATE_FILE))
+        .map_err(|error| error.to_string())?;
+    serde_json::from_str(&content).map_err(|error| error.to_string())
+}
+
+fn write_state(state_dir: &Path, desired: &ForwardingDesiredState) -> Result<(), String> {
+    let content = serde_json::to_vec_pretty(desired).map_err(|error| error.to_string())?;
+    atomic_write_private(&state_dir.join(FORWARDING_STATE_FILE), &content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brocade_deployment::protocol::ForwardingProtocol;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "brocade-forwarding-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRuntime {
+        rules: BTreeMap<i64, ForwardingRuleDesired>,
+        fail_add: BTreeSet<i64>,
+        fail_target_ports: BTreeSet<u16>,
+        fail_target_attempts: BTreeMap<u16, usize>,
+        fail_remove: BTreeSet<i64>,
+        snapshot_calls: usize,
+        fail_snapshot: Option<usize>,
+        operations: Vec<String>,
+    }
+    impl ForwardingRuntime for FakeRuntime {
+        fn inbound_tags(&mut self) -> Result<Vec<String>, String> {
+            self.snapshot_calls += 1;
+            if self.fail_snapshot == Some(self.snapshot_calls) {
+                return Err("injected snapshot failure".to_owned());
+            }
+            Ok(std::iter::once("api".to_owned())
+                .chain(self.rules.keys().map(|id| forwarding_tag(*id)))
+                .collect())
+        }
+        fn remove(&mut self, tag: &str) -> Result<(), String> {
+            let id = forwarding_id(tag).unwrap();
+            self.operations.push(format!("remove:{id}"));
+            if self.fail_remove.contains(&id) {
+                return Err("injected removal failure".to_owned());
+            }
+            self.rules.remove(&id);
+            Ok(())
+        }
+        fn add(&mut self, rule: &ForwardingRuleDesired) -> Result<(), String> {
+            self.operations.push(format!("add:{}", rule.id));
+            if let Some(remaining) = self.fail_target_attempts.get_mut(&rule.target_port) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err("injected transient add failure".to_owned());
+                }
+            }
+            if self.fail_add.contains(&rule.id)
+                || self.fail_target_ports.contains(&rule.target_port)
+            {
+                return Err("injected add failure".to_owned());
+            }
+            self.rules.insert(rule.id, rule.clone());
+            Ok(())
+        }
+    }
+    fn rule(id: i64) -> ForwardingRuleDesired {
+        ForwardingRuleDesired {
+            id,
+            protocol: ForwardingProtocol::TcpUdp,
+            listen_port: 40_000 + id as u16,
+            target_host: "unresolvable.invalid".to_owned(),
+            target_port: 443,
+        }
+    }
+    fn desired(rules: Vec<ForwardingRuleDesired>) -> ForwardingDesiredState {
+        ForwardingDesiredState {
+            generation: 7,
+            rules,
+        }
+    }
+
+    #[test]
+    fn forwarding_stats_keep_rule_identity() {
+        assert_eq!(
+            parse_stat_name("inbound>>>fwd:42>>>traffic>>>downlink"),
+            Some((42, "downlink"))
+        );
+        assert_eq!(forwarding_id("fwd:7"), Some(7));
+        assert_eq!(forwarding_id("in:app/ingress"), None);
+        assert_eq!(parse_stat_name("user>>>fwd:42>>>traffic>>>uplink"), None);
+    }
+
+    #[test]
+    fn forwarding_requires_a_dedicated_default_outbound_but_not_the_address_guard() {
+        let mut config = serde_json::json!({"outbounds":[{
+            "tag": FORWARD_OUTBOUND_TAG, "protocol": "freedom"
+        }]});
+        assert!(forwarding_outbound_is_ready(&config.to_string()));
+        config["outbounds"][0]["settings"]["ipsBlocked"] = serde_json::json!([]);
+        assert!(forwarding_outbound_is_ready(&config.to_string()));
+        assert!(!forwarding_outbound_is_ready(
+            r#"{"outbounds":[{"tag":"out:forward"}]}"#
+        ));
+        assert!(!forwarding_outbound_is_ready("{}"));
+    }
+
+    #[test]
+    fn forwarding_dns_failure_cannot_block_removal_or_other_additions() {
+        let dir = TestDir::new();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, rule(1));
+        let wanted = desired(vec![rule(2), rule(3)]);
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert_eq!(report.error, None);
+        assert_eq!(report.applied_rule_ids, [2, 3]);
+        assert_eq!(runtime.operations, ["remove:1", "add:2", "add:3"]);
+        assert_eq!(read_state(&dir.0).unwrap(), wanted);
+        runtime.operations.clear();
+        reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert!(
+            runtime.operations.is_empty(),
+            "unchanged listeners must not be restarted"
+        );
+    }
+
+    #[test]
+    fn forwarding_partial_failures_checkpoint_success_and_retry_unknown_targets() {
+        let dir = TestDir::new();
+        let old = rule(1);
+        let mut changed = old.clone();
+        changed.target_port = 8443;
+        write_state(&dir.0, &desired(vec![old.clone()])).unwrap();
+        let wanted = desired(vec![changed.clone(), rule(2), rule(3)]);
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, old.clone());
+        runtime.rules.insert(4, rule(4));
+        runtime.rules.insert(5, rule(5));
+        runtime.fail_remove.extend([1, 4]);
+        runtime.fail_add.insert(2);
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert!(report.error.unwrap().contains("rule 1 remove failed"));
+        assert_eq!(report.applied_rule_ids, [1, 3, 4]);
+        assert_eq!(
+            runtime.operations,
+            ["remove:1", "remove:4", "remove:5", "add:2", "add:3"]
+        );
+        assert_eq!(read_state(&dir.0).unwrap().rules, [old, rule(3)]);
+        runtime.operations.clear();
+        runtime.fail_remove.clear();
+        runtime.fail_add.clear();
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert_eq!(report.error, None);
+        assert_eq!(
+            runtime.operations,
+            ["remove:1", "add:1", "remove:4", "add:2"]
+        );
+        assert_eq!(runtime.rules.get(&1), Some(&changed));
+        assert_eq!(read_state(&dir.0).unwrap(), wanted);
+    }
+
+    #[test]
+    fn forwarding_interrupted_change_cannot_hide_a_later_rollback() {
+        let dir = TestDir::new();
+        let old = rule(1);
+        let mut changed = old.clone();
+        changed.target_port = 8443;
+        write_state(&dir.0, &desired(vec![old.clone()])).unwrap();
+        let mut runtime = FakeRuntime {
+            fail_snapshot: Some(2),
+            ..Default::default()
+        };
+        runtime.rules.insert(1, old.clone());
+        assert!(
+            reconcile_listeners(&dir.0, &desired(vec![changed.clone()]), true, &mut runtime)
+                .is_err()
+        );
+        assert_eq!(runtime.rules.get(&1), Some(&changed));
+        assert_eq!(read_state(&dir.0).unwrap().rules, [changed]);
+        runtime.operations.clear();
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![old.clone()]), true, &mut runtime).unwrap();
+        assert_eq!(report.error, None);
+        assert_eq!(runtime.operations, ["remove:1", "add:1"]);
+        assert_eq!(runtime.rules.get(&1), Some(&old));
+    }
+
+    #[test]
+    fn forwarding_without_the_dedicated_outbound_freezes_existing_but_still_revokes() {
+        let dir = TestDir::new();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, rule(1));
+        runtime.rules.insert(2, rule(2));
+        let mut changed = rule(2);
+        changed.target_port = 8443;
+        let report = reconcile_listeners(
+            &dir.0,
+            &desired(vec![rule(1), changed, rule(3)]),
+            false,
+            &mut runtime,
+        )
+        .unwrap();
+        assert!(report.error.is_some());
+        assert_eq!(report.applied_rule_ids, [1, 2]);
+        assert!(runtime.operations.is_empty());
+
+        runtime.rules.insert(4, rule(4));
+        runtime.operations.clear();
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![rule(1)]), false, &mut runtime).unwrap();
+        assert!(report.error.is_some());
+        assert_eq!(report.applied_rule_ids, [1]);
+        assert_eq!(runtime.operations, ["remove:2", "remove:4"]);
+
+        let report = reconcile_listeners(&dir.0, &desired(vec![]), false, &mut runtime).unwrap();
+        assert!(report.error.is_none());
+        assert_eq!(runtime.operations, ["remove:2", "remove:4", "remove:1"]);
+    }
+
+    #[test]
+    fn forwarding_failed_replacement_restores_the_previous_listener_immediately() {
+        let dir = TestDir::new();
+        let old = rule(1);
+        let mut replacement = old.clone();
+        replacement.target_port = 8443;
+        write_state(&dir.0, &desired(vec![old.clone()])).unwrap();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, old.clone());
+        runtime.fail_target_ports.insert(8443);
+        runtime.fail_target_attempts.insert(443, 2);
+
+        let report = reconcile_listeners(
+            &dir.0,
+            &desired(vec![replacement.clone()]),
+            true,
+            &mut runtime,
+        )
+        .unwrap();
+        assert!(report.error.unwrap().contains("rule 1 add failed"));
+        assert_eq!(report.applied_rule_ids, [1]);
+        assert_eq!(runtime.rules.get(&1), Some(&old));
+        assert_eq!(read_state(&dir.0).unwrap().rules, [old]);
+        assert_eq!(
+            runtime.operations,
+            ["remove:1", "add:1", "add:1", "add:1", "add:1"]
+        );
+
+        runtime.fail_target_ports.clear();
+        runtime.operations.clear();
+        let report = reconcile_listeners(
+            &dir.0,
+            &desired(vec![replacement.clone()]),
+            true,
+            &mut runtime,
+        )
+        .unwrap();
+        assert_eq!(report.error, None);
+        assert_eq!(runtime.rules.get(&1), Some(&replacement));
+        assert_eq!(read_state(&dir.0).unwrap().rules, [replacement]);
+        assert_eq!(runtime.operations, ["remove:1", "add:1"]);
+    }
+
+    #[test]
+    fn forwarding_preserves_a_wanted_listener_when_its_checkpoint_is_missing() {
+        let dir = TestDir::new();
+        let existing = rule(1);
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, existing.clone());
+
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![existing]), true, &mut runtime).unwrap();
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no applied checkpoint")));
+        assert_eq!(report.applied_rule_ids, [1]);
+        assert!(runtime.operations.is_empty());
+        assert!(read_state(&dir.0).unwrap().rules.is_empty());
+    }
+
+    /// Exercises the failure path against the pinned Xray instead of the in-memory runtime.
+    #[test]
+    #[ignore = "requires the repository's pinned Xray binary"]
+    fn native_failed_convergence_preserves_the_previous_xray_listener() {
+        use std::{
+            net::{Ipv4Addr, TcpListener, TcpStream},
+            path::PathBuf,
+            process::{Command, Stdio},
+        };
+
+        let binary = std::env::var_os("BROCADE_XRAY_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/xray"));
+        assert!(binary.exists(), "{} is missing", binary.display());
+
+        // Keep this socket open so the replacement AddInbound fails at the real bind boundary.
+        let collision_guard = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .expect("reserve the conflicting listener");
+        let collision_port = collision_guard
+            .local_addr()
+            .expect("collision address")
+            .port();
+        let api_port = distinct_free_port(&[collision_port]);
+        let original_port = distinct_free_port(&[collision_port, api_port]);
+        let dir = TestDir::new();
+        let config = dir.0.join("xray.json");
+        fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({
+                "log": { "loglevel": "warning" },
+                "api": { "tag": "api", "services": ["HandlerService"] },
+                "inbounds": [{
+                    "tag": "api",
+                    "listen": "127.0.0.1",
+                    "port": api_port,
+                    "protocol": "dokodemo-door",
+                    "settings": { "address": "127.0.0.1" }
+                }],
+                "outbounds": [{
+                    "tag": FORWARD_OUTBOUND_TAG,
+                    "protocol": "freedom",
+                    "settings": { "ipsBlocked": [] }
+                }],
+                "routing": { "rules": [{
+                    "type": "field",
+                    "inboundTag": ["api"],
+                    "outboundTag": "api"
+                }] }
+            }))
+            .expect("serialize Xray fixture"),
+        )
+        .expect("write Xray fixture");
+
+        struct TestXray(std::process::Child);
+        impl Drop for TestXray {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = TestXray(
+            Command::new(&binary)
+                .args([
+                    "run",
+                    "-config",
+                    config.to_str().expect("utf-8 config path"),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start isolated Xray"),
+        );
+        let mut ready = false;
+        for _ in 0..50 {
+            if xray_grpc::inbound_tags(api_port).is_ok() {
+                ready = true;
+                break;
+            }
+            if let Some(status) = child.0.try_wait().expect("poll isolated Xray") {
+                panic!("isolated Xray exited before its API was ready: {status}");
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "isolated Xray API did not become ready");
+
+        let original = ForwardingRuleDesired {
+            id: 42,
+            protocol: ForwardingProtocol::Tcp,
+            listen_port: original_port,
+            target_host: "127.0.0.1".to_owned(),
+            target_port: 9,
+        };
+        let wanted = desired(vec![original.clone()]);
+        let mut runtime = XrayForwardingApi(api_port);
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert_eq!(report.error, None);
+        TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))
+            .expect("original forwarding listener accepts connections");
+
+        let report = reconcile_listeners(&dir.0, &wanted, false, &mut runtime).unwrap();
+        assert!(
+            report.error.is_some(),
+            "the outbound preflight must still report failure"
+        );
+        assert!(xray_grpc::inbound_tags(api_port)
+            .unwrap()
+            .contains(&forwarding_tag(42)));
+        TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))
+            .expect("preflight failure preserves the original listener");
+
+        let mut replacement = original.clone();
+        replacement.listen_port = collision_port;
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![replacement]), true, &mut runtime).unwrap();
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("rule 42 preflight failed")),
+            "the real bind conflict must be rejected before replacement: {:?}",
+            report.error
+        );
+        assert!(xray_grpc::inbound_tags(api_port)
+            .unwrap()
+            .contains(&forwarding_tag(42)));
+        assert_eq!(read_state(&dir.0).unwrap().rules, [original]);
+        TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))
+            .expect("failed replacement restores the original listener immediately");
+
+        let report = reconcile_listeners(&dir.0, &desired(vec![]), true, &mut runtime).unwrap();
+        assert_eq!(report.error, None);
+        assert!(!xray_grpc::inbound_tags(api_port)
+            .unwrap()
+            .contains(&forwarding_tag(42)));
+        drop(collision_guard);
+
+        fn distinct_free_port(excluded: &[u16]) -> u16 {
+            loop {
+                let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .expect("reserve local port")
+                    .local_addr()
+                    .expect("local address")
+                    .port();
+                if !excluded.contains(&port) {
+                    return port;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forwarding_errors_fit_the_report_limit() {
+        let mut errors = ReconcileErrors::default();
+        for _ in 0..100 {
+            errors.push("错误".repeat(500));
+        }
+        let message = errors.finish().unwrap();
+        assert!(message.len() <= 4096);
+        assert!(message.contains("additional errors omitted"));
+    }
+}

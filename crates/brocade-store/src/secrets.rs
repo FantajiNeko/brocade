@@ -63,6 +63,16 @@ pub fn external_outbound_context(tenant_id: &str, outbound_id: &str) -> String {
     format!("external-outbound:{tenant_id}/{outbound_id}")
 }
 
+/// Binds an external VLESS outbound's extensible protocol options to the resource that owns them.
+///
+/// Finalmask and XHTTP deliberately carry upstream-defined JSON. Some current fields are shared
+/// secrets (for example Finalmask's Salamander password and XHTTP's padding key), while future
+/// Xray releases may add more without changing Brocade's typed model. Sealing the complete option
+/// document avoids turning a JSONB extension point into a plaintext secret store.
+pub fn external_outbound_options_context(tenant_id: &str, outbound_id: &str) -> String {
+    format!("external-outbound-options:{tenant_id}/{outbound_id}")
+}
+
 /// Binds the short-lived frozen input of a draft tunnel probe to its durable run identity.
 ///
 /// A draft has no immutable model revision from which a worker can reconstruct credentials after
@@ -274,6 +284,56 @@ mod tests {
         with_key(Some(KEY), || {
             let sealed = seal(CTX_DNS_CREDENTIAL, "cfut_secret_token_value").unwrap();
             assert!(!sealed.contains("cfut_"), "明文漏进密文里了：{sealed}");
+        });
+    }
+
+    #[test]
+    fn vless_snapshot_envelope_hides_extensible_options_and_round_trips() {
+        with_key(Some(KEY), || {
+            let mut snapshot = serde_json::json!({
+                "external_outbounds": [{
+                    "tenant": "platform",
+                    "id": "custom-1111-1111",
+                    "protocol": {
+                        "t": "vless",
+                        "v": {
+                            "credential": "11111111-2222-4333-8444-555555555555",
+                            "encryption": "none",
+                            "flow": null,
+                            "transport": {
+                                "t": "xhttp",
+                                "v": {
+                                    "path": "/",
+                                    "mode": "auto",
+                                    "extra": { "xPaddingKey": "padding-secret" }
+                                }
+                            },
+                            "final_mask": {
+                                "tcp": [{
+                                    "type": "salamander",
+                                    "settings": { "password": "mask-secret" }
+                                }]
+                            }
+                        }
+                    },
+                    "bindings": []
+                }]
+            });
+            let original = snapshot.clone();
+
+            crate::materialize::seal_snapshot_external_credentials(&mut snapshot).unwrap();
+
+            let rendered = snapshot.to_string();
+            assert!(!rendered.contains("padding-secret"));
+            assert!(!rendered.contains("mask-secret"));
+            assert!(
+                snapshot["external_outbounds"][0]["protocol"]["v"]["options_sealed"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("v1."))
+            );
+
+            crate::materialize::open_snapshot_external_credentials(&mut snapshot).unwrap();
+            assert_eq!(snapshot, original);
         });
     }
 

@@ -12,6 +12,7 @@ const tunnels = readFileSync(new URL('../src/panes/tunnels.tsx', import.meta.url
 const vpngateProvider = readFileSync(new URL('../src/panes/vpngate-provider.tsx', import.meta.url), 'utf8');
 const vpngate = readFileSync(new URL('../src/panes/vpngate.tsx', import.meta.url), 'utf8');
 const usage = readFileSync(new URL('../src/panes/usage.tsx', import.meta.url), 'utf8');
+const capacity = readFileSync(new URL('../src/panes/capacity.tsx', import.meta.url), 'utf8');
 const telemetry = readFileSync(new URL('../src/panes/telemetry.tsx', import.meta.url), 'utf8');
 const observationCharts = readFileSync(new URL('../src/panes/node-observation-charts.tsx', import.meta.url), 'utf8');
 const observeChart = readFileSync(new URL('../src/ui/observe-chart.ts', import.meta.url), 'utf8');
@@ -26,12 +27,23 @@ test('登录入口与页面功能保持异步边界', () => {
   assert.doesNotMatch(app, /SessionRestoring/);
   assert.match(app, /<Suspense fallback=\{<div id="stage" \/>\}>/);
 
-  for (const module of ['nodes', 'chains', 'tunnels', 'users', 'deploy', 'usage', 'settings', 'password']) {
+  for (const module of ['nodes', 'chains', 'tunnels', 'users', 'deploy', 'usage', 'capacity', 'settings', 'password']) {
     assert.match(preload, new RegExp(`${module}: \\(\\) => import\\('\\./${module}'\\)`));
   }
   assert.match(preload, /topo: \(\) => import\('\.\.\/topo\/canvas'\)/);
 
-  for (const module of ['nodes', 'chains', 'tunnels', 'deploy', 'users', 'usage', 'settings', 'password', 'inspect']) {
+  for (const module of [
+    'nodes',
+    'chains',
+    'tunnels',
+    'deploy',
+    'users',
+    'usage',
+    'capacity',
+    'settings',
+    'password',
+    'inspect',
+  ]) {
     assert.doesNotMatch(panes, new RegExp(`from './${module}'`));
     assert.match(panes, new RegExp(`import\\('./${module}'\\)`));
   }
@@ -52,6 +64,7 @@ test('代码分包与首次 API 请求共用一个持续加载边界', () => {
   assert.match(shell, /<LoadingBoundary fallback=\{<Loading variant="canvas" \/>\} variant="canvas">/);
   assert.match(usage, /monthly\.isPending[\s\S]*?return <Loading variant="usage" \/>/);
   assert.match(usage, /placeholderData: previous => previous/);
+  assert.match(capacity, /queryKey: \['usage-machine-model'\]/);
 });
 
 test('机器详情先显示真实框架，各观测面板在自己的位置渐进读取', () => {

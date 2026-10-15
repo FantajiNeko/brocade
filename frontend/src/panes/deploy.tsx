@@ -29,6 +29,7 @@ import {
   type ArtifactIndexEntry,
   type DeploymentListItem,
   type DeploymentTargetDetail,
+  type DeploymentWaveProgress,
   type NodeAgentStateItem,
   type PlannedAction,
   type PlannedTarget,
@@ -2387,16 +2388,20 @@ function stepState(
 /** 服务端时刻文本 → 毫秒；不带时区的按 UTC，与 Ago / When 的解析一致。 */
 const instantOf = (at: string) => Date.parse(at.endsWith('Z') || at.includes('+') ? at : `${at}Z`);
 
-/** 一步的开始时刻：这一步最早下发的那台。完整日期时间在 title 里。 */
-function StepTime({ targets }: { targets: DeploymentTargetDetail[] }) {
-  const times = targets
-    .map(target => (target.dispatched_at ? instantOf(target.dispatched_at) : NaN))
-    .filter(time => !Number.isNaN(time));
-  if (times.length === 0) return <span className="cgp-time" />;
-  const first = new Date(Math.min(...times));
+/** 控制面时间线时刻。桌面放在左列，窄屏在步骤标题后重复一份简短语义。 */
+function TimelineTime({ at, kind, compact = false }: { at: string | null; kind: '开始' | '结束'; compact?: boolean }) {
+  if (!at) return compact ? null : <span className="cgp-time" />;
+  const instant = instantOf(at);
+  if (!Number.isFinite(instant)) return compact ? null : <span className="cgp-time" />;
+  const date = new Date(instant);
+  const clock = observeClockText(date.getTime() / 1000, true);
   return (
-    <time className="cgp-time" dateTime={first.toISOString()} title={first.toLocaleString()}>
-      {observeClockText(first.getTime() / 1000, true)}
+    <time
+      className={compact ? 'cgp-mobile-time' : 'cgp-time'}
+      dateTime={date.toISOString()}
+      title={`${kind}时间：${date.toLocaleString()}`}
+    >
+      {compact ? `${kind} ${clock}` : clock}
     </time>
   );
 }
@@ -2424,6 +2429,9 @@ function DeploymentStages({
   system,
   retryPending,
   retryingNode,
+  waveProgress,
+  finishedAt,
+  deploymentStatus,
   onRetry,
   onIsolate,
 }: {
@@ -2435,6 +2443,9 @@ function DeploymentStages({
   system: boolean;
   retryPending: boolean;
   retryingNode: string | undefined;
+  waveProgress: DeploymentWaveProgress[];
+  finishedAt: string | null;
+  deploymentStatus: string;
   onRetry: (nodeId: string) => void;
   onIsolate: (target: DeploymentTargetDetail) => void;
 }) {
@@ -2451,6 +2462,7 @@ function DeploymentStages({
 
   const stateOf = (step: DeploymentStep<DeploymentTargetDetail>) =>
     stepState(step, openWave, halted, awaiting && step.wave === openWave);
+  const enteredAt = new Map(waveProgress.map(progress => [progress.wave, progress.entered_at]));
   const mixedOf = (step: DeploymentStep<DeploymentTargetDetail>) =>
     new Set(step.targets.map(target => actionLabels(target).join(' · '))).size > 1;
   /* 这一步做什么：各台动作相同时只写一次，不同时并列。 */
@@ -2481,10 +2493,11 @@ function DeploymentStages({
     return (
       <li key={step.wave} className={`cgp-step ${state.tone}${grouped ? ' sub' : ''}`}>
         <div className="cgp-head">
-          <StepTime targets={step.targets} />
+          <TimelineTime at={enteredAt.get(step.wave) ?? null} kind="开始" />
           <span className="cgp-node">{state.tone === 'run' ? <i /> : icon && <Icon of={icon} size={11} />}</span>
           <span className="cgp-title">
             <b title={STAGE_NOTE[step.stage]}>{grouped ? `第 ${step.step} 步` : step.title}</b>
+            <TimelineTime at={enteredAt.get(step.wave) ?? null} kind="开始" compact />
             {showFacts && <span className="cgp-facts">{facts(step, state.tone)}</span>}
           </span>
           <span className={`cgp-state ${state.tone}`}>{state.label}</span>
@@ -2525,6 +2538,10 @@ function DeploymentStages({
     );
   };
 
+  const finishedTone: StepTone =
+    deploymentStatus === 'succeeded' ? 'ok' : deploymentStatus === 'canceled' ? 'idle' : 'err';
+  const finishedIcon: IconName = deploymentStatus === 'succeeded' ? 'check' : 'close';
+
   return (
     <ol className="cgp-line">
       {groups.flatMap(group => {
@@ -2550,6 +2567,22 @@ function DeploymentStages({
           ...group.steps.map(step => renderStep(step, true, shared)),
         ];
       })}
+      {finishedAt && (
+        <li className={`cgp-end ${finishedTone}`}>
+          <div className="cgp-head">
+            <TimelineTime at={finishedAt} kind="结束" />
+            <span className="cgp-node">
+              <Icon of={finishedIcon} size={11} />
+            </span>
+            <span className="cgp-title">
+              <b>结束</b>
+              <TimelineTime at={finishedAt} kind="结束" compact />
+            </span>
+            <span className={`cgp-state ${finishedTone}`}>{STATUS_TEXT[deploymentStatus] ?? deploymentStatus}</span>
+            <span className="cgp-count" />
+          </div>
+        </li>
+      )}
     </ol>
   );
 }
@@ -2799,6 +2832,9 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                   system={can(who.role, 'system') && !isolate.isPending}
                   retryPending={retry.isPending}
                   retryingNode={retry.variables}
+                  waveProgress={d.wave_progress ?? []}
+                  finishedAt={d.finished_at}
+                  deploymentStatus={d.status}
                   onRetry={nodeId => retry.mutate(nodeId)}
                   onIsolate={target => isolate.mutate(target)}
                 />

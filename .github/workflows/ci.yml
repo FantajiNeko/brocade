@@ -61,6 +61,21 @@ jobs:
       - name: Prepare pinned Xray assets
         run: sh "$GITHUB_WORKSPACE/scripts/prepare-xray-assets.sh"
 
+      - name: ActivityTimer deterministic concurrency regressions
+        run: go test -race ./common/signal -run '^TestActivityTimerConcurrent' -count=100 -timeout=1m
+
+      - name: ActivityTimer real-time races and package compatibility
+        run: |
+          go test -race ./common/signal -run '^TestActivityTimerRealTimeShortTimeoutRace$' -count=20 -timeout=1m
+          go test -race ./common/signal -count=1 -timeout=1m
+          go vet ./common/signal
+
+      - name: Raw splice half-close and idle regressions
+        run: |
+          go test -race ./proxy -run '^TestCopyRawConn(ActivitySurvivesHalfClose|CloseWakesBlockedSplice)$' -count=5 -timeout=2m
+          go test -race ./proxy ./proxy/freedom -count=1 -timeout=3m
+          go vet ./proxy ./proxy/freedom
+
       - name: Data-plane deterministic, kTLS and fuzz-seed tests
         run: |
           go test ./proxy/anytls -count=10 -timeout=5m
@@ -168,6 +183,9 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Xray handoff evidence verifier contract
+        run: node --test scripts/tests/xray-handoff/*.test.cjs scripts/tests/xray-halfclose/*.test.cjs
 
       - name: Install front-end dependencies
         working-directory: frontend

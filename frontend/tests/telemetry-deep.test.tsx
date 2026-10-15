@@ -1051,6 +1051,59 @@ describe('deep host telemetry', () => {
   const lastChart = (name: string) =>
     [...chartMock.setOption.mock.calls].reverse().find(([option]) => option.series?.[0]?.name === name)?.[0];
 
+  it('focuses a Ping curve from its legend button and toggles the selection off', () => {
+    const point = (latency_us: number): PingProbePoint => ({
+      probed_at_unix_secs: 100,
+      attempted: true,
+      latency_us,
+    });
+    const { view, client } = pingPanel({
+      node_id: 'n1',
+      targets: [
+        {
+          name: '广东电信',
+          kind: 'icmp',
+          ipv4: pingSeries('icmp://192.0.2.1', [point(10_000)]),
+          ipv6: null,
+        },
+        {
+          name: '广东联通',
+          kind: 'icmp',
+          ipv4: pingSeries('icmp://192.0.2.2', [point(20_000)]),
+          ipv6: null,
+        },
+      ],
+    });
+    const telecom = view.getByRole('button', { name: '广东电信曲线，丢包率 0%' });
+    const unicom = view.getByRole('button', { name: '广东联通曲线，丢包率 0%' });
+
+    expect(telecom.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(telecom);
+    expect(telecom.getAttribute('aria-pressed')).toBe('true');
+    expect(unicom.getAttribute('aria-pressed')).toBe('false');
+    expect(lastChart('广东电信').series).toMatchObject([
+      { lineStyle: { width: 2.5, opacity: 1 }, areaStyle: { opacity: 1 } },
+      { lineStyle: { width: 1.5, opacity: 0.14 }, areaStyle: { opacity: 0.05 } },
+    ]);
+
+    fireEvent.click(unicom);
+    expect(telecom.getAttribute('aria-pressed')).toBe('false');
+    expect(unicom.getAttribute('aria-pressed')).toBe('true');
+    expect(lastChart('广东电信').series).toMatchObject([
+      { lineStyle: { width: 1.5, opacity: 0.14 } },
+      { lineStyle: { width: 2.5, opacity: 1 } },
+    ]);
+
+    fireEvent.click(unicom);
+    expect(unicom.getAttribute('aria-pressed')).toBe('false');
+    expect(lastChart('广东电信').series).toMatchObject([
+      { lineStyle: { width: 1.5, opacity: 1 }, areaStyle: { opacity: 1 } },
+      { lineStyle: { width: 1.5, opacity: 1 }, areaStyle: { opacity: 1 } },
+    ]);
+    view.unmount();
+    client.clear();
+  });
+
   it('shows range loss rates in both Ping legends while preserving latency curves', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const points = [

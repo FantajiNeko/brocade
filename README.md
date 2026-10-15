@@ -46,7 +46,13 @@ Agent 替换前持久保存回执，重启后恢复轮询与运行上报且摘�
 
 ### 节点自治与观测
 
-主机指标与网卡累计流量计使用独立采样线程：指标仍每 10 秒采集、每 30 秒汇总，流量计独立每 10 秒原子持久化。运行状态报告只读取成功落盘后的内存快照，不触发流量采集或写盘；超过 30 秒的旧快照不再携带，恢复后用累计值补回已知流量。正常退出由流量线程完成最后一次持久化。磁盘慢写不会通过流量计锁阻塞指标采样；异常轮次会记录采集耗时、调度延迟及缺口原因，但真实主机停顿仍可能造成指标缺口。
+Agent v28 与对应受管 Xray 支持跨进程的用户 / 转发累计计数，配置重启不再清空尚未
+上报的值；splice 每次内核传输后递增。已确认的重启停机区间单独上报为零窗口，未知
+采集缺失仍断开。近一小时用户图按真实采样时长重采样，不改写计费；队列满或采集落盘
+失败时保留检查点并暂缓破坏性操作。兼容、存储上限和回滚边界见
+[配置重启的连续用量](.agents/runbooks/console-deployment.md#配置重启的连续用量)。
+
+主机指标与网卡累计流量计使用独立采样线程：指标仍每 10 秒采集、每 30 秒汇总，完成的指标窗口先进入私有磁盘队列，再由独立线程上报；队列只保留最近 120 个窗口（约一小时），Console 短暂停机后按时间顺序补报，重复窗口由数据库键去重。流量计独立每 10 秒原子持久化。运行状态报告只读取成功落盘后的内存快照，不触发流量采集或写盘；超过 30 秒的旧快照不再携带，恢复后用累计值补回已知流量。正常退出由流量线程完成最后一次持久化。磁盘慢写不会通过流量计锁阻塞指标采样；异常轮次会记录采集耗时、调度延迟及缺口原因，但真实主机停顿、磁盘队列写入失败或 Console 不可达超过一小时仍可能造成指标缺口。
 
 agent 接收期望状态，而非待执行的命令序列。它将期望状态与本机实际状态比较，仅在存在偏差时执行操作，并将收敛结果回报控制面。最近一次期望状态会保存在节点本地，因此控制面暂时不可达时，节点仍能发现并修正本机漂移。
 
@@ -60,7 +66,15 @@ Ping 探测目标在设置页按 ICMP / TCP 分类，每个目标有 IPv4、IPv6
 
 实时网卡速率是第三条独立通道：Agent 主动维持到控制面的 WebSocket，无浏览器查看时只保活、不采样；查看机器或机器总览时，控制面下发临时租约并按全局 1/2/5 秒配置采样，最后一个查看者离开 15 秒后停止。控制面只保留每台机器最近 120 秒、最多 600 点的内存环，进程重启即可丢失，不写数据库、不进入离线重放，也不改变诊断和用量的 30 秒口径。浏览器仅通过控制面的 SSE 读取数据，永远不连接 Agent，也不会收到节点地址或节点令牌。
 
+机器详情和用户详情的「用户实时流量」仅系统管理员与租户管理员可见。Agent v29 按同一实时频率读取入口 Xray 的接入用户与转发规则累计计数器，保持 `reset=false`，用本地两次读数计算上下行速率；机器页按用户汇总，用户页汇总该用户当前授权的所有入口机器。租户管理员仅可读所属租户范围，普通用户、访客和其他角色不能获取。控制面合并并发观察需求，再按每个请求的权限过滤输出；用户速率只保留最新内存报告，关闭页面后随观察租约停止，不进入计费或历史。旧 Agent 明确显示未支持；断线、采样失败、计数器重置和截断不会冒充正常零流量。转发按规则所属租户、用户和机器归属合计，并保留来源分类；中继、出口不提供最终用户身份。旧 Agent 只有接入统计时明确提示转发实时待升级。卡片打开时另读近 1 小时的真实计费窗口（`GET /realtime/nodes/{node_id}/user-history`、`GET /users/{tenant_id}/{user_id}/realtime/history`，权限与实时接口相同），画成合计图和每行走势，之后每 30 秒重读；当前速率只显示为读数，与历史分开呈现。未采集的窗口在图上断开，不画成 0。出现过的行保留到离开页面，实时通道断开时保留最后一次读数并提示；默认按名称排列，选择按下行、上行或近 1 小时用量排序后每 5 秒重排，指针停在列表上时暂停；支持按名称或租户搜索。机器详情的用户与用户详情的入口机器都排成多列紧凑格，每项两行：名称与用量，走势与当前下行、上行。
+
 机器配置中的「流量统计」另行记录默认路由网卡的累计接收与发送字节，并与 Xray 用户/中继用量同时展示。Agent 每 10 秒把逻辑累计值原子写入私有状态文件，进程重启沿用原值；整机重启时保留累计值并接入新 boot 的内核计数。异常断电、网卡替换、计数倒退或状态文件丢失时不会猜测缺少的字节，而是把该边界标为缺口；控制面跨 UTC 日期长时间失联时，绝对累计值仍会补回，但无法精确拆分到可能经过的重置边界，也会标出缺口，供操作者以当前总量校准建立新锚点。月度或年度重置均以 UTC+0 的 00:00 为界；当月不存在所选日期时取月末。重置策略与校准属于运行态账务设置，不进入模型修订，也不触发发布。
+
+用户转发的域名由入口 Xray 在新连接建立时解析，并在 TCP 拨号前、UDP 发送前校验实际目标 IP；显式禁止私网、环回、链路本地、云元数据及特殊地址。Agent 不做阻塞式 DNS 预检查，按 15 秒周期先移除撤销的监听，再独立增改规则，单条失败不阻止其他规则收敛。界面的「已监听」只表示入口安装完成，不代表目标可达；DNS 缓存仍按节点策略生效，已有 TCP 连接和持续 UDP 会话不因 DNS 变化强制迁移。撤销沿用关闭监听的现有行为，不主动踢断旧 TCP 连接。
+
+此修复需要分别发布 Xray、含显式 `ipsBlocked` 的新配置，以及 Agent；先完成 Xray 和配置，再升级 Agent。新版 Agent 遇到缺少安全策略的配置会停止安装转发并清理旧监听，报告需要发布安全配置。Console 应先更新，以接收撤销失败后仍有残留监听的错误回报；只升级 Console 不代表节点侧修复已生效。回滚 Agent 不应同时撤掉 Xray 的地址防护。
+
+转发用量保留独立事实账本，与接入账本按查询边界合计：用户本月、用量页每日/月累计、机器 XRAY 月量/角色曲线和容量预测均纳入转发；物理网卡账本已经包含转发，不能再叠加一次。规则移机、撤销或删除不删除历史归属；收据指纹、持久计数头与顺序检查保证重放不重复记账，Agent 实例变化不重置连续计数。细窗口可清理，日汇总持续保留；首读、同秒尾部和旧数据没有实际区间时只显示总量，不伪造曲线。按线路的订阅额度维持接入口径。已有部署的兼容、独立 Agent 29 发布和回滚边界见[部署手册](.agents/runbooks/console-deployment.md#转发统一统计兼容)。
 
 节点日志默认有界：设置页配置全局上限（Agent 20 MiB、Xray 20 MiB、每个 Phantun 实例 10 MiB，三类最低均为 10 MiB），机器可单独覆盖；清除覆盖后会继续继承全局值。Agent 每轮轮询直接取得最终值，不需要创建修订或发布线路。systemd 节点使用独立 journald namespace；OpenRC（Alpine）节点写入 `$BROCADE_AGENT_STATE_DIR/logs/agent.log`；Agent 拉起的 Xray 与每个 Phantun 实例也分别写入该 `logs` 目录。每个日志项的当前段与前一段合计不超过生效上限，降低上限会在线截断已有分段，不重启 Xray/Phantun。systemd 上使用 `journalctl --namespace=brocade-agent -u brocade-agent` 查看 Agent 日志，OpenRC 上使用 `tail -n 100 $BROCADE_AGENT_STATE_DIR/logs/agent.log`。不要删除仍被进程打开的日志来释放空间；有界 sink 会自行滚动。
 
@@ -338,12 +352,32 @@ sudo chmod 0600 /opt/brocade/console.env
 
 ### 5. 配置 systemd
 
-创建 `/etc/systemd/system/brocade-console.service`：
+先创建 `/etc/systemd/system/brocade-console.socket`。这里的地址必须与
+`BROCADE_ADMIN_BIND` 完全一致；默认的单监听模式同时承载 Console 与 Agent API：
+
+```ini
+[Unit]
+Description=Brocade Console listener
+
+[Socket]
+ListenStream=127.0.0.1:8080
+Accept=no
+Backlog=4096
+NoDelay=true
+FileDescriptorName=admin
+Service=brocade-console.service
+
+[Install]
+WantedBy=sockets.target
+```
+
+再创建 `/etc/systemd/system/brocade-console.service`：
 
 ```ini
 [Unit]
 Description=Brocade Console
-After=network-online.target postgresql.service
+Requires=brocade-console.socket
+After=brocade-console.socket network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
@@ -378,14 +412,22 @@ WantedBy=multi-user.target
 
 运营商索引独立于国家库及 Xray 路由规则，使用 MIT 许可的 [gaoyifan/china-operator-ip](https://github.com/gaoyifan/china-operator-ip) 中电信、移动、联通、教育网、科技网五类双栈网段。Console 后台每天从同一提交版本下载完整列表，校验成功后整体替换内存索引，并在 `BROCADE_CACHE_DIR/geoip-china-operators-v1.json` 保存重启缓存；失败时保留上次有效数据并退避重试。首次下载未完成不阻塞页面，来源接口只查询本地内存，不需要 Agent 升级或数据库迁移。
 
-加载并启动服务：
+全新安装时加载并启动 socket 和服务：
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now brocade-console
+sudo systemctl enable --now brocade-console.socket
+sudo systemctl enable --now brocade-console.service
 sudo systemctl status brocade-console
 sudo journalctl -u brocade-console -n 100 --no-pager
 ```
+
+systemd 持有监听 fd；正常 `restart brocade-console.service` 时，新连接在内核监听队列中
+等待新进程接管，旧进程仍按关闭期限完成手上的请求。不要在普通发布中重启或停止
+`brocade-console.socket`。从旧的进程自绑定部署首次切换时，必须先停止旧服务释放端口，再
+启动 socket 和服务；这一次转换本身仍有短维护窗口。若设置了 `BROCADE_AGENT_BIND`，需要
+让 systemd 同时传入两个与配置完全相同的监听地址；Console 按本地地址识别它们，与 fd
+顺序无关。
 
 首次启动时应核对日志中实际连接或自动创建的数据库名称，避免因 `DATABASE_URL` 拼写错误而得到一个新的空数据库。
 
@@ -479,7 +521,7 @@ sudo journalctl -u brocade-console -n 100 --no-pager
 curl --fail https://console.example.net/healthz
 ```
 
-登录控制台后，用户页「授权验证」与隧道详情页「线路拨测」均不应显示“Console 未安装或无法执行拨测 Xray”。授权拨测使用真实用户凭据和真实完整链路，产生的少量流量会正常计入该用户用量；隧道拨测固定从 Console 发出。拨测 Serving 时浏览器只提交条目的不透明 ID；拨测草稿时浏览器提交现有草稿操作，服务端在授权事务中生成并冻结出口，浏览器仍不能直接指定探测落点或后台执行配置。
+登录控制台后，用户页「授权验证」与自定义隧道详情页「拨测」均不应显示“Console 未安装或无法执行拨测 Xray”。授权拨测使用真实用户凭据和真实完整链路，产生的少量流量会正常计入该用户用量；隧道拨测固定从 Console 发出。拨测 Serving 时浏览器只提交条目的不透明 ID；拨测草稿时浏览器提交现有草稿操作，服务端在授权事务中生成并冻结出口，浏览器仍不能直接指定探测落点或后台执行配置。
 
 常用诊断命令如下：
 

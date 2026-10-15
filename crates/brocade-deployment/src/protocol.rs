@@ -11,7 +11,26 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 24;
+pub const AGENT_PROTOCOL_VERSION: u32 = 29;
+
+/// First Agent protocol that can reconcile user-managed forwarding listeners and report their
+/// per-rule counters. Forwarding has its own desired-state endpoint, so older Agents continue
+/// serving their existing workload while the Console exposes the entitlement as pending.
+pub const FORWARDING_PROTOCOL_VERSION: u32 = 26;
+
+/// First Agent protocol that can stream per-user Xray rates on demand. The fields are optional in
+/// both directions, so old Agents keep providing NIC telemetry during a staggered rollout and a
+/// new Agent connected to an old Console simply leaves this sampler idle.
+pub const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION: u32 = 27;
+
+/// Forwarding attribution travels only in on-demand selectors, not listener desired state.
+pub const REALTIME_FORWARDING_TRAFFIC_PROTOCOL_VERSION: u32 = 29;
+
+/// Bounds both a Console selector and one Agent report. At the current maximum identifier sizes,
+/// this keeps a worst-case JSON frame below the realtime channel's 512 KiB frame limit.
+pub const MAX_REALTIME_USER_TRAFFIC_ROWS: usize = 2_048;
+/// Metadata shares the command frame with grant labels; its bound is smaller than rate rows.
+pub const MAX_REALTIME_FORWARDING_TARGETS: usize = 1_024;
 
 /// First Agent protocol that probes each PING target per address family: it receives
 /// `PingProbeSettings` with separate IPv4/IPv6 endpoints and tags every sample with its family.
@@ -647,11 +666,116 @@ pub struct UpdateRealtimeTelemetryPolicyRequest {
 
 /// Commands travel down the long-lived Agent WebSocket. An idle connection receives `Stop` and
 /// sends no samples; opening a console stream leases the node and changes that to `Start`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentRealtimeCommand {
-    Start { interval_millis: u32 },
+    Start {
+        interval_millis: u32,
+        /// Fleet summaries need only NIC rates. Omission preserves the pre-v25 behavior so a
+        /// staggered rollout never hides machine diagnostics from an older Console.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        diagnostics: bool,
+        /// Absent means that only the existing NIC/diagnostic sample is wanted. `All` is used by
+        /// an authorized machine detail; `Labels` lets a user detail ask for exactly its grants
+        /// without sending other users' identities to that browser.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_traffic: Option<RealtimeUserTrafficSelector>,
+    },
     Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RealtimeUserTrafficSelector {
+    All {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        forwarding: Vec<RealtimeForwardingTarget>,
+    },
+    Labels {
+        labels: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        forwarding: Vec<RealtimeForwardingTarget>,
+    },
+}
+
+/// Live attribution only, deliberately excluded from forwarding desired configuration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RealtimeForwardingTarget {
+    pub rule_id: i64,
+    pub tenant_id: String,
+    pub user_id: String,
+}
+
+impl RealtimeUserTrafficSelector {
+    pub fn forwarding(&self) -> &[RealtimeForwardingTarget] {
+        match self {
+            Self::All { forwarding } | Self::Labels { forwarding, .. } => forwarding,
+        }
+    }
+}
+
+#[cfg(test)]
+mod forwarding_realtime_compat_tests {
+    use super::*;
+
+    #[test]
+    fn old_selectors_and_access_reports_remain_readable() {
+        let selector: RealtimeUserTrafficSelector =
+            serde_json::from_str(r#"{"mode":"all"}"#).unwrap();
+        assert!(selector.forwarding().is_empty());
+        let report:RealtimeUserTrafficReport=serde_json::from_str(r#"{"state":"ready","all_users":true,"elapsed_millis":1000,"users":[{"tenant_id":"platform","user_id":"alice","ingress_id":"entry","uplink_bytes_per_sec":1,"downlink_bytes_per_sec":2}]}"#).unwrap();
+        assert!(!report.forwarding_supported);
+        assert_eq!(report.users[0].ingress_id.as_deref(), Some("entry"));
+        assert_eq!(report.users[0].forwarding_rule_id, None);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeUserTrafficState {
+    /// One cumulative reading has been taken; the next one can produce a rate.
+    Warming,
+    Ready,
+    /// Xray is absent or its local stats service could not be read in this round.
+    Unavailable,
+}
+
+/// One user's rate through either an ingress or a forwarding rule on this machine (exactly one
+/// source identity). Grant labels or Console selectors supply ownership; never credentials/IPs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeUserTrafficRate {
+    pub tenant_id: String,
+    pub user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_rule_id: Option<i64>,
+    pub uplink_bytes_per_sec: u64,
+    pub downlink_bytes_per_sec: u64,
+}
+
+/// Ephemeral Xray rates computed by the Agent from two non-resetting cumulative reads. This is
+/// deliberately separate from durable usage: it is neither spooled nor written to PostgreSQL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeUserTrafficReport {
+    pub state: RealtimeUserTrafficState,
+    /// True only when the Agent sampled every valid grant label on the machine. A user-scoped
+    /// subscription leaves this false even if its requested label set happened to cover all rows.
+    pub all_users: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_millis: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<RealtimeUserTrafficRate>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_gap: bool,
+    /// Older Agents omit this; their access rates must not be mistaken for combined traffic.
+    #[serde(default)]
+    pub forwarding_supported: bool,
+    /// Console supplies demand context even when an old Agent ignores forwarding selectors.
+    #[serde(default)]
+    pub forwarding_expected: bool,
 }
 
 /// One rate computed by the Agent from two monotonically increasing NIC counters.
@@ -670,12 +794,20 @@ pub struct AgentRealtimeSample {
     /// they were before this bandwidth hint existed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub diagnostics_unchanged: bool,
+    /// Only the Mux report is unchanged from the last complete Mux baseline. This lets reverse
+    /// health and VPN Gate keep their own refresh cadence without retransmitting idle pools.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mux_unchanged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reverse_health: Option<ReverseHealthReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mux: Option<MuxReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpngate: Option<VpngateRealtimeReport>,
+    /// A complete user-rate report for this round when the watcher requested one. Its absence is
+    /// also how an older Agent reports that it does not support this optional capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_traffic: Option<RealtimeUserTrafficReport>,
     pub sequence: u64,
     pub sampled_at_unix_millis: i64,
     pub elapsed_millis: u32,
@@ -687,6 +819,14 @@ pub struct AgentRealtimeSample {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1009,7 +1149,7 @@ mod agent_release_compat_tests {
         assert_eq!(new.release_id, None);
         assert_eq!(new.attempt, None);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
-        assert_eq!(AGENT_PROTOCOL_VERSION, 24);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 29);
     }
 }
 
@@ -1210,7 +1350,16 @@ pub struct DeploymentDetail {
     pub rollback_of_deployment_id: Option<i64>,
     pub sync_of_deployment_id: Option<i64>,
     pub divergence_cleared_at: Option<String>,
+    /// Control-plane time at which each wave became the current executable step. This is not an
+    /// Agent claim time: a pending or confirmation-gated wave appears here before any node polls.
+    pub wave_progress: Vec<DeploymentWaveProgress>,
     pub targets: Vec<DeploymentTargetDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentWaveProgress {
+    pub wave: u32,
+    pub entered_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1428,11 +1577,42 @@ pub struct UsageReportRequest {
     pub usage_generation_id: i64,
     pub read_at_unix_secs: i64,
     pub xray_started_at_unix_secs: i64,
-    /// Boot time plus the serving process's exact start ticks. Unlike the rounded unix second,
-    /// this changes for two Xray processes started within the same second.
+    /// Counter continuity identity. Legacy processes use boot time plus exact start ticks;
+    /// managed persistent counters use the journal's immutable identity across process restarts.
     pub xray_epoch: String,
     pub route: Option<RouteIpReport>,
     pub counters: Vec<UsageCounter>,
+    /// Confirmed managed-process downtime, not missing collection. Cumulative counters never
+    /// reset to zero. Optional so older Agents and stored receipts retain their wire shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zero_windows: Vec<UsageZeroWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageZeroWindow {
+    pub start_unix_millis: i64,
+    pub end_unix_millis: i64,
+}
+
+#[cfg(test)]
+mod usage_zero_window_compat_tests {
+    use super::*;
+
+    #[test]
+    fn older_usage_reports_keep_the_same_serialized_shape() {
+        let legacy = serde_json::json!({
+            "agent_instance_id": "0123456789abcdef0123456789abcdef", "sequence": 1,
+            "usage_generation_id": 9, "read_at_unix_secs": 100, "xray_started_at_unix_secs": 50,
+            "xray_epoch": "boot:1", "route": null, "counters": []
+        });
+        let decoded: UsageReportRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(decoded.zero_windows.is_empty());
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            legacy,
+            "old queued reports must retain their payload hash across the Console upgrade"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1460,6 +1640,70 @@ pub struct UsageReportResult {
     /// epoch. Persistently non-zero requires investigation and is never billed.
     pub rejected_counters: u64,
     pub gap_samples: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_start_unix_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zero_windows: Vec<UsageZeroWindow>,
+}
+
+/// Transport accepted by one user-managed L4 forwarding listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardingProtocol {
+    Tcp,
+    Udp,
+    TcpUdp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingRuleDesired {
+    pub id: i64,
+    pub protocol: ForwardingProtocol,
+    pub listen_port: u16,
+    pub target_host: String,
+    pub target_port: u16,
+}
+
+/// Complete forwarding state for one node. The Agent replaces only the dynamic `fwd:` listener
+/// namespace and leaves revisioned Xray inbounds untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingDesiredState {
+    pub generation: i64,
+    pub rules: Vec<ForwardingRuleDesired>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingReconcileReport {
+    pub generation: i64,
+    pub applied_rule_ids: Vec<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingUsageCounter {
+    pub rule_id: i64,
+    pub uplink_bytes: u64,
+    pub downlink_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingUsageReportRequest {
+    pub agent_instance_id: String,
+    pub sequence: u64,
+    pub read_at_unix_secs: i64,
+    pub xray_epoch: String,
+    pub counters: Vec<ForwardingUsageCounter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingUsageReportResult {
+    pub node_id: String,
+    pub agent_instance_id: String,
+    pub sequence: u64,
+    pub duplicate: bool,
+    pub accepted_counters: u64,
+    pub inserted_samples: u64,
+    pub skipped_counters: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1532,7 +1776,7 @@ pub struct UsageMonthlyViewRow {
 }
 
 /// One local-calendar day's user traffic inside a [`UsageMonthlySummary`]. The same sample set is
-/// used for the daily bars and the per-view totals so the two presentations keep one accounting
+/// used for the daily bars and combined access/forwarding totals so they keep one accounting
 /// boundary. Days without traffic are omitted; the UI can fill the short, known calendar range
 /// without transferring placeholder rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1552,7 +1796,21 @@ pub struct UsageMonthlySummary {
     pub month_start: String,
     pub month_end: String,
     pub views: Vec<UsageMonthlyViewRow>,
+    #[serde(default)]
+    pub forwarding: Vec<UsageForwardingMonthlyRow>,
     pub days: Vec<UsageDailyRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageForwardingMonthlyRow {
+    pub tenant_id: String,
+    pub user_id: String,
+    pub node_id: String,
+    pub rule_id: i64,
+    pub rule_name: String,
+    pub uplink_bytes: u64,
+    pub downlink_bytes: u64,
+    pub has_gap: bool,
 }
 
 /// One machine's total for one reporting window. The buckets are the agent's USAGE windows
@@ -1584,6 +1842,12 @@ pub struct UsageNodeSeries {
     /// In chronological order (oldest to newest), containing only windows with samples. A machine
     /// that never ran yields an empty array.
     pub buckets: Vec<UsageNodeBucket>,
+    #[serde(default)]
+    pub forwarding: Vec<UsageForwardingWindow>,
+    #[serde(default)]
+    pub month_forwarding_uplink_bytes: u64,
+    #[serde(default)]
+    pub month_forwarding_downlink_bytes: u64,
     pub month_user_uplink_bytes: u64,
     pub month_user_downlink_bytes: u64,
     pub month_relay_uplink_bytes: u64,
@@ -1593,6 +1857,16 @@ pub struct UsageNodeSeries {
     pub month_has_gap: bool,
 }
 
+/// Actual forwarding duration; never assume the normal access reporting cadence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageForwardingWindow {
+    pub window_start: String,
+    pub window_end: String,
+    pub uplink_bytes: u64,
+    pub downlink_bytes: u64,
+    pub has_gap: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageNodeSeriesList {
     /// The series window's left edge (timestamptz text), used by the UI to draw the axis
@@ -1600,6 +1874,55 @@ pub struct UsageNodeSeriesList {
     /// The +08 wall-clock month boundaries, on the same convention as `UsageMonthlySummary`
     pub month_start: String,
     pub nodes: Vec<UsageNodeSeries>,
+}
+
+/// The report windows one machine delivered inside a user-traffic history range, idle windows
+/// included. A window listed here without a matching series point means the user moved no bytes;
+/// a window missing here means nothing was collected, which the UI must not draw as zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserTrafficHistoryNode {
+    pub node_id: String,
+    /// Window right edges in Unix seconds, ascending.
+    pub window_ends_unix_secs: Vec<i64>,
+    /// Actual collection coverage. Empty on an older Console; the UI keeps its legacy fallback.
+    #[serde(default)]
+    pub windows: Vec<(i64, i64)>,
+    /// Confirmed stopped intervals, in milliseconds. Unknown outages must remain absent.
+    #[serde(default)]
+    pub zero_windows: Vec<(i64, i64)>,
+    #[serde(default)]
+    pub forwarding_windows: Vec<(i64, i64)>,
+}
+
+/// One user's accounted bytes on one ingress machine, summed over that user's grants on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserTrafficHistorySeries {
+    pub node_id: String,
+    pub tenant_id: String,
+    pub user_id: String,
+    /// `[window_end_unix_secs, uplink_bytes, downlink_bytes]`, ascending, windows with traffic only.
+    pub points: Vec<(i64, u64, u64)>,
+    /// `[start_unix_secs, end_unix_secs, uplink_bytes, downlink_bytes]`. Keep separate start
+    /// times when a user's multiple ingress counters have different measurement windows.
+    #[serde(default)]
+    pub windows: Vec<(i64, i64, u64, u64)>,
+    #[serde(default)]
+    pub forwarding: bool,
+    /// Legacy forwarding bytes had no interval. Include totals, but do not invent rates.
+    #[serde(default)]
+    pub unplaced_uplink_bytes: u64,
+    #[serde(default)]
+    pub unplaced_downlink_bytes: u64,
+}
+
+/// The recent 30-second accounting windows that open the realtime user-traffic card. They come
+/// from the durable usage tables, so the card is complete before the first on-demand rate arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserTrafficHistory {
+    pub range_start_unix_secs: i64,
+    pub range_end_unix_secs: i64,
+    pub nodes: Vec<UserTrafficHistoryNode>,
+    pub series: Vec<UserTrafficHistorySeries>,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2153,15 +2476,18 @@ pub enum WireGuardPeerStatus {
 
 /// How much undeliverable reporting has piled up locally.
 ///
-/// While the agent cannot reach the control plane it accumulates reports in spool files and drops
-/// the oldest past their limits. Usage and convergence observations have different consequences,
-/// so new agents classify their cumulative losses. `dropped` remains the all-kinds total for old
-/// consoles and may include losses recorded before classification existed.
+/// While the agent cannot reach the control plane it accumulates reports in spool files. Usage
+/// applies backpressure rather than evicting accounting checkpoints; bounded operational queues
+/// keep their newest observations. New agents classify cumulative losses. `dropped` remains the
+/// all-kinds total for old consoles and may include losses recorded before classification existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpoolBacklog {
     pub observation: u32,
     pub usage: u32,
-    /// Cumulative all-kinds total retained for wire compatibility. New readers subtract the two
+    /// Recent host-load windows waiting to be replayed in chronological order.
+    #[serde(default)]
+    pub load: u32,
+    /// Cumulative all-kinds total retained for wire compatibility. New readers subtract the
     /// classified counters below; any remainder is an older loss whose kind is unknowable.
     pub dropped: u64,
     /// Present only on agents that distinguish lost accounting from lost convergence evidence.
@@ -2170,6 +2496,9 @@ pub struct SpoolBacklog {
     /// Present only on agents that distinguish lost convergence evidence from lost accounting.
     #[serde(default)]
     pub observation_dropped: Option<u64>,
+    /// Present only on agents that persist the bounded host-load queue.
+    #[serde(default)]
+    pub load_dropped: Option<u64>,
 }
 
 // ── Telemetry: host load and per-hop link estimates ────────────────────────────────────────
@@ -2187,12 +2516,12 @@ pub struct SpoolBacklog {
 //
 // Unlike usage, the agent differences locally and reports **rates** rather than cumulative
 // counters. Usage reports counters and lets the control plane difference them because billing
-// data has to be auditable and replay-proof. A load reading has no value once it is stale, and
-// keeping a previous reading per machine on the control plane would provide nothing. The cost is
-// that the control plane can no longer detect a counter reset itself, which is why `btime` is
-// included: it changes when the machine reboots and every cumulative counter returns to zero.
-// Usage makes the same determination with `xray_started_at`, and this reuses that approach rather
-// than introducing a second one.
+// data has to be auditable and replay-proof. Load history remains useful across a maintenance
+// window but not indefinitely, so the Agent persists only its newest hour and the control plane
+// deduplicates each replayed window. The control plane cannot derive a rate from a later cumulative
+// reading, which is why `btime` is included in every completed window: it changes when the machine
+// reboots and every cumulative counter returns to zero. Usage makes the same determination with
+// `xray_started_at`, and this reuses that approach rather than introducing a second one.
 //
 // None of this enters the model and none of it creates a revision. It is runtime observation, in
 // the same category as `user_app_quotas`.
@@ -2200,17 +2529,21 @@ pub struct SpoolBacklog {
 /// One round from one machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadReportRequest {
-    /// When the agent finished this round, in unix seconds. Checked against the control plane's
-    /// own clock, as usage is, so a machine with an incorrect clock cannot record readings with a
-    /// future timestamp.
+    /// When the agent finished this round, in unix seconds. Bounded against the control plane's
+    /// clock so a replay cannot insert arbitrary old history or future windows.
     pub read_at_unix_secs: i64,
+    /// When this HTTP attempt left the Agent. The disk spool rewrites this field on every retry so
+    /// the control plane can distinguish queue age from a slow node clock. Older Agents omit it
+    /// and remain valid for fresh, non-replayed reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_at_unix_secs: Option<i64>,
     /// `/proc/stat`'s btime. A change means the machine rebooted and every cumulative counter
     /// restarted, which invalidates the differences in this round's first window.
     pub btime_unix_secs: i64,
     pub host: HostFacts,
-    /// Usually one entry. More only when a round could not be sent and the next one carries the
-    /// backlog, which is best-effort: unlike usage there is no spool behind this. See
-    /// `LoadReportResult`.
+    /// Usually one entry. The Agent persists up to 120 reports and replays them in chronological
+    /// order; duplicate windows are harmless because storage keys them by node and window start.
+    /// A request can still carry more than one entry for compatibility with earlier batching.
     pub samples: Vec<LoadSample>,
     pub processes: Vec<ProcessSample>,
     /// Empty on a machine with no xray, or one whose hops carry no connections right now.
@@ -2611,11 +2944,9 @@ pub struct HopLinkSample {
 
 /// What the control plane made of one report.
 ///
-/// Load reporting deliberately has no spool, and this type is where that shows: a rejected window
-/// is discarded. The spool exists so a locally established fact survives an outage, because usage
-/// drives billing and a convergence result is the only record that convergence happened. A CPU
-/// reading from five minutes ago is neither, so adding usage's spool here would introduce a file
-/// that can fill a disk in exchange for readings that are no longer used.
+/// The Agent uses this result while draining a bounded one-hour spool. Accepted and duplicate
+/// windows leave the queue; retryable transport/server failures keep its head in place; a permanent
+/// 4xx rejection is counted as a lost load window so one malformed entry cannot block later data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadReportResult {
     pub node_id: String,
@@ -3178,6 +3509,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forwarding_wire_shape_keeps_protocol_and_counter_identity() {
+        let desired = ForwardingDesiredState {
+            generation: 7,
+            rules: vec![ForwardingRuleDesired {
+                id: 42,
+                protocol: ForwardingProtocol::TcpUdp,
+                listen_port: 20_042,
+                target_host: "example.com".to_owned(),
+                target_port: 443,
+            }],
+        };
+        let wire = serde_json::to_value(&desired).unwrap();
+        assert_eq!(wire["rules"][0]["protocol"], "tcp_udp");
+        assert_eq!(
+            serde_json::from_value::<ForwardingDesiredState>(wire).unwrap(),
+            desired
+        );
+
+        let usage = ForwardingUsageReportRequest {
+            agent_instance_id: "agent-1".to_owned(),
+            sequence: 8,
+            read_at_unix_secs: 9,
+            xray_epoch: "xray-1".to_owned(),
+            counters: vec![ForwardingUsageCounter {
+                rule_id: 42,
+                uplink_bytes: 10,
+                downlink_bytes: 20,
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<ForwardingUsageReportRequest>(
+                serde_json::to_value(&usage).unwrap()
+            )
+            .unwrap(),
+            usage
+        );
+        assert_eq!(FORWARDING_PROTOCOL_VERSION, 26);
+    }
+
+    #[test]
     fn online_source_protocols_are_additive_and_use_stable_names() {
         let legacy = serde_json::json!({"ip": "1.1.1.1", "last_seen_unix_secs": 1});
         let mut source: OnlineSource = serde_json::from_value(legacy.clone()).unwrap();
@@ -3270,6 +3641,8 @@ mod tests {
         assert_eq!(report.online_sources, None);
         assert_eq!(report.spool.usage_dropped, None);
         assert_eq!(report.spool.observation_dropped, None);
+        assert_eq!(report.spool.load, 0);
+        assert_eq!(report.spool.load_dropped, None);
     }
 
     #[test]
@@ -3323,7 +3696,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 24);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 29);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,
@@ -3418,10 +3791,32 @@ mod tests {
     fn realtime_commands_have_a_small_stable_wire_shape() {
         assert_eq!(
             serde_json::to_string(&AgentRealtimeCommand::Start {
-                interval_millis: 1000
+                interval_millis: 1000,
+                diagnostics: true,
+                user_traffic: None,
             })
             .unwrap(),
             r#"{"type":"start","interval_millis":1000}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: None,
+            })
+            .unwrap(),
+            r#"{"type":"start","interval_millis":1000,"diagnostics":false}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentRealtimeCommand>(
+                r#"{"type":"start","interval_millis":1000}"#
+            )
+            .unwrap(),
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: true,
+                user_traffic: None,
+            }
         );
         assert_eq!(
             serde_json::to_string(&AgentRealtimeCommand::Stop).unwrap(),
@@ -3442,6 +3837,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!nic_only.diagnostics_unchanged);
+        assert!(!nic_only.mux_unchanged);
         assert_eq!(nic_only.mux, None);
         assert_eq!(nic_only.vpngate, None);
 
@@ -3909,7 +4305,7 @@ mod tests {
         let encoded = serde_json::to_value(&new).unwrap();
         assert_eq!(encoded["family"], "ipv6");
         assert_eq!(encoded["skip_reason"], "no_route");
-        assert_eq!(DUAL_STACK_PING_PROTOCOL_VERSION, AGENT_PROTOCOL_VERSION);
+        assert_eq!(DUAL_STACK_PING_PROTOCOL_VERSION, 24);
     }
 }
 

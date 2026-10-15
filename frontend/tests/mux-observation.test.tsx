@@ -130,6 +130,51 @@ function sendMux(pools: unknown[], workers: unknown[] = [worker], events: unknow
   );
 }
 
+function confirmUnchangedMux() {
+  const now = Date.now();
+  act(() =>
+    Events.current.send('sample', {
+      node_id: 'node-a',
+      received_at_unix_millis: now,
+      sample: {
+        sampled_at_unix_millis: now,
+        mux_unchanged: true,
+      },
+    }),
+  );
+}
+
+it('treats an old initial Mux snapshot as warm-up before declaring it stale', () => {
+  render(<MuxObservationCard nodeId="node-a" />);
+  const now = Date.now();
+  act(() =>
+    Events.current.send('sample', {
+      node_id: 'node-a',
+      received_at_unix_millis: now,
+      sample: {
+        sampled_at_unix_millis: now,
+        mux: {
+          boot_id: '9',
+          sequence: 3,
+          sampled_at_unix_ms: now - 16_000,
+          pools: [pool()],
+          workers: [worker],
+          events: [],
+        },
+      },
+    }),
+  );
+
+  expect(screen.getByRole('status').textContent).toBe('正在获取实时状态…');
+  expect(screen.queryByText(/正在同步实时数据/)).toBeNull();
+  expect(screen.getByLabelText('Mux 连接复用').textContent).not.toContain('Worker');
+  expect(screen.getByLabelText('Mux 连接复用').textContent).not.toContain('状态事件');
+  expect(screen.queryByText(/实时数据连接已中断/)).toBeNull();
+
+  act(() => vi.advanceTimersByTime(16_000));
+  expect(screen.getByText(/实时数据连接已中断，或数据已超过 15 秒未更新/)).toBeTruthy();
+});
+
 it('shows current capacity and derives reuse counters only from this browser observation window', () => {
   render(<MuxObservationCard nodeId="node-a" nodeName={id => ({ 'node-a': 'JP', 'tyo-exit': 'TYO' })[id] ?? id} />);
   expect(screen.queryByLabelText('Mux 连接复用')).toBeNull();
@@ -163,6 +208,20 @@ it('shows current capacity and derives reuse counters only from this browser obs
   expect(dispatchStats).toContain('复用率 75%');
   expect(screen.getByText(/发生 1 次按需拨号/)).toBeTruthy();
   expect(screen.getByText(/未达到复用阈值则创建新 Worker/)).toBeTruthy();
+});
+
+it('keeps an idle Mux fresh while unchanged diagnostics are confirmed', () => {
+  render(<MuxObservationCard nodeId="node-a" />);
+  sendMux([pool()]);
+
+  for (let elapsed = 0; elapsed < 20_000; elapsed += 5_000) {
+    act(() => vi.advanceTimersByTime(5_000));
+    confirmUnchangedMux();
+  }
+
+  const card = screen.getByLabelText('Mux 连接复用');
+  expect(card.textContent).toContain('运行正常');
+  expect(card.textContent).not.toContain('数据已过期');
 });
 
 it('shows active health policy, current quarantine and window deltas without needing old events', () => {

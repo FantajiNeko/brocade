@@ -1,11 +1,35 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { ConsoleSnapshot, DeploymentListItem, ExternalOutbound, TunnelProbeView } from '../src/api';
 import { draft } from '../src/draft';
 import { singleTunnelTenant, TunnelsPane } from '../src/panes/tunnels';
 import { SessionProvider } from '../src/session';
 import type { Win } from '../src/wm/store';
+
+// A custom tunnel detail draws its probe chart with ECharts, which jsdom cannot render.
+vi.mock('echarts/core', () => ({
+  use: vi.fn(),
+  init: vi.fn(() => ({ setOption: vi.fn(), resize: vi.fn(), dispose: vi.fn() })),
+}));
+vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {} }));
+vi.mock('echarts/components', () => ({
+  GridComponent: {},
+  MarkAreaComponent: {},
+  MarkLineComponent: {},
+  TooltipComponent: {},
+}));
+vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
+
+beforeEach(() => {
+  vi.stubGlobal(
+    'ResizeObserver',
+    class {
+      observe() {}
+      disconnect() {}
+    },
+  );
+});
 
 const initial = { node_count: 0, chain_group_count: [] };
 
@@ -116,11 +140,14 @@ function mount(
         protocol: tunnel.protocol.t,
         supported: true,
         unsupported_reason: null,
-        health: 'unknown',
+        health: 'paused',
+        health_reason: { kind: 'not-scheduled' },
         policy: null,
         latest_run: null,
       },
       retention_days: 7,
+      slow_ttfb_ms: 300,
+      bucket_secs: 360,
       summary: {
         window_secs: 86_400,
         total: 0,
@@ -129,6 +156,10 @@ function mount(
         p50_ms: null,
         p95_ms: null,
         failures: 0,
+        timeouts: 0,
+        connect_failures: 0,
+        target_failures: 0,
+        exit_ips: 0,
       },
       points: [],
       recent_runs: [],
@@ -374,10 +405,22 @@ it('keeps the VPN Gate list row limited to configured metadata', () => {
 it('owns editing and deletion without exposing hidden chain proxy management', async () => {
   const view = mount({ drill: { p: 'custom', id: outbound.id } });
 
-  expect(view.container.querySelector('.tunnel-strip')?.children).toHaveLength(3);
-  expect(view.getByRole('heading', { name: outbound.name })).toBeTruthy();
+  expect(await view.findByRole('heading', { name: outbound.name })).toBeTruthy();
+  const connection = view.getByRole('heading', { name: '连接' }).closest('section') as HTMLElement;
+  expect([...connection.querySelectorAll('dt')].map(term => term.textContent)).toEqual([
+    '地址',
+    '协议',
+    '密码',
+    '传输安全',
+    'SNI',
+    '指纹',
+  ]);
+  expect(within(connection).getByText('edge.example.com:443')).toBeTruthy();
+  expect(within(connection).getByText('已密封')).toBeTruthy();
+  expect(view.getByText('AnyTLS · TLS · edge.example.com:443')).toBeTruthy();
+  expect(view.container.querySelector('.tnd-head .st')?.textContent).toBe('未监测');
+  expect(view.getByText('定时监测未启用')).toBeTruthy();
   expect(view.queryByText(/租户/)).toBeNull();
-  expect(view.getByText('传输安全')).toBeTruthy();
   expect(view.queryByText('安全层')).toBeNull();
   expect(view.queryByText('链式代理引用')).toBeNull();
   expect(view.queryByRole('button', { name: /优选入口/ })).toBeNull();
@@ -391,7 +434,7 @@ it('owns editing and deletion without exposing hidden chain proxy management', a
   await waitFor(() => expect(view.getByRole('dialog', { name: '删除隧道' })).toBeTruthy());
 });
 
-it('identifies VLESS Encryption without a separate transport-security fact', () => {
+it('identifies VLESS Encryption without a separate transport-security fact', async () => {
   const encrypted: ExternalOutbound = {
     ...outbound,
     id: 'encrypted',
@@ -413,7 +456,15 @@ it('identifies VLESS Encryption without a separate transport-security fact', () 
   };
   const view = mount({ drill: { p: 'custom', id: encrypted.id } }, encryptedSnapshot);
 
-  expect(view.container.querySelector('.tunnel-strip')?.children).toHaveLength(2);
+  const connection = (await view.findByRole('heading', { name: '连接' })).closest('section') as HTMLElement;
+  expect([...connection.querySelectorAll('dt')].map(term => term.textContent)).toEqual([
+    '地址',
+    '协议',
+    'UUID',
+    '加密',
+    '传输',
+  ]);
+  expect(within(connection).getByText('mlkem768x25519plus')).toBeTruthy();
   expect(view.getAllByText('VLESS Encryption').length).toBeGreaterThan(0);
   expect(view.queryByText('传输安全')).toBeNull();
   expect(view.queryByText('安全层')).toBeNull();

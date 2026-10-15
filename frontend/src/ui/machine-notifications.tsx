@@ -15,6 +15,7 @@ import { CPU_STEAL_ALERT_PCT } from './telemetry-thresholds';
 
 const INCIDENT_GROUP_WINDOW_MS = 60_000;
 const DEFAULT_VISIBLE_NOTIFICATIONS = 10;
+const PUBLIC_IP_PREVIEW_COUNT = 3;
 
 export interface MachineIncident {
   kind: 'control_plane_offline' | 'cpu_steal';
@@ -300,7 +301,8 @@ export function MachineNotifications({
 }) {
   const queryClient = useQueryClient();
   const readSubmittedForOpen = useRef(false);
-  const [expanded, setExpanded] = useState(false);
+  const [incidentsExpanded, setIncidentsExpanded] = useState(false);
+  const [publicIpExpanded, setPublicIpExpanded] = useState(false);
   const presence = usePresence(open, 180);
   // Keep masked public data in a separate cache entry. A logout must never reuse an operator's
   // unmasked notification response while the public request is still in flight.
@@ -344,7 +346,8 @@ export function MachineNotifications({
             }
           : current,
       );
-      setExpanded(false);
+      setIncidentsExpanded(false);
+      setPublicIpExpanded(false);
       await queryClient.invalidateQueries({ queryKey });
     },
   });
@@ -366,15 +369,12 @@ export function MachineNotifications({
   const unreadCount = data?.unread_count ?? 0;
   // The clear cursor dismisses incidents, not the retained public-IP change log returned by the server.
   const publicIpEvents = (data?.events ?? []).filter(event => event.event_kind === 'public_ip_changed');
-  const totalNotifications = groups.length + publicIpEvents.length;
-  const visibleGroupCount = expanded ? groups.length : Math.min(groups.length, DEFAULT_VISIBLE_NOTIFICATIONS);
-  const visibleGroups = groups.slice(0, visibleGroupCount);
-  const visibleIpCount = expanded
-    ? publicIpEvents.length
-    : Math.min(publicIpEvents.length, DEFAULT_VISIBLE_NOTIFICATIONS - visibleGroupCount);
-  const visibleIpEvents = publicIpEvents.slice(0, visibleIpCount);
-  const hiddenCount = totalNotifications - visibleGroups.length - visibleIpEvents.length;
-  const hasCollapsedNotifications = totalNotifications > DEFAULT_VISIBLE_NOTIFICATIONS;
+  // 宿主机告警和公网地址变化是两类内容，各自折叠。此前二者共用十条额度：告警一多，
+  // 公网变化可能只剩一两条甚至完全看不到。地址变化固定保留最近三条，剩余记录在本节展开。
+  const visibleGroups = incidentsExpanded ? groups : groups.slice(0, DEFAULT_VISIBLE_NOTIFICATIONS);
+  const hiddenGroupCount = groups.length - visibleGroups.length;
+  const visibleIpEvents = publicIpExpanded ? publicIpEvents : publicIpEvents.slice(0, PUBLIC_IP_PREVIEW_COUNT);
+  const hiddenIpCount = publicIpEvents.length - visibleIpEvents.length;
   const label = query.error
     ? '机器通知读取失败'
     : activeCount
@@ -395,7 +395,10 @@ export function MachineNotifications({
         title={label}
         onClick={event => {
           event.stopPropagation();
-          if (open) setExpanded(false);
+          if (open) {
+            setIncidentsExpanded(false);
+            setPublicIpExpanded(false);
+          }
           onToggle();
         }}
       >
@@ -455,20 +458,40 @@ export function MachineNotifications({
                     onNode={onNode}
                   />
                 ))}
+                {groups.length > DEFAULT_VISIBLE_NOTIFICATIONS && (
+                  <div className="machine-notification-more">
+                    <button
+                      type="button"
+                      aria-expanded={incidentsExpanded}
+                      onClick={() => setIncidentsExpanded(value => !value)}
+                    >
+                      {incidentsExpanded ? '收起' : `查看更多 ${hiddenGroupCount} 条`}
+                    </button>
+                  </div>
+                )}
                 {visibleIpEvents.length > 0 && (
                   <section className="machine-notification-history">
                     <h3>公网地址变化</h3>
-                    {visibleIpEvents.map(event => (
-                      <PublicIpEvent key={event.id} event={event} onNode={onNode} />
-                    ))}
+                    <div id="machine-notification-public-ip-events">
+                      {visibleIpEvents.map(event => (
+                        <PublicIpEvent key={event.id} event={event} onNode={onNode} />
+                      ))}
+                    </div>
+                    {publicIpEvents.length > PUBLIC_IP_PREVIEW_COUNT && (
+                      <div className="machine-notification-more">
+                        <button
+                          type="button"
+                          aria-expanded={publicIpExpanded}
+                          aria-controls="machine-notification-public-ip-events"
+                          onClick={() => setPublicIpExpanded(value => !value)}
+                        >
+                          {publicIpExpanded
+                            ? `收起到最近 ${PUBLIC_IP_PREVIEW_COUNT} 条`
+                            : `查看其余 ${hiddenIpCount} 条`}
+                        </button>
+                      </div>
+                    )}
                   </section>
-                )}
-                {hasCollapsedNotifications && (
-                  <div className="machine-notification-more">
-                    <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
-                      {expanded ? '收起' : `查看更多 ${hiddenCount} 条`}
-                    </button>
-                  </div>
                 )}
               </>
             )}

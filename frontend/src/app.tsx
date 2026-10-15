@@ -13,6 +13,7 @@ import {
 } from './api';
 import { DirectLogin, Login, parseDirectLoginHash } from './ui/login';
 import {
+  announceSessionChange,
   autoPublicSuppressed,
   enterPublic,
   isVisitor,
@@ -112,6 +113,7 @@ export function App() {
       const branding = queryClient.getQueryData<BrandingSettings>(['branding']);
       queryClient.clear();
       if (branding) queryClient.setQueryData(['branding'], branding);
+      announceSessionChange();
       prefetchInitialRouteData(queryClient, window.location.hash, next);
       setSession(next);
     },
@@ -163,7 +165,7 @@ export function App() {
 
   useEffect(() => {
     if (brandingQuery.data) {
-      document.title = `${brandingQuery.data.site_name} | 跨境网络小管家`;
+      document.title = `${brandingQuery.data.site_name} | Invisible networks. Infallible control.`;
       syncFavicon(brandingQuery.data.icon_data_url);
     }
   }, [brandingQuery.data]);
@@ -209,6 +211,7 @@ export function App() {
     } catch {
       /* 撤销请求失败（网络异常等）也继续进入登录页：用户已表达退出意图，cookie 可能已失效 */
     }
+    announceSessionChange();
     setSession(null);
     const currentBranding = queryClient.getQueryData<BrandingSettings>(['branding']);
     queryClient.clear();

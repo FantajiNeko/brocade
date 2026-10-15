@@ -200,6 +200,14 @@
         "domainStrategy": "UseIP",
         "ipsBlocked": []
       },
+      "tag": "out:forward"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP",
+        "ipsBlocked": []
+      },
       "tag": "out:egress"
     },
     {

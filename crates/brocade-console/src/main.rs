@@ -116,11 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the address the agent face actually ended up on, which depends on whether it was split off.
     let agent_origin = format!("http://{}", agent_bind.unwrap_or(admin_bind));
 
-    let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
-    let agent_listener = match agent_bind {
-        Some(bind) => Some(tokio::net::TcpListener::bind(bind).await?),
-        None => None,
-    };
+    let listeners = brocade_console::socket_activation::open(admin_bind, agent_bind).await?;
+    let admin_listener = listeners.admin;
+    let agent_listener = listeners.agent;
     // Said out loud on every start: "embedded" is what the deployed binary should report, and
     // seeing a path here on a production machine is the whole explanation for a console that does
     // not match the API next to it.
@@ -128,14 +126,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dir) => format!("from {dir}"),
         None => "embedded".to_owned(),
     };
+    let listener_source = if listeners.socket_activated {
+        "systemd socket activation"
+    } else {
+        "direct bind"
+    };
     match agent_bind {
         Some(bind) => {
-            eprintln!("brocade-console admin listening on http://{admin_bind} (console ui: {ui})");
-            eprintln!("brocade-console agent listening on http://{bind}");
+            eprintln!(
+                "brocade-console admin listening on http://{admin_bind} \
+                 ({listener_source}; console ui: {ui})"
+            );
+            eprintln!("brocade-console agent listening on http://{bind} ({listener_source})");
         }
         None => eprintln!(
             "brocade-console listening on http://{admin_bind} \
-             (console + agent on one listener; console ui: {ui})"
+             (console + agent on one listener; {listener_source}; console ui: {ui})"
         ),
     }
 
@@ -161,6 +167,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Ok(rows)) => eprintln!("load: 将 {rows} 条历史窗口封存为分钟数据"),
                 Ok(Err(error)) => eprintln!("load: 历史聚合失败：{error}"),
                 Err(_) => eprintln!("load: 历史聚合达到本轮时间预算，下轮继续"),
+            }
+        }
+    });
+
+    // One capacity forecast per machine and UTC day, so a closed period can be checked against
+    // what the forecast page said. The first pass after midnight records the day; hourly passes
+    // only cover restarts and outages, since a day's first record stands.
+    let forecaster = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                forecaster.record_machine_traffic_forecasts(),
+            )
+            .await
+            {
+                Ok(Ok(0)) => {}
+                Ok(Ok(rows)) => eprintln!("traffic: 记录 {rows} 台机器的当日流量预测"),
+                Ok(Err(error)) => eprintln!("traffic: 记录流量预测失败：{error}"),
+                Err(_) => eprintln!("traffic: 记录流量预测超时，下轮重试"),
             }
         }
     });
@@ -253,6 +282,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("presence: 清掉 {rows} 条过期来源"),
                 Err(error) => eprintln!("presence: 清理来源失败：{error}"),
+            }
+            match pruner
+                .prune_machine_traffic_forecasts(
+                    brocade_store::MACHINE_TRAFFIC_FORECAST_RETENTION_DAYS,
+                )
+                .await
+            {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("traffic: 清掉 {rows} 条过期流量预测"),
+                Err(error) => eprintln!("traffic: 清理流量预测失败：{error}"),
             }
         }
     });

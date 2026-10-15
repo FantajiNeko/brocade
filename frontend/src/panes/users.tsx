@@ -35,11 +35,12 @@ import {
   type IssuedUserDirectLogin,
   type NetworkOperator,
   type UsageMonthlyViewRow,
+  type UsageForwardingMonthlyRow,
   type UserListItem,
   type UserOnlineSource,
   type UserPresence,
 } from '../api';
-import { can, isVisitor, useSession } from '../session';
+import { can, isPublic, isVisitor, useSession } from '../session';
 import { Ago, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { bytes, shareOf } from '../ui/format';
@@ -58,6 +59,9 @@ import { PASSWORD_MIN_LENGTH, passwordConfirmation } from '../ui/password-policy
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { useNarrow } from '../ui/viewport';
 import { directLoginUrl } from '../ui/login';
+import { canViewUserRealtimeTraffic } from '../session';
+import { UserRealtimeTrafficCard } from '../user-traffic-realtime';
+import { UserForwardingCard } from './user-forwarding';
 
 // 用户列表：一行一个用户，点击后就地展开。
 // 此处原为授权矩阵，行是用户、列是接入面。列数随数据增长：每个接入点一列，每个线路再加
@@ -323,10 +327,10 @@ const observedTitle = (source: UserOnlineSource, online: boolean) =>
   ].join('\n');
 
 // 时间线分组：在线来源在最前，离线来源按最后出现分到今天、昨天、7 天内与保留期内。
-// 7 天内与保留期内默认折叠。
 type PresenceBucket = 'online' | 'today' | 'yesterday' | 'week' | 'retention';
 const PRESENCE_BUCKETS: PresenceBucket[] = ['online', 'today', 'yesterday', 'week', 'retention'];
 const OLDER_PRESENCE_BUCKETS = new Set<PresenceBucket>(['week', 'retention']);
+const PRESENCE_HISTORY_PREVIEW_LIMIT = 5;
 
 function offlineBucket(lastSeen: number, today: number): PresenceBucket {
   if (Number.isNaN(lastSeen)) return 'retention';
@@ -446,6 +450,11 @@ const firstSeenOrder = (source: UserOnlineSource) => {
   return Number.isNaN(t) ? 0 : t;
 };
 
+const lastSeenOrder = (source: UserOnlineSource) => {
+  const t = observedAt(source.last_observed_at);
+  return Number.isNaN(t) ? 0 : t;
+};
+
 function UserPresenceCard({
   user,
   presence,
@@ -463,7 +472,7 @@ function UserPresenceCard({
   pending: boolean;
   error: unknown;
 }) {
-  const [olderExpanded, setOlderExpanded] = useState(false);
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const today = new Date(useNow()).setHours(0, 0, 0, 0);
   const online = presence?.sources ?? [];
   // 在线与离线来源排在同一条时间线上，打开详情即读取离线来源。名册只轮询在线来源，历史只为
@@ -482,7 +491,10 @@ function UserPresenceCard({
   });
   // 重新读取完成前，上一份历史里可能还有刚恢复在线的地址；同一地址只在「在线」出现一次。
   const onlineIps = new Set(online.map(source => source.ip));
-  const offline = (history.data?.sources ?? []).filter(source => !onlineIps.has(source.ip));
+  const offline = (history.data?.sources ?? [])
+    .filter(source => !onlineIps.has(source.ip))
+    .sort((a, b) => lastSeenOrder(b) - lastSeenOrder(a) || a.ip.localeCompare(b.ip));
+  const visibleOffline = historyExpanded ? offline : offline.slice(0, PRESENCE_HISTORY_PREVIEW_LIMIT);
   const retentionDays = history.data?.retention_days ?? 30;
   const historyCountries = new Map(history.data?.source_countries?.map(({ ip, country }) => [ip, country]));
   const historyOperators = new Map(history.data?.source_operators?.map(({ ip, operator }) => [ip, operator]));
@@ -495,7 +507,7 @@ function UserPresenceCard({
       [...online].sort((a, b) => firstSeenOrder(b) - firstSeenOrder(a) || a.ip.localeCompare(b.ip)),
     );
   }
-  for (const source of offline) {
+  for (const source of visibleOffline) {
     const bucket = offlineBucket(observedAt(source.last_observed_at), today);
     groups.set(bucket, [...(groups.get(bucket) ?? []), source]);
   }
@@ -506,13 +518,8 @@ function UserPresenceCard({
     week: '7 天内',
     retention: `${retentionDays} 天内`,
   };
-  const olderCount = [...OLDER_PRESENCE_BUCKETS].reduce((sum, bucket) => sum + (groups.get(bucket)?.length ?? 0), 0);
-  // 只有更早的来源时直接展开，否则整张卡只剩一个按钮
-  const olderOnly = PRESENCE_BUCKETS.every(bucket => OLDER_PRESENCE_BUCKETS.has(bucket) || !groups.has(bucket));
-  const showOlder = olderExpanded || olderOnly;
-  const visibleBuckets = PRESENCE_BUCKETS.filter(
-    bucket => groups.has(bucket) && (showOlder || !OLDER_PRESENCE_BUCKETS.has(bucket)),
-  );
+  const hiddenHistoryCount = Math.max(0, offline.length - PRESENCE_HISTORY_PREVIEW_LIMIT);
+  const visibleBuckets = PRESENCE_BUCKETS.filter(bucket => groups.has(bucket));
 
   const partial = presence?.state === 'partial';
   const reading = error ? (
@@ -601,17 +608,17 @@ function UserPresenceCard({
           </div>
         )}
         {!!history.error && <ErrorBox error={history.error} />}
-        {history.data?.truncated && showOlder && (
+        {history.data?.truncated && (historyExpanded || offline.length <= PRESENCE_HISTORY_PREVIEW_LIMIT) && (
           <span className="user-presence-history-note">记录较多，仅显示最近 256 个来源 IP。</span>
         )}
-        {olderCount > 0 && !olderOnly && (
+        {offline.length > PRESENCE_HISTORY_PREVIEW_LIMIT && (
           <button
             type="button"
             className="user-presence-more"
-            aria-expanded={olderExpanded}
-            onClick={() => setOlderExpanded(expanded => !expanded)}
+            aria-expanded={historyExpanded}
+            onClick={() => setHistoryExpanded(expanded => !expanded)}
           >
-            {olderExpanded ? '收起更早的来源' : `显示更早的 ${olderCount} 个来源`}
+            {historyExpanded ? '收起历史来源' : `显示其余 ${hiddenHistoryCount} 个历史来源`}
           </button>
         )}
       </div>
@@ -897,7 +904,7 @@ function UserUsageLedger({
   monthEnd,
 }: {
   state: MonthlyUsageState;
-  rows: UsageMonthlyViewRow[];
+  rows: (UsageMonthlyViewRow | UsageForwardingMonthlyRow)[];
   monthEnd: string | null;
 }) {
   const uplink = rows.reduce((sum, row) => sum + row.uplink_bytes, 0);
@@ -920,6 +927,16 @@ function UserUsageLedger({
         {monthEnd && <QuotaReset monthEnd={monthEnd} />}
       </div>
       <div className="user-usage-compose">
+        <span className="muted">
+          接入{' '}
+          {bytes(
+            rows.filter(row => 'app_id' in row).reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0),
+          )}
+          {' · '}转发{' '}
+          {bytes(
+            rows.filter(row => 'rule_id' in row).reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0),
+          )}
+        </span>
         {/* 下方两行写出同样的数值；组成条只表示比例。 */}
         <div className="usage-split" aria-hidden="true">
           {known && total > 0 && (
@@ -1117,29 +1134,58 @@ function UserDirectLoginIssuedDialog({
       onClose={onClose}
       canClose={() => confirmDiscardChanges(guardScope)}
     >
-      <section className="dialog-surface user-password-card user-login-issued-card">
+      <section className="dialog-surface user-password-card user-login-issued-card user-direct-login-card">
         <header>
           <span>
             <b>{user.direct_login_enabled ? '直达页面已重新生成' : '直达页面已生成'}</b>
-            <small>完整链接和 TOKEN 只显示这一次</small>
+            <small>请保存完整链接，关闭后无法再次查看 TOKEN</small>
           </span>
           <DialogClose aria-label="关闭" title="关闭">
             <Icon of="close" size={14} />
           </DialogClose>
         </header>
-        <div className="user-login-issued">
-          <span>
-            直达页面 <code>{url}</code>{' '}
-            <CopyButton className="user-fcopy" text={url} label="复制直达页面" successLabel="直达页面已复制" iconOnly />
-          </span>
-          <span>
-            UUID <code>{issued.uuid}</code> <CopyButton className="user-fcopy" text={issued.uuid} iconOnly />
-          </span>
-          <span>
-            TOKEN <code>{issued.token}</code> <CopyButton className="user-fcopy" text={issued.token} iconOnly />
-          </span>
+        <div className="user-direct-login-body">
+          <div className="user-direct-login-field primary">
+            <div className="user-direct-login-label">
+              <span>直达登录链接</span>
+              <CopyButton className="btn sm" text={url} label="复制链接" successLabel="链接已复制" />
+            </div>
+            <code>{url}</code>
+          </div>
+          <div className="user-direct-login-credentials">
+            <div className="user-direct-login-field">
+              <div className="user-direct-login-label">
+                <span>UUID</span>
+                <CopyButton
+                  className="btn icon sm"
+                  text={issued.uuid}
+                  label="复制 UUID"
+                  successLabel="UUID 已复制"
+                  iconOnly
+                />
+              </div>
+              <code>{issued.uuid}</code>
+            </div>
+            <div className="user-direct-login-field">
+              <div className="user-direct-login-label">
+                <span>TOKEN</span>
+                <CopyButton
+                  className="btn icon sm"
+                  text={issued.token}
+                  label="复制 TOKEN"
+                  successLabel="TOKEN 已复制"
+                  iconOnly
+                />
+              </div>
+              <code>{issued.token}</code>
+            </div>
+          </div>
         </div>
         <footer>
+          <span className="user-direct-login-note">
+            <Icon of="security" size={13} />
+            链接含登录凭据，请妥善保管
+          </span>
           <DialogClose className="btn primary" onClick={clearUnsavedChanges}>
             我已保存
           </DialogClose>
@@ -1810,11 +1856,11 @@ function UserList({
     (monthly.data?.views ?? []).map((r: UsageMonthlyViewRow) => [`${r.tenant_id}/${r.user_id}/${r.app_id}`, r]),
   );
 
-  // 单个用户的本月合计：累加其名下各线路的行。
+  // 用户总量包含接入与转发；按线路的额度仍只读取 usageByView。
   const usageOf = (u: UserListItem) => {
-    const rows = apps
-      .map(a => usageByView.get(`${u.tenant_id}/${u.id}/${a.id}`))
-      .filter((r): r is UsageMonthlyViewRow => !!r);
+    const rows = [...(monthly.data?.views ?? []), ...(monthly.data?.forwarding ?? [])].filter(
+      row => row.tenant_id === u.tenant_id && row.user_id === u.id,
+    );
     return {
       rows,
       total: rows.reduce((n, r) => n + r.uplink_bytes + r.downlink_bytes, 0),
@@ -2261,6 +2307,10 @@ function UserList({
             </div>
           </section>
 
+          {canViewUserRealtimeTraffic(who) && (
+            <UserRealtimeTrafficCard key={`traffic:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
+          )}
+
           {canViewPresence && (
             <UserPresenceCard
               key={`presence:${r.key}`}
@@ -2339,6 +2389,15 @@ function UserList({
               )}
             </div>
           </section>
+          {!isPublic(who) && (
+            <UserForwardingCard
+              user={u}
+              nodes={snapshot.data.snapshot.nodes ?? []}
+              canAuthorize={can(who.role, 'manage-tenants')}
+              canManageRules={editable || selfService}
+              canViewRealtime={canViewUserRealtimeTraffic(who)}
+            />
+          )}
           <GrantProbePanel key={r.key} user={u} readOnly={!canReadArtifacts && !selfService} />
         </div>
       </section>

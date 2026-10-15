@@ -16,6 +16,7 @@ use crate::cert;
 use crate::console;
 use crate::deployment;
 use crate::distribution;
+use crate::forwarding;
 use crate::grant_automation;
 use crate::grant_probe;
 use crate::host_tuning;
@@ -42,7 +43,9 @@ use crate::{
     CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DeleteFrontRequest,
     DeleteFrontResult, DeleteStepResult, DeploymentCommandResult, DeploymentDetail, DeploymentList,
     DeploymentVerification, DeploymentWaveConfirmationResult, DynamicClashSubscription,
-    E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, FrontClientConfigState,
+    E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, ForwardingDesiredState,
+    ForwardingEntitlementWrite, ForwardingOverview, ForwardingReconcileReport, ForwardingRuleWrite,
+    ForwardingUsageReportRequest, ForwardingUsageReportResult, FrontClientConfigState,
     FrontRouteAnalysisView, HopLinkList, IssuedAdminToken, IssuedNodeToken, IssuedUserDirectLogin,
     IssuedUserLogin, LinkHealthItem, LinkHealthRequest, LinkHealthResult, LinkMtuView,
     LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult, LoadSeriesQuery,
@@ -61,7 +64,8 @@ use crate::{
     UpsertGrantResult, UpsertIngressResult, UpsertTenantResult, UpsertUserResult,
     UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest, UsageReportResult,
     UsageSampleList, UserAppQuotaList, UserDirectLoginRequest, UserGrantProbePlan, UserList,
-    VerifyDeploymentRequest, WarpBindingRemoval,
+    UserRealtimeTarget, UserTrafficHistory, UserTrafficHistoryScope, VerifyDeploymentRequest,
+    WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -305,6 +309,25 @@ impl PgStore {
     /// Physical NIC totals are operational accounting: no model revision or deployment is made.
     pub async fn node_traffic(&self, actor: &AdminContext) -> Result<crate::NodeTrafficView> {
         traffic::load_node_traffic(&self.pool, actor).await
+    }
+
+    /// Physical provider capacity with an explicitly estimated user allocation. This is an
+    /// operational planning view and does not modify revisions or accounting ledgers.
+    pub async fn machine_traffic_model(
+        &self,
+        actor: &AdminContext,
+    ) -> Result<crate::MachineTrafficModelView> {
+        traffic::load_machine_traffic_model(&self.pool, actor).await
+    }
+
+    /// Record today's forecast for every measured machine; later calls on the same UTC day keep
+    /// the first record. Returns the number of machines recorded by this call.
+    pub async fn record_machine_traffic_forecasts(&self) -> Result<u64> {
+        traffic::record_machine_traffic_forecasts(&self.pool).await
+    }
+
+    pub async fn prune_machine_traffic_forecasts(&self, retain_days: u32) -> Result<u64> {
+        traffic::prune_machine_traffic_forecasts(&self.pool, retain_days).await
     }
 
     pub async fn update_node_traffic(
@@ -1536,6 +1559,90 @@ impl PgStore {
         console::list_users(&self.pool, actor, tenant_id, include_disabled).await
     }
 
+    pub async fn forwarding_overview(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<ForwardingOverview> {
+        forwarding::overview(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn set_forwarding_entitlement(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        node_id: &str,
+        request: ForwardingEntitlementWrite,
+    ) -> Result<ForwardingOverview> {
+        forwarding::set_entitlement(&self.pool, actor, tenant_id, user_id, node_id, request).await
+    }
+
+    pub async fn delete_forwarding_entitlement(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        node_id: &str,
+    ) -> Result<ForwardingOverview> {
+        forwarding::delete_entitlement(&self.pool, actor, tenant_id, user_id, node_id).await
+    }
+
+    pub async fn create_forwarding_rule(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        request: ForwardingRuleWrite,
+    ) -> Result<ForwardingOverview> {
+        forwarding::create_rule(&self.pool, actor, tenant_id, user_id, request).await
+    }
+
+    pub async fn update_forwarding_rule(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        rule_id: i64,
+        request: ForwardingRuleWrite,
+    ) -> Result<ForwardingOverview> {
+        forwarding::update_rule(&self.pool, actor, tenant_id, user_id, rule_id, request).await
+    }
+
+    pub async fn delete_forwarding_rule(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        rule_id: i64,
+    ) -> Result<ForwardingOverview> {
+        forwarding::delete_rule(&self.pool, actor, tenant_id, user_id, rule_id).await
+    }
+
+    pub async fn forwarding_desired_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<ForwardingDesiredState> {
+        forwarding::desired_for_node(&self.pool, node_id).await
+    }
+
+    pub async fn record_forwarding_reconcile(
+        &self,
+        node_id: &str,
+        report: ForwardingReconcileReport,
+    ) -> Result<ForwardingDesiredState> {
+        forwarding::record_reconcile(&self.pool, node_id, report).await
+    }
+
+    pub async fn record_forwarding_usage(
+        &self,
+        node_id: &str,
+        report: ForwardingUsageReportRequest,
+    ) -> Result<ForwardingUsageReportResult> {
+        forwarding::record_usage(&self.pool, node_id, report).await
+    }
+
     pub async fn list_user_presence(
         &self,
         actor: &AdminContext,
@@ -2042,6 +2149,38 @@ impl PgStore {
         usage::list_usage_samples(&self.pool, actor, limit, tenant_id, user_id, node_id).await
     }
 
+    pub async fn user_realtime_targets(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<UserRealtimeTarget>> {
+        usage::user_realtime_targets(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn node_forwarding_realtime_targets(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+    ) -> Result<Vec<brocade_deployment::protocol::RealtimeForwardingTarget>> {
+        Ok(
+            usage::forwarding_realtime_targets(&self.pool, actor, Some(node_id), None)
+                .await?
+                .into_iter()
+                .map(|(_, target)| target)
+                .collect(),
+        )
+    }
+
+    pub async fn list_user_traffic_history(
+        &self,
+        actor: &AdminContext,
+        scope: UserTrafficHistoryScope<'_>,
+        window_secs: u32,
+    ) -> Result<UserTrafficHistory> {
+        usage::list_user_traffic_history(&self.pool, actor, scope, window_secs).await
+    }
+
     pub async fn list_monthly_usage_summary(
         &self,
         actor: &AdminContext,
@@ -2062,11 +2201,19 @@ impl PgStore {
     }
 
     pub async fn prune_usage_report_receipts(&self, retain_days: u32) -> Result<u64> {
-        usage::prune_usage_report_receipts(&self.pool, retain_days).await
+        let usage = usage::prune_usage_report_receipts(&self.pool, retain_days).await?;
+        let forwarding = forwarding::prune_usage_report_receipts(&self.pool, retain_days).await?;
+        usage
+            .checked_add(forwarding)
+            .ok_or_else(|| StoreError::InvalidData("usage receipt prune count overflow".to_owned()))
     }
 
     pub async fn prune_usage_samples(&self, retain_days: u32) -> Result<u64> {
-        usage::prune_usage_samples(&self.pool, retain_days).await
+        let ordinary = usage::prune_usage_samples(&self.pool, retain_days).await?;
+        let forwarding = forwarding::prune_usage_samples(&self.pool, retain_days).await?;
+        ordinary
+            .checked_add(forwarding)
+            .ok_or_else(|| StoreError::InvalidData("usage prune count overflow".to_owned()))
     }
 
     pub async fn prune_user_online_sources(&self, retain_days: u32) -> Result<u64> {

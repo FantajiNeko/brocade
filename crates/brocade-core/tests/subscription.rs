@@ -6,12 +6,12 @@ use brocade_core::{
     ir::{routing::compile_app, system::compile_system, validate::validate_app},
     model::{
         AnyTls, AnyTlsMasquerade, AppView, Chain, Dns, DomainStrategy, ExternalOutbound,
-        ExternalOutboundProtocol, ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2,
-        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
-        IngressWires, IpFamily, ModelSnapshot, MtProto, Node, Projection,
-        ProjectionDownloadEndpoint, ProjectionEndpoint, ProtocolProjection, RealityFallbackMode,
-        RealityXhttp, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp, XhttpDownload,
-        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+        ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
+        ExternalVlessWebsocket, Front, FrontStrategy, Grant, Hysteria2, HysteriaBandwidth,
+        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily,
+        ModelSnapshot, MtProto, Node, Projection, ProjectionDownloadEndpoint, ProjectionEndpoint,
+        ProtocolProjection, RealityFallbackMode, RealityXhttp, Tls, TlsXhttp, Transport, User,
+        WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
     physical::user::{project_user, SubscriptionProtocol, UserPlan},
     Level,
@@ -278,6 +278,32 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            id: "custom-4444-4444".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "WebSocket 前置".to_owned(),
+            address: "ws.proxy.example".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "11111111-2222-4333-8444-555555555555".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Websocket(ExternalVlessWebsocket {
+                    path: "/front".to_owned(),
+                    host: Some("ws-host.proxy.example".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
+                ech_config_list: Some("ech-config-list".to_owned()),
+                pinned_peer_cert_sha256: Some("11".repeat(32)),
+                verify_peer_cert_by_name: Some("cert.proxy.example".to_owned()),
+                server_name: "ws-sni.proxy.example".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
             id: "warp-8f3a-2d71".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Cloudflare WARP".to_owned(),
@@ -313,6 +339,7 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             external_via: vec![
                 "custom-1111-1111".to_owned(),
                 "custom-3333-3333".to_owned(),
+                "custom-4444-4444".to_owned(),
                 "warp-8f3a-2d71".to_owned(),
             ],
             strategy: FrontStrategy::UrlTest,
@@ -340,8 +367,30 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
     assert!(clash.contains("server: ss.proxy.example"), "{clash}");
     assert!(clash.contains("cipher: aes-256-gcm"), "{clash}");
     assert!(clash.contains("password: classic-password"), "{clash}");
+    assert!(clash.contains("name: \"WebSocket 前置\""), "{clash}");
+    assert!(clash.contains("server: ws.proxy.example"), "{clash}");
+    assert!(clash.contains("network: ws"), "{clash}");
+    assert!(clash.contains("path: \"/front\""), "{clash}");
+    assert!(clash.contains("Host: ws-host.proxy.example"), "{clash}");
     assert!(
-        clash.contains("proxies: [\"香港入口\", \"供应商前置\", \"Shadowsocks 前置\"]"),
+        clash.contains("servername: ws-sni.proxy.example"),
+        "{clash}"
+    );
+    assert!(clash.contains("alpn: [h2, \"http/1.1\"]"), "{clash}");
+    assert!(
+        clash.contains(&format!("fingerprint: {}", "11".repeat(32))),
+        "{clash}"
+    );
+    assert!(
+        clash.contains("name-cert-verify: cert.proxy.example"),
+        "{clash}"
+    );
+    assert!(clash.contains("ech-opts:"), "{clash}");
+    assert!(clash.contains("config: ech-config-list"), "{clash}");
+    assert!(
+        clash.contains(
+            "proxies: [\"香港入口\", \"供应商前置\", \"Shadowsocks 前置\", \"WebSocket 前置\"]"
+        ),
         "{clash}"
     );
     assert!(!clash.contains("unused.proxy.example"), "{clash}");

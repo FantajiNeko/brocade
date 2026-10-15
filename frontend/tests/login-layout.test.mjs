@@ -15,7 +15,7 @@ test('登录、初始化与直达登录共用分栏版式', () => {
   assert.doesNotMatch(login, /className="fw|login-fw|fw-kind|fw-title/);
   assert.match(login, /<BrandIcon branding=\{branding\} className="login-mark" \/>/);
   assert.match(login, /<span className="login-word">\{branding\.site_name\}<\/span>/);
-  assert.match(login, /<div className="login-tagline">跨境网络小管家<\/div>/);
+  assert.match(login, /<div className="login-tagline">Invisible networks\. Infallible control\.<\/div>/);
   assert.match(login, /<svg className="login-routes" viewBox="0 0 440 300" aria-hidden="true">/);
 });
 

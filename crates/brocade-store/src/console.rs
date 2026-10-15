@@ -911,6 +911,46 @@ fn validate_external_outbound_id(id: &str, protocol: &str) -> Result<()> {
     }
 }
 
+/// Restores secret leaves hidden by the console redactor before an existing extensible JSON
+/// document is saved again. The marker is valid only when there is a value at the same path in
+/// the current row; accepting it for a new path would persist the literal marker as a key.
+fn restore_redacted_json_values(
+    requested: &mut Value,
+    existing: Option<&Value>,
+    label: &str,
+) -> Result<()> {
+    match requested {
+        Value::String(value) if value == "<redacted>" => {
+            let current = existing.ok_or_else(|| {
+                StoreError::InvalidData(format!(
+                    "{label} contains <redacted> at a path with no stored value"
+                ))
+            })?;
+            *requested = current.clone();
+        }
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                restore_redacted_json_values(
+                    value,
+                    existing.and_then(|current| current.get(name)),
+                    label,
+                )?;
+            }
+        }
+        Value::Array(items) => {
+            for (index, value) in items.iter_mut().enumerate() {
+                restore_redacted_json_values(
+                    value,
+                    existing.and_then(|current| current.get(index)),
+                    label,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub(crate) async fn upsert_external_outbound_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
@@ -937,7 +977,10 @@ pub(crate) async fn upsert_external_outbound_tx(
     validate_external_outbound_id(&id, requested_protocol)?;
 
     let existing = sqlx::query(
-        "SELECT tenant_id, credential_sealed, protocol FROM external_outbounds WHERE id = $1 FOR UPDATE",
+        "SELECT tenant_id, credential_sealed, protocol, protocol_options
+           FROM external_outbounds
+          WHERE id = $1
+          FOR UPDATE",
     )
     .bind(&id)
     .fetch_optional(&mut **tx)
@@ -980,14 +1023,20 @@ pub(crate) async fn upsert_external_outbound_tx(
         )?
     };
 
-    let protocol_options = match request.protocol {
+    let mut protocol_options = match request.protocol {
         ExternalOutboundProtocol::Anytls { .. } => json!({}),
         ExternalOutboundProtocol::Vless {
             encryption,
             flow,
             transport,
+            final_mask,
             ..
-        } => json!({ "encryption": encryption, "flow": flow, "transport": transport }),
+        } => json!({
+            "encryption": encryption,
+            "flow": flow,
+            "transport": transport,
+            "final_mask": final_mask,
+        }),
         ExternalOutboundProtocol::Shadowsocks2022 { method, .. } => {
             json!({ "method": method })
         }
@@ -1048,6 +1097,56 @@ pub(crate) async fn upsert_external_outbound_tx(
             "max_candidates": max_candidates,
         }),
     };
+    if requested_protocol == "vless" {
+        let existing_options = match existing.as_ref() {
+            Some(row) if row.try_get::<String, _>("protocol")? == requested_protocol => {
+                let stored = row.try_get::<Value, _>("protocol_options")?;
+                Some(crate::materialize::open_external_outbound_protocol_options(
+                    &tenant_id,
+                    &id,
+                    requested_protocol,
+                    stored,
+                )?)
+            }
+            _ => None,
+        };
+        restore_redacted_json_values(
+            &mut protocol_options,
+            existing_options.as_ref(),
+            "VLESS protocol options",
+        )?;
+
+        let reusable_envelope = match existing.as_ref() {
+            Some(row) if existing_options.is_some() => {
+                let stored = row.try_get::<Value, _>("protocol_options")?;
+                stored
+                    .get("brocade_sealed")
+                    .and_then(Value::as_str)
+                    .is_some()
+                    .then_some(stored)
+            }
+            _ => None,
+        };
+        if existing_options.as_ref() == Some(&protocol_options) {
+            if let Some(envelope) = reusable_envelope {
+                protocol_options = envelope;
+            } else {
+                protocol_options = crate::materialize::seal_external_outbound_protocol_options(
+                    &tenant_id,
+                    &id,
+                    requested_protocol,
+                    protocol_options,
+                )?;
+            }
+        } else {
+            protocol_options = crate::materialize::seal_external_outbound_protocol_options(
+                &tenant_id,
+                &id,
+                requested_protocol,
+                protocol_options,
+            )?;
+        }
+    }
     let security = serde_json::to_value(request.security)?;
     let changed = sqlx::query(
         "INSERT INTO external_outbounds
@@ -4669,6 +4768,36 @@ mod model_id_tests {
         assert!(validate_external_outbound_id("vpngate-jp", "vpngate").is_err());
         assert!(validate_external_outbound_id("warp-platform", "warp").is_err());
         assert!(validate_external_outbound_id("vpngate-8f3a-2d71", "wireguard").is_err());
+    }
+
+    #[test]
+    fn restores_only_redacted_leaves_from_existing_vless_options() {
+        let existing = json!({
+            "final_mask": { "tcp": [{ "settings": { "password": "mask-secret" } }] },
+            "transport": { "v": { "extra": { "xPaddingKey": "padding-secret" } } }
+        });
+        let mut requested = json!({
+            "final_mask": { "tcp": [{ "settings": { "password": "<redacted>" } }] },
+            "transport": { "v": { "extra": { "xPaddingKey": "replacement" } } }
+        });
+
+        restore_redacted_json_values(&mut requested, Some(&existing), "test").unwrap();
+
+        assert_eq!(
+            requested["final_mask"]["tcp"][0]["settings"]["password"],
+            "mask-secret"
+        );
+        assert_eq!(
+            requested["transport"]["v"]["extra"]["xPaddingKey"],
+            "replacement"
+        );
+    }
+
+    #[test]
+    fn refuses_redacted_vless_option_without_a_stored_value() {
+        let mut requested = json!({ "password": "<redacted>" });
+        let error = restore_redacted_json_values(&mut requested, None, "test").unwrap_err();
+        assert!(error.to_string().contains("no stored value"), "{error}");
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod client_config;
 pub mod compile;
 pub mod diagnostic;
 pub mod format;
+pub mod forwarding;
 pub mod hash;
 pub mod ir;
 pub mod model;

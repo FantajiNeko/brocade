@@ -11,15 +11,15 @@ use brocade_core::{
     model::{
         Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, DestMatch, Dns, DomainStrategy,
         EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
-        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
-        ExternalWarpBinding, Front, FrontStrategy, Grant, HopDial, HopIn, HopMux, HopPool, HopWire,
-        Hysteria2, HysteriaBandwidth, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, Ingress,
-        IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSettings, ModelSnapshot, MtProto,
-        Node, NodeEgressDnsPolicy, OverlaySettings, Projection, ProjectionDownloadEndpoint,
-        ProjectionEndpoint, Reality, RealityClientPolicy, RealityFallbackMode, RealitySite,
-        RealityXhttp, Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp, XhttpDownload,
-        XhttpMode, XhttpXmux,
+        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessGrpc,
+        ExternalVlessGrpcMode, ExternalVlessTransport, ExternalVlessWebsocket, ExternalVlessXhttp,
+        ExternalVlessXhttpDownload, ExternalWarpBinding, Front, FrontStrategy, Grant, HopDial,
+        HopIn, HopMux, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaMasquerade,
+        HysteriaObfs, HysteriaPortHop, Ingress, IngressWires, IpFamily, ListenerDial, ListenerRef,
+        ModelSettings, ModelSnapshot, MtProto, Node, NodeEgressDnsPolicy, OverlaySettings,
+        Projection, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityClientPolicy,
+        RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User,
+        WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
     },
     Diagnostic, Level,
 };
@@ -122,6 +122,118 @@ fn external_vless_requires_an_explicit_transport() {
 }
 
 #[test]
+fn external_vless_rejects_fields_the_embedded_xray_cannot_preserve() {
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: vec![Front {
+            id: "front".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "前置".to_owned(),
+            via: Vec::new(),
+            external_via: vec!["custom-grpc".to_owned(), "custom-reality".to_owned()],
+            strategy: FrontStrategy::Select,
+        }],
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Proxy {
+                    outbound: "custom-grpc".to_owned(),
+                },
+            }],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    doc.external_outbounds = vec![
+        ExternalOutbound {
+            id: "custom-grpc".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "gRPC".to_owned(),
+            address: "grpc.example.net".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "6f9d1a8e-2b3c-4d5e-8f70-1a2b3c4d5e6f".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Grpc(ExternalVlessGrpc {
+                    service_name: "edge".to_owned(),
+                    mode: ExternalVlessGrpcMode::Guna,
+                    authority: Some("".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: Some("not-a-sha256".to_owned()),
+                verify_peer_cert_by_name: Some("bad name".to_owned()),
+                server_name: "grpc.example.net".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-reality".to_owned(),
+            tenant: "platform.acme".to_owned(),
+            name: "REALITY".to_owned(),
+            address: "reality.example.net".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "11111111-2222-4333-8444-555555555555".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Raw,
+            },
+            security: ExternalOutboundSecurity::Reality {
+                server_name: "reality.example.net".to_owned(),
+                public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+                short_id: "abcdef".to_owned(),
+                fingerprint: "chrome".to_owned(),
+                mldsa65_verify: Some("too-short".to_owned()),
+                spider_x: Some("missing-slash".to_owned()),
+            },
+            bindings: Vec::new(),
+        },
+    ];
+
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_app(&doc, &app, &mut diagnostics);
+    validate_app(&sys, &app_ir, &mut diagnostics);
+
+    for code in [
+        "external-outbound.grpc-guna-unsupported",
+        "external-outbound.tls-pinned-peer-cert-sha256",
+        "external-outbound.tls-verify-peer-cert-by-name",
+        "external-outbound.reality-mldsa65-verify",
+        "external-outbound.reality-spider-x",
+        "front.external-vless-grpc-options",
+        "front.external-reality-extensions",
+    ] {
+        assert_has(&diagnostics, Level::Error, code);
+    }
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "external-outbound.grpc-authority"),
+        "显式空 authority 是分享标准允许的值：{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport() {
     let mut doc = doc(vec![node(
         "hk",
@@ -160,6 +272,10 @@ fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport(
             method: "aes-256-gcm".to_owned(),
         },
         security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
             server_name: "ss.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
@@ -334,6 +450,10 @@ fn managed_vpngate_pool_is_node_only_and_validates_its_selection_policy() {
             max_candidates: 0,
         },
         security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
             server_name: "operator.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
@@ -641,6 +761,99 @@ fn external_tunnel_visibility_follows_tenant_ancestry() {
 }
 
 #[test]
+fn external_vless_websocket_validates_path_host_and_flow() {
+    let mut doc = doc(vec![node(
+        "hk",
+        "platform.acme",
+        Some("hk.example.net"),
+        [10, 66, 0, 1],
+        true,
+    )]);
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![ingress("i", "c", "hk", None)],
+        fronts: Vec::new(),
+        steps: vec![step(
+            "c",
+            "hk",
+            vec![Rule {
+                dest_match: DestMatch::Any,
+                action: Action::Proxy {
+                    outbound: "custom-4444-4444".to_owned(),
+                },
+            }],
+            None,
+        )],
+        grants: Vec::new(),
+    };
+    doc.external_outbounds = vec![ExternalOutbound {
+        id: "custom-4444-4444".to_owned(),
+        tenant: "platform.acme".to_owned(),
+        name: "External WebSocket".to_owned(),
+        address: "ws.example.net".to_owned(),
+        port: 443,
+        protocol: ExternalOutboundProtocol::Vless {
+            final_mask: None,
+            credential: "6f9d1a8e-2b3c-4d5e-8f70-1a2b3c4d5e6f".to_owned(),
+            encryption: "none".to_owned(),
+            flow: Some("xtls-rprx-vision".to_owned()),
+            transport: ExternalVlessTransport::Websocket(ExternalVlessWebsocket {
+                path: "bad path#fragment".to_owned(),
+                host: Some("   ".to_owned()),
+            }),
+        },
+        security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
+            server_name: "ws.example.net".to_owned(),
+            fingerprint: "chrome".to_owned(),
+        },
+        bindings: Vec::new(),
+    }];
+
+    let diagnostics_for = |doc: &ModelSnapshot| {
+        let mut diagnostics = Vec::new();
+        let sys = compile_system(doc, &mut diagnostics);
+        let app_ir = compile_app(doc, &app, &mut diagnostics);
+        validate_app(&sys, &app_ir, &mut diagnostics);
+        diagnostics
+    };
+    let invalid = diagnostics_for(&doc);
+    for code in [
+        "external-outbound.websocket-flow-conflict",
+        "external-outbound.websocket-path",
+        "external-outbound.websocket-host",
+    ] {
+        assert_has(&invalid, Level::Error, code);
+    }
+
+    let ExternalOutboundProtocol::Vless {
+        flow, transport, ..
+    } = &mut doc.external_outbounds[0].protocol
+    else {
+        unreachable!()
+    };
+    *flow = None;
+    let ExternalVlessTransport::Websocket(websocket) = transport else {
+        unreachable!()
+    };
+    websocket.path = "/socket?ed=2048".to_owned();
+    websocket.host = Some("ws-host.example.net".to_owned());
+
+    let valid = diagnostics_for(&doc);
+    assert!(
+        valid
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with("external-outbound.websocket")),
+        "{valid:#?}"
+    );
+}
+
+#[test]
 fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
     let mut doc = doc(vec![node(
         "hk",
@@ -675,10 +888,12 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
         address: "upload.example.net".to_owned(),
         port: 443,
         protocol: ExternalOutboundProtocol::Vless {
+            final_mask: None,
             credential: "6f9d1a8e-2b3c-4d5e-8f70-1a2b3c4d5e6f".to_owned(),
             encryption: "none".to_owned(),
             flow: Some("xtls-rprx-vision".to_owned()),
             transport: ExternalVlessTransport::Xhttp(ExternalVlessXhttp {
+                extra: None,
                 path: "bad path?query".to_owned(),
                 host: Some("   ".to_owned()),
                 mux: Some(0),
@@ -695,6 +910,10 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
             }),
         },
         security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
             server_name: "upload.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
@@ -738,6 +957,10 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
         address: "download.example.net".to_owned(),
         port: 443,
         security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
             server_name: "download.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
@@ -798,6 +1021,10 @@ fn external_socks_auth_and_wireguard_shape_are_validated() {
             credential: String::new(),
         },
         security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
             server_name: "proxy.example.net".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
@@ -5096,6 +5323,7 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
         ("mlkem768x25519plus.native.1rtt.".to_owned(), false),
     ] {
         doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Vless {
+            final_mask: None,
             credential: "uuid".to_owned(),
             encryption: value.clone(),
             flow: None,
@@ -5114,12 +5342,17 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
     }
 
     doc.external_outbounds[0].protocol = ExternalOutboundProtocol::Vless {
+        final_mask: None,
         credential: "uuid".to_owned(),
         encryption: format!("mlkem768x25519plus.native.1rtt.{}", "A".repeat(43)),
         flow: None,
         transport: ExternalVlessTransport::Raw,
     };
     doc.external_outbounds[0].security = ExternalOutboundSecurity::Tls {
+        alpn: Vec::new(),
+        ech_config_list: None,
+        pinned_peer_cert_sha256: None,
+        verify_peer_cert_by_name: None,
         server_name: "edge.example.com".to_owned(),
         fingerprint: "chrome".to_owned(),
     };

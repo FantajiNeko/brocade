@@ -16,6 +16,7 @@ type Manager struct {
 	onlineMaps map[string]*OnlineMap
 	channels   map[string]*Channel
 	running    bool
+	journal    counterJournal
 }
 
 // NewManager creates an instance of Statistics Manager.
@@ -24,6 +25,16 @@ func NewManager(ctx context.Context, config *Config) (*Manager, error) {
 		counters:   make(map[string]*Counter),
 		onlineMaps: make(map[string]*OnlineMap),
 		channels:   make(map[string]*Channel),
+	}
+	journal, err := openCounterJournal()
+	if err != nil {
+		return nil, err
+	}
+	if journal != nil {
+		m.journal = journal
+		for name, counter := range journal.Counters() {
+			m.counters[name] = counter
+		}
 	}
 
 	return m, nil
@@ -44,6 +55,13 @@ func (m *Manager) RegisterCounter(name string) (stats.Counter, error) {
 	}
 	errors.LogDebug(context.Background(), "create new counter ", name)
 	c := new(Counter)
+	if m.journal != nil && journalCounterName(name) {
+		var err error
+		c, err = m.journal.Register(name)
+		if err != nil {
+			return nil, err
+		}
+	}
 	m.counters[name] = c
 	return c, nil
 }

@@ -112,6 +112,8 @@ import {
   type HopsDraft,
 } from './rules';
 import { freePortAcross, freeSpanAcross, occupiedPorts, portClash, spanClash } from './ports';
+import { ingressPortMigrationConfirmation, planIngressPortMigration } from './ingress-port-migration';
+import { mtprotoNodeEligibility } from '../mtproto-capability';
 
 /* Hysteria 2 的端口从此值起分配，跳转区间的默认长度同此。与 model.rs 的
  * HYSTERIA2_PORT_BASE / DEFAULT_HYSTERIA2_HOP_SPAN 保持一致——两处不一致不会报错，
@@ -2129,11 +2131,7 @@ export function IngressStreamRow({
   const mtprotoNode = streamNodes.data?.nodes.find(node => node.node_id === ingress.node);
   const mtprotoUnavailable = streamNodes.isPending
     ? '正在读取机器公网地址'
-    : !mtprotoNode?.public_ipv4
-      ? '当前机器没有配置公网 IPv4，不能启用 MTProxy'
-      : mtprotoNode.public_ipv4_nat
-        ? '当前机器的公网 IPv4 未直接配置在网卡上，不能启用 MTProxy'
-        : null;
+    : mtprotoNodeEligibility(mtprotoNode).reason;
   const tcpTaken = useMemo(
     () =>
       occupiedPorts(
@@ -5223,6 +5221,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const ingressCertificateName = ingressNode?.certificate_name;
   const ingressCertificateTrack = ingressNode?.certificate_track;
   const [pendingIngressNode, setPendingIngressNode] = useState<string | null>(null);
+  const [moveIngressPlanError, setMoveIngressPlanError] = useState<unknown>(null);
   const [pendingBind, setPendingBind] = useState<string | null>(null);
   const vlessPanel = useImmediatePanelVisibility(!!ingress?.wires.vless);
   const encryptionPanel = useImmediatePanelVisibility(!!ingress?.wires.vless_encryption);
@@ -5237,11 +5236,11 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   // 更换入口即将接入面迁移到另一台机器（链头随之改变，订阅链接也会变化）。
   // 编辑器第 0 位固定为入口，因此该操作只能在接入面区块执行。
   const moveIngress = useMutation({
-    mutationFn: async (toNode: string) => {
+    mutationFn: async ({ toNode, port, wires }: { toNode: string; port: number; wires: Wires }) => {
       const g = (a?.ingresses ?? []).find(x => x.chain === chain);
       if (!g) throw new Error('这条链没有接入面');
       const base = ingressUpsertBody(g);
-      await upsertIngress(app, { ...base, node_id: toNode }, base);
+      await upsertIngress(app, { ...base, node_id: toNode, port, wires }, base);
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
@@ -5310,6 +5309,46 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   // 其规则无法再访问。
   const chainSteps = (a.steps ?? []).filter(s => s.chain === chain);
   const probe = byChain(probes.data?.chains).get(chain);
+  const requestIngressMove = (toNode: string) => {
+    if (!ingress || !toNode || toNode === ingress.node || moveIngress.isPending) return false;
+    setMoveIngressPlanError(null);
+    try {
+      const tcpTaken = occupiedPorts(
+        snapshot.data?.snapshot.apps ?? [],
+        nodes.data?.nodes ?? [],
+        compiled.data?.system,
+        ingress.id,
+        'tcp',
+      );
+      const udpTaken = occupiedPorts(
+        snapshot.data?.snapshot.apps ?? [],
+        nodes.data?.nodes ?? [],
+        compiled.data?.system,
+        ingress.id,
+        'udp',
+      );
+      const plan = planIngressPortMigration(
+        { port: ingress.port, wires: currentWires(ingress) },
+        toNode,
+        tcpTaken,
+        udpTaken,
+      );
+      if (
+        plan.rotations.length > 0 &&
+        !window.confirm(ingressPortMigrationConfirmation(nameOf(toNode), plan.rotations))
+      ) {
+        setPendingIngressNode(null);
+        return false;
+      }
+      setPendingIngressNode(toNode);
+      moveIngress.mutate({ toNode, port: plan.port, wires: plan.wires });
+      return true;
+    } catch (error) {
+      setPendingIngressNode(null);
+      setMoveIngressPlanError(error);
+      return false;
+    }
+  };
 
   return (
     // 线路详情自己拥有唯一一张页面纸，不再依赖工作区额外包一层通用纸。亮色下这张纸
@@ -5373,9 +5412,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                       className="f"
                       value={pendingIngressNode ?? ingress.node}
                       onChange={e => {
-                        if (!e.target.value) return;
-                        setPendingIngressNode(e.target.value);
-                        moveIngress.mutate(e.target.value);
+                        if (!requestIngressMove(e.target.value)) e.currentTarget.value = ingress.node;
                       }}
                     >
                       {(nodes.data?.nodes ?? [])
@@ -5656,7 +5693,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
           )}
         </div>
       </div>
-      {moveIngress.error && <ErrorBox error={moveIngress.error} />}
+      {(moveIngressPlanError || moveIngress.error) && <ErrorBox error={moveIngressPlanError ?? moveIngress.error} />}
 
       {/* 线路与机器详情使用同一种规则卡：标题、摘要和规则树属于同一块，不再用独立的
           `h4.sec` 分节线。卡面尺寸与用户页的「网络拨测」一致。 */}

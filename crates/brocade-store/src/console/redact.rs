@@ -108,14 +108,12 @@ pub(crate) fn redact_private_keys(value: &mut Value) {
             object.retain(|name, _| !name.ends_with("psk"));
             // Hysteria's Salamander password is a symmetric credential. Keep the field so a
             // full-object edit can round-trip the enabled state, but never send its value.
-            if let Some(password) = object.get_mut("password") {
-                *password = Value::String("<redacted>".to_owned());
-            }
-            if let Some(credential) = object.get_mut("credential") {
-                *credential = Value::String("<redacted>".to_owned());
-            }
-            for value in object.values_mut() {
-                redact_private_keys(value);
+            for (name, value) in object.iter_mut() {
+                if is_sensitive_json_key(name) {
+                    *value = Value::String("<redacted>".to_owned());
+                } else {
+                    redact_private_keys(value);
+                }
             }
         }
         Value::Array(items) => {
@@ -125,6 +123,15 @@ pub(crate) fn redact_private_keys(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn is_sensitive_json_key(name: &str) -> bool {
+    matches!(
+        name,
+        "password" | "credential" | "xPaddingKey" | "sessionKey" | "seqKey"
+    ) || name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("cookie")
 }
 
 pub(crate) fn redacted_value<T: Serialize>(value: T) -> Result<Value> {
@@ -325,6 +332,32 @@ mod tests {
         assert_eq!(value["transport"]["obfs"]["password"], "<redacted>");
         assert_eq!(value["transport"]["obfs"]["kind"], "salamander");
         assert!(!value.to_string().contains("HY2-SECRET"));
+    }
+
+    #[test]
+    fn redaction_masks_vless_extensible_option_secrets_but_keeps_their_shape() {
+        let mut value = json!({
+            "final_mask": {
+                "tcp": [{ "type": "salamander", "settings": { "password": "MASK-SECRET" } }]
+            },
+            "extra": {
+                "xPaddingKey": "PADDING-SECRET",
+                "sessionKey": "session-id",
+                "headers": { "Authorization": "Bearer HTTP-SECRET", "Accept": "text/plain" }
+            }
+        });
+
+        redact_private_keys(&mut value);
+
+        assert_eq!(
+            value["final_mask"]["tcp"][0]["settings"]["password"],
+            "<redacted>"
+        );
+        assert_eq!(value["extra"]["xPaddingKey"], "<redacted>");
+        assert_eq!(value["extra"]["sessionKey"], "<redacted>");
+        assert_eq!(value["extra"]["headers"]["Authorization"], "<redacted>");
+        assert_eq!(value["extra"]["headers"]["Accept"], "text/plain");
+        assert!(!value.to_string().contains("SECRET"));
     }
 
     #[test]

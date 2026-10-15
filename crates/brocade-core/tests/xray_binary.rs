@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{engine::general_purpose, Engine as _};
 use brocade_core::{
     artifacts::{
         subscription,
@@ -30,12 +31,13 @@ use brocade_core::{
     model::{
         Accept, Action, AnyTls, AnyTlsMasquerade, AppView, Chain, DestMatch, Dns, DomainStrategy,
         EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
-        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
-        ExternalWarpBinding, HopDial, HopEncryption, HopIn, HopMux, HopPool, HopWire, Hysteria2,
-        HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
-        IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSnapshot, Node,
-        NodeEgressDnsPolicy, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
+        ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessGrpc,
+        ExternalVlessGrpcMode, ExternalVlessHttp, ExternalVlessHttpUpgrade, ExternalVlessKcp,
+        ExternalVlessTransport, ExternalVlessWebsocket, ExternalVlessXhttp,
+        ExternalVlessXhttpDownload, ExternalWarpBinding, HopDial, HopEncryption, HopIn, HopMux,
+        HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade,
+        HysteriaObfs, Ingress, IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSnapshot,
+        Node, NodeEgressDnsPolicy, ProjectionDownloadEndpoint, ProjectionEndpoint, Reality,
         RealityFallbackLimits, RealityFallbackMode, RealitySettings, RealityXhttp, Rule, Step, Tls,
         TlsXhttp, Transport, User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpXmux,
     },
@@ -133,6 +135,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
         return;
     };
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    let mldsa65_verify = general_purpose::URL_SAFE_NO_PAD.encode(vec![0_u8; 1952]);
     doc.external_outbounds = vec![
         ExternalOutbound {
             id: "custom-1111-1111".to_owned(),
@@ -141,12 +144,15 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             address: "vless.example.net".to_owned(),
             port: 443,
             protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
                 credential: "6f9d1a8e-2b3c-4d5e-8f70-1a2b3c4d5e6f".to_owned(),
                 encryption: "none".to_owned(),
                 flow: Some("xtls-rprx-vision".to_owned()),
                 transport: ExternalVlessTransport::Raw,
             },
             security: ExternalOutboundSecurity::Reality {
+                mldsa65_verify: Some(mldsa65_verify),
+                spider_x: Some("/search".to_owned()),
                 server_name: "apps.apple.com".to_owned(),
                 public_key: INGRESS_PUBLIC.to_owned(),
                 short_id: "abcdef0123456789".to_owned(),
@@ -174,10 +180,12 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             address: "upload.example.net".to_owned(),
             port: 443,
             protocol: ExternalOutboundProtocol::Vless {
+                final_mask: Some(json!({})),
                 credential: "2c858c84-b8f4-41aa-9296-968fa3ab05d2".to_owned(),
                 encryption: "none".to_owned(),
                 flow: None,
                 transport: ExternalVlessTransport::Xhttp(ExternalVlessXhttp {
+                    extra: Some(json!({ "noSSEHeader": true })),
                     path: "/external-upload".to_owned(),
                     host: Some("upload-http.example.net".to_owned()),
                     mux: Some(4),
@@ -186,6 +194,10 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                         address: "download.example.net".to_owned(),
                         port: 8443,
                         security: ExternalOutboundSecurity::Tls {
+                            alpn: Vec::new(),
+                            ech_config_list: None,
+                            pinned_peer_cert_sha256: None,
+                            verify_peer_cert_by_name: None,
                             server_name: "download.example.net".to_owned(),
                             fingerprint: "chrome".to_owned(),
                         },
@@ -197,6 +209,8 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 }),
             },
             security: ExternalOutboundSecurity::Reality {
+                mldsa65_verify: None,
+                spider_x: None,
                 server_name: "apps.apple.com".to_owned(),
                 public_key: INGRESS_PUBLIC.to_owned(),
                 short_id: "abcdef0123456789".to_owned(),
@@ -215,6 +229,10 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 credential: String::new(),
             },
             security: ExternalOutboundSecurity::Tls {
+                alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
+                ech_config_list: Some("ech-config-list".to_owned()),
+                pinned_peer_cert_sha256: Some("00".repeat(32)),
+                verify_peer_cert_by_name: Some("cert.example.net".to_owned()),
                 server_name: "http.example.net".to_owned(),
                 fingerprint: "chrome".to_owned(),
             },
@@ -266,6 +284,137 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             security: ExternalOutboundSecurity::None,
             bindings: Vec::new(),
         },
+        ExternalOutbound {
+            id: "custom-8888-8888".to_owned(),
+            tenant: "platform".to_owned(),
+            name: "VLESS WebSocket".to_owned(),
+            address: "ws.example.net".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "11111111-2222-4333-8444-555555555555".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Websocket(ExternalVlessWebsocket {
+                    path: "/socket".to_owned(),
+                    host: Some("ws-host.example.net".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "ws-sni.example.net".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-9999-9999".to_owned(),
+            tenant: "platform".to_owned(),
+            name: "VLESS mKCP".to_owned(),
+            address: "kcp.example.net".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: Some(json!({})),
+                credential: "22222222-3333-4444-8555-666666666666".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Kcp(ExternalVlessKcp {
+                    mtu: Some(1200),
+                    tti: Some(50),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "kcp.example.net".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-aaaa-aaaa".to_owned(),
+            tenant: "platform".to_owned(),
+            name: "VLESS HTTP/2".to_owned(),
+            address: "h2.example.net".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "33333333-4444-4555-8666-777777777777".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Http(ExternalVlessHttp {
+                    path: "/legacy-h2".to_owned(),
+                    host: Some("h2-host.example.net".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "h2.example.net".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-bbbb-bbbb".to_owned(),
+            tenant: "platform".to_owned(),
+            name: "VLESS gRPC".to_owned(),
+            address: "grpc.example.net".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "44444444-5555-4666-8777-888888888888".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::Grpc(ExternalVlessGrpc {
+                    service_name: "Brocade.Edge".to_owned(),
+                    mode: ExternalVlessGrpcMode::Multi,
+                    authority: Some("authority.example.net".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "grpc.example.net".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
+        ExternalOutbound {
+            id: "custom-cccc-cccc".to_owned(),
+            tenant: "platform".to_owned(),
+            name: "VLESS HTTPUpgrade".to_owned(),
+            address: "upgrade.example.net".to_owned(),
+            port: 443,
+            protocol: ExternalOutboundProtocol::Vless {
+                final_mask: None,
+                credential: "55555555-6666-4777-8888-999999999999".to_owned(),
+                encryption: "none".to_owned(),
+                flow: None,
+                transport: ExternalVlessTransport::HttpUpgrade(ExternalVlessHttpUpgrade {
+                    path: "/upgrade".to_owned(),
+                    host: Some("upgrade-host.example.net".to_owned()),
+                }),
+            },
+            security: ExternalOutboundSecurity::Tls {
+                alpn: Vec::new(),
+                ech_config_list: None,
+                pinned_peer_cert_sha256: None,
+                verify_peer_cert_by_name: None,
+                server_name: "upgrade.example.net".to_owned(),
+                fingerprint: "chrome".to_owned(),
+            },
+            bindings: Vec::new(),
+        },
     ];
     app.steps[0].rules = [
         "custom-1111-1111",
@@ -274,6 +423,11 @@ fn external_proxy_protocols_load_in_the_real_binary() {
         "custom-4444-4444",
         "custom-5555-5555",
         "custom-6666-6666",
+        "custom-8888-8888",
+        "custom-9999-9999",
+        "custom-aaaa-aaaa",
+        "custom-bbbb-bbbb",
+        "custom-cccc-cccc",
         "custom-7777-7777",
     ]
     .into_iter()

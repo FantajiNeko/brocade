@@ -39,16 +39,36 @@ const clock = (unixMillis: number) =>
     second: '2-digit',
     hour12: false,
   });
+const STALE_MS = 15_000;
 
 export function VpngateObservationCard({ nodeId }: { nodeId: string }) {
   const realtime = useNodeRealtime(nodeId);
   const report = realtime.last?.event.sample.vpngate;
   if (!report || report.pools.length === 0) return null;
   const stale = !freshVpngateReport(realtime);
+  // The first snapshot may predate this demand-driven subscription. Treat that bounded interval
+  // as synchronization, while an explicit disconnect still surfaces immediately.
+  const warming = stale && realtime.connected && realtime.now - realtime.observingSince <= STALE_MS;
   const healthy = report.pools.filter(pool => pool.state === 'healthy').length;
   const standbys = report.pools.reduce((total, pool) => total + pool.ready_standbys, 0);
   const troubled = report.pools.filter(pool => pool.state !== 'healthy');
   const backends = (outboundId: string) => report.backends.filter(backend => backend.outbound_id === outboundId);
+
+  // 按需观测启动时可能先收到上一帧；同步完成前不展示这份已经失效的池状态。
+  if (warming) {
+    return (
+      <div className="panel ov-card" aria-label="VPN Gate 实时路径">
+        <header>
+          <PanelTitle of="outbound">VPN Gate 实时路径</PanelTitle>
+          <span className="sp" />
+          <span className="hint">5 秒探活 · 最近 32 条切换事件</span>
+        </header>
+        <p className="rt-dx" role="status">
+          正在获取实时状态…
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="panel ov-card" aria-label="VPN Gate 实时路径">
@@ -67,7 +87,7 @@ export function VpngateObservationCard({ nodeId }: { nodeId: string }) {
         <span className="rvh-tail">{stale ? '数据已过期' : '计数自本次 Agent 启动'}</span>
       </p>
 
-      {stale && <p className="rt-dx bad">实时数据超过 15 秒未更新，以下只代表最近一次快照。</p>}
+      {stale && <p className="rt-dx bad">实时数据连接已中断，或数据已超过 15 秒未更新。以下只代表最近一次快照。</p>}
 
       {report.pools.map(pool => (
         <details

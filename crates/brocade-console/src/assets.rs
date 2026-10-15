@@ -138,12 +138,15 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
 
 /// Both the browser title and React's first render use the same saved branding.
 pub(crate) fn branded_index(html: &str, branding: &brocade_store::BrandingSettings) -> String {
-    let title = format!("{} | 跨境网络小管家", branding.site_name)
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;");
+    let title = format!(
+        "{} | Invisible networks. Infallible control.",
+        branding.site_name
+    )
+    .replace('&', "&amp;")
+    .replace('<', "&lt;")
+    .replace('>', "&gt;")
+    .replace('"', "&quot;")
+    .replace('\'', "&#39;");
     let mut html = html.to_owned();
     if let Some(start) = html.find("<title>") {
         if let Some(end) = html[start..].find("</title>") {
@@ -247,7 +250,7 @@ mod tests {
 
     #[test]
     fn saved_site_icon_is_the_initial_favicon() {
-        let html = r#"<html><head><link id="brocade-favicon" rel="icon" href="/favicon.svg" data-default-href="/favicon.svg" /><title>跨境网络小管家</title></head></html>"#;
+        let html = r#"<html><head><link id="brocade-favicon" rel="icon" href="/favicon.svg" data-default-href="/favicon.svg" /><title>Invisible networks. Infallible control.</title></head></html>"#;
         let branding = brocade_store::BrandingSettings {
             site_name: "我的站点".to_owned(),
             icon_data_url: Some("data:image/png;base64,iVBORw0KGgo=".to_owned()),
@@ -262,7 +265,7 @@ mod tests {
 
     #[test]
     fn saved_site_icon_cannot_escape_the_favicon_attribute() {
-        let html = r#"<html><head><link id="brocade-favicon" rel="icon" href="/favicon.svg" /><title>跨境网络小管家</title></head></html>"#;
+        let html = r#"<html><head><link id="brocade-favicon" rel="icon" href="/favicon.svg" /><title>Invisible networks. Infallible control.</title></head></html>"#;
         let branding = brocade_store::BrandingSettings {
             site_name: "我的站点".to_owned(),
             icon_data_url: Some(r#"x" onload="alert(1)&<>'"#.to_owned()),

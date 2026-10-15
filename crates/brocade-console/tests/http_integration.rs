@@ -789,10 +789,13 @@ async fn initial_html_uses_current_branding_without_default_title_flash() {
         let bootstrap: Value = serde_json::from_str(raw).unwrap();
         assert_eq!(bootstrap["site_name"], name);
         if path == "/" {
-            assert!(html.contains("<title>我的站点 | 跨境网络小管家</title>"));
+            assert!(
+                html.contains("<title>我的站点 | Invisible networks. Infallible control.</title>")
+            );
         } else {
-            assert!(html
-                .contains("<title>新站点 &lt;/script&gt;&lt;b&gt;&amp; | 跨境网络小管家</title>"));
+            assert!(html.contains(
+                "<title>新站点 &lt;/script&gt;&lt;b&gt;&amp; | Invisible networks. Infallible control.</title>"
+            ));
         }
     }
 }
@@ -1115,15 +1118,23 @@ async fn realtime_websocket_authenticates_leases_and_forwards_a_sample() {
     assert_eq!(
         start,
         brocade_deployment::protocol::AgentRealtimeCommand::Start {
-            interval_millis: 1000
+            interval_millis: 1000,
+            diagnostics: true,
+            user_traffic: Some(
+                brocade_deployment::protocol::RealtimeUserTrafficSelector::All {
+                    forwarding: Vec::new()
+                }
+            ),
         }
     );
 
     let sample = brocade_deployment::protocol::AgentRealtimeSample {
         diagnostics_unchanged: false,
+        mux_unchanged: false,
         reverse_health: None,
         mux: None,
         vpngate: None,
+        user_traffic: None,
         sequence: 1,
         sampled_at_unix_millis: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1277,7 +1288,13 @@ async fn realtime_settings_and_sse_create_one_bounded_node_lease() {
     assert_eq!(
         *agent.commands.borrow(),
         brocade_deployment::protocol::AgentRealtimeCommand::Start {
-            interval_millis: 2000
+            interval_millis: 2000,
+            diagnostics: true,
+            user_traffic: Some(
+                brocade_deployment::protocol::RealtimeUserTrafficSelector::All {
+                    forwarding: Vec::new()
+                }
+            ),
         }
     );
 
@@ -1311,6 +1328,140 @@ async fn realtime_settings_and_sse_create_one_bounded_node_lease() {
         StatusCode::CONFLICT,
         "retired nodes retain history but may not create new live sampling leases"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn realtime_user_traffic_is_admin_only_and_filters_shared_machine_samples() {
+    use brocade_deployment::protocol::{
+        AgentRealtimeCommand, AgentRealtimeSample, RealtimeUserTrafficSelector,
+    };
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let token = admin_token(&db).await;
+    let service = RealtimeService::new(Default::default());
+    let agent = service.register_agent("n1".to_owned()).await;
+    let app = admin_router_with_services(
+        db.store.clone(),
+        ConsoleServices::new(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            brocade_console::geoip::GeoIpLookup::default(),
+            service.clone(),
+        ),
+    );
+    let path = "/users/platform.acme/alice/realtime/snapshot";
+    let result = get_json_with_token(&app, path, &token).await;
+    assert_eq!(result.0, StatusCode::OK);
+    assert_eq!(result.1["nodes"][0]["node_id"], "n1");
+    assert_eq!(
+        *agent.commands.borrow(),
+        AgentRealtimeCommand::Start {
+            interval_millis: 1000,
+            diagnostics: false,
+            user_traffic: Some(RealtimeUserTrafficSelector::Labels {
+                forwarding: Vec::new(),
+                labels: vec![brocade_core::model::grant_label(
+                    "alice",
+                    "platform.acme",
+                    "ing-b2c3"
+                )],
+            }),
+        }
+    );
+    let _machine = service.subscribe(["n1".to_owned()]).await;
+    let sampled_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let sample: AgentRealtimeSample = serde_json::from_value(json!({
+        "sequence": 1, "sampled_at_unix_millis": sampled_at, "elapsed_millis": 1000,
+        "interface": "eth0", "rx_bytes_per_sec": 50, "tx_bytes_per_sec": 20, "has_gap": false,
+        "user_traffic": { "state": "ready", "all_users": true, "elapsed_millis": 1000, "users": [
+            { "tenant_id": "platform.acme", "user_id": "alice", "ingress_id": "ing-b2c3", "uplink_bytes_per_sec": 10, "downlink_bytes_per_sec": 20 },
+            { "tenant_id": "platform.acme", "user_id": "bob", "ingress_id": "ing-b2c3", "uplink_bytes_per_sec": 30, "downlink_bytes_per_sec": 40 }
+        ] }
+    })).unwrap();
+    service
+        .record_sample("n1", agent.session, sample)
+        .await
+        .unwrap();
+    let result = get_json_with_token(&app, path, &token).await;
+    assert_eq!(result.0, StatusCode::OK);
+    let sample = &result.1["nodes"][0]["samples"][0]["sample"];
+    assert_eq!(sample["user_traffic"]["users"].as_array().unwrap().len(), 1);
+    assert_eq!(sample["user_traffic"]["users"][0]["user_id"], "alice");
+    assert!(sample.get("rx_bytes_per_sec").is_none());
+
+    for role in [
+        brocade_store::AdminRole::Readonly,
+        brocade_store::AdminRole::User,
+        brocade_store::AdminRole::Editor,
+        brocade_store::AdminRole::Publisher,
+    ] {
+        let actor = AdminContext::new("operator", role, Some("platform.acme".to_owned()));
+        assert!(matches!(
+            db.store
+                .user_realtime_targets(&actor, "platform.acme", "alice")
+                .await,
+            Err(brocade_store::StoreError::Forbidden(_))
+        ));
+    }
+    let outside = AdminContext::new(
+        "admin",
+        brocade_store::AdminRole::TenantAdmin,
+        Some("platform.other".to_owned()),
+    );
+    assert!(matches!(
+        db.store
+            .user_realtime_targets(&outside, "platform.acme", "alice")
+            .await,
+        Err(brocade_store::StoreError::Forbidden(_))
+    ));
+    let created = post_json(&app, &token, "/admin/operators", json!({ "id": "live-reader", "display_name": "Reader", "role": "readonly", "tenant_scope": "platform.acme", "password": "fixture-reader-password" })).await;
+    assert_eq!(created.0, StatusCode::CREATED);
+    let issued = post_json(
+        &app,
+        &token,
+        "/admin/operators/live-reader/token",
+        json!({}),
+    )
+    .await;
+    let readonly_token = issued.1["token"].as_str().unwrap();
+    assert_eq!(
+        get_json_with_token(&app, path, readonly_token).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let machine = get_json_with_token(&app, "/realtime/nodes/n1/snapshot", readonly_token).await;
+    assert_eq!(machine.0, StatusCode::OK);
+    assert!(machine.1["nodes"][0]["samples"][0]["sample"]
+        .get("user_traffic")
+        .is_none());
+
+    // The card's one-hour accounting history follows the same administrator-only boundary.
+    for history in [
+        "/users/platform.acme/alice/realtime/history",
+        "/realtime/nodes/n1/user-history",
+    ] {
+        let allowed = get_json_with_token(&app, history, &token).await;
+        assert_eq!(allowed.0, StatusCode::OK, "{history}");
+        assert_eq!(
+            allowed.1["range_end_unix_secs"].as_i64().unwrap()
+                - allowed.1["range_start_unix_secs"].as_i64().unwrap(),
+            3_600,
+            "{history}"
+        );
+        assert_eq!(allowed.1["nodes"][0]["node_id"], "n1", "{history}");
+        assert_eq!(
+            get_json_with_token(&app, history, readonly_token).await.0,
+            StatusCode::FORBIDDEN,
+            "{history}"
+        );
+    }
 }
 
 /// One listener carries both faces, which is what a deployment gets unless it asks for the split.
@@ -4757,6 +4908,134 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
         "platform.acme/alice"
     );
     login_cookie(&app, "platform.acme/alice", "user-chosen-password").await;
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_forwarding_grants_nodes_to_admins_and_rules_to_the_exact_user() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, admin_token) = admin_app(&db).await;
+
+    let granted = put_json(
+        &app,
+        &admin_token,
+        "/users/platform.acme/alice/forwarding-nodes/n1",
+        json!({
+            "enabled": true,
+            "tcp_allowed": true,
+            "udp_allowed": false,
+            "listen_port_start": 20000,
+            "listen_port_end": 20100,
+            "max_rules": 4,
+            "allow_private_targets": false
+        }),
+    )
+    .await;
+    assert_eq!(granted.0, StatusCode::OK, "{}", granted.1);
+
+    let issued = post_json(
+        &app,
+        &admin_token,
+        "/users/platform.acme/alice/login",
+        json!({}),
+    )
+    .await;
+    let cookie = login_cookie(&app, "alice", issued.1["password"].as_str().unwrap()).await;
+    let own = get_json_with_cookie(&app, "/users/platform.acme/alice/forwarding", &cookie).await;
+    assert_eq!(own.0, StatusCode::OK, "{}", own.1);
+    assert_eq!(own.1["entitlements"][0]["public_ipv4"], "n1.example.net");
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/users/platform.acme/alice/forwarding")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "node_id": "n1",
+                        "name": "Web",
+                        "protocol": "tcp",
+                        "listen_port": 20042,
+                        "target_host": "1.1.1.1",
+                        "target_port": 443,
+                        "enabled": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(response_json(created).await["rules"][0]["name"], "Web");
+
+    let another = get_json_with_cookie(&app, "/users/platform.acme/bob/forwarding", &cookie).await;
+    assert_eq!(another.0, StatusCode::FORBIDDEN);
+    let grant_attempt = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/users/platform.acme/alice/forwarding-nodes/n1")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "enabled": false }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant_attempt.status(), StatusCode::FORBIDDEN);
+
+    let remove_attempt = app
+        .clone()
+        .oneshot(
+            Request::delete("/users/platform.acme/alice/forwarding-nodes/n1")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(remove_attempt.status(), StatusCode::FORBIDDEN);
+
+    let revoked = put_json(
+        &app,
+        &admin_token,
+        "/users/platform.acme/alice/forwarding-nodes/n1",
+        json!({
+            "enabled": false,
+            "tcp_allowed": true,
+            "udp_allowed": false,
+            "listen_port_start": 20000,
+            "listen_port_end": 20100,
+            "max_rules": 4,
+            "allow_private_targets": false
+        }),
+    )
+    .await;
+    assert_eq!(revoked.0, StatusCode::OK, "{}", revoked.1);
+
+    let removed = app
+        .clone()
+        .oneshot(
+            Request::delete("/users/platform.acme/alice/forwarding-nodes/n1")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::OK);
+    let removed = response_json(removed).await;
+    assert_eq!(removed["entitlements"], json!([]));
+    assert_eq!(removed["rules"], json!([]));
 }
 
 #[tokio::test]

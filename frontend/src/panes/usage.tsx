@@ -1,6 +1,4 @@
-// 用量按自然月展示。月份选择只切换整张视图，不把两个月叠在一起比较；读数栏与每日柱形
-// 来自同一个月汇总端点。整页是一张卡：左侧读数栏回答“这个月用了多少”，右侧柱形图回答
-// “每天怎样组成”。
+// 用量页只回答“这个月用了多少”。机器容量预测是独立的管理员工作面，不在这里复用页签。
 
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
@@ -55,6 +53,14 @@ function controlPlaneToday(now: Date): string {
 }
 
 export function UsagePane() {
+  return (
+    <div className="cardpage usage-page">
+      <MonthlyUsagePanel />
+    </div>
+  );
+}
+
+function MonthlyUsagePanel() {
   const [monthOffset, setMonthOffset] = useState<0 | -1>(0);
   const monthly = useQuery({
     queryKey: monthOffset === 0 ? ['usage-monthly'] : ['usage-monthly', monthOffset],
@@ -67,32 +73,30 @@ export function UsagePane() {
   if (monthly.isPending) return <Loading variant="usage" />;
 
   return (
-    <div className="cardpage usage-page">
-      <section
-        className="panel titled usage-summary-panel"
-        data-page-title="true"
-        aria-busy={monthly.isFetching || undefined}
-      >
-        <header>
-          <ListIcon of="usage" />
-          <h4>用量</h4>
-          <span className="sp" />
-          {monthly.isFetching && !monthly.isPending && <span className="usage-refreshing">读取中</span>}
-          <div className="segsw usage-month-tabs" role="group" aria-label="用量月份">
-            <button type="button" aria-pressed={monthOffset === 0} onClick={() => setMonthOffset(0)}>
-              本月
-            </button>
-            <button type="button" aria-pressed={monthOffset === -1} onClick={() => setMonthOffset(-1)}>
-              上月
-            </button>
-          </div>
-        </header>
+    <section
+      className="panel titled usage-summary-panel"
+      data-page-title="true"
+      aria-busy={monthly.isFetching || undefined}
+    >
+      <header>
+        <ListIcon of="usage" />
+        <h4>用量</h4>
+        <span className="sp" />
+        {monthly.isFetching && !monthly.isPending && <span className="usage-refreshing">读取中</span>}
+        <div className="segsw usage-month-tabs" role="group" aria-label="用量月份">
+          <button type="button" aria-pressed={monthOffset === 0} onClick={() => setMonthOffset(0)}>
+            本月
+          </button>
+          <button type="button" aria-pressed={monthOffset === -1} onClick={() => setMonthOffset(-1)}>
+            上月
+          </button>
+        </div>
+      </header>
 
-        {/* A failed refresh keeps the month already on screen; the error explains why it may be stale. */}
-        {monthly.error && <ErrorBox error={monthly.error} />}
-        {monthly.data && <UsageMonth summary={monthly.data} />}
-      </section>
-    </div>
+      {/* A failed refresh keeps the month already on screen; the error explains why it may be stale. */}
+      {monthly.error && <ErrorBox error={monthly.error} />}
+      {monthly.data && <UsageMonth summary={monthly.data} />}
+    </section>
   );
 }
 
@@ -118,10 +122,14 @@ function UsageLedger({
   onSelectDay: (day: string) => void;
 }) {
   const views = summary.views;
-  const uplink = views.reduce((sum, row) => sum + row.uplink_bytes, 0);
-  const downlink = views.reduce((sum, row) => sum + row.downlink_bytes, 0);
+  const forwarding = summary.forwarding ?? [];
+  const all = [...views, ...forwarding];
+  const accessBytes = views.reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0);
+  const forwardingBytes = forwarding.reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0);
+  const uplink = all.reduce((sum, row) => sum + row.uplink_bytes, 0);
+  const downlink = all.reduce((sum, row) => sum + row.downlink_bytes, 0);
   const total = uplink + downlink;
-  const people = new Set(views.map(row => `${row.tenant_id}/${row.user_id}`)).size;
+  const people = new Set(all.map(row => `${row.tenant_id}/${row.user_id}`)).size;
   const apps = new Set(views.map(row => row.app_id)).size;
   // Today is still accumulating, so the average covers only days that have ended. An older control
   // plane without daily rows cannot answer either daily reading.
@@ -178,6 +186,14 @@ function UsageLedger({
         </dl>
       </div>
       <dl className="usage-facts">
+        <div>
+          <dt>接入</dt>
+          <dd>{bytes(accessBytes)}</dd>
+        </div>
+        <div>
+          <dt>转发</dt>
+          <dd>{bytes(forwardingBytes)}</dd>
+        </div>
         <div>
           <dt>日均</dt>
           <dd title={closedDays.length > 0 ? `按 ${closedDays.length} 个完整日计算` : undefined}>

@@ -13,8 +13,10 @@ use std::{
 
 use brocade_core::model::VPNGATE_MAX_CANDIDATES;
 use brocade_deployment::protocol::{
-    AgentRealtimeCommand, AgentRealtimeSample, RealtimeNodeSnapshot, RealtimeSampleEvent,
-    RealtimeTelemetryPolicy, VpngateBackendRole,
+    AgentRealtimeCommand, AgentRealtimeSample, RealtimeForwardingTarget, RealtimeNodeSnapshot,
+    RealtimeSampleEvent, RealtimeTelemetryPolicy, RealtimeUserTrafficSelector,
+    RealtimeUserTrafficState, VpngateBackendRole, MAX_REALTIME_FORWARDING_TARGETS,
+    MAX_REALTIME_USER_TRAFFIC_ROWS,
 };
 use serde::Serialize;
 use tokio::sync::{broadcast, watch, Mutex};
@@ -76,12 +78,76 @@ struct AgentConnection {
     commands: watch::Sender<AgentRealtimeCommand>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct WatchDemand {
+    total: usize,
+    diagnostics: usize,
+    user_all: usize,
+    user_labels: HashMap<String, usize>,
+    forwarding: HashMap<RealtimeForwardingTarget, usize>,
+}
+
+impl WatchDemand {
+    fn is_watched(&self) -> bool {
+        self.total > 0
+    }
+
+    fn wants_diagnostics(&self) -> bool {
+        self.diagnostics > 0
+    }
+
+    fn user_traffic(&self) -> Option<RealtimeUserTrafficSelector> {
+        let mut forwarding = self
+            .forwarding
+            .iter()
+            .filter_map(|(target, count)| (*count > 0).then_some(target.clone()))
+            .collect::<Vec<_>>();
+        forwarding.sort();
+        forwarding.truncate(MAX_REALTIME_FORWARDING_TARGETS);
+        if self.user_all > 0 {
+            return Some(RealtimeUserTrafficSelector::All { forwarding });
+        }
+        let mut labels = self
+            .user_labels
+            .iter()
+            .filter_map(|(label, count)| (*count > 0).then_some(label.clone()))
+            .collect::<Vec<_>>();
+        if labels.is_empty() && forwarding.is_empty() {
+            return None;
+        }
+        labels.sort();
+        if labels.len() > MAX_REALTIME_USER_TRAFFIC_ROWS
+            || labels.iter().map(|label| label.len() + 4).sum::<usize>()
+                + forwarding
+                    .iter()
+                    .map(|target| target.tenant_id.len() + target.user_id.len() + 80)
+                    .sum::<usize>()
+                > 256 * 1024
+        {
+            // This can require many simultaneous user-detail tabs. Sampling all active users is
+            // bounded on the Agent and preserves useful live data without growing a command past
+            // the realtime frame limit.
+            Some(RealtimeUserTrafficSelector::All { forwarding })
+        } else {
+            Some(RealtimeUserTrafficSelector::Labels { labels, forwarding })
+        }
+    }
+}
+
+fn start_command(policy: RealtimeTelemetryPolicy, demand: &WatchDemand) -> AgentRealtimeCommand {
+    AgentRealtimeCommand::Start {
+        interval_millis: policy.interval_secs * 1000,
+        diagnostics: demand.wants_diagnostics(),
+        user_traffic: demand.user_traffic(),
+    }
+}
+
 #[derive(Debug)]
 struct Inner {
     policy: RealtimeTelemetryPolicy,
     next_session: u64,
     agents: HashMap<String, AgentConnection>,
-    watchers: HashMap<String, usize>,
+    watchers: HashMap<String, WatchDemand>,
     /// Incremented whenever the watch state changes. A grace-period task may stop a node only if
     /// its captured generation is still current.
     stop_generation: HashMap<String, u64>,
@@ -111,6 +177,10 @@ pub struct RealtimeSubscription {
 struct WatchLease {
     service: RealtimeService,
     nodes: Vec<String>,
+    diagnostics: bool,
+    user_all: bool,
+    user_labels: HashMap<String, Vec<String>>,
+    forwarding: HashMap<String, Vec<RealtimeForwardingTarget>>,
 }
 
 impl Drop for WatchLease {
@@ -120,7 +190,15 @@ impl Drop for WatchLease {
         // HTTP streams always live on a Tokio runtime. If shutdown has already torn it down there
         // is no Agent connection left to stop, so failing to obtain a handle is harmless.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { service.release(nodes).await });
+            let diagnostics = self.diagnostics;
+            let user_all = self.user_all;
+            let user_labels = std::mem::take(&mut self.user_labels);
+            let forwarding = std::mem::take(&mut self.forwarding);
+            runtime.spawn(async move {
+                service
+                    .release(nodes, diagnostics, user_all, user_labels, forwarding)
+                    .await
+            });
         }
     }
 }
@@ -151,11 +229,10 @@ impl RealtimeService {
         inner.policy = policy;
         let watched = inner.watchers.clone();
         for (node_id, agent) in &mut inner.agents {
-            let wanted = policy.enabled && watched.get(node_id).copied().unwrap_or(0) > 0;
+            let demand = watched.get(node_id).cloned().unwrap_or_default();
+            let wanted = policy.enabled && demand.is_watched();
             let command = if wanted {
-                AgentRealtimeCommand::Start {
-                    interval_millis: policy.interval_secs * 1000,
-                }
+                start_command(policy, &demand)
             } else {
                 AgentRealtimeCommand::Stop
             };
@@ -171,12 +248,10 @@ impl RealtimeService {
         let mut inner = self.inner.lock().await;
         inner.next_session = inner.next_session.wrapping_add(1).max(1);
         let session = inner.next_session;
-        let watched = inner.watchers.get(&node_id).copied().unwrap_or(0) > 0;
-        let active = inner.policy.enabled && watched;
+        let demand = inner.watchers.get(&node_id).cloned().unwrap_or_default();
+        let active = inner.policy.enabled && demand.is_watched();
         let initial = if active {
-            AgentRealtimeCommand::Start {
-                interval_millis: inner.policy.interval_secs * 1000,
-            }
+            start_command(inner.policy, &demand)
         } else {
             AgentRealtimeCommand::Stop
         };
@@ -229,6 +304,19 @@ impl RealtimeService {
         validate_sample(&sample).map_err(RecordSampleError::Invalid)?;
         let received_at_unix_millis = unix_millis();
         let mut inner = self.inner.lock().await;
+        if inner
+            .watchers
+            .get(node_id)
+            .is_some_and(|demand| demand.forwarding.len() > MAX_REALTIME_FORWARDING_TARGETS)
+        {
+            if let Some(report) = sample
+                .user_traffic
+                .as_mut()
+                .filter(|report| report.state == RealtimeUserTrafficState::Ready)
+            {
+                report.truncated = true;
+            }
+        }
         let agent = inner
             .agents
             .get_mut(node_id)
@@ -269,19 +357,34 @@ impl RealtimeService {
         // Keep bulky worker state only on the newest ring entry; NIC history stays small. Move
         // the previous snapshot forward for an Agent delta instead of cloning it every second.
         if let Some(previous) = ring.back_mut() {
+            // Rates are complete per-frame and only the latest one is rendered. Keeping every
+            // user's rows in the NIC history would multiply a large report by 120 seconds.
+            previous.sample.user_traffic = None;
             if stored_event.sample.diagnostics_unchanged {
                 stored_event.sample.reverse_health = previous.sample.reverse_health.take();
                 stored_event.sample.mux = previous.sample.mux.take();
                 stored_event.sample.vpngate = previous.sample.vpngate.take();
             } else {
                 previous.sample.reverse_health = None;
-                previous.sample.mux = None;
                 previous.sample.vpngate = None;
+                if stored_event.sample.mux_unchanged {
+                    stored_event.sample.mux = previous.sample.mux.take().map(|mut report| {
+                        // The Agent has freshly confirmed that the normalized Mux state is
+                        // unchanged. Materialize that confirmation in the self-contained ring
+                        // snapshot so a newly opened browser does not inherit the old baseline's
+                        // age and immediately call a healthy idle pool stale.
+                        report.sampled_at_unix_ms = stored_event.sample.sampled_at_unix_millis;
+                        report
+                    });
+                } else {
+                    previous.sample.mux = None;
+                }
             }
         }
         // A snapshot is authoritative, never a delta. If the first event after reconnect was an
         // invalid delta there is no previous state to preserve, so it correctly becomes empty.
         stored_event.sample.diagnostics_unchanged = false;
+        stored_event.sample.mux_unchanged = false;
         ring.push_back(stored_event);
         trim_ring(ring, oldest);
         let _ = self
@@ -291,6 +394,83 @@ impl RealtimeService {
     }
 
     pub async fn subscribe(&self, nodes: impl IntoIterator<Item = String>) -> RealtimeSubscription {
+        self.subscribe_with_demand(nodes, true, true, HashMap::new(), HashMap::new())
+            .await
+    }
+
+    pub async fn subscribe_with_forwarding(
+        &self,
+        node_id: String,
+        forwarding: Vec<RealtimeForwardingTarget>,
+    ) -> RealtimeSubscription {
+        self.subscribe_with_demand(
+            [node_id.clone()],
+            true,
+            true,
+            HashMap::new(),
+            HashMap::from([(node_id, forwarding)]),
+        )
+        .await
+    }
+
+    pub async fn subscribe_diagnostics(
+        &self,
+        nodes: impl IntoIterator<Item = String>,
+    ) -> RealtimeSubscription {
+        self.subscribe_with_demand(nodes, true, false, HashMap::new(), HashMap::new())
+            .await
+    }
+
+    /// Fleet totals consume only NIC rates. Keeping this a distinct lease prevents a global
+    /// header from turning machine-only worker snapshots into permanent fleet-wide traffic.
+    pub async fn subscribe_nic(
+        &self,
+        nodes: impl IntoIterator<Item = String>,
+    ) -> RealtimeSubscription {
+        self.subscribe_with_demand(nodes, false, false, HashMap::new(), HashMap::new())
+            .await
+    }
+
+    /// Subscribe to exact compiled grant labels across several machines. Diagnostics stay off and
+    /// the browser response is filtered again by the HTTP layer, so concurrent user pages share
+    /// one Agent sample without learning one another's identities.
+    pub async fn subscribe_user_traffic(
+        &self,
+        labels_by_node: HashMap<String, Vec<String>>,
+    ) -> RealtimeSubscription {
+        let nodes = labels_by_node.keys().cloned().collect::<Vec<_>>();
+        self.subscribe_with_demand(nodes, false, false, labels_by_node, HashMap::new())
+            .await
+    }
+
+    pub async fn subscribe_user_targets(
+        &self,
+        targets: Vec<brocade_store::UserRealtimeTarget>,
+    ) -> RealtimeSubscription {
+        let nodes = targets
+            .iter()
+            .map(|t| t.node_id.clone())
+            .collect::<Vec<_>>();
+        let labels = targets
+            .iter()
+            .map(|t| (t.node_id.clone(), t.labels.clone()))
+            .collect();
+        let forwarding = targets
+            .into_iter()
+            .map(|t| (t.node_id, t.forwarding))
+            .collect();
+        self.subscribe_with_demand(nodes, false, false, labels, forwarding)
+            .await
+    }
+
+    async fn subscribe_with_demand(
+        &self,
+        nodes: impl IntoIterator<Item = String>,
+        diagnostics: bool,
+        user_all: bool,
+        user_labels: HashMap<String, Vec<String>>,
+        forwarding: HashMap<String, Vec<RealtimeForwardingTarget>>,
+    ) -> RealtimeSubscription {
         let visible_nodes = nodes
             .into_iter()
             .filter(|node| !node.is_empty())
@@ -304,17 +484,36 @@ impl RealtimeService {
         let mut inner = self.inner.lock().await;
         let policy = inner.policy;
         for node_id in &ordered {
-            let count = inner.watchers.entry(node_id.clone()).or_default();
-            let was_zero = *count == 0;
-            *count = count.saturating_add(1);
+            let demand = inner.watchers.entry(node_id.clone()).or_default();
+            let was_watched = demand.is_watched();
+            let previous_command = start_command(policy, demand);
+            demand.total = demand.total.saturating_add(1);
+            if diagnostics {
+                demand.diagnostics = demand.diagnostics.saturating_add(1);
+            }
+            if user_all {
+                demand.user_all = demand.user_all.saturating_add(1);
+            }
+            if let Some(labels) = user_labels.get(node_id) {
+                for label in labels {
+                    let count = demand.user_labels.entry(label.clone()).or_default();
+                    *count = count.saturating_add(1);
+                }
+            }
+            if let Some(targets) = forwarding.get(node_id) {
+                for target in targets {
+                    *demand.forwarding.entry(target.clone()).or_default() += 1;
+                }
+            }
+            let next_command = start_command(policy, demand);
             *inner.stop_generation.entry(node_id.clone()).or_default() += 1;
-            if was_zero && policy.enabled {
+            if policy.enabled && (!was_watched || previous_command != next_command) {
                 if let Some(agent) = inner.agents.get_mut(node_id) {
-                    agent.commands.send_replace(AgentRealtimeCommand::Start {
-                        interval_millis: policy.interval_secs * 1000,
-                    });
+                    agent.commands.send_replace(next_command);
                     agent.active = true;
-                    send_status(&self.events, node_id, agent, policy.interval_secs);
+                    if !was_watched {
+                        send_status(&self.events, node_id, agent, policy.interval_secs);
+                    }
                 }
             }
         }
@@ -339,6 +538,10 @@ impl RealtimeService {
             _lease: WatchLease {
                 service: self.clone(),
                 nodes: ordered,
+                diagnostics,
+                user_all,
+                user_labels,
+                forwarding,
             },
         }
     }
@@ -388,14 +591,62 @@ impl RealtimeService {
         selections
     }
 
-    async fn release(&self, nodes: Vec<String>) {
+    async fn release(
+        &self,
+        nodes: Vec<String>,
+        diagnostics: bool,
+        user_all: bool,
+        user_labels: HashMap<String, Vec<String>>,
+        forwarding: HashMap<String, Vec<RealtimeForwardingTarget>>,
+    ) {
         let mut scheduled = Vec::new();
         {
             let mut inner = self.inner.lock().await;
+            let policy = inner.policy;
             for node_id in nodes {
-                let count = inner.watchers.entry(node_id.clone()).or_default();
-                *count = count.saturating_sub(1);
-                if *count == 0 {
+                let demand = inner.watchers.entry(node_id.clone()).or_default();
+                let previous_command = start_command(policy, demand);
+                demand.total = demand.total.saturating_sub(1);
+                if diagnostics {
+                    demand.diagnostics = demand.diagnostics.saturating_sub(1);
+                }
+                if user_all {
+                    demand.user_all = demand.user_all.saturating_sub(1);
+                }
+                if let Some(labels) = user_labels.get(&node_id) {
+                    for label in labels {
+                        let remove = demand.user_labels.get_mut(label).is_some_and(|count| {
+                            *count = count.saturating_sub(1);
+                            *count == 0
+                        });
+                        if remove {
+                            demand.user_labels.remove(label);
+                        }
+                    }
+                }
+                if let Some(targets) = forwarding.get(&node_id) {
+                    for target in targets {
+                        let remove = demand.forwarding.get_mut(target).is_some_and(|count| {
+                            *count = count.saturating_sub(1);
+                            *count == 0
+                        });
+                        if remove {
+                            demand.forwarding.remove(target);
+                        }
+                    }
+                }
+                let next_command = start_command(policy, demand);
+                let is_watched = demand.is_watched();
+                if policy.enabled
+                    && previous_command != next_command
+                    && is_watched
+                    && inner.agents.get(&node_id).is_some_and(|agent| agent.active)
+                {
+                    if let Some(agent) = inner.agents.get_mut(&node_id) {
+                        agent.commands.send_replace(next_command);
+                    }
+                }
+                if !is_watched {
                     let generation = inner.stop_generation.entry(node_id.clone()).or_default();
                     *generation += 1;
                     scheduled.push((node_id, *generation));
@@ -420,13 +671,19 @@ impl RealtimeService {
             .await
             .watchers
             .get(node_id)
-            .copied()
-            .unwrap_or(0)
+            .cloned()
+            .unwrap_or_default()
+            .total
     }
 
     async fn stop_if_still_idle(&self, node_id: String, generation: u64) {
         let mut inner = self.inner.lock().await;
-        if inner.watchers.get(&node_id).copied().unwrap_or(0) != 0
+        if inner
+            .watchers
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default()
+            .is_watched()
             || inner.stop_generation.get(&node_id).copied() != Some(generation)
         {
             return;
@@ -481,9 +738,15 @@ fn send_status(
 
 fn validate_sample(sample: &AgentRealtimeSample) -> Result<(), &'static str> {
     if sample.diagnostics_unchanged
-        && (sample.reverse_health.is_some() || sample.mux.is_some() || sample.vpngate.is_some())
+        && (sample.mux_unchanged
+            || sample.reverse_health.is_some()
+            || sample.mux.is_some()
+            || sample.vpngate.is_some())
     {
         return Err("unchanged diagnostics sample carries a report");
+    }
+    if sample.mux_unchanged && sample.mux.is_some() {
+        return Err("unchanged mux sample carries a report");
     }
     let interface_chars = sample.interface.chars().count();
     if interface_chars == 0 || interface_chars > MAX_INTERFACE_CHARS {
@@ -504,6 +767,47 @@ fn validate_sample(sample: &AgentRealtimeSample) -> Result<(), &'static str> {
         || sample.sampled_at_unix_millis > now.saturating_add(MAX_FUTURE_CLOCK_SKEW_MILLIS)
     {
         return Err("sample timestamp is invalid");
+    }
+    if let Some(report) = sample.user_traffic.as_ref() {
+        if report.users.len() > MAX_REALTIME_USER_TRAFFIC_ROWS {
+            return Err("user traffic report exceeds its row bound");
+        }
+        match report.state {
+            RealtimeUserTrafficState::Ready => {
+                if !report.elapsed_millis.is_some_and(|elapsed| {
+                    (MIN_ELAPSED_MILLIS..=MAX_ELAPSED_MILLIS).contains(&elapsed)
+                }) {
+                    return Err("ready user traffic report has an invalid interval");
+                }
+            }
+            RealtimeUserTrafficState::Warming | RealtimeUserTrafficState::Unavailable => {
+                if report.elapsed_millis.is_some()
+                    || !report.users.is_empty()
+                    || report.truncated
+                    || report.has_gap
+                {
+                    return Err("inactive user traffic report carries rate data");
+                }
+            }
+        }
+        let mut identities = HashSet::new();
+        for user in &report.users {
+            if user.tenant_id.is_empty()
+                || user.user_id.is_empty()
+                || !matches!((&user.ingress_id,user.forwarding_rule_id), (Some(id),None) if !id.is_empty() && id.len()<=64)
+                    && !matches!((&user.ingress_id,user.forwarding_rule_id), (None,Some(id)) if id>0 && report.forwarding_supported)
+                || user.tenant_id.len() > 128
+                || user.user_id.len() > 64
+                || !identities.insert((
+                    &user.tenant_id,
+                    &user.user_id,
+                    &user.ingress_id,
+                    user.forwarding_rule_id,
+                ))
+            {
+                return Err("user traffic report contains an invalid identity");
+            }
+        }
     }
     if let Some(vpngate) = sample.vpngate.as_ref() {
         if vpngate.boot_id.is_empty()
@@ -540,7 +844,7 @@ mod tests {
     use super::*;
 
     fn current(commands: &mut watch::Receiver<AgentRealtimeCommand>) -> AgentRealtimeCommand {
-        *commands.borrow_and_update()
+        commands.borrow_and_update().clone()
     }
 
     async fn next(commands: &mut watch::Receiver<AgentRealtimeCommand>) -> AgentRealtimeCommand {
@@ -551,6 +855,7 @@ mod tests {
     fn sample(sequence: u64) -> AgentRealtimeSample {
         AgentRealtimeSample {
             diagnostics_unchanged: false,
+            mux_unchanged: false,
             sequence,
             sampled_at_unix_millis: unix_millis(),
             elapsed_millis: 1000,
@@ -560,6 +865,7 @@ mod tests {
             reverse_health: None,
             mux: None,
             vpngate: None,
+            user_traffic: None,
             has_gap: false,
         }
     }
@@ -644,10 +950,59 @@ mod tests {
         assert_eq!(
             next(&mut agent.commands).await,
             AgentRealtimeCommand::Start {
-                interval_millis: 1000
+                interval_millis: 1000,
+                diagnostics: true,
+                user_traffic: Some(RealtimeUserTrafficSelector::All {
+                    forwarding: Vec::new()
+                }),
             }
         );
         drop(subscription);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(next(&mut agent.commands).await, AgentRealtimeCommand::Stop);
+    }
+
+    #[tokio::test]
+    async fn fleet_and_node_leases_request_only_the_diagnostics_they_consume() {
+        let service = RealtimeService::with_stop_grace(
+            RealtimeTelemetryPolicy::default(),
+            Duration::from_millis(1),
+        );
+        let mut agent = service.register_agent("n1".to_owned()).await;
+        assert_eq!(current(&mut agent.commands), AgentRealtimeCommand::Stop);
+
+        let fleet = service.subscribe_nic(["n1".to_owned()]).await;
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: None,
+            }
+        );
+
+        let node = service.subscribe(["n1".to_owned()]).await;
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: true,
+                user_traffic: Some(RealtimeUserTrafficSelector::All {
+                    forwarding: Vec::new()
+                }),
+            }
+        );
+
+        drop(node);
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: None,
+            }
+        );
+        drop(fleet);
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(next(&mut agent.commands).await, AgentRealtimeCommand::Stop);
     }
@@ -669,6 +1024,141 @@ mod tests {
         service.unregister_agent("n1", old.session).await;
         let snapshot = service.subscribe(["n1".to_owned()]).await;
         assert!(snapshot.snapshots[0].connected);
+    }
+
+    #[tokio::test]
+    async fn user_label_demand_unions_and_returns_to_exact_scope_after_machine_view_closes() {
+        let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
+        let mut agent = service.register_agent("n1".to_owned()).await;
+        let labels = |label: &str| HashMap::from([("n1".to_owned(), vec![label.to_owned()])]);
+        let first = service.subscribe_user_traffic(labels("a")).await;
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: Some(RealtimeUserTrafficSelector::Labels {
+                    forwarding: Vec::new(),
+                    labels: vec!["a".to_owned()]
+                }),
+            }
+        );
+        let second = service.subscribe_user_traffic(labels("b")).await;
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: Some(RealtimeUserTrafficSelector::Labels {
+                    forwarding: Vec::new(),
+                    labels: vec!["a".to_owned(), "b".to_owned()]
+                }),
+            }
+        );
+        let machine = service.subscribe(["n1".to_owned()]).await;
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: true,
+                user_traffic: Some(RealtimeUserTrafficSelector::All {
+                    forwarding: Vec::new()
+                }),
+            }
+        );
+        drop(machine);
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: Some(RealtimeUserTrafficSelector::Labels {
+                    forwarding: Vec::new(),
+                    labels: vec!["a".to_owned(), "b".to_owned()]
+                }),
+            }
+        );
+        drop(second);
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: Some(RealtimeUserTrafficSelector::Labels {
+                    forwarding: Vec::new(),
+                    labels: vec!["a".to_owned()]
+                }),
+            }
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn forwarding_demand_is_refcounted_and_bounds_are_explicit() {
+        let service = RealtimeService::new(Default::default());
+        let mut agent = service.register_agent("n1".to_owned()).await;
+        let target = RealtimeForwardingTarget {
+            rule_id: 7,
+            tenant_id: "platform".to_owned(),
+            user_id: "alice".to_owned(),
+        };
+        let targets = vec![brocade_store::UserRealtimeTarget {
+            node_id: "n1".to_owned(),
+            labels: vec![],
+            forwarding: vec![target.clone()],
+        }];
+        let first = service.subscribe_user_targets(targets.clone()).await;
+        let command = next(&mut agent.commands).await;
+        assert!(
+            matches!(command,AgentRealtimeCommand::Start { user_traffic:Some(RealtimeUserTrafficSelector::Labels { labels,forwarding }),.. } if labels.is_empty() && forwarding==vec![target.clone()])
+        );
+        let second = service.subscribe_user_targets(targets).await;
+        drop(first);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(service.watcher_count("n1").await, 1);
+        assert_eq!(
+            service.inner.lock().await.watchers["n1"].forwarding[&target],
+            1
+        );
+        drop(second);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(service.inner.lock().await.watchers["n1"]
+            .forwarding
+            .is_empty());
+        let many = (1..=MAX_REALTIME_FORWARDING_TARGETS + 1)
+            .map(|rule_id| RealtimeForwardingTarget {
+                rule_id: rule_id as i64,
+                tenant_id: "t".repeat(128),
+                user_id: "u".repeat(64),
+            })
+            .collect::<Vec<_>>();
+        let _lease = service
+            .subscribe_with_forwarding("n1".to_owned(), many)
+            .await;
+        let command = next(&mut agent.commands).await;
+        assert!(serde_json::to_vec(&command).unwrap().len() < 512 * 1024);
+        assert!(
+            matches!(command,AgentRealtimeCommand::Start { user_traffic:Some(RealtimeUserTrafficSelector::All { forwarding }),.. } if forwarding.len()==MAX_REALTIME_FORWARDING_TARGETS)
+        );
+        let mut sample = sample(1);
+        sample.user_traffic=Some(serde_json::from_value(serde_json::json!({"state":"ready","all_users":true,"elapsed_millis":1000,"users":[],"forwarding_supported":true})).unwrap());
+        service
+            .record_sample("n1", agent.session, sample)
+            .await
+            .unwrap();
+        let snapshot = service.subscribe(["n1".to_owned()]).await;
+        assert!(
+            snapshot.snapshots[0].samples[0]
+                .sample
+                .user_traffic
+                .as_ref()
+                .unwrap()
+                .truncated
+        );
     }
 
     #[tokio::test]
@@ -739,6 +1229,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mux_only_delta_keeps_the_latest_complete_ring_baseline() {
+        let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
+        let mut subscription = service.subscribe(["n1".to_owned()]).await;
+        let agent = service.register_agent("n1".to_owned()).await;
+        let mut first = sample(1);
+        first.mux = Some(brocade_deployment::protocol::MuxReport {
+            boot_id: "boot".to_owned(),
+            sequence: 1,
+            sampled_at_unix_ms: unix_millis(),
+            pools: Vec::new(),
+            workers: Vec::new(),
+            events: Vec::new(),
+        });
+        service
+            .record_sample("n1", agent.session, first)
+            .await
+            .unwrap();
+
+        let mut second = sample(2);
+        second.mux_unchanged = true;
+        let confirmed_at = second.sampled_at_unix_millis;
+        service
+            .record_sample("n1", agent.session, second)
+            .await
+            .unwrap();
+        let delta = loop {
+            if let RealtimeBroadcast::Sample(event) = subscription.events.recv().await.unwrap() {
+                if event.sample.sequence == 2 {
+                    break event;
+                }
+            }
+        };
+        assert!(delta.sample.mux_unchanged);
+        assert!(delta.sample.mux.is_none());
+
+        let snapshot = service.subscribe(["n1".to_owned()]).await;
+        let latest = &snapshot.snapshots[0].samples[1].sample;
+        assert!(!latest.mux_unchanged);
+        assert_eq!(
+            latest.mux.as_ref().map(|report| report.sampled_at_unix_ms),
+            Some(confirmed_at)
+        );
+    }
+
+    #[tokio::test]
     async fn watchers_share_one_lease_and_only_the_last_drop_stops_sampling() {
         let service = RealtimeService::with_stop_grace(
             RealtimeTelemetryPolicy::default(),
@@ -778,7 +1313,11 @@ mod tests {
         assert_eq!(
             next(&mut agent.commands).await,
             AgentRealtimeCommand::Start {
-                interval_millis: 5000
+                interval_millis: 5000,
+                diagnostics: true,
+                user_traffic: Some(RealtimeUserTrafficSelector::All {
+                    forwarding: Vec::new()
+                }),
             }
         );
         service

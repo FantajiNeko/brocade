@@ -67,6 +67,7 @@ function queryClient() {
       vless_encryption_base: 13800,
       anytls_base: 14443,
       hy2_base: 30000,
+      mtproto_base: 28800,
       hop_base: 20000,
     },
     reality_site: { dest: 'www.cloudflare.com:443', server_names: ['www.cloudflare.com'] },
@@ -519,7 +520,7 @@ describe('新建链向导', () => {
   it('接入协议沿用详情页的逐行选择样式，图标与端口编辑不干扰开关', () => {
     const view = mount();
     const cards = [...view.container.querySelectorAll('.wzp-card')];
-    expect(cards).toHaveLength(4);
+    expect(cards).toHaveLength(5);
     expect(cards.every(card => card.classList.contains('protocol-choice'))).toBe(true);
     expect(cards.every(card => card.querySelector('.protocol-choice-copy .protocol-choice-icon'))).toBe(true);
     expect(cards[0].querySelector('.protocol-choice-icon polygon')).toBeTruthy();
@@ -529,6 +530,7 @@ describe('新建链向导', () => {
       'TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。',
       'TCP 入站；支持 TLS / REALITY、Padding 与连接复用。',
       'QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。',
+      '先选择入口节点',
     ]);
 
     const anyTls = view.getByRole('checkbox', { name: 'AnyTLS' }) as HTMLInputElement;
@@ -551,6 +553,51 @@ describe('新建链向导', () => {
     expect((within(encryptionCard).getByRole('combobox', { name: '握手档位' }) as HTMLSelectElement).value).toBe(
       'native',
     );
+  });
+
+  it('在新链中启用 MTProxy，并把端口和投影一同写入草稿', async () => {
+    draft.init(`wizard-mtproxy-${Math.random()}`);
+    draft.clear();
+    const done = vi.fn();
+    const view = render(
+      <QueryClientProvider client={queryClient()}>
+        <SessionProvider value={{ who: operator, initial }}>
+          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    const mtproxy = view.getByRole('checkbox', { name: 'MTProxy' }) as HTMLInputElement;
+    expect(mtproxy.disabled).toBe(true);
+
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
+    expect(mtproxy.disabled).toBe(false);
+    fireEvent.click(mtproxy);
+    expect((view.getByRole('textbox', { name: 'MTProxy 监听端口' }) as HTMLInputElement).value).toBe('28800');
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: 'Telegram 接入' } });
+    fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
+
+    await waitFor(() => expect(done).toHaveBeenCalledOnce());
+    expect(draft.ops().find(op => op.op === 'create_ingress')).toMatchObject({
+      ingress: {
+        wires: { mtproto: { port: 28800 } },
+        projection: { mtproto: {} },
+      },
+    });
+  });
+
+  it('NAT 入口不允许在新链中启用 MTProxy', () => {
+    const client = queryClient();
+    client.setQueryData(['nodes'], {
+      nodes: [...agentNodes, { ...agentNodes[0], node_id: 'nat-edge-01', name: 'NAT 入口', public_ipv4_nat: true }],
+    });
+    const view = mount(client);
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'nat-edge-01' },
+    });
+    expect((view.getByRole('checkbox', { name: 'MTProxy' }) as HTMLInputElement).disabled).toBe(true);
+    expect(view.getByText('当前机器的公网 IPv4 未直接配置在网卡上，不能启用 MTProxy')).toBeTruthy();
   });
 
   it('选择用户不依赖入口节点，之后选择入口仍保留授权选择', () => {

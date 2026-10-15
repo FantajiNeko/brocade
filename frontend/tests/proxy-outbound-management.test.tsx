@@ -99,6 +99,236 @@ it('imports VLESS Encryption without requiring TLS', async () => {
     security: { t: 'none' },
   });
 });
+it('imports legacy base64 VLESS WebSocket links with TLS aliases', async () => {
+  const view = editor();
+  const uuid = '11111111-2222-4333-8444-555555555555';
+  const authority = window
+    .btoa(`none:${uuid}@192.0.2.44:443`)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  const link =
+    `vless://${authority}?path=%2Fvideo%2Fexample&remarks=%E6%96%B0%E5%8A%A0%E5%9D%A1` +
+    '&obfsParam=ws.example.net&obfs=websocket&tls=1&peer=tls.example.net&udp=1&fingerprint=chrome';
+
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: { value: link },
+  });
+  expect(view.getByText('✓ 已识别，可以生成 Xray outbound')).toBeTruthy();
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0]).toMatchObject({
+    name: '新加坡',
+    address: '192.0.2.44',
+    port: 443,
+    protocol: {
+      t: 'vless',
+      v: {
+        credential: uuid,
+        encryption: 'none',
+        flow: null,
+        transport: { t: 'websocket', v: { path: '/video/example', host: 'ws.example.net' } },
+      },
+    },
+    security: { t: 'tls', v: { server_name: 'tls.example.net', fingerprint: 'chrome' } },
+  });
+});
+it('preserves the complete XHTTP, Finalmask and TLS share-link payload', async () => {
+  const view = editor();
+  const pins = '11'.repeat(32);
+  const extra = {
+    noSSEHeader: true,
+    xmux: { maxConcurrency: 7 },
+    downloadSettings: {
+      address: 'download.example.com',
+      port: 8443,
+      network: 'xhttp',
+      security: 'tls',
+      tlsSettings: {
+        serverName: 'download-sni.example.com',
+        fingerprint: 'firefox',
+        alpn: ['h2'],
+        echConfigList: 'download-ech',
+        pinnedPeerCertSha256: pins,
+        verifyPeerCertByName: 'download-cert.example.com',
+      },
+      xhttpSettings: {
+        path: '/download',
+        host: 'download-host.example.com',
+        mode: 'packet-up',
+        xmux: { maxConcurrency: 3 },
+      },
+    },
+  };
+  const finalMask = { tcp: [], udp: [] };
+  const params = new URLSearchParams({
+    type: 'xhttp',
+    security: 'tls',
+    path: '/upload',
+    host: 'upload-host.example.com',
+    mode: 'stream-up',
+    extra: JSON.stringify(extra),
+    fm: JSON.stringify(finalMask),
+    sni: 'upload-sni.example.com',
+    fp: 'chrome',
+    alpn: 'h2,http/1.1',
+    ech: 'upload-ech',
+    pcs: pins,
+    vcn: 'upload-cert.example.com',
+  });
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: { value: `vless://11111111-2222-4333-8444-555555555555@upload.example.com:443?${params}#Full` },
+  });
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0]).toMatchObject({
+    name: 'Full',
+    protocol: {
+      t: 'vless',
+      v: {
+        final_mask: finalMask,
+        transport: {
+          t: 'xhttp',
+          v: {
+            path: '/upload',
+            host: 'upload-host.example.com',
+            mode: 'stream-up',
+            mux: 7,
+            extra,
+            download: {
+              address: 'download.example.com',
+              port: 8443,
+              path: '/download',
+              host: 'download-host.example.com',
+              mode: 'packet-up',
+              mux: 3,
+              security: {
+                t: 'tls',
+                v: {
+                  server_name: 'download-sni.example.com',
+                  fingerprint: 'firefox',
+                  alpn: ['h2'],
+                  ech_config_list: 'download-ech',
+                  pinned_peer_cert_sha256: pins,
+                  verify_peer_cert_by_name: 'download-cert.example.com',
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    security: {
+      t: 'tls',
+      v: {
+        server_name: 'upload-sni.example.com',
+        fingerprint: 'chrome',
+        alpn: ['h2', 'http/1.1'],
+        ech_config_list: 'upload-ech',
+        pinned_peer_cert_sha256: pins,
+        verify_peer_cert_by_name: 'upload-cert.example.com',
+      },
+    },
+  });
+});
+it('makes raw XHTTP xmux and downloadSettings visibly authoritative', () => {
+  const existing: ExternalOutbound = {
+    ...outbound,
+    protocol: {
+      t: 'vless',
+      v: {
+        credential: '<redacted>',
+        encryption: 'none',
+        flow: null,
+        final_mask: null,
+        transport: {
+          t: 'xhttp',
+          v: {
+            path: '/upload',
+            host: null,
+            mux: 7,
+            mode: 'stream-up',
+            download: null,
+            extra: {
+              xmux: { maxConcurrency: 7, maxConnections: 2 },
+              downloadSettings: { network: 'xhttp', extraFutureField: true },
+            },
+          },
+        },
+      },
+    },
+  };
+  const view = wrap(
+    <ExternalOutboundEditor tenantId="platform" existing={existing} onClose={() => undefined} onSaved={vi.fn()} />,
+  );
+
+  const mux = view.getByLabelText('XHTTP 上传 XMUX') as HTMLInputElement;
+  const download = view.getByRole('checkbox', { name: /下载使用另一组服务器/ }) as HTMLInputElement;
+  expect(mux.disabled).toBe(true);
+  expect(download.disabled).toBe(true);
+  expect(view.getByText('当前值由 Extra JSON 的 xmux 完整定义。')).toBeTruthy();
+
+  fireEvent.change(view.getByLabelText('XHTTP Extra JSON'), {
+    target: { value: '{"noSSEHeader":true}' },
+  });
+  expect(mux.disabled).toBe(false);
+  expect(mux.value).toBe('');
+  expect(download.disabled).toBe(false);
+  expect(download.checked).toBe(false);
+});
+it.each([
+  ['mKCP', 'type=kcp&mtu=1200&tti=50', { t: 'kcp', v: { mtu: 1200, tti: 50 } }],
+  [
+    'HTTP/2',
+    'type=http&path=%2Fh2&host=h2-host.example.com',
+    { t: 'http', v: { path: '/h2', host: 'h2-host.example.com' } },
+  ],
+  [
+    'gRPC',
+    'type=grpc&serviceName=Brocade.Edge&mode=multi&authority=authority.example.com',
+    { t: 'grpc', v: { service_name: 'Brocade.Edge', mode: 'multi', authority: 'authority.example.com' } },
+  ],
+  [
+    'HTTPUpgrade',
+    'type=httpupgrade&path=%2Fupgrade&host=upgrade-host.example.com',
+    { t: 'http_upgrade', v: { path: '/upgrade', host: 'upgrade-host.example.com' } },
+  ],
+])('imports the %s VLESS transport without dropping its fields', async (_name, transportQuery, transport) => {
+  const view = editor();
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: {
+      value:
+        `vless://11111111-2222-4333-8444-555555555555@edge.example.com:443?${transportQuery}` +
+        '&security=tls&sni=edge.example.com&fp=chrome#Transport',
+    },
+  });
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0]).toMatchObject({
+    protocol: { t: 'vless', v: { transport } },
+  });
+});
+it('rejects recognized VLESS fields when they would be ignored or silently downgraded', () => {
+  const view = editor();
+  const input = view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…');
+  fireEvent.change(input, {
+    target: {
+      value:
+        'vless://11111111-2222-4333-8444-555555555555@edge.example.com:443?type=tcp&path=%2Fignored' +
+        '&security=tls&sni=edge.example.com',
+    },
+  });
+  expect(view.getByText(/path；不会静默丢弃/)).toBeTruthy();
+  fireEvent.change(input, {
+    target: {
+      value:
+        'vless://11111111-2222-4333-8444-555555555555@edge.example.com:443?type=grpc' +
+        '&serviceName=edge&mode=guna&security=tls&sni=edge.example.com',
+    },
+  });
+  expect(view.getByText('当前内置 Xray 已移除 gRPC guna，不能静默替换成 gun')).toBeTruthy();
+  expect(view.getByRole('button', { name: '创建并选中' }).hasAttribute('disabled')).toBe(true);
+});
 it('rejects transport security layered over VLESS Encryption', () => {
   const view = editor();
   fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
@@ -161,6 +391,16 @@ it('offers native VLESS Encryption as a manual choice with no TLS fields', () =>
   fireEvent.click(view.getByRole('button', { name: 'AnyTLS' }));
   expect(view.getByRole('button', { name: 'AnyTLS' }).getAttribute('aria-pressed')).toBe('true');
   expect(view.queryByLabelText('VLESS Encryption 参数')).toBeNull();
+});
+it('offers WebSocket as a manual VLESS transport and disables Vision flow', () => {
+  const view = editor();
+  fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+  fireEvent.click(view.getByRole('button', { name: 'WebSocket' }));
+  expect(view.getByRole('button', { name: 'WebSocket' }).getAttribute('aria-pressed')).toBe('true');
+  expect(view.getByLabelText('WebSocket Path')).toBeTruthy();
+  expect(view.getByLabelText('WebSocket Host')).toBeTruthy();
+  expect(view.getByRole('combobox', { name: 'Flow' }).hasAttribute('disabled')).toBe(true);
+  expect(view.getByText('WebSocket 与 Vision Flow 不兼容。')).toBeTruthy();
 });
 it('deletes an unused resource through a reversible draft', async () => {
   const closed = vi.fn();

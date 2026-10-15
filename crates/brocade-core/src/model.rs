@@ -22,6 +22,7 @@ use std::{
 
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -911,6 +912,10 @@ pub fn vpngate_runtime_peer(slot: usize) -> Option<Ipv4Addr> {
 ///
 /// `credential` has one name across variants so the store can seal it through one path and the
 /// console redactor can mask it without a deny-list of protocol-specific field names.
+// VLESS intentionally owns the complete transport/share-link shape, including extensible JSON.
+// External outbounds are revision data off every packet hot path, so boxing the transport would
+// spread allocation and constructor churn through the model solely to shrink this cold enum.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum ExternalOutboundProtocol {
@@ -923,6 +928,14 @@ pub enum ExternalOutboundProtocol {
         flow: Option<String>,
         /// The wire carrying VLESS.
         transport: ExternalVlessTransport,
+        /// Optional Xray Finalmask tree from the VLESS share-link `fm` parameter.
+        ///
+        /// Finalmask deliberately remains structured JSON: its mask pipeline is extensible in
+        /// Xray and the share-link standard transports the complete object rather than a fixed
+        /// list of scalar fields. Validation still requires an object, and artifact rendering
+        /// copies it byte-for-byte semantically into `streamSettings.finalmask`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_mask: Option<Value>,
     },
     /// Shadowsocks tunnel settings. The variant name and serialized `shadowsocks2022` tag are
     /// retained for stored-model compatibility, but `method` may also be a supported classic
@@ -1035,9 +1048,9 @@ fn vpngate_max_candidates() -> u8 {
 /// This belongs to the VLESS protocol variant rather than to [`ExternalOutbound`]: the other
 /// supported proxy protocols keep their own fixed transport shape, and making this a global axis
 /// would allow combinations Xray cannot use (for example WireGuard over XHTTP).
-// Raw carries no data while Xhttp carries a full XHTTP transport config, so the two variants
-// differ widely in size. This is per-external-outbound configuration, off any hot path, so the
-// layout footprint is immaterial and Xhttp is not worth boxing.
+// Raw carries no data while Xhttp carries a full XHTTP transport config, so the variants differ
+// widely in size. This is per-external-outbound configuration, off any hot path, so the layout
+// footprint is immaterial and Xhttp is not worth boxing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v", rename_all = "snake_case")]
@@ -1045,7 +1058,69 @@ pub enum ExternalVlessTransport {
     /// Xray still spells the renamed RAW transport `tcp` in the broadly compatible JSON form.
     #[default]
     Raw,
+    Kcp(ExternalVlessKcp),
+    Websocket(ExternalVlessWebsocket),
+    /// Legacy HTTP/2 transport. Current Xray merged it into XHTTP `stream-one`, so the compiler
+    /// emits that supported equivalent while retaining the imported transport identity.
+    Http(ExternalVlessHttp),
+    Grpc(ExternalVlessGrpc),
+    HttpUpgrade(ExternalVlessHttpUpgrade),
     Xhttp(ExternalVlessXhttp),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalVlessKcp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tti: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalVlessWebsocket {
+    /// Request path sent in the WebSocket upgrade. A query string is allowed because some
+    /// providers use it for early-data negotiation.
+    pub path: String,
+    /// Optional HTTP Host header, independent from the TLS SNI carried by outbound security.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalVlessHttp {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalVlessGrpcMode {
+    #[default]
+    Gun,
+    Multi,
+    Guna,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalVlessGrpc {
+    pub service_name: String,
+    #[serde(default)]
+    pub mode: ExternalVlessGrpcMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalVlessHttpUpgrade {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1062,6 +1137,11 @@ pub struct ExternalVlessXhttp {
     /// endpoint, security and XHTTP settings must travel together rather than as loose overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download: Option<ExternalVlessXhttpDownload>,
+    /// Complete XHTTP `extra` object after typed top-level fields have been removed. Keeping the
+    /// remainder makes new Xray tuning fields round-trip without waiting for another schema
+    /// migration while path, host, mode, XMUX and download stay available to the guided UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1148,6 +1228,14 @@ pub enum ExternalOutboundSecurity {
         server_name: String,
         #[serde(default = "external_fingerprint_chrome")]
         fingerprint: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        alpn: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ech_config_list: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned_peer_cert_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verify_peer_cert_by_name: Option<String>,
     },
     Reality {
         server_name: String,
@@ -1155,6 +1243,10 @@ pub enum ExternalOutboundSecurity {
         short_id: String,
         #[serde(default = "external_fingerprint_chrome")]
         fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mldsa65_verify: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spider_x: Option<String>,
     },
 }
 

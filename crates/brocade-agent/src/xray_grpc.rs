@@ -19,10 +19,13 @@ use std::{
 };
 
 use brocade_deployment::protocol::{
-    OnlineSource, OnlineSourceProtocol, UserOnlineSources, MAX_ONLINE_SOURCE_ENTRIES,
-    MAX_ONLINE_SOURCE_PROTOCOLS, MAX_ONLINE_SOURCE_USERS,
+    ForwardingProtocol, OnlineSource, OnlineSourceProtocol, UserOnlineSources,
+    MAX_ONLINE_SOURCE_ENTRIES, MAX_ONLINE_SOURCE_PROTOCOLS, MAX_ONLINE_SOURCE_USERS,
 };
 
+const ADD_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/AddInbound";
+const REMOVE_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/RemoveInbound";
+const LIST_INBOUNDS_PATH: &str = "/xray.app.proxyman.command.HandlerService/ListInbounds";
 const ALTER_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/AlterInbound";
 const GET_INBOUND_USERS_PATH: &str = "/xray.app.proxyman.command.HandlerService/GetInboundUsers";
 const QUERY_STATS_PATH: &str = "/xray.app.stats.command.StatsService/QueryStats";
@@ -34,6 +37,8 @@ const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 const HYSTERIA2_ACCOUNT: &str = "xray.proxy.hysteria.account.Account";
 const ANYTLS_ACCOUNT: &str = "xray.proxy.anytls.Account";
 const MTPROTO_ACCOUNT: &str = "xray.proxy.mtproto.Account";
+const RECEIVER_CONFIG: &str = "xray.app.proxyman.ReceiverConfig";
+const DOKODEMO_CONFIG: &str = "xray.proxy.dokodemo.Config";
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const END_STREAM: u8 = 0x1;
 const ACK: u8 = 0x1;
@@ -122,6 +127,77 @@ pub(crate) fn remove_user(api_port: u16, tag: &str, email: &str) -> Result<(), S
     let mut operation = Vec::new();
     bytes_field(&mut operation, 1, email.as_bytes());
     alter_inbound(api_port, tag, REMOVE_USER_OPERATION, &operation)
+}
+
+pub(crate) fn add_forwarding_inbound(
+    api_port: u16,
+    tag: &str,
+    protocol: ForwardingProtocol,
+    listen_port: u16,
+    target_host: &str,
+    target_port: u16,
+) -> Result<(), String> {
+    let request = forwarding_inbound_request(tag, protocol, listen_port, target_host, target_port);
+    grpc_unary(api_port, ADD_INBOUND_PATH, &request).map(|_| ())
+}
+
+fn forwarding_inbound_request(
+    tag: &str,
+    protocol: ForwardingProtocol,
+    listen_port: u16,
+    target_host: &str,
+    target_port: u16,
+) -> Vec<u8> {
+    let mut port_range = Vec::new();
+    varint_field(&mut port_range, 1, u64::from(listen_port));
+    varint_field(&mut port_range, 2, u64::from(listen_port));
+    let mut port_list = Vec::new();
+    message_field(&mut port_list, 1, &port_range);
+    let mut receiver = Vec::new();
+    message_field(&mut receiver, 1, &port_list);
+
+    let mut address = Vec::new();
+    match target_host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(IpAddr::V4(value)) => bytes_field(&mut address, 1, &value.octets()),
+        Ok(IpAddr::V6(value)) => bytes_field(&mut address, 1, &value.octets()),
+        Err(_) => bytes_field(&mut address, 2, target_host.as_bytes()),
+    }
+    let mut proxy = Vec::new();
+    message_field(&mut proxy, 1, &address);
+    varint_field(&mut proxy, 2, u64::from(target_port));
+    if matches!(
+        protocol,
+        ForwardingProtocol::Tcp | ForwardingProtocol::TcpUdp
+    ) {
+        varint_field(&mut proxy, 7, 2);
+    }
+    if matches!(
+        protocol,
+        ForwardingProtocol::Udp | ForwardingProtocol::TcpUdp
+    ) {
+        varint_field(&mut proxy, 7, 3);
+    }
+
+    let mut inbound = Vec::new();
+    bytes_field(&mut inbound, 1, tag.as_bytes());
+    message_field(&mut inbound, 2, &typed_message(RECEIVER_CONFIG, &receiver));
+    message_field(&mut inbound, 3, &typed_message(DOKODEMO_CONFIG, &proxy));
+    let mut request = Vec::new();
+    message_field(&mut request, 1, &inbound);
+    request
+}
+
+pub(crate) fn remove_inbound(api_port: u16, tag: &str) -> Result<(), String> {
+    let mut request = Vec::new();
+    bytes_field(&mut request, 1, tag.as_bytes());
+    grpc_unary(api_port, REMOVE_INBOUND_PATH, &request).map(|_| ())
+}
+
+pub(crate) fn inbound_tags(api_port: u16) -> Result<Vec<String>, String> {
+    let mut request = Vec::new();
+    varint_field(&mut request, 1, 1);
+    let response = grpc_unary(api_port, LIST_INBOUNDS_PATH, &request)?;
+    decode_inbound_tags(&response)
 }
 
 fn alter_inbound(
@@ -600,6 +676,27 @@ fn decode_inbound_users(message: &[u8]) -> Result<Vec<XrayUser>, String> {
     Ok(users)
 }
 
+/// `ListInboundsResponse { repeated core.InboundHandlerConfig inbounds = 1 }`; only the tag field
+/// is returned because the request sets `isOnlyTags`.
+fn decode_inbound_tags(message: &[u8]) -> Result<Vec<String>, String> {
+    let mut tags = Vec::new();
+    let mut cursor = 0;
+    while let Some((number, field)) = next_field(message, &mut cursor)? {
+        let (1, Field::Bytes(inbound)) = (number, field) else {
+            continue;
+        };
+        let mut inbound_cursor = 0;
+        while let Some((number, field)) = next_field(inbound, &mut inbound_cursor)? {
+            if let (1, Field::Bytes(tag)) = (number, field) {
+                tags.push(utf8(tag, "inbound tag")?);
+            }
+        }
+    }
+    tags.sort();
+    tags.dedup();
+    Ok(tags)
+}
+
 /// `User { uint32 level = 1; string email = 2; TypedMessage account = 3 }`.
 fn decode_user(message: &[u8]) -> Result<XrayUser, String> {
     let mut email = None;
@@ -744,6 +841,87 @@ mod tests {
         assert!(online
             .windows(GET_USERS_STATS_PATH.len())
             .any(|window| window == GET_USERS_STATS_PATH.as_bytes()));
+        for path in [ADD_INBOUND_PATH, REMOVE_INBOUND_PATH, LIST_INBOUNDS_PATH] {
+            let headers = request_headers(10085, path);
+            assert!(headers
+                .windows(path.len())
+                .any(|window| window == path.as_bytes()));
+        }
+    }
+
+    fn bytes_fields(message: &[u8], wanted: u32) -> Vec<Vec<u8>> {
+        let mut fields = Vec::new();
+        let mut cursor = 0;
+        while let Some((number, field)) = next_field(message, &mut cursor).unwrap() {
+            if number == wanted {
+                if let Field::Bytes(bytes) = field {
+                    fields.push(bytes.to_vec());
+                }
+            }
+        }
+        fields
+    }
+
+    fn varint_fields(message: &[u8], wanted: u32) -> Vec<u64> {
+        let mut fields = Vec::new();
+        let mut cursor = 0;
+        while let Some((number, field)) = next_field(message, &mut cursor).unwrap() {
+            if number == wanted {
+                if let Field::Varint(value) = field {
+                    fields.push(value);
+                }
+            }
+        }
+        fields
+    }
+
+    fn typed_value(message: &[u8]) -> (String, Vec<u8>) {
+        let type_name = bytes_fields(message, 1).remove(0);
+        let value = bytes_fields(message, 2).remove(0);
+        (String::from_utf8(type_name).unwrap(), value)
+    }
+
+    #[test]
+    fn forwarding_inbound_encodes_port_target_and_both_networks() {
+        let request = forwarding_inbound_request(
+            "fwd:42",
+            ForwardingProtocol::TcpUdp,
+            20_042,
+            "example.com",
+            8443,
+        );
+        let inbound = bytes_fields(&request, 1).remove(0);
+        assert_eq!(bytes_fields(&inbound, 1), [b"fwd:42".to_vec()]);
+
+        let receiver = bytes_fields(&inbound, 2).remove(0);
+        let (receiver_type, receiver) = typed_value(&receiver);
+        assert_eq!(receiver_type, RECEIVER_CONFIG);
+        let port_list = bytes_fields(&receiver, 1).remove(0);
+        let port_range = bytes_fields(&port_list, 1).remove(0);
+        assert_eq!(varint_fields(&port_range, 1), [20_042]);
+        assert_eq!(varint_fields(&port_range, 2), [20_042]);
+
+        let proxy = bytes_fields(&inbound, 3).remove(0);
+        let (proxy_type, proxy) = typed_value(&proxy);
+        assert_eq!(proxy_type, DOKODEMO_CONFIG);
+        let address = bytes_fields(&proxy, 1).remove(0);
+        assert_eq!(bytes_fields(&address, 2), [b"example.com".to_vec()]);
+        assert_eq!(varint_fields(&proxy, 2), [8443]);
+        assert_eq!(varint_fields(&proxy, 7), [2, 3]);
+    }
+
+    #[test]
+    fn inbound_tag_snapshot_is_sorted_and_deduplicated() {
+        let mut response = Vec::new();
+        for tag in ["fwd:9", "api", "fwd:2", "fwd:9"] {
+            let mut inbound = Vec::new();
+            bytes_field(&mut inbound, 1, tag.as_bytes());
+            message_field(&mut response, 1, &inbound);
+        }
+        assert_eq!(
+            decode_inbound_tags(&response).unwrap(),
+            ["api", "fwd:2", "fwd:9"]
+        );
     }
 
     #[test]

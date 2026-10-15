@@ -2,7 +2,7 @@ import { StrictMode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CompileView, ConsoleSnapshot, SnapshotApp, Whoami } from '../src/api';
+import type { CompileView, ConsoleSnapshot, NodeAgentStateItem, SnapshotApp, Whoami } from '../src/api';
 import { draft } from '../src/draft';
 import { ChainsPane } from '../src/panes/chains';
 import { SessionProvider } from '../src/session';
@@ -212,6 +212,73 @@ describe('客户端配置面板', () => {
     await waitFor(() => expect(save.disabled).toBe(true));
     expect(panel.getByText('edge.example.com:443')).toBeTruthy();
     expect(panel.getByText('[2001:db8::20]:443')).toBeTruthy();
+  });
+});
+
+describe('入站机器迁移', () => {
+  const node = (node_id: string, name: string) =>
+    ({
+      node_id,
+      name,
+      retired_at: null,
+      public_ipv4: '192.0.2.1',
+      public_ipv4_nat: false,
+      wg_fake_tcp_port: null,
+    }) as NodeAgentStateItem;
+
+  const occupiedApp: SnapshotApp = {
+    ...app,
+    id: 'app-2',
+    label: '占用端口的项目',
+    chains: [{ id: 'chain-2', tenant: 'platform', name: '已有线路' }],
+    ingresses: [
+      {
+        ...app.ingresses[0],
+        id: 'ingress-2',
+        chain: 'chain-2',
+        node: 'target',
+        port: 443,
+      },
+    ],
+    steps: [{ chain: 'chain-2', node: 'target', accept: null, hop_in: null, rules: [] }],
+  };
+
+  const renderMigration = async (confirm: boolean) => {
+    draft.init(`ingress-migration-${confirm}`);
+    const prepared = setup();
+    prepared.client.setQueryData(['snapshot'], {
+      ...snapshot,
+      snapshot: { ...snapshot.snapshot, apps: [app, occupiedApp] },
+    });
+    prepared.client.setQueryData(['nodes'], { nodes: [node('entry', '当前入口'), node('target', '目标入口')] });
+    const confirmation = vi.fn((_message: string) => confirm);
+    vi.stubGlobal('confirm', confirmation);
+    const view = prepared.mount();
+    await view.findByText('链路规则');
+    const panel = within(view.getByRole('heading', { name: '入站' }).closest('section')!);
+    const selection = panel.getByRole('combobox') as HTMLSelectElement;
+    fireEvent.change(selection, { target: { value: 'target' } });
+    return { confirmation, selection };
+  };
+
+  it('发现冲突后先说明轮转结果，取消时不写入草稿', async () => {
+    const { confirmation, selection } = await renderMigration(false);
+    expect(confirmation).toHaveBeenCalledOnce();
+    expect(confirmation.mock.calls[0][0]).toContain('VLESS · TLS / REALITY：TCP 443');
+    expect(confirmation.mock.calls[0][0]).toContain('改用 444');
+    expect(draft.ops()).toEqual([]);
+    expect(selection.value).toBe('entry');
+  });
+
+  it('确认后把机器和轮转端口合并成同一条草稿操作', async () => {
+    const { confirmation } = await renderMigration(true);
+    expect(confirmation).toHaveBeenCalledOnce();
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
+    expect(draft.ops()[0]).toMatchObject({
+      op: 'upsert_ingress',
+      app_id: 'app-1',
+      ingress: { node_id: 'target', port: 444 },
+    });
   });
 });
 

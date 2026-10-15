@@ -62,6 +62,8 @@ interface Face {
   icon?: IconName;
   /* 默认对所有角色可见。按角色隐藏入口属于体验优化，不构成安全边界。 */
   roles?: AdminRole[];
+  /* public 使用 readonly 角色，但仍是访客，不应看到内部容量与配置工作面。 */
+  hideFromPublic?: boolean;
 }
 
 // 顶栏只显示当前主工作流。规则负责选择转发目标；隧道资源本身的生命周期统一在隧道页管理。
@@ -72,12 +74,21 @@ const NAV: Face[] = [
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },
+  {
+    key: 'capacity',
+    label: '预测',
+    icon: 'forecast',
+    roles: ['readonly', 'editor', 'publisher', 'tenant-admin', 'system-admin'],
+    hideFromPublic: true,
+  },
 ];
 
 /* 手机端把日常查看的机器、线路和用量留在顶栏。用户、隧道与发布仍使用同一份 Face
    定义，只是移动到账户牌菜单，避免两套角色权限和名称逐渐分叉。 */
 const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'usage');
-const MOBILE_MORE = NAV.filter(f => f.key === 'tunnels' || f.key === 'users' || f.key === 'deploy');
+const MOBILE_MORE = NAV.filter(
+  f => f.key === 'tunnels' || f.key === 'users' || f.key === 'deploy' || f.key === 'capacity',
+);
 
 // 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
@@ -109,7 +120,8 @@ function accountOf(who: Whoami) {
   return { name, role: ROLE_LABEL[who.role], initial: Array.from(name)[0]?.toUpperCase() ?? '?', guest: false };
 }
 
-const visible = (faces: Face[], who: Whoami) => faces.filter(f => !f.roles || f.roles.includes(who.role));
+const visible = (faces: Face[], who: Whoami) =>
+  faces.filter(f => (!f.roles || f.roles.includes(who.role)) && (!f.hideFromPublic || !isPublic(who)));
 
 export function ForgeShell({
   branding,

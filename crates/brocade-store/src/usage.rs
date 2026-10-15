@@ -9,15 +9,469 @@ use brocade_core::model::{
 use brocade_deployment::plan::{DesiredArtifact, DesiredGrants, NodeDesiredState, PlannedAction};
 
 use brocade_deployment::protocol::{
-    UsageChainSample, UsageDailyRow, UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket,
+    RealtimeForwardingTarget, UsageChainSample, UsageDailyRow, UsageForwardingMonthlyRow,
+    UsageForwardingWindow, UsageMonthlySummary, UsageMonthlyViewRow, UsageNodeBucket,
     UsageNodeSeries, UsageNodeSeriesList, UsageReportRequest, UsageReportResult, UsageSample,
-    UsageSampleList,
+    UsageSampleList, UserTrafficHistory, UserTrafficHistoryNode, UserTrafficHistorySeries,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{AdminContext, Result, StoreError};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRealtimeTarget {
+    pub node_id: String,
+    pub labels: Vec<String>,
+    pub forwarding: Vec<RealtimeForwardingTarget>,
+}
+
+/// Resolve current grant labels and entitled forwarding rules, grouped by active entry machine.
+/// This is live authorization, not revision history: revoked sources leave the next live lease.
+pub async fn user_realtime_targets(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Vec<UserRealtimeTarget>> {
+    if !actor.can_view_user_realtime_traffic() {
+        return Err(StoreError::Forbidden(
+            "user realtime traffic requires an administrator".to_owned(),
+        ));
+    }
+    actor.require_tenant_access(tenant_id, "user realtime traffic")?;
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id = $1 AND id = $2)",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
+    }
+
+    let rows = sqlx::query(
+        "SELECT ingress.node_id, grant_row.ingress_id
+           FROM grants grant_row
+           JOIN ingresses ingress ON ingress.id = grant_row.ingress_id
+           JOIN nodes node ON node.id = ingress.node_id
+          WHERE grant_row.tenant_id = $1
+            AND grant_row.user_id = $2
+            AND node.retired_at IS NULL
+          ORDER BY ingress.node_id, grant_row.ingress_id",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        let node_id: String = row.try_get("node_id")?;
+        let ingress_id: String = row.try_get("ingress_id")?;
+        grouped
+            .entry(node_id)
+            .or_default()
+            .push(grant_label(user_id, tenant_id, &ingress_id));
+    }
+    let mut targets = grouped
+        .into_iter()
+        .map(|(node_id, labels)| {
+            (
+                node_id.clone(),
+                UserRealtimeTarget {
+                    node_id,
+                    labels,
+                    forwarding: Vec::new(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (node_id, target) in
+        forwarding_realtime_targets(pool, actor, None, Some((tenant_id, user_id))).await?
+    {
+        targets
+            .entry(node_id.clone())
+            .or_insert_with(|| UserRealtimeTarget {
+                node_id,
+                labels: Vec::new(),
+                forwarding: Vec::new(),
+            })
+            .forwarding
+            .push(target);
+    }
+    Ok(targets.into_values().collect())
+}
+
+pub async fn forwarding_realtime_targets(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: Option<&str>,
+    user: Option<(&str, &str)>,
+) -> Result<Vec<(String, RealtimeForwardingTarget)>> {
+    if !actor.can_view_user_realtime_traffic() {
+        return Err(StoreError::Forbidden(
+            "forwarding realtime requires an administrator".to_owned(),
+        ));
+    }
+    if let Some((tenant_id, _)) = user {
+        actor.require_tenant_access(tenant_id, "forwarding realtime")?;
+    }
+    let rows = sqlx::query(
+        "SELECT r.id,r.node_id,r.tenant_id,r.user_id FROM forwarding_rules r
+         JOIN forwarding_entitlements e ON e.tenant_id=r.tenant_id AND e.user_id=r.user_id AND e.node_id=r.node_id
+         JOIN users u ON u.tenant_id=r.tenant_id AND u.id=r.user_id
+         JOIN nodes n ON n.id=r.node_id
+         WHERE r.enabled AND r.deleted_at IS NULL AND e.enabled AND u.status='active' AND n.retired_at IS NULL
+           AND ($1::text IS NULL OR r.node_id=$1)
+           AND ($2::text IS NULL OR r.tenant_id=$2 OR r.tenant_id LIKE $3 ESCAPE '\\')
+           AND ($4::text IS NULL OR r.tenant_id=$4 AND r.user_id=$5)
+         ORDER BY r.node_id,r.id",
+    ).bind(node_id).bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern())
+     .bind(user.map(|u| u.0)).bind(user.map(|u| u.1)).fetch_all(pool).await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get("node_id")?,
+                RealtimeForwardingTarget {
+                    rule_id: row.try_get("id")?,
+                    tenant_id: row.try_get("tenant_id")?,
+                    user_id: row.try_get("user_id")?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Which accounting history the realtime user-traffic card reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserTrafficHistoryScope<'a> {
+    /// Every user in the actor's tenant scope on one ingress machine (machine detail).
+    Node(&'a str),
+    /// One user on every machine that carried or may carry its traffic (user detail).
+    User {
+        tenant_id: &'a str,
+        user_id: &'a str,
+    },
+}
+
+/// The card renders one hour of 30-second windows; longer ranges belong to the usage page.
+const USER_TRAFFIC_HISTORY_MAX_SECS: u32 = 3_600;
+
+/// Recent per-user accounting windows for the realtime user-traffic card.
+///
+/// Authorization matches the live user rates: only system and tenant administrators, with tenant
+/// administrators limited to their scope. Window existence comes from `usage_node_windows`, which
+/// records every delivered report including idle ones; it carries timestamps only and is limited
+/// to machines the caller already resolved, so it is read without a tenant filter.
+pub async fn list_user_traffic_history(
+    pool: &PgPool,
+    actor: &AdminContext,
+    scope: UserTrafficHistoryScope<'_>,
+    window_secs: u32,
+) -> Result<UserTrafficHistory> {
+    if !actor.can_view_user_realtime_traffic() {
+        return Err(StoreError::Forbidden(
+            "user traffic history requires an administrator".to_owned(),
+        ));
+    }
+    let window_secs = window_secs.clamp(60, USER_TRAFFIC_HISTORY_MAX_SECS);
+    // The user scope reuses the live authorization: tenant access, user existence and the
+    // machines that currently hold the user's grants.
+    let granted_nodes = match scope {
+        UserTrafficHistoryScope::Node(_) => Vec::new(),
+        UserTrafficHistoryScope::User { tenant_id, user_id } => {
+            user_realtime_targets(pool, actor, tenant_id, user_id)
+                .await?
+                .into_iter()
+                .map(|target| target.node_id)
+                .collect()
+        }
+    };
+    let range_end: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(pool)
+        .await?;
+    let range_start = range_end - i64::from(window_secs);
+
+    let rows = match scope {
+        UserTrafficHistoryScope::Node(node_id) => {
+            sqlx::query(
+                "SELECT node_id, tenant_id, user_id,
+                        extract(epoch FROM window_start)::bigint AS window_start,
+                        extract(epoch FROM window_end)::bigint AS window_end,
+                        sum(uplink_bytes)::bigint AS uplink_bytes,
+                        sum(downlink_bytes)::bigint AS downlink_bytes
+                   FROM usage_samples
+                  WHERE node_id = $1
+                    AND window_end > to_timestamp($2::double precision)
+                    AND window_end <= to_timestamp($3::double precision)
+                    AND ($4::text IS NULL OR tenant_id = $4 OR tenant_id LIKE $5 ESCAPE '\\')
+                  GROUP BY node_id, tenant_id, user_id, window_start, window_end
+                  ORDER BY node_id, tenant_id, user_id, window_end, window_start",
+            )
+            .bind(node_id)
+            .bind(range_start as f64)
+            .bind(range_end as f64)
+            .bind(actor.tenant_scope())
+            .bind(actor.tenant_scope_like_pattern())
+            .fetch_all(pool)
+            .await?
+        }
+        UserTrafficHistoryScope::User { tenant_id, user_id } => {
+            sqlx::query(
+                "SELECT node_id, tenant_id, user_id,
+                        extract(epoch FROM window_start)::bigint AS window_start,
+                        extract(epoch FROM window_end)::bigint AS window_end,
+                        sum(uplink_bytes)::bigint AS uplink_bytes,
+                        sum(downlink_bytes)::bigint AS downlink_bytes
+                   FROM usage_samples
+                  WHERE tenant_id = $1
+                    AND user_id = $2
+                    AND window_end > to_timestamp($3::double precision)
+                    AND window_end <= to_timestamp($4::double precision)
+                  GROUP BY node_id, tenant_id, user_id, window_start, window_end
+                  ORDER BY node_id, tenant_id, user_id, window_end, window_start",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .bind(range_start as f64)
+            .bind(range_end as f64)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    let mut series: Vec<UserTrafficHistorySeries> = Vec::new();
+    for row in rows {
+        let node_id: String = row.try_get("node_id")?;
+        let tenant_id: String = row.try_get("tenant_id")?;
+        let user_id: String = row.try_get("user_id")?;
+        let point = (
+            row.try_get::<i64, _>("window_end")?,
+            i64_to_u64("uplink_bytes", row.try_get("uplink_bytes")?)?,
+            i64_to_u64("downlink_bytes", row.try_get("downlink_bytes")?)?,
+        );
+        let window = (
+            row.try_get::<i64, _>("window_start")?,
+            point.0,
+            point.1,
+            point.2,
+        );
+        match series.last_mut() {
+            Some(last)
+                if last.node_id == node_id
+                    && last.tenant_id == tenant_id
+                    && last.user_id == user_id =>
+            {
+                if let Some(previous) = last
+                    .points
+                    .last_mut()
+                    .filter(|previous| previous.0 == point.0)
+                {
+                    previous.1 = previous.1.checked_add(point.1).ok_or_else(|| {
+                        StoreError::InvalidData("history uplink overflow".to_owned())
+                    })?;
+                    previous.2 = previous.2.checked_add(point.2).ok_or_else(|| {
+                        StoreError::InvalidData("history downlink overflow".to_owned())
+                    })?;
+                } else {
+                    last.points.push(point);
+                }
+                last.windows.push(window);
+            }
+            _ => series.push(UserTrafficHistorySeries {
+                node_id,
+                tenant_id,
+                user_id,
+                points: vec![point],
+                windows: vec![window],
+                forwarding: false,
+                unplaced_uplink_bytes: 0,
+                unplaced_downlink_bytes: 0,
+            }),
+        }
+    }
+
+    // Preserve source boundaries and actual durations. Legacy bytes have no measured interval.
+    let (node_filter, tenant_filter, user_filter) = match scope {
+        UserTrafficHistoryScope::Node(node) => (Some(node), None, None),
+        UserTrafficHistoryScope::User { tenant_id, user_id } => {
+            (None, Some(tenant_id), Some(user_id))
+        }
+    };
+    let forwarding_rows = sqlx::query(
+        "SELECT node_id,tenant_id,user_id,extract(epoch FROM window_start)::bigint AS start,
+                extract(epoch FROM read_at)::bigint AS end,sum(uplink_bytes)::bigint AS up,
+                sum(downlink_bytes)::bigint AS down,bool_or(has_gap) AS has_gap
+         FROM forwarding_usage_samples
+         WHERE read_at>to_timestamp($1) AND read_at<=to_timestamp($2)
+           AND ($3::text IS NULL OR node_id=$3)
+           AND ($4::text IS NULL OR tenant_id=$4 AND user_id=$5)
+           AND ($6::text IS NULL OR tenant_id=$6 OR tenant_id LIKE $7 ESCAPE '\\')
+         GROUP BY node_id,tenant_id,user_id,window_start,read_at ORDER BY node_id,tenant_id,user_id,read_at,window_start",
+    ).bind(range_start as f64).bind(range_end as f64).bind(node_filter).bind(tenant_filter).bind(user_filter)
+     .bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(pool).await?;
+    let mut forwarded = BTreeMap::<(String, String, String), UserTrafficHistorySeries>::new();
+    for row in forwarding_rows {
+        let node_id: String = row.try_get("node_id")?;
+        let tenant_id: String = row.try_get("tenant_id")?;
+        let user_id: String = row.try_get("user_id")?;
+        let entry = forwarded
+            .entry((node_id.clone(), tenant_id.clone(), user_id.clone()))
+            .or_insert_with(|| UserTrafficHistorySeries {
+                node_id,
+                tenant_id,
+                user_id,
+                points: Vec::new(),
+                windows: Vec::new(),
+                forwarding: true,
+                unplaced_uplink_bytes: 0,
+                unplaced_downlink_bytes: 0,
+            });
+        let up = i64_to_u64("forwarding up", row.try_get("up")?)?;
+        let down = i64_to_u64("forwarding down", row.try_get("down")?)?;
+        if let Some(start) = row
+            .try_get::<Option<i64>, _>("start")?
+            .filter(|_| !row.get::<bool, _>("has_gap"))
+        {
+            let end = row.try_get("end")?;
+            entry.points.push((end, up, down));
+            entry.windows.push((start, end, up, down));
+        } else {
+            entry.unplaced_uplink_bytes = entry
+                .unplaced_uplink_bytes
+                .checked_add(up)
+                .ok_or_else(|| StoreError::InvalidData("forwarding history overflow".to_owned()))?;
+            entry.unplaced_downlink_bytes = entry
+                .unplaced_downlink_bytes
+                .checked_add(down)
+                .ok_or_else(|| StoreError::InvalidData("forwarding history overflow".to_owned()))?;
+        }
+    }
+    series.extend(forwarded.into_values());
+
+    // A machine appears once its windows are wanted: the requested machine, every machine holding
+    // the user's grants now, and any machine that still has accounted bytes inside the range.
+    let mut node_ids = BTreeSet::new();
+    if let UserTrafficHistoryScope::Node(node_id) = scope {
+        node_ids.insert(node_id.to_owned());
+    }
+    node_ids.extend(granted_nodes);
+    node_ids.extend(series.iter().map(|entry| entry.node_id.clone()));
+    let node_ids = node_ids.into_iter().collect::<Vec<_>>();
+    let window_rows = sqlx::query(
+        "SELECT node_id, extract(epoch FROM window_end)::bigint AS window_end
+           FROM usage_node_windows
+          WHERE node_id = ANY($1)
+            AND window_end > to_timestamp($2::double precision)
+            AND window_end <= to_timestamp($3::double precision)
+          GROUP BY node_id, window_end
+          ORDER BY node_id, window_end",
+    )
+    .bind(&node_ids)
+    .bind(range_start as f64)
+    .bind(range_end as f64)
+    .fetch_all(pool)
+    .await?;
+    let mut windows = node_ids
+        .into_iter()
+        .map(|node_id| (node_id, Vec::new()))
+        .collect::<BTreeMap<String, Vec<i64>>>();
+    for row in window_rows {
+        let node_id: String = row.try_get("node_id")?;
+        windows
+            .entry(node_id)
+            .or_default()
+            .push(row.try_get("window_end")?);
+    }
+
+    let receipt_rows = sqlx::query(
+        "SELECT node_id, extract(epoch FROM read_at)::bigint AS read_at, result
+           FROM usage_report_receipts
+          WHERE node_id = ANY($1)
+            AND read_at > to_timestamp($2::double precision)
+            AND read_at <= to_timestamp($3::double precision)
+          ORDER BY node_id, read_at",
+    )
+    .bind(windows.keys().collect::<Vec<_>>())
+    .bind(range_start as f64)
+    .bind(range_end as f64)
+    .fetch_all(pool)
+    .await?;
+    let mut coverage = BTreeMap::<String, Vec<(i64, i64)>>::new();
+    let mut zeros = BTreeMap::<String, Vec<(i64, i64)>>::new();
+    for row in receipt_rows {
+        let node_id: String = row.try_get("node_id")?;
+        let end: i64 = row.try_get("read_at")?;
+        let result: UsageReportResult = serde_json::from_value(row.try_get("result")?)?;
+        if let Some(start) = result.window_start_unix_secs {
+            coverage
+                .entry(node_id.clone())
+                .or_default()
+                .push((start, end));
+            windows.entry(node_id.clone()).or_default().push(end);
+        }
+        zeros.entry(node_id).or_default().extend(
+            result
+                .zero_windows
+                .into_iter()
+                .map(|window| (window.start_unix_millis, window.end_unix_millis)),
+        );
+    }
+    // Legacy receipts lack coverage metadata. Real nonzero windows still have precise bounds;
+    // legacy idle points retain their 30-second interpretation, never bridge an unknown outage.
+    for entry in series.iter().filter(|entry| !entry.forwarding) {
+        coverage
+            .entry(entry.node_id.clone())
+            .or_default()
+            .extend(entry.windows.iter().map(|w| (w.0, w.1)));
+    }
+    let forwarding_coverage_rows = sqlx::query(
+        "SELECT node_id,extract(epoch FROM window_start)::bigint AS start,extract(epoch FROM window_end)::bigint AS end
+         FROM forwarding_usage_windows WHERE node_id=ANY($1) AND NOT has_gap AND window_end>to_timestamp($2) AND window_end<=to_timestamp($3)
+         AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\')
+         GROUP BY node_id,window_start,window_end ORDER BY node_id,window_end,window_start",
+    ).bind(windows.keys().collect::<Vec<_>>()).bind(range_start as f64).bind(range_end as f64)
+     .bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(pool).await?;
+    let mut forwarding_coverage = BTreeMap::<String, Vec<(i64, i64)>>::new();
+    for row in forwarding_coverage_rows {
+        forwarding_coverage
+            .entry(row.try_get("node_id")?)
+            .or_default()
+            .push((row.try_get("start")?, row.try_get("end")?));
+    }
+    Ok(UserTrafficHistory {
+        range_start_unix_secs: range_start,
+        range_end_unix_secs: range_end,
+        nodes: windows
+            .into_iter()
+            .map(|(node_id, mut window_ends_unix_secs)| {
+                window_ends_unix_secs.sort_unstable();
+                window_ends_unix_secs.dedup();
+                let mut node_windows = coverage.remove(&node_id).unwrap_or_default();
+                for &end in &window_ends_unix_secs {
+                    if !node_windows.iter().any(|window| window.1 == end) {
+                        node_windows.push((end - 30, end));
+                    }
+                }
+                node_windows.sort_unstable();
+                node_windows.dedup();
+                let mut zero_windows = zeros.remove(&node_id).unwrap_or_default();
+                zero_windows.sort_unstable();
+                zero_windows.dedup();
+                UserTrafficHistoryNode {
+                    forwarding_windows: forwarding_coverage.remove(&node_id).unwrap_or_default(),
+                    node_id,
+                    window_ends_unix_secs,
+                    windows: node_windows,
+                    zero_windows,
+                }
+            })
+            .collect(),
+        series,
+    })
+}
 
 /// How far the agent's reported instant may diverge from the control plane's clock and still
 /// count. Beyond it the whole round is refused — the window boundary decides which month these
@@ -605,6 +1059,17 @@ pub async fn record_usage_report(
             "usage report contains too many counters".to_owned(),
         ));
     }
+    if request.zero_windows.len() > 64
+        || request.zero_windows.iter().any(|window| {
+            window.start_unix_millis <= 0
+                || window.end_unix_millis <= window.start_unix_millis
+                || window.end_unix_millis / 1000 > request.read_at_unix_secs
+        })
+    {
+        return Err(StoreError::InvalidData(
+            "invalid confirmed zero windows".to_owned(),
+        ));
+    }
     if request.xray_epoch.trim().is_empty() || request.xray_epoch.len() > 128 {
         return Err(StoreError::InvalidData(
             "usage xray_epoch must contain 1..128 bytes".to_owned(),
@@ -691,6 +1156,22 @@ pub async fn record_usage_report(
         revision_id: generation.revision_id,
         deployment_id: generation.deployment_id,
     };
+    let previous_read: Option<i64> = sqlx::query_scalar(
+        "SELECT extract(epoch FROM read_at)::bigint FROM usage_report_receipts
+         WHERE node_id = $1 AND agent_instance_id = $2 ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(node_id)
+    .bind(&agent_instance_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    // Even an empty QueryStats response is a successful local observation. Unlike an API
+    // failure it proves no user counters exist; include that coverage without creating fake
+    // user detail rows or resetting heads.
+    let mut coverage_start = request.counters.is_empty().then(|| {
+        previous_read
+            .unwrap_or(request.xray_started_at_unix_secs)
+            .max(request.xray_started_at_unix_secs)
+    });
     let mut accepted_readings = 0_u64;
     let mut inserted_samples = 0_u64;
     let mut skipped_counters = 0_u64;
@@ -814,6 +1295,8 @@ pub async fn record_usage_report(
                     )
                 };
                 if window_start < request.read_at_unix_secs {
+                    coverage_start =
+                        Some(coverage_start.map_or(window_start, |start| start.min(window_start)));
                     let insert = UsageSampleInsert {
                         node_id,
                         owner: &owner,
@@ -861,6 +1344,8 @@ pub async fn record_usage_report(
             // second as authorization, while the schema correctly requires end > start.
             let window_start = candidate_start.min(request.read_at_unix_secs.saturating_sub(1));
             if window_start < request.read_at_unix_secs {
+                coverage_start =
+                    Some(coverage_start.map_or(window_start, |start| start.min(window_start)));
                 let insert = UsageSampleInsert {
                     node_id,
                     owner: &owner,
@@ -923,6 +1408,8 @@ pub async fn record_usage_report(
         skipped_counters,
         rejected_counters,
         gap_samples,
+        window_start_unix_secs: coverage_start.filter(|start| *start < request.read_at_unix_secs),
+        zero_windows: request.zero_windows,
     };
     let result_json = serde_json::to_value(&result)?;
     sqlx::query(
@@ -1152,6 +1639,9 @@ async fn list_usage_node_series_selected(
     let blank = |node_id: String| UsageNodeSeries {
         node_id,
         buckets: Vec::new(),
+        forwarding: Vec::new(),
+        month_forwarding_uplink_bytes: 0,
+        month_forwarding_downlink_bytes: 0,
         month_user_uplink_bytes: 0,
         month_user_downlink_bytes: 0,
         month_relay_uplink_bytes: 0,
@@ -1199,6 +1689,44 @@ async fn list_usage_node_series_selected(
         entry.month_relay_downlink_bytes =
             i64_to_u64("relay_downlink_bytes", row.try_get("relay_downlink_bytes")?)?;
         entry.month_has_gap = row.try_get("has_gap")?;
+    }
+
+    let forwarding_windows = sqlx::query(
+        "SELECT node_id,window_start::text,window_end::text,sum(uplink_bytes)::bigint AS up,
+                sum(downlink_bytes)::bigint AS down,bool_or(has_gap) AS has_gap
+         FROM forwarding_usage_windows WHERE window_end >= $1::timestamptz AND window_end <= $2::timestamptz
+           AND ($3::text IS NULL OR tenant_id=$3 OR tenant_id LIKE $4 ESCAPE '\\')
+           AND ($5::text IS NULL OR node_id=$5)
+         GROUP BY node_id,window_start,window_end ORDER BY node_id,window_end,window_start",
+    ).bind(&since).bind(&until).bind(tenant_scope).bind(&tenant_pattern).bind(node_id).fetch_all(pool).await?;
+    for row in forwarding_windows {
+        let node_id: String = row.try_get("node_id")?;
+        by_node
+            .entry(node_id.clone())
+            .or_insert_with(|| blank(node_id))
+            .forwarding
+            .push(UsageForwardingWindow {
+                window_start: row.try_get("window_start")?,
+                window_end: row.try_get("window_end")?,
+                uplink_bytes: i64_to_u64("up", row.try_get("up")?)?,
+                downlink_bytes: i64_to_u64("down", row.try_get("down")?)?,
+                has_gap: row.try_get("has_gap")?,
+            });
+    }
+    let forwarding_month = sqlx::query(
+        "SELECT node_id,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down,bool_or(has_gap) AS has_gap
+         FROM forwarding_usage_rollups WHERE period_start >= $1::timestamptz AND period_start < $2::timestamptz
+           AND ($3::text IS NULL OR tenant_id=$3 OR tenant_id LIKE $4 ESCAPE '\\')
+           AND ($5::text IS NULL OR node_id=$5) GROUP BY node_id",
+    ).bind(&inst_month_start).bind(&inst_month_end).bind(tenant_scope).bind(&tenant_pattern).bind(node_id).fetch_all(pool).await?;
+    for row in forwarding_month {
+        let node_id: String = row.try_get("node_id")?;
+        let entry = by_node
+            .entry(node_id.clone())
+            .or_insert_with(|| blank(node_id));
+        entry.month_forwarding_uplink_bytes = i64_to_u64("up", row.try_get("up")?)?;
+        entry.month_forwarding_downlink_bytes = i64_to_u64("down", row.try_get("down")?)?;
+        entry.month_has_gap |= row.try_get::<bool, _>("has_gap")?;
     }
 
     Ok(UsageNodeSeriesList {
@@ -1526,6 +2054,31 @@ pub async fn list_monthly_usage_summary_for_offset(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let forwarding_rows = sqlx::query(
+        "SELECT s.tenant_id,s.user_id,s.node_id,s.rule_id,r.name AS rule_name,
+                sum(s.uplink_bytes)::bigint AS uplink_bytes,sum(s.downlink_bytes)::bigint AS downlink_bytes,
+                bool_or(s.has_gap) AS has_gap
+         FROM forwarding_usage_rollups s JOIN forwarding_rules r ON r.id=s.rule_id
+         WHERE s.period_start >= $1::timestamptz AND s.period_start < $2::timestamptz
+           AND ($3::text IS NULL OR s.tenant_id=$3 OR s.tenant_id LIKE $4 ESCAPE '\\')
+         GROUP BY s.tenant_id,s.user_id,s.node_id,s.rule_id,r.name ORDER BY s.tenant_id,s.user_id,s.node_id,s.rule_id",
+    ).bind(&inst_start).bind(&inst_end).bind(tenant_scope).bind(&tenant_pattern).fetch_all(&mut *tx).await?;
+    let forwarding = forwarding_rows
+        .iter()
+        .map(|row| {
+            Ok(UsageForwardingMonthlyRow {
+                tenant_id: row.try_get("tenant_id")?,
+                user_id: row.try_get("user_id")?,
+                node_id: row.try_get("node_id")?,
+                rule_id: row.try_get("rule_id")?,
+                rule_name: row.try_get("rule_name")?,
+                uplink_bytes: i64_to_u64("uplink_bytes", row.try_get("uplink_bytes")?)?,
+                downlink_bytes: i64_to_u64("downlink_bytes", row.try_get("downlink_bytes")?)?,
+                has_gap: row.try_get("has_gap")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     // Daily composition uses the exact same attribution and filtering boundary as the view
     // totals above. `window_start` decides both the month and local day; a 30-second sample is
     // never split across two labels. Empty dates are omitted and filled by the UI from the
@@ -1536,7 +2089,11 @@ pub async fn list_monthly_usage_summary_for_offset(
                 sum(s.uplink_bytes)::bigint AS uplink_bytes,
                 sum(s.downlink_bytes)::bigint AS downlink_bytes,
                 bool_or(s.has_gap) AS has_gap
-         FROM usage_rollups s
+         FROM (
+             SELECT period_start,tenant_id,uplink_bytes,downlink_bytes,has_gap FROM usage_rollups
+             UNION ALL
+             SELECT period_start,tenant_id,uplink_bytes,downlink_bytes,has_gap FROM forwarding_usage_rollups
+         ) s
          WHERE s.period_start >= $1::timestamptz
            AND s.period_start < $2::timestamptz
            AND (
@@ -1570,6 +2127,7 @@ pub async fn list_monthly_usage_summary_for_offset(
         month_start: wall_start,
         month_end: wall_end,
         views,
+        forwarding,
         days,
     })
 }

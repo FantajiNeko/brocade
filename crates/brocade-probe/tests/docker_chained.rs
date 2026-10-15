@@ -226,6 +226,7 @@ fn chained_probe_crosses_two_real_xray_servers_and_obeys_member_routing() {
         address: Ipv4Addr::LOCALHOST.to_string(),
         port: host_port,
         protocol: ExternalOutboundProtocol::Vless {
+            final_mask: None,
             credential: MEMBER_UUID.to_owned(),
             encryption: "none".to_owned(),
             flow: None,

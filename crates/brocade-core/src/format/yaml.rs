@@ -866,6 +866,7 @@ fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProx
             if let ExternalOutboundSecurity::Tls {
                 server_name,
                 fingerprint,
+                ..
             } = &proxy.security
             {
                 lines.push(format!("    sni: {}", scalar(server_name)));
@@ -877,6 +878,7 @@ fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProx
             encryption,
             flow,
             transport,
+            ..
         } => {
             lines.push("    type: vless".to_owned());
             lines.push(format!("    uuid: {}", scalar(credential)));
@@ -885,6 +887,53 @@ fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProx
             }
             match transport {
                 ExternalVlessTransport::Raw => lines.push("    network: tcp".to_owned()),
+                ExternalVlessTransport::Kcp(kcp) => {
+                    lines.push("    network: mkcp".to_owned());
+                    lines.push("    mkcp-opts:".to_owned());
+                    if let Some(mtu) = kcp.mtu {
+                        lines.push(format!("      mtu: {mtu}"));
+                    }
+                    if let Some(tti) = kcp.tti {
+                        lines.push(format!("      tti: {tti}"));
+                    }
+                }
+                ExternalVlessTransport::Websocket(websocket) => {
+                    lines.push("    network: ws".to_owned());
+                    lines.push("    ws-opts:".to_owned());
+                    lines.push(format!("      path: {}", yaml_quote(&websocket.path)));
+                    if let Some(host) = &websocket.host {
+                        lines.push("      headers:".to_owned());
+                        lines.push(format!("        Host: {}", scalar(host)));
+                    }
+                }
+                ExternalVlessTransport::Http(http) => {
+                    lines.push("    network: h2".to_owned());
+                    lines.push("    h2-opts:".to_owned());
+                    lines.push(format!("      path: {}", yaml_quote(&http.path)));
+                    if let Some(host) = &http.host {
+                        lines.push("      host:".to_owned());
+                        lines.push(format!("        - {}", scalar(host)));
+                    }
+                }
+                ExternalVlessTransport::Grpc(grpc) => {
+                    lines.push("    network: grpc".to_owned());
+                    lines.push("    grpc-opts:".to_owned());
+                    lines.push(format!(
+                        "      grpc-service-name: {}",
+                        yaml_quote(&grpc.service_name)
+                    ));
+                }
+                ExternalVlessTransport::HttpUpgrade(http_upgrade) => {
+                    // Mihomo exposes Xray's HTTPUpgrade wire through its WebSocket option set.
+                    lines.push("    network: ws".to_owned());
+                    lines.push("    ws-opts:".to_owned());
+                    lines.push(format!("      path: {}", yaml_quote(&http_upgrade.path)));
+                    if let Some(host) = &http_upgrade.host {
+                        lines.push("      headers:".to_owned());
+                        lines.push(format!("        Host: {}", scalar(host)));
+                    }
+                    lines.push("      v2ray-http-upgrade: true".to_owned());
+                }
                 ExternalVlessTransport::Xhttp(xhttp) => {
                     lines.push("    network: xhttp".to_owned());
                     lines.push("    xhttp-opts:".to_owned());
@@ -1062,16 +1111,45 @@ fn push_external_security(
         ExternalOutboundSecurity::Tls {
             server_name,
             fingerprint,
+            alpn,
+            ech_config_list,
+            pinned_peer_cert_sha256,
+            verify_peer_cert_by_name,
+            ..
         } => {
             lines.push(format!("{pad}tls: true"));
             lines.push(format!("{pad}servername: {}", scalar(server_name)));
             lines.push(format!("{pad}client-fingerprint: {}", scalar(fingerprint)));
+            if !alpn.is_empty() {
+                lines.push(format!(
+                    "{pad}alpn: [{}]",
+                    alpn.iter()
+                        .map(|value| scalar(value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if let Some(name) = verify_peer_cert_by_name {
+                lines.push(format!("{pad}name-cert-verify: {}", scalar(name)));
+            }
+            if let Some(pin) = pinned_peer_cert_sha256
+                .as_deref()
+                .and_then(|pins| pins.split(',').find(|pin| !pin.trim().is_empty()))
+            {
+                lines.push(format!("{pad}fingerprint: {}", scalar(pin.trim())));
+            }
+            if let Some(ech) = ech_config_list {
+                lines.push(format!("{pad}ech-opts:"));
+                lines.push(format!("{pad}  enable: true"));
+                lines.push(format!("{pad}  config: {}", scalar(ech)));
+            }
         }
         ExternalOutboundSecurity::Reality {
             server_name,
             public_key,
             short_id,
             fingerprint,
+            ..
         } => {
             lines.push(format!("{pad}tls: true"));
             lines.push(format!("{pad}servername: {}", scalar(server_name)));

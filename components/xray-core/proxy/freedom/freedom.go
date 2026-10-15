@@ -168,6 +168,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.CanSpliceCopy.Store(session.SpliceCopyDirect)
 	inbound := session.InboundFromContext(ctx)
 	blockedIPMatcher := h.getBlockedIPMatcher(ctx, inbound)
+	if blockedIPMatcher != nil {
+		ctx = internet.ContextWithIPBlocker(ctx, blockedIPMatcher.Match)
+	}
 
 	destination := ob.Target
 	origTargetAddr := ob.OriginalTarget.Address
@@ -216,6 +219,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
+		if isBlockedAddress(blockedIPMatcher, dialDest.Address) {
+			return errors.New("blocked target IP: ", dialDest.Address).AtInfo()
+		}
 		rawConn, err := dialer.Dial(ctx, dialDest)
 		if err != nil {
 			return err

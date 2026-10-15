@@ -1,5 +1,5 @@
-import { useMemo, useState, useSyncExternalStore } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ApiError,
   cancelTunnelProbe,
@@ -9,16 +9,19 @@ import {
   startTunnelProbe,
   updateTunnelProbePolicy,
   type TunnelProbeHealth,
+  type TunnelProbeHealthReason,
   type TunnelProbeListItem,
   type TunnelProbeResultStatus,
   type TunnelProbeRun,
   type TunnelProbeSource,
+  type TunnelProbeView,
 } from './api';
 import { draft } from './draft';
-import { EmptyState, ErrorBox, Loading, SegmentedControl } from './ui/bits';
+import { ErrorBox, Loading, SegmentedControl } from './ui/bits';
 import { DialogClose, DialogLayer } from './ui/dialog';
-import { PanelTitle } from './ui/icons';
+import { Icon, PanelTitle } from './ui/icons';
 import { confirmDiscardChanges, useUnsavedChanges } from './ui/navigation-guard';
+import { RegionFlag } from './ui/region-flag';
 
 const INTERVALS = [
   { value: 60, label: '每分钟' },
@@ -46,124 +49,485 @@ const resultText: Record<TunnelProbeResultStatus, string> = {
   interrupted: '执行中断',
 };
 
+/** Results that count as a failed run. Canceled and unsupported runs never reached the target. */
+const FAILED_RESULTS = new Set<TunnelProbeResultStatus>(['timeout', 'connect-failed', 'target-failed', 'interrupted']);
+const COUNTED_RESULTS = new Set<TunnelProbeResultStatus>(['ok', 'timeout', 'connect-failed', 'target-failed']);
+
 const phaseOrder = ['queued', 'preparing', 'starting-xray', 'requesting'] as const;
 const phaseText = ['排队', '冻结配置', '启动 Xray', '请求落点'] as const;
+
+const WINDOWS = [
+  { value: 86_400, label: '24 小时' },
+  { value: 604_800, label: '7 天' },
+] as const;
+const windowText = (seconds: number) => WINDOWS.find(option => option.value === seconds)?.label ?? `${seconds} 秒`;
+
+/** Records shown before the operator asks for the rest of the retained list. */
+const RUNS_SHOWN = 5;
 
 const isActive = (run: TunnelProbeRun | null | undefined) => run?.status === 'queued' || run?.status === 'running';
 const intervalText = (seconds: number) => INTERVALS.find(option => option.value === seconds)?.label ?? `${seconds} 秒`;
 const dateText = (seconds: number | null) =>
   seconds === null ? '—' : new Date(seconds * 1000).toLocaleString('zh-CN', { hour12: false });
 
+const two = (value: number) => String(value).padStart(2, '0');
+/** HH:MM for today, MM-DD HH:MM otherwise; probe records span at most the retention week. */
+export function probeClock(seconds: number, nowMs = Date.now()): string {
+  const date = new Date(seconds * 1000);
+  const now = new Date(nowMs);
+  const time = `${two(date.getHours())}:${two(date.getMinutes())}`;
+  return date.toDateString() === now.toDateString()
+    ? time
+    : `${two(date.getMonth() + 1)}-${two(date.getDate())} ${time}`;
+}
+
+/** One decimal, rounded down so a single failure never reads as 100%. */
+const successRateText = (rate: number) => {
+  const tenths = Math.floor(rate * 1000) / 10;
+  return Number.isInteger(tenths) ? String(tenths) : tenths.toFixed(1);
+};
+
+function sinceText(seconds: number, nowMs = Date.now()): string {
+  const elapsed = Math.max(0, Math.round(nowMs / 1000 - seconds));
+  if (elapsed < 60) return '刚刚';
+  if (elapsed < 3_600) return `${Math.round(elapsed / 60)} 分钟前`;
+  if (elapsed < 86_400) return `${Math.round(elapsed / 3_600)} 小时前`;
+  return `${Math.round(elapsed / 86_400)} 天前`;
+}
+
 function HealthBadge({ health }: { health: TunnelProbeHealth }) {
   return <span className={`tunnel-probe-health ${health}`}>{healthText[health]}</span>;
 }
 
-function ProbePhases({ run }: { run: TunnelProbeRun }) {
+export const tunnelProbeQueryKey = (tenantId: string, outboundId: string, windowSecs: number) =>
+  ['tunnel-probe', tenantId, outboundId, windowSecs] as const;
+
+/** The detail page header and the probe panel read one query, so a window switch or a poll is
+ * one request. Switching windows keeps the previous window on screen until the next one arrives. */
+export function useTunnelProbeView(tenantId: string, outboundId: string, windowSecs: number, enabled = true) {
+  return useQuery({
+    queryKey: tunnelProbeQueryKey(tenantId, outboundId, windowSecs),
+    queryFn: () => fetchTunnelProbe(tenantId, outboundId, windowSecs),
+    enabled,
+    staleTime: 15_000,
+    retry: false,
+    retryOnMount: false,
+    refetchOnMount: false,
+    placeholderData: keepPreviousData,
+    refetchInterval: query => (isActive(query.state.data?.item.latest_run) ? 2_000 : 15_000),
+  });
+}
+
+// ECharts stays out of the tunnel list and Settings: only a tunnel detail loads the chart module,
+// and it gates its first paint on the module so the page appears complete at once.
+const importTunnelProbeChart = () => import('./tunnel-probe-chart');
+type TunnelProbeChartComponent = Awaited<ReturnType<typeof importTunnelProbeChart>>['TunnelProbeChart'];
+export type TunnelProbeChartState =
+  { status: 'pending' } | { status: 'ready'; Chart: TunnelProbeChartComponent } | { status: 'error'; error: unknown };
+
+let loadedTunnelProbeChart: TunnelProbeChartComponent | null = null;
+let tunnelProbeChartPromise: Promise<TunnelProbeChartComponent> | null = null;
+
+function loadTunnelProbeChart(): Promise<TunnelProbeChartComponent> {
+  if (loadedTunnelProbeChart) return Promise.resolve(loadedTunnelProbeChart);
+  tunnelProbeChartPromise ??= importTunnelProbeChart().then(module => {
+    loadedTunnelProbeChart = module.TunnelProbeChart;
+    return loadedTunnelProbeChart;
+  });
+  return tunnelProbeChartPromise;
+}
+
+export function useTunnelProbeChart(enabled = true): TunnelProbeChartState {
+  const [state, setState] = useState<TunnelProbeChartState>(() =>
+    loadedTunnelProbeChart ? { status: 'ready', Chart: loadedTunnelProbeChart } : { status: 'pending' },
+  );
+  useEffect(() => {
+    if (!enabled || state.status !== 'pending') return;
+    let active = true;
+    loadTunnelProbeChart().then(
+      Chart => {
+        if (active) setState({ status: 'ready', Chart });
+      },
+      error => {
+        if (active) setState({ status: 'error', error });
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [enabled, state.status]);
+  return state;
+}
+
+export type TunnelProbeTone = 'ok' | 'warn' | 'err' | 'idle';
+export interface TunnelProbeStatus {
+  /** `unpublished`: the tunnel has no Serving copy, so only a draft can be probed. */
+  key: TunnelProbeHealth | 'unpublished';
+  word: string;
+  tone: TunnelProbeTone;
+  why: string;
+}
+
+const TONE: Record<TunnelProbeHealth, TunnelProbeTone> = {
+  healthy: 'ok',
+  degraded: 'warn',
+  down: 'err',
+  paused: 'idle',
+  unknown: 'idle',
+};
+
+function reasonText(reason: TunnelProbeHealthReason, failure: TunnelProbeRun | undefined, nowMs: number): string {
+  const detail = failure?.error_detail ? `：${failure.error_detail}` : '';
+  switch (reason.kind) {
+    case 'not-scheduled':
+      return '定时监测未启用';
+    case 'no-samples':
+      return '最近 7 天没有 Serving 拨测';
+    case 'stale':
+      return reason.latest_finished_at_unix_secs === null
+        ? '最近一次拨测没有完成'
+        : `最近一次拨测在 ${sinceText(reason.latest_finished_at_unix_secs, nowMs)}，已超过 3 个周期`;
+    case 'consecutive-failures':
+      return `连续 ${reason.count} 次失败，最近一次${reason.latest ? resultText[reason.latest] : '失败'}${detail}`;
+    case 'latest-failed':
+      return `最近一次${reason.result ? resultText[reason.result] : '失败'}${detail}`;
+    case 'low-success-rate':
+      return `最近 ${reason.samples} 次成功 ${reason.succeeded} 次`;
+    case 'slow':
+      return reason.samples === 1
+        ? `最近一次拨测首字节 ${reason.max_ttfb_ms} ms，超过 ${reason.threshold_ms} ms`
+        : `最近 ${reason.samples} 次拨测首字节最高 ${reason.max_ttfb_ms} ms，超过 ${reason.threshold_ms} ms`;
+    case 'healthy':
+      return reason.max_ttfb_ms === null
+        ? `最近 ${reason.samples} 次全部成功`
+        : `最近 ${reason.samples} 次全部成功，首字节最高 ${reason.max_ttfb_ms} ms`;
+  }
+}
+
+/** Status of a custom tunnel as the Console judged it. `view` is null when the Console has no
+ * record of the tunnel at all, which only happens before it is published or first probed. */
+export function tunnelProbeStatus(view: TunnelProbeView | null, nowMs = Date.now()): TunnelProbeStatus {
+  if (!view || !view.item.supported) {
+    return {
+      key: 'unpublished',
+      word: '未发布',
+      tone: 'idle',
+      why: view?.item.unsupported_reason ?? '尚未进入 Serving；发布后才能启用定时监测或拨测 Serving',
+    };
+  }
+  const { health, health_reason: reason } = view.item;
+  const failure = view.recent_runs.find(
+    run => run.source === 'serving' && run.result !== null && COUNTED_RESULTS.has(run.result) && run.result !== 'ok',
+  );
+  return {
+    key: health,
+    word: healthText[health],
+    tone: TONE[health],
+    why: reason ? reasonText(reason, failure, nowMs) : '',
+  };
+}
+
+/** The newest run that reported where traffic leaves the tunnel. */
+export const tunnelExitRun = (view: TunnelProbeView | null | undefined) =>
+  view?.recent_runs.find(run => run.exit_ip) ?? (view?.item.latest_run?.exit_ip ? view.item.latest_run : null);
+
+function ProbeProgress({ run, source }: { run: TunnelProbeRun; source: TunnelProbeSource }) {
   const current = Math.max(0, phaseOrder.indexOf(run.phase as (typeof phaseOrder)[number]));
   return (
-    <ol className="tunnel-probe-phases" aria-label="拨测进度">
-      {phaseText.map((label, index) => (
-        <li className={index < current ? 'done' : index === current ? 'current' : ''} key={label}>
-          <span>{index + 1}</span>
-          {label}
-        </li>
-      ))}
-    </ol>
+    <div className="tnd-verdict is-run" role="status">
+      <span className="cg-lamp run" aria-hidden />
+      <b>拨测中</b>
+      <span className="tnd-why">
+        {phaseText[current]} · 第 {current + 1} 步，共 {phaseText.length} 步 · {source === 'draft' ? '草稿' : 'Serving'}
+      </span>
+      <ol className="tnd-steps" aria-label="拨测进度">
+        {phaseText.map((label, index) => (
+          <li
+            className={index < current ? 'done' : index === current ? 'current' : ''}
+            key={label}
+            title={label}
+            aria-label={label}
+          />
+        ))}
+      </ol>
+    </div>
   );
 }
 
-function ProbeChart({
-  points,
-  p95Ms,
-}: {
-  points: { result: TunnelProbeResultStatus; ttfb_ms: number | null }[];
-  p95Ms: number | null;
-}) {
-  const geometry = useMemo(() => {
-    const maximum = Math.max(
-      1,
-      p95Ms ?? 0,
-      ...points.flatMap(point => (point.ttfb_ms === null ? [] : [point.ttfb_ms])),
-    );
-    const x = (index: number) => (points.length <= 1 ? 300 : (index / (points.length - 1)) * 580 + 10);
-    const y = (value: number) => 104 - (value / maximum) * 88;
-    const segments: string[] = [];
-    let current = '';
-    points.forEach((point, index) => {
-      if (point.result !== 'ok' || point.ttfb_ms === null) {
-        if (current) segments.push(current);
-        current = '';
-        return;
-      }
-      current += `${current ? ' L' : 'M'} ${x(index).toFixed(1)} ${y(point.ttfb_ms).toFixed(1)}`;
-    });
-    if (current) segments.push(current);
-    return { segments, x, y };
-  }, [points, p95Ms]);
-
-  if (points.length === 0) return <p className="tunnel-probe-chart-empty">完成第一次拨测后，这里会出现首字节趋势。</p>;
+function Verdict({ status, view }: { status: TunnelProbeStatus; view: TunnelProbeView | null }) {
+  const policy = view?.item.policy;
+  const lastServing = view?.recent_runs.find(run => run.source === 'serving' && run.finished_at_unix_secs !== null);
+  const lastAny = view?.recent_runs.find(run => run.finished_at_unix_secs !== null);
+  const timing =
+    status.key !== 'unpublished' && policy?.enabled
+      ? `上次 ${lastServing?.finished_at_unix_secs ? probeClock(lastServing.finished_at_unix_secs) : '—'} · 下次 ${
+          policy.next_run_at_unix_secs ? probeClock(policy.next_run_at_unix_secs) : '—'
+        }`
+      : lastAny?.finished_at_unix_secs
+        ? `上次 ${probeClock(lastAny.finished_at_unix_secs)}`
+        : '';
   return (
-    <svg className="tunnel-probe-chart" viewBox="0 0 600 116" preserveAspectRatio="none" aria-label="首字节趋势">
-      <line x1="10" x2="590" y1="104" y2="104" className="axis" />
-      {p95Ms !== null && (
-        <line
-          x1="10"
-          x2="590"
-          y1={geometry.y(p95Ms)}
-          y2={geometry.y(p95Ms)}
-          className="p95"
-          aria-label={`P95 ${p95Ms} 毫秒`}
-        />
-      )}
-      {geometry.segments.map((segment, index) => (
-        <path d={segment} className="line" key={index} />
-      ))}
-      {points.map((point, index) =>
-        point.result === 'ok' && point.ttfb_ms !== null ? (
-          <circle cx={geometry.x(index)} cy={geometry.y(point.ttfb_ms)} r="2.5" className="reading" key={index} />
-        ) : (
-          <g key={index}>
-            <line x1={geometry.x(index)} x2={geometry.x(index)} y1="86" y2="104" className="failure-drop" />
-            <circle cx={geometry.x(index)} cy="104" r="3.5" className="failure" />
-          </g>
+    <div className={`tnd-verdict tone-${status.tone}`}>
+      <span className={`cg-lamp ${status.tone}`} aria-hidden />
+      <b>{status.word}</b>
+      <span className="tnd-why" title={status.why}>
+        {status.why}
+      </span>
+      {timing && <span className="tnd-when">{timing}</span>}
+    </div>
+  );
+}
+
+interface MetricCell {
+  label: string;
+  value: ReactNode;
+  sub: ReactNode;
+  tone?: 'warn' | 'err';
+  wide?: boolean;
+}
+
+function exitCell(view: TunnelProbeView | null, windowSecs: number): MetricCell {
+  const exit = tunnelExitRun(view);
+  if (!exit?.exit_ip) return { label: '出口', value: '—', sub: '拨测成功后显示', wide: true };
+  const seen = exit.finished_at_unix_secs ?? exit.queued_at_unix_secs;
+  const many = view && view.summary.exit_ips > 1 ? ` · ${windowText(windowSecs)}内 ${view.summary.exit_ips} 个 IP` : '';
+  return {
+    label: '出口',
+    value: (
+      <>
+        <RegionFlag code={exit.exit_loc} />
+        <span className="tnd-ip">{exit.exit_ip}</span>
+      </>
+    ),
+    sub: `${exit.exit_loc ?? '未知地区'} · ${probeClock(seen)}${many}`,
+    wide: true,
+  };
+}
+
+function Metrics({
+  view,
+  status,
+  windowSecs,
+}: {
+  view: TunnelProbeView | null;
+  status: TunnelProbeStatus;
+  windowSecs: number;
+}) {
+  let cells: MetricCell[];
+  if (status.key === 'unpublished') {
+    const runs = view?.recent_runs.filter(run => run.finished_at_unix_secs !== null) ?? [];
+    const latest = runs[0];
+    if (!latest) return null;
+    cells = [
+      {
+        label: '最近一次',
+        value:
+          latest.result === 'ok' ? (
+            <>
+              {latest.ttfb_ms}
+              <span className="u">ms</span>
+            </>
+          ) : (
+            <span className="err">{latest.result ? resultText[latest.result] : '未完成'}</span>
+          ),
+        sub: `${latest.source === 'draft' ? `草稿 ${latest.draft_sha256?.slice(0, 8) ?? '—'}` : 'Serving'} · ${probeClock(latest.finished_at_unix_secs!)}`,
+      },
+      {
+        label: '草稿拨测',
+        value: (
+          <>
+            {runs.filter(run => run.result === 'ok').length}
+            <span className="u">/ {runs.length} 成功</span>
+          </>
         ),
-      )}
-    </svg>
+        sub: '手动发起',
+      },
+      exitCell(view, windowSecs),
+    ];
+  } else {
+    const summary = view!.summary;
+    const split = [
+      ['超时', summary.timeouts],
+      ['连接', summary.connect_failures],
+      ['落点', summary.target_failures],
+    ]
+      .filter(([, count]) => Number(count) > 0)
+      .map(([label, count]) => `${label} ${count}`)
+      .join(' · ');
+    cells = [
+      {
+        label: '可用率',
+        value:
+          summary.success_rate === null ? (
+            '—'
+          ) : (
+            <>
+              {successRateText(summary.success_rate)}
+              <span className="u">%</span>
+            </>
+          ),
+        sub: `${summary.succeeded} / ${summary.total} 次 · ${windowText(windowSecs)}`,
+      },
+      {
+        label: '首字节 P50',
+        value:
+          summary.p50_ms === null ? (
+            '—'
+          ) : (
+            <>
+              {summary.p50_ms}
+              <span className="u">ms</span>
+            </>
+          ),
+        sub: '中位数',
+      },
+      {
+        label: 'P95',
+        value:
+          summary.p95_ms === null ? (
+            '—'
+          ) : (
+            <>
+              {summary.p95_ms}
+              <span className="u">ms</span>
+            </>
+          ),
+        sub: '慢尾',
+      },
+      {
+        label: '失败',
+        value: summary.failures,
+        sub: split || '—',
+        tone: summary.failures === 0 ? undefined : status.key === 'down' ? 'err' : 'warn',
+      },
+      exitCell(view, windowSecs),
+    ];
+  }
+  return (
+    <dl className={`tnd-metrics is-${cells.length}`}>
+      {cells.map(cell => (
+        <div className={cell.wide ? 'is-wide' : undefined} key={cell.label}>
+          <dt>{cell.label}</dt>
+          <dd className={cell.tone}>{cell.value}</dd>
+          <small>{cell.sub}</small>
+        </div>
+      ))}
+    </dl>
   );
 }
 
 function RunRows({ runs }: { runs: TunnelProbeRun[] }) {
-  if (runs.length === 0) return <p className="tunnel-probe-inline-empty">还没有拨测记录。</p>;
+  const [all, setAll] = useState(false);
+  if (runs.length === 0) return <p className="tnd-none">还没有拨测记录。</p>;
+  const shown = all ? runs : runs.slice(0, RUNS_SHOWN);
   return (
-    <div className="tunnel-probe-runs">
-      {runs.map(run => (
-        <article className={`tunnel-probe-run ${run.result ?? run.status}`} key={run.id}>
-          <span className="tunnel-probe-run-mark" aria-hidden />
-          <span className="tunnel-probe-run-main">
-            <b>{run.result ? resultText[run.result] : run.status === 'running' ? '运行中' : '等待执行'}</b>
-            <small>
-              {run.trigger === 'manual' ? '手动' : '定时'} · {run.source === 'draft' ? '草稿' : 'Serving'} ·{' '}
-              {dateText(run.finished_at_unix_secs ?? run.queued_at_unix_secs)}
-            </small>
-          </span>
-          <span className="tunnel-probe-run-reading">
-            <b>{run.ttfb_ms === null ? '—' : `${run.ttfb_ms} ms`}</b>
-            <small>{run.http_status === null ? (run.error_detail ?? '尚未完成') : `HTTP ${run.http_status}`}</small>
-          </span>
-          {run.source === 'draft' ? (
-            <span
-              className="tunnel-probe-run-revision draft"
-              title={`点击时冻结的草稿，基于修订 r${run.topology_revision}`}
-            >
-              草稿 {run.draft_sha256?.slice(0, 8) ?? '—'}
-            </span>
-          ) : (
-            <span className="tunnel-probe-run-revision" title={`Serving generation ${run.serving_generation ?? '—'}`}>
-              G{run.serving_generation ?? '—'} · r{run.topology_revision}
-            </span>
-          )}
-        </article>
-      ))}
+    <>
+      <div className="tnd-runs">
+        {shown.map(run => {
+          const failed = run.result !== null && FAILED_RESULTS.has(run.result);
+          const tone = run.result === 'ok' ? 'ok' : failed ? 'fail' : isActive(run) ? 'run' : 'muted';
+          const revision =
+            run.source === 'draft'
+              ? `点击时冻结的草稿，基于修订 r${run.topology_revision}`
+              : `Serving G${run.serving_generation ?? '—'} · r${run.topology_revision}`;
+          return (
+            <article className={`tnd-run is-${tone}`} key={run.id} title={revision}>
+              <span className="tnd-run-when">{probeClock(run.finished_at_unix_secs ?? run.queued_at_unix_secs)}</span>
+              <span className="tnd-run-ic" aria-hidden>
+                {tone === 'ok' ? (
+                  <Icon of="check" size={11} />
+                ) : tone === 'fail' ? (
+                  <Icon of="close" size={11} />
+                ) : (
+                  <Icon of="clock" size={11} />
+                )}
+              </span>
+              <b className="tnd-run-val">
+                {run.result === 'ok' && run.ttfb_ms !== null ? (
+                  <>
+                    {run.ttfb_ms}
+                    <span className="u">ms</span>
+                  </>
+                ) : run.result ? (
+                  resultText[run.result]
+                ) : run.status === 'running' ? (
+                  '运行中'
+                ) : (
+                  '等待执行'
+                )}
+              </b>
+              <span className="tnd-run-detail">
+                {run.result === 'ok' ? (
+                  <>
+                    {run.http_status !== null && <span>HTTP {run.http_status}</span>}
+                    {run.exit_ip && (
+                      <>
+                        <RegionFlag code={run.exit_loc} />
+                        <span className="tnd-ip">{run.exit_ip}</span>
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <span className="tnd-run-error">{run.error_detail ?? ''}</span>
+                )}
+              </span>
+              <span className="tnd-run-tags">
+                {run.trigger === 'manual' && <span className="tnd-tag">手动</span>}
+                {run.source === 'draft' && (
+                  <span className="tnd-tag draft">草稿 {run.draft_sha256?.slice(0, 8) ?? '—'}</span>
+                )}
+              </span>
+            </article>
+          );
+        })}
+      </div>
+      {runs.length > RUNS_SHOWN && (
+        <button className="tnd-more" type="button" onClick={() => setAll(value => !value)}>
+          {all ? '收起' : `显示最近 ${runs.length} 次`}
+        </button>
+      )}
+    </>
+  );
+}
+
+const endpointText = (url: string) => url.replace(/^https?:\/\//, '');
+
+function PolicyLine({
+  item,
+  published,
+  endpointUrl,
+  editable,
+  onEdit,
+}: {
+  item: TunnelProbeListItem | null;
+  published: boolean;
+  endpointUrl: string | null;
+  editable: boolean;
+  onEdit: () => void;
+}) {
+  const policy = item?.policy;
+  return (
+    <div className="tnd-policy">
+      <span className="tnd-k">定时监测</span>
+      {!published ? (
+        <span>发布后可启用</span>
+      ) : policy?.enabled ? (
+        <span>
+          {intervalText(policy.interval_secs)} · 超时 {policy.timeout_secs} 秒
+        </span>
+      ) : (
+        <span className="warn">{policy ? '已暂停' : '未启用'}</span>
+      )}
+      {endpointUrl && (
+        <span className="tnd-route" title="拨测从 Console 发起，经这条隧道请求落点">
+          Console → {endpointText(endpointUrl)}
+        </span>
+      )}
+      {published && item && (
+        <button className="btn tnd-mini" type="button" disabled={!editable} onClick={onEdit}>
+          {policy?.enabled ? '修改' : '设置'}
+        </button>
+      )}
     </div>
   );
 }
@@ -288,17 +652,19 @@ export function TunnelProbePanel({
   outboundId,
   draftSupported,
   editable,
+  windowSecs,
+  onWindowChange,
 }: {
   tenantId: string;
   outboundId: string;
   draftSupported: boolean;
   editable: boolean;
+  windowSecs: number;
+  onWindowChange: (windowSecs: number) => void;
 }) {
   const qc = useQueryClient();
   const draftEntries = useSyncExternalStore(draft.subscribe, draft.snapshot);
-  const [windowSecs, setWindowSecs] = useState(86_400);
   const [policyOpen, setPolicyOpen] = useState(false);
-  const [requestedSource, setRequestedSource] = useState<TunnelProbeSource>('serving');
   const capability = useQuery({
     queryKey: ['tunnel-probe-capability'],
     queryFn: fetchTunnelProbeCapability,
@@ -308,15 +674,16 @@ export function TunnelProbePanel({
     retryOnMount: false,
     refetchOnMount: false,
   });
-  const probe = useQuery({
-    queryKey: ['tunnel-probe', tenantId, outboundId, windowSecs],
-    queryFn: () => fetchTunnelProbe(tenantId, outboundId, windowSecs),
-    staleTime: 15_000,
+  // The probe target is Console configuration; only operators who may change policies read it.
+  const inventory = useQuery({
+    queryKey: ['tunnel-probes'],
+    queryFn: fetchTunnelProbes,
+    staleTime: 60_000,
+    enabled: editable,
     retry: false,
-    retryOnMount: false,
-    refetchOnMount: false,
-    refetchInterval: query => (isActive(query.state.data?.item.latest_run) ? 2_000 : 15_000),
   });
+  const probe = useTunnelProbeView(tenantId, outboundId, windowSecs);
+  const chart = useTunnelProbeChart();
   const refresh = () => qc.invalidateQueries({ queryKey: ['tunnel-probe', tenantId, outboundId] });
   const start = useMutation({
     mutationFn: (source: TunnelProbeSource) => startTunnelProbe(tenantId, outboundId, source),
@@ -325,162 +692,114 @@ export function TunnelProbePanel({
   const cancel = useMutation({ mutationFn: (id: number) => cancelTunnelProbe(id), onSuccess: refresh });
   const available = capability.data?.available ?? false;
 
-  const startControls = (servingSupported: boolean, servingReason?: string | null) => {
-    const selectedSource =
-      requestedSource === 'serving' && !servingSupported && draftSupported
-        ? 'draft'
-        : requestedSource === 'draft' && !draftSupported && servingSupported
-          ? 'serving'
-          : requestedSource;
-    const sourceAvailable = selectedSource === 'serving' ? servingSupported : draftSupported;
-    const unavailableReason =
-      selectedSource === 'serving'
-        ? (servingReason ?? '这条隧道尚未进入 Serving')
-        : '当前草稿是 WARP；Console 没有可用于拨测的独立身份';
-    return (
-      <div className="tunnel-probe-start">
-        <select
-          className="f"
-          value={selectedSource}
-          disabled={!editable || start.isPending}
-          aria-label="拨测目标"
-          onChange={event => setRequestedSource(event.target.value as TunnelProbeSource)}
-        >
-          <option value="serving" disabled={!servingSupported}>
-            Serving{servingSupported ? '' : '（不可用）'}
-          </option>
-          <option value="draft" disabled={!draftSupported}>
-            草稿{draftEntries.length > 0 ? `（${draftEntries.length} 项修改）` : ''}
-            {draftSupported ? '' : '（不支持）'}
-          </option>
-        </select>
-        <button
-          className="btn primary"
-          disabled={!editable || !available || !sourceAvailable || start.isPending}
-          title={
-            !sourceAvailable
-              ? unavailableReason
-              : !available
-                ? (capability.data?.reason ?? 'Console 拨测组件不可用')
-                : undefined
-          }
-          onClick={() => start.mutate(selectedSource)}
-        >
-          {start.isPending ? '排队中…' : selectedSource === 'serving' ? '拨测 Serving' : '拨测草稿'}
-        </button>
-      </div>
-    );
-  };
-
   if (probe.isPending) return <Loading variant="panel" />;
-  if (probe.error instanceof ApiError && probe.error.status === 404) {
-    return (
-      <section className="panel config-panel tunnel-panel tunnel-probe-panel">
-        <header>
-          <PanelTitle of="tunnels">线路拨测</PanelTitle>
-          <div className="tunnel-probe-actions">{startControls(false, '这条隧道尚未进入 Serving')}</div>
-        </header>
-        <EmptyState icon="tunnels" title={draftSupported ? '可拨测当前草稿' : 'WARP 暂不支持 Console 拨测'}>
-          {draftSupported
-            ? '这条隧道还未进入 Serving；可以先冻结并拨测当前草稿。定时监测仍需在发布后启用。'
-            : 'WARP 的身份按机器分配，Console 没有可复用的独立身份；这里不会借用任一节点的私钥。'}
-        </EmptyState>
-        {!available && capability.data && (
-          <p className="tunnel-probe-warning">{capability.data.reason ?? 'Console 拨测组件不可用'}</p>
-        )}
-        {capability.error && <ErrorBox error={capability.error} />}
-        {start.error && <ErrorBox error={start.error} />}
-      </section>
-    );
-  }
-  if (probe.error) return <ErrorBox error={probe.error} />;
-  const view = probe.data!;
-  const active = view.recent_runs.find(isActive) ?? (isActive(view.item.latest_run) ? view.item.latest_run : null);
+  const missing = probe.error instanceof ApiError && probe.error.status === 404;
+  if (probe.error && !missing) return <ErrorBox error={probe.error} />;
+  const view = missing ? null : (probe.data ?? null);
+  const status = tunnelProbeStatus(view);
+  const published = status.key !== 'unpublished';
+  const active = view?.recent_runs.find(isActive) ?? (isActive(view?.item.latest_run) ? view!.item.latest_run : null);
+  // A published tunnel can still carry an unpublished edit; its draft is then worth probing too.
+  const draftChanged = draftEntries.some(
+    entry =>
+      entry.op.op === 'upsert_external_outbound' &&
+      entry.op.outbound.tenant_id === tenantId &&
+      entry.op.outbound.id === outboundId,
+  );
+  const blocked = !editable || !available || start.isPending;
+  const blockedReason = !editable
+    ? undefined
+    : !available
+      ? (capability.data?.reason ?? 'Console 拨测组件不可用')
+      : undefined;
+
   return (
-    <section className="panel config-panel tunnel-panel tunnel-probe-panel">
+    <section className="panel config-panel cg-sec tnd-probe">
       <header>
-        <PanelTitle of="tunnels">线路拨测</PanelTitle>
-        <HealthBadge health={view.item.health} />
-        <div className="tunnel-probe-actions">
+        <PanelTitle of="observe">拨测</PanelTitle>
+        <span className="sp" />
+        {published && (
           <SegmentedControl
+            className="tnd-seg"
             value={windowSecs}
-            options={[
-              { value: 86_400, label: '24 小时' },
-              { value: 604_800, label: '7 天' },
-            ]}
-            onChange={setWindowSecs}
+            options={WINDOWS}
+            onChange={onWindowChange}
             ariaLabel="拨测统计范围"
           />
+        )}
+        {active ? (
           <button
             className="btn"
-            disabled={!editable || !view.item.supported}
-            title={!view.item.supported ? (view.item.unsupported_reason ?? undefined) : undefined}
-            onClick={() => setPolicyOpen(true)}
+            type="button"
+            disabled={!editable || cancel.isPending || active.cancel_requested}
+            onClick={() => cancel.mutate(active.id)}
           >
-            设置
+            {active.cancel_requested || cancel.isPending ? '取消中…' : '取消'}
           </button>
-          {active ? (
-            <button
-              className="btn danger"
-              disabled={!editable || cancel.isPending}
-              onClick={() => cancel.mutate(active.id)}
-            >
-              {active.cancel_requested || cancel.isPending ? '取消中…' : '取消'}
-            </button>
-          ) : (
-            startControls(view.item.supported, view.item.unsupported_reason)
-          )}
-        </div>
+        ) : (
+          <>
+            {published && draftChanged && draftSupported && (
+              <button
+                className="btn"
+                type="button"
+                disabled={blocked}
+                title={blockedReason ?? '草稿修改了这条隧道；拨测点击时冻结的草稿'}
+                onClick={() => start.mutate('draft')}
+              >
+                拨测草稿
+              </button>
+            )}
+            {(published || draftSupported) && (
+              <button
+                className="btn primary"
+                type="button"
+                disabled={blocked}
+                title={blockedReason}
+                onClick={() => start.mutate(published ? 'serving' : 'draft')}
+              >
+                {start.isPending ? '排队中…' : published ? '立即拨测' : '拨测草稿'}
+              </button>
+            )}
+          </>
+        )}
       </header>
-      <p className="cardsub tunnel-probe-source">
-        起点 <b>Console</b> · 落点{' '}
-        <span className="mono">{view.item.latest_run ? '使用运行时冻结地址' : '全局探测地址'}</span> · 健康与趋势只统计
-        Serving
-      </p>
-      {!view.item.supported && (
-        <p className="tunnel-probe-warning">Serving：{view.item.unsupported_reason ?? '当前不可拨测'}</p>
-      )}
-      {!available && capability.data && (
-        <p className="tunnel-probe-warning">{capability.data.reason ?? 'Console 拨测组件不可用'}</p>
+      {active ? <ProbeProgress run={active} source={active.source} /> : <Verdict status={status} view={view} />}
+      {editable && capability.data && !available && (
+        <p className="tnd-notice">{capability.data.reason ?? 'Console 拨测组件不可用'}</p>
       )}
       {capability.error && <ErrorBox error={capability.error} />}
       {(start.error || cancel.error) && <ErrorBox error={start.error ?? cancel.error} />}
-      {active && <ProbePhases run={active} />}
-      <div className="tunnel-probe-dashboard">
-        <div className="tunnel-probe-plot">
-          <ProbeChart points={view.points} p95Ms={view.summary.p95_ms} />
-        </div>
-        <dl className="tunnel-probe-metrics">
-          <div>
-            <dt>成功率</dt>
-            <dd>{view.summary.success_rate === null ? '—' : `${Math.round(view.summary.success_rate * 100)}%`}</dd>
-            <small>
-              {view.summary.succeeded}/{view.summary.total} 次
-            </small>
-          </div>
-          <div>
-            <dt>P50</dt>
-            <dd>{view.summary.p50_ms === null ? '—' : `${view.summary.p50_ms} ms`}</dd>
-            <small>首字节中位数</small>
-          </div>
-          <div>
-            <dt>P95</dt>
-            <dd>{view.summary.p95_ms === null ? '—' : `${view.summary.p95_ms} ms`}</dd>
-            <small>首字节慢尾</small>
-          </div>
-          <div className={view.summary.failures > 0 ? 'bad' : ''}>
-            <dt>失败</dt>
-            <dd>{view.summary.failures}</dd>
-            <small>超时、连接与落点错误</small>
-          </div>
-        </dl>
+      <Metrics view={view} status={status} windowSecs={windowSecs} />
+      {!published ? (
+        <p className="tnd-chart-note">发布后开始定时拨测</p>
+      ) : chart.status === 'ready' ? (
+        <chart.Chart
+          points={view!.points}
+          windowSecs={windowSecs}
+          endUnixSecs={Math.floor(probe.dataUpdatedAt / 1000)}
+          bucketSecs={view!.bucket_secs}
+          intervalSecs={view!.item.policy?.interval_secs ?? null}
+          p50Ms={view!.summary.p50_ms}
+          slowMs={view!.slow_ttfb_ms}
+        />
+      ) : chart.status === 'error' ? (
+        <ErrorBox error={chart.error} />
+      ) : (
+        <div className="tnd-chart" aria-hidden />
+      )}
+      <div className="tnd-subhead">
+        <b>拨测记录</b>
+        <span>保留 {view?.retention_days ?? 7} 天 · 含手动与草稿</span>
       </div>
-      <div className="tunnel-probe-record-head">
-        <b>最近记录</b>
-        <span>保留 {view.retention_days} 天</span>
-      </div>
-      <RunRows runs={view.recent_runs} />
-      {policyOpen && <TunnelProbePolicyDialog item={view.item} onClose={() => setPolicyOpen(false)} />}
+      <RunRows runs={view?.recent_runs ?? []} />
+      <PolicyLine
+        item={view?.item ?? null}
+        published={published}
+        endpointUrl={inventory.data?.endpoint_url ?? null}
+        editable={editable}
+        onEdit={() => setPolicyOpen(true)}
+      />
+      {policyOpen && view && <TunnelProbePolicyDialog item={view.item} onClose={() => setPolicyOpen(false)} />}
     </section>
   );
 }

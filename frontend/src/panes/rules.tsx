@@ -3912,6 +3912,18 @@ function externalSecurityLabel(security: ExternalOutboundSecurity): string {
   return `${security.t.toUpperCase()} · ${security.v.fingerprint}`;
 }
 
+function externalVlessTransportLabel(transport: ExternalVlessTransport['t']): string {
+  return {
+    raw: 'RAW',
+    kcp: 'mKCP',
+    websocket: 'WebSocket',
+    http: 'HTTP/2',
+    grpc: 'gRPC',
+    http_upgrade: 'HTTPUpgrade',
+    xhttp: 'XHTTP',
+  }[transport];
+}
+
 function externalOutboundFacts(outbound: ExternalOutbound): {
   transport: string;
   transportSecurity: string | null;
@@ -3919,7 +3931,7 @@ function externalOutboundFacts(outbound: ExternalOutbound): {
 } {
   const protocol = outbound.protocol;
   if (protocol.t === 'vless') {
-    const transport = protocol.v.transport.t === 'xhttp' ? 'XHTTP' : 'RAW';
+    const transport = externalVlessTransportLabel(protocol.v.transport.t);
     return {
       transport: `${transport}${protocol.v.flow ? ` · ${protocol.v.flow}` : ''}`,
       transportSecurity: protocol.v.encryption !== 'none' ? null : externalSecurityLabel(outbound.security),
@@ -3990,6 +4002,29 @@ function decodeShareBase64(value: string): string {
   return window.atob(normalized);
 }
 
+function normalizeLegacyVlessShareLink(value: string): { value: string; encryption: string | null } {
+  if (!value.toLowerCase().startsWith('vless://')) return { value, encryption: null };
+  const authorityStart = 'vless://'.length;
+  const delimiters = [value.indexOf('?', authorityStart), value.indexOf('#', authorityStart)].filter(
+    index => index >= 0,
+  );
+  const authorityEnd = delimiters.length > 0 ? Math.min(...delimiters) : value.length;
+  const authority = value.slice(authorityStart, authorityEnd);
+
+  try {
+    const decoded = authority.includes('@') ? authority : decodeShareBase64(authority);
+    const match = /^([^:]+):([^@]+)@(.+)$/.exec(decoded);
+    if (!match) return { value, encryption: null };
+    const [, encryption, credential, endpoint] = match;
+    return {
+      value: `vless://${encodeURIComponent(credential)}@${endpoint}${value.slice(authorityEnd)}`,
+      encryption,
+    };
+  } catch {
+    return { value, encryption: null };
+  }
+}
+
 function externalObject(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -4041,6 +4076,35 @@ function parseExternalXhttpMux(value: unknown, field: string): number | null {
   return parsed;
 }
 
+function parseExternalOptionalInteger(
+  value: string | null,
+  field: string,
+  minimum: number,
+  maximum: number,
+): number | null {
+  if (value === null || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${field} 必须是 ${minimum}–${maximum} 的整数`);
+  }
+  return parsed;
+}
+
+function parseExternalJsonObject(value: string | null, field: string): Record<string, unknown> | null {
+  if (value === null || value === '') return null;
+  try {
+    const parsed = externalObject(JSON.parse(value));
+    if (!parsed) throw new Error();
+    return parsed;
+  } catch {
+    throw new Error(`${field} 必须是 JSON 对象`);
+  }
+}
+
+function externalOptionalParam(url: URL, name: string): string | null {
+  return url.searchParams.has(name) ? (url.searchParams.get(name) ?? '') : null;
+}
+
 function externalXhttpHost(value: unknown): string | null {
   if (Array.isArray(value)) return externalString(value[0]);
   return externalString(value);
@@ -4057,7 +4121,22 @@ function parseExternalDownloadSecurity(
   const settings = externalObject(download[kind === 'tls' ? 'tlsSettings' : 'realitySettings']) ?? {};
   const serverName = externalString(settings.serverName) ?? fallbackAddress;
   const fingerprint = externalString(settings.fingerprint) ?? 'chrome';
-  if (kind === 'tls') return { t: 'tls', v: { server_name: serverName, fingerprint } };
+  if (kind === 'tls') {
+    const alpn = Array.isArray(settings.alpn)
+      ? settings.alpn.filter((value): value is string => typeof value === 'string')
+      : [];
+    return {
+      t: 'tls',
+      v: {
+        server_name: serverName,
+        fingerprint,
+        alpn,
+        ech_config_list: externalString(settings.echConfigList),
+        pinned_peer_cert_sha256: externalString(settings.pinnedPeerCertSha256),
+        verify_peer_cert_by_name: externalString(settings.verifyPeerCertByName),
+      },
+    };
+  }
   return {
     t: 'reality',
     v: {
@@ -4065,33 +4144,85 @@ function parseExternalDownloadSecurity(
       public_key: externalString(settings.publicKey) ?? '',
       short_id: externalString(settings.shortId) ?? '',
       fingerprint,
+      mldsa65_verify: externalString(settings.mldsa65Verify),
+      spider_x: externalString(settings.spiderX),
     },
   };
 }
 
 function parseExternalVlessTransport(url: URL): ExternalVlessTransport {
-  const network = (url.searchParams.get('type') || 'tcp').toLowerCase();
+  const legacyObfs = url.searchParams.get('obfs')?.toLowerCase();
+  if (legacyObfs && legacyObfs !== 'websocket' && legacyObfs !== 'ws') {
+    throw new Error(`不支持此 VLESS obfs：${legacyObfs}`);
+  }
+  const network = (
+    url.searchParams.get('type') ||
+    (legacyObfs === 'websocket' || legacyObfs === 'ws' ? 'ws' : '') ||
+    'tcp'
+  ).toLowerCase();
   if (network === 'tcp' || network === 'raw') return { t: 'raw' };
-  if (network !== 'xhttp') throw new Error('当前外部 VLESS 支持 RAW/TCP 和 XHTTP');
+  if (network === 'kcp' || network === 'mkcp') {
+    return {
+      t: 'kcp',
+      v: {
+        mtu: parseExternalOptionalInteger(url.searchParams.get('mtu'), 'mKCP MTU', 21, 4_294_967_295),
+        tti: parseExternalOptionalInteger(url.searchParams.get('tti'), 'mKCP TTI', 10, 1000),
+      },
+    };
+  }
+  if (network === 'ws' || network === 'websocket') {
+    const host = url.searchParams.get('host');
+    const legacyHost = url.searchParams.get('obfsParam');
+    if (host !== null && legacyHost !== null && host !== legacyHost) {
+      throw new Error('VLESS host 与 obfsParam 不一致，不能猜测应使用哪一个');
+    }
+    return {
+      t: 'websocket',
+      v: {
+        path: url.searchParams.get('path') || '/',
+        host: host || legacyHost || null,
+      },
+    };
+  }
+  if (network === 'http' || network === 'h2') {
+    return {
+      t: 'http',
+      v: { path: url.searchParams.get('path') || '/', host: url.searchParams.get('host') || null },
+    };
+  }
+  if (network === 'grpc') {
+    const mode = (url.searchParams.get('mode') || 'gun').toLowerCase();
+    if (mode === 'guna') throw new Error('当前内置 Xray 已移除 gRPC guna，不能静默替换成 gun');
+    if (!['gun', 'multi'].includes(mode)) throw new Error('gRPC mode 必须是 gun 或 multi');
+    return {
+      t: 'grpc',
+      v: {
+        service_name: url.searchParams.get('serviceName') || '',
+        mode: mode as 'gun' | 'multi',
+        authority: externalOptionalParam(url, 'authority'),
+      },
+    };
+  }
+  if (network === 'httpupgrade') {
+    return {
+      t: 'http_upgrade',
+      v: { path: url.searchParams.get('path') || '/', host: url.searchParams.get('host') || null },
+    };
+  }
+  if (network !== 'xhttp') {
+    throw new Error('VLESS type 必须是 tcp、kcp、ws、http、grpc、httpupgrade 或 xhttp');
+  }
 
   const flow = url.searchParams.get('flow');
   if (flow) throw new Error('XHTTP 不能和 Vision Flow 同时使用');
   const path = url.searchParams.get('path') || '/';
   const host = url.searchParams.get('host') || null;
   const mode = parseExternalXhttpMode(url.searchParams.get('mode'), '上传模式');
-  let extra: Record<string, unknown> = {};
-  const encodedExtra = url.searchParams.get('extra');
-  if (encodedExtra) {
-    try {
-      extra = externalObject(JSON.parse(encodedExtra)) ?? {};
-    } catch {
-      throw new Error('XHTTP extra 不是有效的 JSON');
-    }
-  }
-  const xmux = externalObject(extra.xmux);
+  const extra = parseExternalJsonObject(url.searchParams.get('extra'), 'XHTTP extra');
+  const xmux = externalObject(extra?.xmux);
   const mux = parseExternalXhttpMux(xmux?.maxConcurrency, '上传 XMUX');
-  const downloadValue = externalObject(extra.downloadSettings);
-  if (!downloadValue) return { t: 'xhttp', v: { path, host, mux, mode, download: null } };
+  const downloadValue = externalObject(extra?.downloadSettings);
+  if (!downloadValue) return { t: 'xhttp', v: { path, host, mux, mode, download: null, extra } };
 
   const address = externalString(downloadValue.address);
   const port = Number(downloadValue.port);
@@ -4118,8 +4249,96 @@ function parseExternalVlessTransport(url: URL): ExternalVlessTransport {
         mux: parseExternalXhttpMux(downloadXmux?.maxConcurrency, '下载 XMUX'),
         mode: parseExternalXhttpMode(downloadXhttp.mode, '下载模式'),
       },
+      extra,
     },
   };
+}
+
+const VLESS_SHARE_PARAMS = new Set([
+  'type',
+  'encryption',
+  'flow',
+  'security',
+  'path',
+  'host',
+  'mtu',
+  'tti',
+  'serviceName',
+  'mode',
+  'authority',
+  'extra',
+  'fm',
+  'fp',
+  'sni',
+  'alpn',
+  'ech',
+  'pcs',
+  'vcn',
+  'pbk',
+  'sid',
+  'pqv',
+  'spx',
+  'obfs',
+  'obfsParam',
+  'tls',
+  'peer',
+  'udp',
+  'fingerprint',
+  'remarks',
+  'remark',
+  'ps',
+  'insecure',
+  'allowInsecure',
+]);
+
+function assertNoUnknownVlessParams(url: URL) {
+  const unknown = [...new Set(url.searchParams.keys())].filter(name => !VLESS_SHARE_PARAMS.has(name));
+  if (unknown.length > 0) throw new Error(`暂不识别 VLESS 参数：${unknown.join('、')}；不会静默忽略`);
+}
+
+const VLESS_SHARE_COMMON_PARAMS = new Set([
+  'type',
+  'encryption',
+  'flow',
+  'security',
+  'fm',
+  'tls',
+  'udp',
+  'remarks',
+  'remark',
+  'ps',
+  'insecure',
+  'allowInsecure',
+]);
+
+function assertVlessParamApplicability(
+  url: URL,
+  transport: ExternalVlessTransport,
+  security: ExternalOutboundSecurity['t'],
+) {
+  const allowed = new Set(VLESS_SHARE_COMMON_PARAMS);
+  const transportParams: Record<ExternalVlessTransport['t'], string[]> = {
+    raw: [],
+    kcp: ['mtu', 'tti'],
+    websocket: ['path', 'host', 'obfs', 'obfsParam'],
+    http: ['path', 'host'],
+    grpc: ['serviceName', 'mode', 'authority'],
+    http_upgrade: ['path', 'host'],
+    xhttp: ['path', 'host', 'mode', 'extra'],
+  };
+  transportParams[transport.t].forEach(name => allowed.add(name));
+  if (security !== 'none') {
+    ['fp', 'fingerprint', 'sni', 'peer'].forEach(name => allowed.add(name));
+  }
+  if (security === 'tls') {
+    ['alpn', 'ech', 'pcs', 'vcn'].forEach(name => allowed.add(name));
+  } else if (security === 'reality') {
+    ['pbk', 'sid', 'pqv', 'spx'].forEach(name => allowed.add(name));
+  }
+  const inapplicable = [...new Set(url.searchParams.keys())].filter(name => !allowed.has(name));
+  if (inapplicable.length > 0) {
+    throw new Error(`这些 VLESS 参数不适用于当前传输或安全层：${inapplicable.join('、')}；不会静默丢弃`);
+  }
 }
 
 function parseExternalShareLink(raw: string): ParsedExternalShare {
@@ -4151,8 +4370,11 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
     };
   }
 
-  const url = new URL(value);
-  const name = decodeURIComponent(url.hash.replace(/^#/, ''));
+  const normalizedVless = normalizeLegacyVlessShareLink(value);
+  const url = new URL(normalizedVless.value);
+  const name = url.hash
+    ? decodeURIComponent(url.hash.replace(/^#/, ''))
+    : (url.searchParams.get('remarks') ?? url.searchParams.get('remark') ?? url.searchParams.get('ps') ?? '');
   if (url.protocol === 'anytls:') {
     if (url.password) throw new Error('AnyTLS 密码中的特殊字符必须使用百分号编码');
     if (!url.username) throw new Error('AnyTLS 链接缺少密码');
@@ -4173,17 +4395,57 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
     };
   }
   if (url.protocol === 'vless:') {
+    assertNoUnknownVlessParams(url);
     const transport = parseExternalVlessTransport(url);
-    const security = url.searchParams.get('security');
-    const encryption = url.searchParams.get('encryption') || 'none';
+    const legacyTls = url.searchParams.get('tls')?.toLowerCase();
+    const legacySecurity =
+      legacyTls === null || legacyTls === undefined
+        ? null
+        : legacyTls === '1' || legacyTls === 'true' || legacyTls === 'tls'
+          ? 'tls'
+          : legacyTls === '0' || legacyTls === 'false' || legacyTls === 'none'
+            ? 'none'
+            : null;
+    if (legacyTls && !legacySecurity) throw new Error('无法识别此 VLESS 链接的 tls 参数');
+    const explicitSecurity = url.searchParams.get('security');
+    if (explicitSecurity && legacySecurity && explicitSecurity !== legacySecurity) {
+      throw new Error('VLESS security 与旧版 tls 参数互相冲突');
+    }
+    const security = explicitSecurity || legacySecurity;
+    const insecure = url.searchParams.get('allowInsecure') ?? url.searchParams.get('insecure');
+    if (insecure && !['0', 'false'].includes(insecure.toLowerCase())) {
+      throw new Error('当前 Xray 已移除 allowInsecure；请让提供方改用 pcs 证书钉扎');
+    }
+    const queryEncryption = url.searchParams.get('encryption');
+    if (queryEncryption && normalizedVless.encryption && queryEncryption !== normalizedVless.encryption) {
+      throw new Error('VLESS encryption 与旧版 authority 中的加密参数不一致');
+    }
+    const encryption = queryEncryption || normalizedVless.encryption || 'none';
     if (!vlessEncryptionIsValid(encryption))
       throw new Error('VLESS Encryption 参数无效，请粘贴完整的客户端 encryption 值');
     if (security && !['none', 'tls', 'reality'].includes(security)) throw new Error('不支持此 VLESS 传输安全');
     if (encryption !== 'none' && security && security !== 'none') {
       throw new Error('VLESS Encryption 不叠加 TLS 或 REALITY 传输安全');
     }
-    const serverName = url.searchParams.get('sni') || url.hostname;
-    const fingerprint = url.searchParams.get('fp') || 'chrome';
+    const sni = url.searchParams.get('sni');
+    const peer = url.searchParams.get('peer');
+    if (sni !== null && peer !== null && sni !== peer) {
+      throw new Error('VLESS sni 与旧版 peer 参数不一致');
+    }
+    const fp = url.searchParams.get('fp');
+    const legacyFingerprint = url.searchParams.get('fingerprint');
+    if (fp !== null && legacyFingerprint !== null && fp !== legacyFingerprint) {
+      throw new Error('VLESS fp 与旧版 fingerprint 参数不一致');
+    }
+    const udp = url.searchParams.get('udp');
+    if (udp !== null && !['1', 'true'].includes(udp.toLowerCase())) {
+      throw new Error('当前 Xray 不能在单个 VLESS outbound 上关闭 UDP，udp 参数必须为 1 或 true');
+    }
+    const serverName = sni || peer || url.hostname;
+    const fingerprint = fp || legacyFingerprint || 'chrome';
+    const alpnValue = url.searchParams.get('alpn');
+    const alpn = alpnValue === null ? [] : alpnValue.split(',');
+    if (alpn.some(value => !value || /\s/.test(value))) throw new Error('ALPN 必须使用英文逗号分隔且不能包含空白');
     const securityValue: ExternalOutboundSecurity =
       encryption !== 'none'
         ? { t: 'none' }
@@ -4195,15 +4457,28 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
                 public_key: url.searchParams.get('pbk') || '',
                 short_id: url.searchParams.get('sid') || '',
                 fingerprint,
+                mldsa65_verify: externalOptionalParam(url, 'pqv'),
+                spider_x: externalOptionalParam(url, 'spx'),
               },
             }
           : security === 'tls'
-            ? { t: 'tls', v: { server_name: serverName, fingerprint } }
+            ? {
+                t: 'tls',
+                v: {
+                  server_name: serverName,
+                  fingerprint,
+                  alpn,
+                  ech_config_list: externalOptionalParam(url, 'ech'),
+                  pinned_peer_cert_sha256: externalOptionalParam(url, 'pcs'),
+                  verify_peer_cert_by_name: externalOptionalParam(url, 'vcn'),
+                },
+              }
             : { t: 'none' };
+    assertVlessParamApplicability(url, transport, securityValue.t);
     if (securityValue.t === 'none' && encryption === 'none')
       throw new Error('VLESS 链接必须启用 Encryption、TLS 或 REALITY');
     return {
-      address: url.hostname,
+      address: url.hostname.replace(/^\[|\]$/g, ''),
       port: Number(url.port || 443),
       name,
       protocol: {
@@ -4213,6 +4488,7 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
           encryption,
           flow: url.searchParams.get('flow') || null,
           transport,
+          final_mask: parseExternalJsonObject(url.searchParams.get('fm'), 'Finalmask'),
         },
       },
       security: securityValue,
@@ -4313,9 +4589,59 @@ type ExternalXhttpDraft = {
   downloadSecurityKind: 'tls' | 'reality';
   downloadServerName: string;
   downloadFingerprint: string;
+  downloadAlpn: string;
+  downloadEchConfigList: string;
+  downloadPinnedPeerCertSha256: string;
+  downloadVerifyPeerCertByName: string;
   downloadPublicKey: string;
   downloadShortId: string;
+  downloadMldsa65Verify: string;
+  downloadSpiderX: string;
+  extra: string;
 };
+
+type ExternalWebsocketDraft = {
+  path: string;
+  host: string;
+};
+
+type ExternalKcpDraft = { mtu: string; tti: string };
+type ExternalHttpDraft = { path: string; host: string };
+type ExternalGrpcDraft = { serviceName: string; mode: 'gun' | 'multi' | 'guna'; authority: string };
+
+function externalWebsocketDraft(protocol: ExternalOutboundProtocol | null | undefined): ExternalWebsocketDraft {
+  const transport = protocol?.t === 'vless' ? protocol.v.transport : null;
+  const websocket = transport?.t === 'websocket' ? transport.v : null;
+  return {
+    path: websocket?.path ?? '/',
+    host: websocket?.host ?? '',
+  };
+}
+
+function externalKcpDraft(protocol: ExternalOutboundProtocol | null | undefined): ExternalKcpDraft {
+  const transport = protocol?.t === 'vless' ? protocol.v.transport : null;
+  const kcp = transport?.t === 'kcp' ? transport.v : null;
+  return { mtu: kcp?.mtu ? String(kcp.mtu) : '', tti: kcp?.tti ? String(kcp.tti) : '' };
+}
+
+function externalHttpDraft(
+  protocol: ExternalOutboundProtocol | null | undefined,
+  kind: 'http' | 'http_upgrade',
+): ExternalHttpDraft {
+  const transport = protocol?.t === 'vless' ? protocol.v.transport : null;
+  const value = transport?.t === kind ? transport.v : null;
+  return { path: value?.path ?? '/', host: value?.host ?? '' };
+}
+
+function externalGrpcDraft(protocol: ExternalOutboundProtocol | null | undefined): ExternalGrpcDraft {
+  const transport = protocol?.t === 'vless' ? protocol.v.transport : null;
+  const grpc = transport?.t === 'grpc' ? transport.v : null;
+  return {
+    serviceName: grpc?.service_name ?? '',
+    mode: grpc?.mode ?? 'gun',
+    authority: grpc?.authority ?? '',
+  };
+}
 
 function externalXhttpDraft(protocol: ExternalOutboundProtocol | null | undefined): ExternalXhttpDraft {
   const transport = protocol?.t === 'vless' ? protocol.v.transport : null;
@@ -4337,8 +4663,17 @@ function externalXhttpDraft(protocol: ExternalOutboundProtocol | null | undefine
     downloadSecurityKind: downloadSecurity?.t === 'reality' ? 'reality' : 'tls',
     downloadServerName: downloadSecurity && downloadSecurity.t !== 'none' ? downloadSecurity.v.server_name : '',
     downloadFingerprint: downloadSecurity && downloadSecurity.t !== 'none' ? downloadSecurity.v.fingerprint : 'chrome',
+    downloadAlpn: downloadSecurity?.t === 'tls' ? (downloadSecurity.v.alpn ?? []).join(',') : '',
+    downloadEchConfigList: downloadSecurity?.t === 'tls' ? (downloadSecurity.v.ech_config_list ?? '') : '',
+    downloadPinnedPeerCertSha256:
+      downloadSecurity?.t === 'tls' ? (downloadSecurity.v.pinned_peer_cert_sha256 ?? '') : '',
+    downloadVerifyPeerCertByName:
+      downloadSecurity?.t === 'tls' ? (downloadSecurity.v.verify_peer_cert_by_name ?? '') : '',
     downloadPublicKey: downloadSecurity?.t === 'reality' ? downloadSecurity.v.public_key : '',
     downloadShortId: downloadSecurity?.t === 'reality' ? downloadSecurity.v.short_id : '',
+    downloadMldsa65Verify: downloadSecurity?.t === 'reality' ? (downloadSecurity.v.mldsa65_verify ?? '') : '',
+    downloadSpiderX: downloadSecurity?.t === 'reality' ? (downloadSecurity.v.spider_x ?? '') : '',
+    extra: xhttp?.extra ? JSON.stringify(xhttp.extra, null, 2) : '',
   };
 }
 
@@ -4346,10 +4681,65 @@ function externalXhttpPathIsValid(value: string): boolean {
   return value.startsWith('/') && !/[\s?#]/.test(value);
 }
 
+function externalWebsocketPathIsValid(value: string): boolean {
+  return value.startsWith('/') && !/[\s#]/.test(value);
+}
+
+function externalWebsocketHostIsValid(value: string): boolean {
+  return !value.trim() || !/\s/.test(value);
+}
+
+function externalJsonObjectText(value: string): Record<string, unknown> | null | undefined {
+  if (!value.trim()) return null;
+  try {
+    return externalObject(JSON.parse(value)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function externalJsonOwns(value: Record<string, unknown> | null | undefined, key: string): boolean {
+  return !!value && Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function externalOptionalMuxIsValid(value: string): boolean {
   if (!value.trim()) return true;
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= 128;
+}
+
+function externalTlsPinsAreValid(value: string): boolean {
+  if (!value.trim()) return true;
+  let sawPin = false;
+  const valid = value.split(',').every(pin => {
+    const compact = pin.trim().replace(/:/g, '');
+    if (!compact) return true;
+    sawPin = true;
+    return /^[0-9a-f]{64}$/i.test(compact);
+  });
+  return valid && sawPin;
+}
+
+function externalTlsNamesAreValid(value: string): boolean {
+  if (!value.trim()) return true;
+  let sawName = false;
+  const valid = value.split(',').every(name => {
+    const trimmed = name.trim();
+    if (!trimmed) return true;
+    sawName = true;
+    return !/\s/.test(trimmed);
+  });
+  return valid && sawName;
+}
+
+function externalMldsa65VerifyIsValid(value: string): boolean {
+  if (!value.trim()) return true;
+  if (value !== value.trim() || value.includes('=')) return false;
+  try {
+    return decodeShareBase64(value).length === 1952;
+  } catch {
+    return false;
+  }
 }
 
 export function TunnelDeleteDialog({
@@ -4487,7 +4877,19 @@ export function ExternalOutboundEditor({
   const [vlessTransport, setVlessTransport] = useState<ExternalVlessTransport['t']>(
     existing?.protocol.t === 'vless' ? existing.protocol.v.transport.t : 'raw',
   );
+  const [websocket, setWebsocket] = useState<ExternalWebsocketDraft>(() => externalWebsocketDraft(existing?.protocol));
+  const [kcp, setKcp] = useState<ExternalKcpDraft>(() => externalKcpDraft(existing?.protocol));
+  const [http, setHttp] = useState<ExternalHttpDraft>(() => externalHttpDraft(existing?.protocol, 'http'));
+  const [grpc, setGrpc] = useState<ExternalGrpcDraft>(() => externalGrpcDraft(existing?.protocol));
+  const [httpUpgrade, setHttpUpgrade] = useState<ExternalHttpDraft>(() =>
+    externalHttpDraft(existing?.protocol, 'http_upgrade'),
+  );
   const [xhttp, setXhttp] = useState<ExternalXhttpDraft>(() => externalXhttpDraft(existing?.protocol));
+  const [finalMask, setFinalMask] = useState(
+    existing?.protocol.t === 'vless' && existing.protocol.v.final_mask
+      ? JSON.stringify(existing.protocol.v.final_mask, null, 2)
+      : '',
+  );
   const [method, setMethod] = useState(
     existing?.protocol.t === 'shadowsocks2022' ? existing.protocol.v.method : '2022-blake3-aes-256-gcm',
   );
@@ -4529,6 +4931,22 @@ export function ExternalOutboundEditor({
   );
   const [publicKey, setPublicKey] = useState(existing?.security.t === 'reality' ? existing.security.v.public_key : '');
   const [shortId, setShortId] = useState(existing?.security.t === 'reality' ? existing.security.v.short_id : '');
+  const [alpn, setAlpn] = useState(existing?.security.t === 'tls' ? (existing.security.v.alpn ?? []).join(',') : '');
+  const [echConfigList, setEchConfigList] = useState(
+    existing?.security.t === 'tls' ? (existing.security.v.ech_config_list ?? '') : '',
+  );
+  const [pinnedPeerCertSha256, setPinnedPeerCertSha256] = useState(
+    existing?.security.t === 'tls' ? (existing.security.v.pinned_peer_cert_sha256 ?? '') : '',
+  );
+  const [verifyPeerCertByName, setVerifyPeerCertByName] = useState(
+    existing?.security.t === 'tls' ? (existing.security.v.verify_peer_cert_by_name ?? '') : '',
+  );
+  const [mldsa65Verify, setMldsa65Verify] = useState(
+    existing?.security.t === 'reality' ? (existing.security.v.mldsa65_verify ?? '') : '',
+  );
+  const [spiderX, setSpiderX] = useState(
+    existing?.security.t === 'reality' ? (existing.security.v.spider_x ?? '') : '',
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
@@ -4543,7 +4961,13 @@ export function ExternalOutboundEditor({
       setEncryption(parsed.protocol.v.encryption);
       setFlow(parsed.protocol.v.flow ?? '');
       setVlessTransport(parsed.protocol.v.transport.t);
+      setKcp(externalKcpDraft(parsed.protocol));
+      setWebsocket(externalWebsocketDraft(parsed.protocol));
+      setHttp(externalHttpDraft(parsed.protocol, 'http'));
+      setGrpc(externalGrpcDraft(parsed.protocol));
+      setHttpUpgrade(externalHttpDraft(parsed.protocol, 'http_upgrade'));
       setXhttp(externalXhttpDraft(parsed.protocol));
+      setFinalMask(parsed.protocol.v.final_mask ? JSON.stringify(parsed.protocol.v.final_mask, null, 2) : '');
     } else if (parsed.protocol.t === 'shadowsocks2022') {
       setMethod(parsed.protocol.v.method);
     } else if (parsed.protocol.t === 'socks5' || parsed.protocol.t === 'http_connect') {
@@ -4554,17 +4978,44 @@ export function ExternalOutboundEditor({
       setServerName(parsed.security.v.server_name);
       setFingerprint(parsed.security.v.fingerprint);
     }
+    if (parsed.security.t === 'tls') {
+      setAlpn((parsed.security.v.alpn ?? []).join(','));
+      setEchConfigList(parsed.security.v.ech_config_list ?? '');
+      setPinnedPeerCertSha256(parsed.security.v.pinned_peer_cert_sha256 ?? '');
+      setVerifyPeerCertByName(parsed.security.v.verify_peer_cert_by_name ?? '');
+    }
     if (parsed.security.t === 'reality') {
       setPublicKey(parsed.security.v.public_key);
       setShortId(parsed.security.v.short_id);
+      setMldsa65Verify(parsed.security.v.mldsa65_verify ?? '');
+      setSpiderX(parsed.security.v.spider_x ?? '');
     }
   };
 
   const patchXhttp = (patch: Partial<ExternalXhttpDraft>) => setXhttp(current => ({ ...current, ...patch }));
+  const patchXhttpExtra = (extra: string) =>
+    setXhttp(current => {
+      const previous = externalJsonObjectText(current.extra);
+      const next = externalJsonObjectText(extra);
+      return {
+        ...current,
+        extra,
+        ...(externalJsonOwns(previous, 'xmux') && next !== undefined && !externalJsonOwns(next, 'xmux')
+          ? { mux: '' }
+          : {}),
+        ...(externalJsonOwns(previous, 'downloadSettings') &&
+        next !== undefined &&
+        !externalJsonOwns(next, 'downloadSettings')
+          ? { downloadEnabled: false }
+          : {}),
+      };
+    });
+  const patchWebsocket = (patch: Partial<ExternalWebsocketDraft>) =>
+    setWebsocket(current => ({ ...current, ...patch }));
 
   const chooseVlessTransport = (next: ExternalVlessTransport['t']) => {
     setVlessTransport(next);
-    if (next === 'xhttp') setFlow('');
+    if (next !== 'raw') setFlow('');
   };
 
   const chooseProtocol = (next: EditableExternalProtocol) => {
@@ -4611,14 +5062,49 @@ export function ExternalOutboundEditor({
     (realityServerNameIsValid(xhttp.downloadServerName) &&
       realityPublicKeyIsValid(xhttp.downloadPublicKey) &&
       realityShortIdIsValid(xhttp.downloadShortId) &&
-      realityFingerprintIsValid(xhttp.downloadFingerprint));
+      realityFingerprintIsValid(xhttp.downloadFingerprint) &&
+      externalMldsa65VerifyIsValid(xhttp.downloadMldsa65Verify) &&
+      (!xhttp.downloadSpiderX.trim() || xhttp.downloadSpiderX.startsWith('/')));
+  const downloadTlsValid =
+    xhttp.downloadSecurityKind !== 'tls' ||
+    ((!xhttp.downloadAlpn.trim() || xhttp.downloadAlpn.split(',').every(value => !!value && !/\s/.test(value))) &&
+      externalTlsPinsAreValid(xhttp.downloadPinnedPeerCertSha256) &&
+      externalTlsNamesAreValid(xhttp.downloadVerifyPeerCertByName));
+  const websocketValid =
+    protocolKind !== 'vless' ||
+    vlessTransport !== 'websocket' ||
+    (!flow && externalWebsocketPathIsValid(websocket.path) && externalWebsocketHostIsValid(websocket.host));
+  const kcpValid =
+    vlessTransport !== 'kcp' ||
+    (!flow &&
+      (!kcp.mtu.trim() || (Number.isInteger(Number(kcp.mtu)) && Number(kcp.mtu) >= 21)) &&
+      (!kcp.tti.trim() || (Number.isInteger(Number(kcp.tti)) && Number(kcp.tti) >= 10 && Number(kcp.tti) <= 1000)));
+  const httpValid =
+    vlessTransport !== 'http' ||
+    (!flow && externalWebsocketPathIsValid(http.path) && externalWebsocketHostIsValid(http.host));
+  const grpcValid =
+    vlessTransport !== 'grpc' ||
+    (!flow &&
+      grpc.mode !== 'guna' &&
+      !!grpc.serviceName.trim() &&
+      !/\s/.test(grpc.serviceName) &&
+      !/\s/.test(grpc.authority));
+  const httpUpgradeValid =
+    vlessTransport !== 'http_upgrade' ||
+    (!flow && externalWebsocketPathIsValid(httpUpgrade.path) && externalWebsocketHostIsValid(httpUpgrade.host));
+  const finalMaskValue = externalJsonObjectText(finalMask);
+  const extraValue = externalJsonObjectText(xhttp.extra);
+  const extraOwnsXmux = externalJsonOwns(extraValue, 'xmux');
+  const extraOwnsDownload = externalJsonOwns(extraValue, 'downloadSettings');
   const xhttpValid =
     protocolKind !== 'vless' ||
     vlessTransport !== 'xhttp' ||
     (!flow &&
       externalXhttpPathIsValid(xhttp.path) &&
-      externalOptionalMuxIsValid(xhttp.mux) &&
+      (extraOwnsXmux || externalOptionalMuxIsValid(xhttp.mux)) &&
+      extraValue !== undefined &&
       (!xhttp.downloadEnabled ||
+        extraOwnsDownload ||
         (xhttp.mode !== 'stream-one' &&
           !!xhttp.downloadAddress.trim() &&
           Number.isInteger(Number(xhttp.downloadPort)) &&
@@ -4627,6 +5113,7 @@ export function ExternalOutboundEditor({
           externalXhttpPathIsValid(xhttp.downloadPath) &&
           externalOptionalMuxIsValid(xhttp.downloadMux) &&
           !!xhttp.downloadServerName.trim() &&
+          downloadTlsValid &&
           downloadRealityValid)));
   const valid =
     currentEntryCanSave &&
@@ -4654,8 +5141,22 @@ export function ExternalOutboundEditor({
     (protocolKind !== 'vless' ||
       (vlessEncryptionIsValid(encryption) && (encryption !== 'none' || transportSecurityKind !== 'none'))) &&
     (protocolKind !== 'anytls' || transportSecurityKind === 'tls') &&
+    kcpValid &&
+    websocketValid &&
+    httpValid &&
+    grpcValid &&
+    httpUpgradeValid &&
     xhttpValid &&
+    finalMaskValue !== undefined &&
+    (protocolKind !== 'vless' ||
+      transportSecurityKind !== 'reality' ||
+      ['raw', 'grpc', 'xhttp'].includes(vlessTransport)) &&
     (transportSecurityKind === 'none' || !!serverName.trim()) &&
+    (transportSecurityKind !== 'tls' || !alpn.trim() || alpn.split(',').every(value => !!value && !/\s/.test(value))) &&
+    (transportSecurityKind !== 'tls' || externalTlsPinsAreValid(pinnedPeerCertSha256)) &&
+    (transportSecurityKind !== 'tls' || externalTlsNamesAreValid(verifyPeerCertByName)) &&
+    (transportSecurityKind !== 'reality' || externalMldsa65VerifyIsValid(mldsa65Verify)) &&
+    (transportSecurityKind !== 'reality' || !spiderX.trim() || spiderX.startsWith('/')) &&
     primaryRealityValid;
 
   const downloadSecurity: ExternalOutboundSecurity =
@@ -4665,6 +5166,14 @@ export function ExternalOutboundEditor({
           v: {
             server_name: xhttp.downloadServerName.trim(),
             fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
+            ...(xhttp.downloadAlpn.trim() ? { alpn: xhttp.downloadAlpn.split(',') } : {}),
+            ...(xhttp.downloadEchConfigList ? { ech_config_list: xhttp.downloadEchConfigList } : {}),
+            ...(xhttp.downloadPinnedPeerCertSha256
+              ? { pinned_peer_cert_sha256: xhttp.downloadPinnedPeerCertSha256 }
+              : {}),
+            ...(xhttp.downloadVerifyPeerCertByName
+              ? { verify_peer_cert_by_name: xhttp.downloadVerifyPeerCertByName }
+              : {}),
           },
         }
       : {
@@ -4674,12 +5183,35 @@ export function ExternalOutboundEditor({
             public_key: xhttp.downloadPublicKey.trim(),
             short_id: xhttp.downloadShortId.trim(),
             fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
+            ...(xhttp.downloadMldsa65Verify ? { mldsa65_verify: xhttp.downloadMldsa65Verify } : {}),
+            ...(xhttp.downloadSpiderX ? { spider_x: xhttp.downloadSpiderX } : {}),
           },
         };
-  const transport: ExternalVlessTransport =
-    vlessTransport === 'raw'
-      ? { t: 'raw' }
-      : {
+  const transport: ExternalVlessTransport = (() => {
+    switch (vlessTransport) {
+      case 'raw':
+        return { t: 'raw' };
+      case 'kcp':
+        return {
+          t: 'kcp',
+          v: { mtu: kcp.mtu.trim() ? Number(kcp.mtu) : null, tti: kcp.tti.trim() ? Number(kcp.tti) : null },
+        };
+      case 'websocket':
+        return { t: 'websocket', v: { path: websocket.path.trim(), host: websocket.host.trim() || null } };
+      case 'http':
+        return { t: 'http', v: { path: http.path.trim(), host: http.host.trim() || null } };
+      case 'grpc':
+        return {
+          t: 'grpc',
+          v: { service_name: grpc.serviceName.trim(), mode: grpc.mode, authority: grpc.authority.trim() || null },
+        };
+      case 'http_upgrade':
+        return {
+          t: 'http_upgrade',
+          v: { path: httpUpgrade.path.trim(), host: httpUpgrade.host.trim() || null },
+        };
+      case 'xhttp':
+        return {
           t: 'xhttp',
           v: {
             path: xhttp.path.trim(),
@@ -4697,13 +5229,25 @@ export function ExternalOutboundEditor({
                   mode: xhttp.downloadMode,
                 }
               : null,
+            ...(extraValue ? { extra: extraValue } : {}),
           },
         };
+    }
+  })();
   const protocol: ExternalOutboundProtocol =
     protocolKind === 'anytls'
       ? { t: 'anytls', v: { credential } }
       : protocolKind === 'vless'
-        ? { t: 'vless', v: { credential, encryption, flow: flow || null, transport } }
+        ? {
+            t: 'vless',
+            v: {
+              credential,
+              encryption,
+              flow: flow || null,
+              transport,
+              ...(finalMaskValue ? { final_mask: finalMaskValue } : {}),
+            },
+          }
         : protocolKind === 'shadowsocks2022'
           ? { t: 'shadowsocks2022', v: { credential, method } }
           : protocolKind === 'socks5'
@@ -4730,7 +5274,14 @@ export function ExternalOutboundEditor({
       : transportSecurityKind === 'tls'
         ? {
             t: 'tls',
-            v: { server_name: serverName.trim(), fingerprint: fingerprint.trim() || 'chrome' },
+            v: {
+              server_name: serverName.trim(),
+              fingerprint: fingerprint.trim() || 'chrome',
+              ...(alpn.trim() ? { alpn: alpn.split(',') } : {}),
+              ...(echConfigList ? { ech_config_list: echConfigList } : {}),
+              ...(pinnedPeerCertSha256 ? { pinned_peer_cert_sha256: pinnedPeerCertSha256 } : {}),
+              ...(verifyPeerCertByName ? { verify_peer_cert_by_name: verifyPeerCertByName } : {}),
+            },
           }
         : {
             t: 'reality',
@@ -4739,6 +5290,8 @@ export function ExternalOutboundEditor({
               public_key: publicKey.trim(),
               short_id: shortId.trim(),
               fingerprint: fingerprint.trim() || 'chrome',
+              ...(mldsa65Verify ? { mldsa65_verify: mldsa65Verify } : {}),
+              ...(spiderX ? { spider_x: spiderX } : {}),
             },
           };
   const outbound: ExternalOutbound = {
@@ -4898,9 +5451,8 @@ export function ExternalOutboundEditor({
                         <span>
                           <small>{parsedShareUsesVlessEncryption ? '传输' : '传输 / 传输安全'}</small>
                           <b>
-                            {parsedShare.value.protocol.t === 'vless' &&
-                            parsedShare.value.protocol.v.transport.t === 'xhttp'
-                              ? 'XHTTP'
+                            {parsedShare.value.protocol.t === 'vless'
+                              ? externalVlessTransportLabel(parsedShare.value.protocol.v.transport.t)
                               : 'RAW'}
                             {!parsedShareUsesVlessEncryption && ` / ${parsedShare.value.security.t.toUpperCase()}`}
                           </b>
@@ -5091,6 +5643,56 @@ export function ExternalOutboundEditor({
                           </button>
                           <button
                             type="button"
+                            aria-label="mKCP"
+                            className={vlessTransport === 'kcp' ? 'on' : ''}
+                            aria-pressed={vlessTransport === 'kcp'}
+                            onClick={() => chooseVlessTransport('kcp')}
+                          >
+                            <b>mKCP</b>
+                            <small>UDP 可靠传输</small>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="WebSocket"
+                            className={vlessTransport === 'websocket' ? 'on' : ''}
+                            aria-pressed={vlessTransport === 'websocket'}
+                            onClick={() => chooseVlessTransport('websocket')}
+                          >
+                            <b>WebSocket</b>
+                            <small>HTTP Upgrade 传输</small>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="HTTP/2"
+                            className={vlessTransport === 'http' ? 'on' : ''}
+                            aria-pressed={vlessTransport === 'http'}
+                            onClick={() => chooseVlessTransport('http')}
+                          >
+                            <b>HTTP/2</b>
+                            <small>兼容旧 HTTP 传输</small>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="gRPC"
+                            className={vlessTransport === 'grpc' ? 'on' : ''}
+                            aria-pressed={vlessTransport === 'grpc'}
+                            onClick={() => chooseVlessTransport('grpc')}
+                          >
+                            <b>gRPC</b>
+                            <small>HTTP/2 RPC 传输</small>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label="HTTPUpgrade"
+                            className={vlessTransport === 'http_upgrade' ? 'on' : ''}
+                            aria-pressed={vlessTransport === 'http_upgrade'}
+                            onClick={() => chooseVlessTransport('http_upgrade')}
+                          >
+                            <b>HTTPUpgrade</b>
+                            <small>HTTP/1.1 Upgrade</small>
+                          </button>
+                          <button
+                            type="button"
                             aria-label="XHTTP"
                             className={vlessTransport === 'xhttp' ? 'on' : ''}
                             aria-pressed={vlessTransport === 'xhttp'}
@@ -5107,7 +5709,8 @@ export function ExternalOutboundEditor({
                       <span className="v">
                         <select
                           className="f"
-                          disabled={vlessTransport === 'xhttp'}
+                          aria-label="Flow"
+                          disabled={vlessTransport !== 'raw'}
                           value={flow}
                           onChange={event => setFlow(event.target.value)}
                         >
@@ -5115,11 +5718,206 @@ export function ExternalOutboundEditor({
                           <option value="xtls-rprx-vision">xtls-rprx-vision</option>
                           <option value="xtls-rprx-vision-udp443">xtls-rprx-vision-udp443</option>
                         </select>
-                        {vlessTransport === 'xhttp' && <span className="sub">XHTTP 与 Vision Flow 不兼容。</span>}
+                        {vlessTransport !== 'raw' && (
+                          <span className="sub">
+                            {externalVlessTransportLabel(vlessTransport)} 与 Vision Flow 不兼容。
+                          </span>
+                        )}
                       </span>
                     </label>
+                    {vlessTransport === 'kcp' && (
+                      <section className="external-transport-panel">
+                        <header>
+                          <span>
+                            <b>mKCP 链路</b>
+                            <small>留空时沿用 Xray 默认值</small>
+                          </span>
+                          <i>KCP</i>
+                        </header>
+                        <div className="row">
+                          <span className="k">MTU / TTI</span>
+                          <span className="v external-xhttp-pair">
+                            <input
+                              className="f mono"
+                              type="number"
+                              min={21}
+                              aria-label="mKCP MTU"
+                              placeholder="默认 MTU"
+                              value={kcp.mtu}
+                              onChange={event => setKcp(current => ({ ...current, mtu: event.target.value }))}
+                            />
+                            <input
+                              className="f mono"
+                              type="number"
+                              min={10}
+                              max={1000}
+                              aria-label="mKCP TTI"
+                              placeholder="10–1000 ms"
+                              value={kcp.tti}
+                              onChange={event => setKcp(current => ({ ...current, tti: event.target.value }))}
+                            />
+                          </span>
+                        </div>
+                      </section>
+                    )}
+                    {vlessTransport === 'websocket' && (
+                      <section className="external-transport-panel">
+                        <header>
+                          <span>
+                            <b>WebSocket 链路</b>
+                            <small>HTTP Upgrade 使用的请求路径与 Host 请求头</small>
+                          </span>
+                          <i>WS</i>
+                        </header>
+                        <label className="row">
+                          <span className="k">Path</span>
+                          <span className="v">
+                            <input
+                              className="f mono"
+                              aria-label="WebSocket Path"
+                              placeholder="/"
+                              value={websocket.path}
+                              aria-invalid={!externalWebsocketPathIsValid(websocket.path)}
+                              onChange={event => patchWebsocket({ path: event.target.value })}
+                            />
+                            <span className="sub">以 / 开头；允许查询参数，不允许空白或 #。</span>
+                          </span>
+                        </label>
+                        <label className="row">
+                          <span className="k">HTTP Host（可选）</span>
+                          <span className="v">
+                            <input
+                              className="f mono"
+                              aria-label="WebSocket Host"
+                              placeholder="默认不覆盖"
+                              value={websocket.host}
+                              aria-invalid={!externalWebsocketHostIsValid(websocket.host)}
+                              onChange={event => patchWebsocket({ host: event.target.value })}
+                            />
+                            <span className="sub">只设置 WebSocket Upgrade 的 Host；TLS SNI 在下方独立配置。</span>
+                          </span>
+                        </label>
+                      </section>
+                    )}
+                    {vlessTransport === 'http' && (
+                      <section className="external-transport-panel">
+                        <header>
+                          <span>
+                            <b>HTTP/2 链路</b>
+                            <small>编译为当前 Xray 的 XHTTP stream-one 等价形式</small>
+                          </span>
+                          <i>H2</i>
+                        </header>
+                        <label className="row">
+                          <span className="k">Path</span>
+                          <span className="v">
+                            <input
+                              className="f mono"
+                              aria-label="HTTP/2 Path"
+                              value={http.path}
+                              onChange={event => setHttp(current => ({ ...current, path: event.target.value }))}
+                            />
+                          </span>
+                        </label>
+                        <label className="row">
+                          <span className="k">Host（可选）</span>
+                          <span className="v">
+                            <input
+                              className="f mono"
+                              aria-label="HTTP/2 Host"
+                              value={http.host}
+                              onChange={event => setHttp(current => ({ ...current, host: event.target.value }))}
+                            />
+                          </span>
+                        </label>
+                      </section>
+                    )}
+                    {vlessTransport === 'grpc' && (
+                      <section className="external-transport-panel">
+                        <header>
+                          <span>
+                            <b>gRPC 链路</b>
+                            <small>Service Name、传输模式和可选 Authority</small>
+                          </span>
+                          <i>gRPC</i>
+                        </header>
+                        <label className="row">
+                          <span className="k">Service Name</span>
+                          <span className="v">
+                            <input
+                              className="f mono"
+                              aria-label="gRPC Service Name"
+                              value={grpc.serviceName}
+                              onChange={event => setGrpc(current => ({ ...current, serviceName: event.target.value }))}
+                            />
+                          </span>
+                        </label>
+                        <div className="row">
+                          <span className="k">模式 / Authority</span>
+                          <span className="v external-xhttp-pair">
+                            <select
+                              className="f mono"
+                              aria-label="gRPC Mode"
+                              value={grpc.mode}
+                              onChange={event =>
+                                setGrpc(current => ({
+                                  ...current,
+                                  mode: event.target.value as ExternalGrpcDraft['mode'],
+                                }))
+                              }
+                            >
+                              <option value="gun">gun</option>
+                              <option value="multi">multi</option>
+                              <option value="guna" disabled>
+                                guna（当前 Xray 已移除）
+                              </option>
+                            </select>
+                            <input
+                              className="f mono"
+                              aria-label="gRPC Authority"
+                              placeholder="默认跟随 SNI"
+                              value={grpc.authority}
+                              onChange={event => setGrpc(current => ({ ...current, authority: event.target.value }))}
+                            />
+                          </span>
+                        </div>
+                      </section>
+                    )}
+                    {vlessTransport === 'http_upgrade' && (
+                      <section className="external-transport-panel">
+                        <header>
+                          <span>
+                            <b>HTTPUpgrade 链路</b>
+                            <small>HTTP/1.1 Upgrade 请求路径和 Host</small>
+                          </span>
+                          <i>HUS</i>
+                        </header>
+                        <label className="row">
+                          <span className="k">Path</span>
+                          <span className="v">
+                            <input
+                              className="f mono"
+                              aria-label="HTTPUpgrade Path"
+                              value={httpUpgrade.path}
+                              onChange={event => setHttpUpgrade(current => ({ ...current, path: event.target.value }))}
+                            />
+                          </span>
+                        </label>
+                        <label className="row">
+                          <span className="k">Host（可选）</span>
+                          <span className="v">
+                            <input
+                              className="f mono"
+                              aria-label="HTTPUpgrade Host"
+                              value={httpUpgrade.host}
+                              onChange={event => setHttpUpgrade(current => ({ ...current, host: event.target.value }))}
+                            />
+                          </span>
+                        </label>
+                      </section>
+                    )}
                     {vlessTransport === 'xhttp' && (
-                      <section className="external-xhttp-panel">
+                      <section className="external-transport-panel">
                         <header>
                           <span>
                             <b>XHTTP 上传链路</b>
@@ -5172,10 +5970,28 @@ export function ExternalOutboundEditor({
                               aria-label="XHTTP 上传 XMUX"
                               placeholder="并发 1–128"
                               value={xhttp.mux}
+                              disabled={extraOwnsXmux}
                               onChange={event => patchXhttp({ mux: event.target.value })}
                             />
                           </span>
+                          {extraOwnsXmux && <span className="sub">当前值由 Extra JSON 的 xmux 完整定义。</span>}
                         </div>
+                        <label className="row">
+                          <span className="k">Extra JSON（可选）</span>
+                          <span className="v">
+                            <textarea
+                              className="f mono external-share-link"
+                              aria-label="XHTTP Extra JSON"
+                              placeholder='{"xPaddingBytes":"100-1000"}'
+                              value={xhttp.extra}
+                              aria-invalid={externalJsonObjectText(xhttp.extra) === undefined}
+                              onChange={event => patchXhttpExtra(event.target.value)}
+                            />
+                            <span className="sub">
+                              完整保留 Xray extra；其中的 xmux / downloadSettings 优先于下方可视化字段。
+                            </span>
+                          </span>
+                        </label>
                         <label className="row external-xhttp-download-switch">
                           <span className="k">独立下载链路</span>
                           <span className="v">
@@ -5183,6 +5999,7 @@ export function ExternalOutboundEditor({
                               <input
                                 type="checkbox"
                                 checked={xhttp.downloadEnabled}
+                                disabled={extraOwnsDownload}
                                 onChange={event =>
                                   patchXhttp({
                                     downloadEnabled: event.target.checked,
@@ -5192,13 +6009,16 @@ export function ExternalOutboundEditor({
                               />
                               下载使用另一组服务器、TLS 和 XHTTP 参数
                             </span>
+                            {extraOwnsDownload && (
+                              <span className="sub">当前下载链路由 Extra JSON 的 downloadSettings 完整定义。</span>
+                            )}
                             {xhttp.downloadEnabled && xhttp.mode === 'stream-one' && (
                               <span className="sub external-field-error">stream-one 无法拆分独立下载链路。</span>
                             )}
                           </span>
                         </label>
                         {xhttp.downloadEnabled && (
-                          <div className="external-xhttp-download">
+                          <fieldset className="external-xhttp-download" disabled={extraOwnsDownload}>
                             <header>
                               <b>下载链路</b>
                               <small>对应 Xray downloadSettings，不沿用上传端安全参数</small>
@@ -5341,6 +6161,61 @@ export function ExternalOutboundEditor({
                                   </span>
                                 )}
                             </div>
+                            {xhttp.downloadSecurityKind === 'tls' && (
+                              <>
+                                <label className="row">
+                                  <span className="k">下载 ALPN（可选）</span>
+                                  <span className="v">
+                                    <input
+                                      className="f mono"
+                                      aria-label="下载 TLS ALPN"
+                                      placeholder="h2,http/1.1"
+                                      value={xhttp.downloadAlpn}
+                                      onChange={event => patchXhttp({ downloadAlpn: event.target.value })}
+                                    />
+                                  </span>
+                                </label>
+                                <label className="row">
+                                  <span className="k">下载 ECH Config List（可选）</span>
+                                  <span className="v">
+                                    <textarea
+                                      className="f mono external-share-link"
+                                      aria-label="下载 ECH Config List"
+                                      value={xhttp.downloadEchConfigList}
+                                      onChange={event => patchXhttp({ downloadEchConfigList: event.target.value })}
+                                    />
+                                  </span>
+                                </label>
+                                <label className="row">
+                                  <span className="k">下载证书 SHA-256（可选）</span>
+                                  <span className="v">
+                                    <input
+                                      className="f mono"
+                                      aria-label="下载证书 SHA-256"
+                                      aria-invalid={!externalTlsPinsAreValid(xhttp.downloadPinnedPeerCertSha256)}
+                                      value={xhttp.downloadPinnedPeerCertSha256}
+                                      onChange={event =>
+                                        patchXhttp({ downloadPinnedPeerCertSha256: event.target.value })
+                                      }
+                                    />
+                                  </span>
+                                </label>
+                                <label className="row">
+                                  <span className="k">下载证书名称（可选）</span>
+                                  <span className="v">
+                                    <input
+                                      className="f mono"
+                                      aria-label="下载证书名称"
+                                      aria-invalid={!externalTlsNamesAreValid(xhttp.downloadVerifyPeerCertByName)}
+                                      value={xhttp.downloadVerifyPeerCertByName}
+                                      onChange={event =>
+                                        patchXhttp({ downloadVerifyPeerCertByName: event.target.value })
+                                      }
+                                    />
+                                  </span>
+                                </label>
+                              </>
+                            )}
                             {xhttp.downloadSecurityKind === 'reality' && (
                               <>
                                 <label className="row">
@@ -5373,12 +6248,49 @@ export function ExternalOutboundEditor({
                                     )}
                                   </span>
                                 </label>
+                                <label className="row">
+                                  <span className="k">下载 ML-DSA-65 校验键（可选）</span>
+                                  <span className="v">
+                                    <textarea
+                                      className="f mono external-share-link"
+                                      aria-label="下载 REALITY ML-DSA-65 Verify"
+                                      aria-invalid={!externalMldsa65VerifyIsValid(xhttp.downloadMldsa65Verify)}
+                                      value={xhttp.downloadMldsa65Verify}
+                                      onChange={event => patchXhttp({ downloadMldsa65Verify: event.target.value })}
+                                    />
+                                  </span>
+                                </label>
+                                <label className="row">
+                                  <span className="k">下载 Spider X（可选）</span>
+                                  <span className="v">
+                                    <input
+                                      className="f mono"
+                                      aria-label="下载 REALITY Spider X"
+                                      value={xhttp.downloadSpiderX}
+                                      onChange={event => patchXhttp({ downloadSpiderX: event.target.value })}
+                                    />
+                                  </span>
+                                </label>
                               </>
                             )}
-                          </div>
+                          </fieldset>
                         )}
                       </section>
                     )}
+                    <label className="row">
+                      <span className="k">Finalmask JSON（可选）</span>
+                      <span className="v">
+                        <textarea
+                          className="f mono external-share-link"
+                          aria-label="Finalmask JSON"
+                          placeholder='{"tcp":[{"type":"header-http"}]}'
+                          value={finalMask}
+                          aria-invalid={externalJsonObjectText(finalMask) === undefined}
+                          onChange={event => setFinalMask(event.target.value)}
+                        />
+                        <span className="sub">对应分享链接 fm；完整对象原样进入 Xray streamSettings.finalmask。</span>
+                      </span>
+                    </label>
                   </>
                 )}
                 {protocolKind === 'shadowsocks2022' && (
@@ -5588,6 +6500,67 @@ export function ExternalOutboundEditor({
                     </label>
                   </>
                 )}
+                {transportSecurityKind === 'tls' && (
+                  <section className="external-transport-panel">
+                    <header>
+                      <span>
+                        <b>TLS 扩展</b>
+                        <small>分享链接中的 ALPN、ECH 和证书校验约束</small>
+                      </span>
+                      <i>TLS</i>
+                    </header>
+                    <label className="row">
+                      <span className="k">ALPN（可选）</span>
+                      <span className="v">
+                        <input
+                          className="f mono"
+                          aria-label="TLS ALPN"
+                          placeholder="h2,http/1.1"
+                          value={alpn}
+                          onChange={event => setAlpn(event.target.value)}
+                        />
+                        <span className="sub">英文逗号分隔，不加空格。</span>
+                      </span>
+                    </label>
+                    <label className="row">
+                      <span className="k">ECH Config List（可选）</span>
+                      <span className="v">
+                        <textarea
+                          className="f mono external-share-link"
+                          aria-label="ECH Config List"
+                          value={echConfigList}
+                          onChange={event => setEchConfigList(event.target.value)}
+                        />
+                      </span>
+                    </label>
+                    <label className="row">
+                      <span className="k">证书 SHA-256（可选）</span>
+                      <span className="v">
+                        <input
+                          className="f mono"
+                          aria-label="Pinned Peer Certificate SHA-256"
+                          aria-invalid={!externalTlsPinsAreValid(pinnedPeerCertSha256)}
+                          placeholder="多个值用英文逗号分隔"
+                          value={pinnedPeerCertSha256}
+                          onChange={event => setPinnedPeerCertSha256(event.target.value)}
+                        />
+                      </span>
+                    </label>
+                    <label className="row">
+                      <span className="k">证书名称（可选）</span>
+                      <span className="v">
+                        <input
+                          className="f mono"
+                          aria-label="Verify Peer Certificate By Name"
+                          aria-invalid={!externalTlsNamesAreValid(verifyPeerCertByName)}
+                          placeholder="多个值用英文逗号分隔"
+                          value={verifyPeerCertByName}
+                          onChange={event => setVerifyPeerCertByName(event.target.value)}
+                        />
+                      </span>
+                    </label>
+                  </section>
+                )}
                 {transportSecurityKind === 'reality' && (
                   <>
                     <label className="row">
@@ -5616,6 +6589,30 @@ export function ExternalOutboundEditor({
                         {!realityShortIdIsValid(shortId) && (
                           <span className="sub bad">需要 2–16 位、偶数长度的十六进制字符串。</span>
                         )}
+                      </span>
+                    </label>
+                    <label className="row">
+                      <span className="k">ML-DSA-65 校验键（可选）</span>
+                      <span className="v">
+                        <textarea
+                          className="f mono external-share-link"
+                          aria-label="REALITY ML-DSA-65 Verify"
+                          aria-invalid={!externalMldsa65VerifyIsValid(mldsa65Verify)}
+                          value={mldsa65Verify}
+                          onChange={event => setMldsa65Verify(event.target.value)}
+                        />
+                      </span>
+                    </label>
+                    <label className="row">
+                      <span className="k">Spider X（可选）</span>
+                      <span className="v">
+                        <input
+                          className="f mono"
+                          aria-label="REALITY Spider X"
+                          placeholder="/"
+                          value={spiderX}
+                          onChange={event => setSpiderX(event.target.value)}
+                        />
                       </span>
                     </label>
                   </>

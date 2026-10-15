@@ -51,6 +51,121 @@ sha256sum /opt/brocade/brocade-console
 
 ## 数据库兼容
 
+### 发布工单阶段时间
+
+发布详情的步骤时间来自控制面阶段切换，不再复用 Agent 领取目标时写入且会随租约刷新的
+`deployment_target_state.dispatched_at`。新表 `deployment_wave_progress` 按工单和 wave 只保存
+一条 `entered_at`：第一阶段使用工单创建时间，后续阶段在前一阶段关闭并使其成为当前阶段
+的同一事务内写入。等待人工确认也已经进入该阶段，因此确认和节点领取都不能改写时间。
+终态仍以 `deployments.finished_at` 作为「结束」节点。
+
+已有环境部署前停止 Console 写入、备份数据库和旧二进制，并记录 version 1 migration
+checksum；先在生产备份的隔离恢复库验证，再以应用角色执行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-deployment-wave-progress.sql
+```
+
+脚本只新增表并回填历史：首个有效 wave 取工单创建时间，有确认记录的 wave 取确认时间；
+缺少控制面事件的旧自动 wave 才以首次 Agent 领取时间作近似。脚本故意拒绝重复或部分执行。
+核对表、主键、外键、检查约束、所有权和回填结果，并审查本次 `0001_init.sql` 的其它差异
+都已兼容后，才按目标二进制更新 version 1 的 SQLx SHA-384。旧 Console 会忽略新增表；
+回退旧二进制时可以保留该表，但必须恢复旧 checksum。无需升级 Agent 或 Xray。
+
+### 用户实时流量
+
+此功能不改变数据库或计费。先部署 Console，再独立发布 Agent v27；未升级的机器显示
+未支持，既有实时网卡和 30 秒用量上报继续正常。只批准 Console 部署不会升级机队。
+验证系统/租户管理员的机器与用户卡片、并发订阅隔离、普通用户/访客禁止获取、断线和
+计数器回退。旧 Agent 忽略可选选择器，新 Agent 兼容旧 Console 的无选择器命令。
+
+### 转发统一统计兼容
+
+用户总量、用量页每日/月累计、机器 XRAY 和用户归属预测同时纳入转发；按线路的订阅
+额度仍只计算该线路接入。物理网卡账本已包含转发，禁止再叠加逻辑字节。统计不改变
+ForwardingRuleDesired、不创建配置/授权发布、不重启 Xray。
+
+已有转发数据库先停止 Console 写入并备份，以应用角色执行
+`scripts/compat-forwarding-traffic.sql`。`schema_file` 须来自目标 `0001_init.sql` 的
+`BEGIN FORWARDING TRAFFIC PROJECTIONS` / `END FORWARDING TRAFFIC PROJECTIONS` 标记之间。
+脚本新增计数序号、收据指纹、窗口、历史机器归属与日汇总，并以原始事实回填既有总量；
+未知旧区间保持 NULL，不伪造零覆盖或秒速率。核对用户/机器/规则和每日总量一致、
+所有权与其余 schema 差异后，单独更新 migration checksum。
+
+顺序为数据库兼容 → Console → 独立批准 Agent 29 灰度；无需更新 Xray。旧 Agent
+继续记转发用量，新字段默认缺省，界面明确提示转发实时待升级。新 Agent 每轮按需
+读取非重置 inbound 转发计数并与接入速率共同报告；仍仅管理员可见。实时授权由
+Console 解析，不写进转发配置；SSE 授权刷新同步撤销与移机的选择范围。
+回滚保留事实、汇总和计数头，不能整库恢复覆盖回滚期间的新用量；回退 Console
+前恢复对应 checksum，回退 Agent 后只失去新增转发实时能力。
+
+### 配置重启的连续用量
+
+Agent v28 与对应 Xray 共同保留用户 / 转发累计计数，受管 Linux 数据面以私有
+`xray-accounting.bin` 共享映射承载计数，不再在进程替换时清零。字典上限 16,384 项，
+主文件约 8 MiB；从不复用已存在标签的槽位。计数注册或落盘失败不允许新连接绕过统计；
+Agent 采集 / spool 失败阻止破坏性的变更，满队列保留旧检查点而不是删除。
+splice 按每次完成的内核传输递增，不再等到 64 MiB 或连接结束才入账。
+
+先部署 Console，再独立发布 Agent 28，最后灰度对应 Xray。旧 Agent / Xray 保持原路径；
+只有两者均升级且 journal 生效后，才具备跨进程计数连续性。第一次退出旧 Xray 仍没有
+其内存外的尾部副本，不能声称此次升级恢复了历史丢失数据。新旧 Console 最低协议仍为 20。
+
+用量协议可选零窗口表示已经确认停止的区间，不是把累计计数归零。零区间与真实窗口起点
+随既有用量回执 JSON 持久化，不增加表或迁移；历史响应保留旧 points 与结束时间字段。
+用户流量图按真实窗口的平均速率重采样，确认停机为 0，未知离线仍为空缺，不改写计费。
+异常退出无法凭最后联系时间猜零，断电 / 磁盘损坏也不承诺逐字节持久性。
+
+禁止在进程运行时删除、截断或替换 journal。回退到旧 Xray 后再次升级时，Agent 为中断的
+连续性保留一份 `xray-accounting.previous.bin`，并创建新计数身份，避免旧绝对值重复计费。
+该副本不是可直接覆盖回去的回滚入口；二进制回滚仍创建新的审计发布单。
+验证真实小流量长连接、退出前未采集尾部、重试去重、长期停用后重启、零窗口与未知空缺。
+
+### 机器流量配额与容量预测
+
+用量页的机器容量模型在 `node_traffic_policy` 增加可空的 `quota_bytes NUMERIC(20,0)`；
+NULL 表示尚未配置机器供应商配额，正整数表示当前重置周期的固定字节额度。预测读取已有
+物理网卡日账本、用户日账本和当前授权拓扑，不改写历史数据，也不需要升级 Agent/Xray。
+
+已有环境部署前停止 Console 写入、保存数据库与旧二进制，先在隔离恢复库验证，再以应用
+角色执行 `psql -v app_role=<应用角色> -f scripts/compat-traffic-capacity.sql`。脚本只扩列与约束，
+故意拒绝重复或部分执行。
+核对列、约束和所有本次 `0001_init.sql` 差异后，才按目标二进制更新 version 1 的 SQLx
+SHA-384；不能只为绕过 checksum 修改迁移表。旧 Console 会忽略该列；回退旧二进制时
+可以保留列，但必须恢复与旧二进制匹配的迁移 checksum。
+
+上线后以系统管理员验证设置/清除配额、P50/P90 风险状态和用户贡献展开；以只读管理员
+验证只读视图，以自助用户和 public 验证既不显示入口也无法读取 `/usage/machine-model`。
+用户贡献是“当前授权与拓扑上的比例估算”；单个用户的机器占用按
+`(uplink_bytes + downlink_bytes) * 2` 换算，因为代理载荷在同一机器的客户端侧和下一跳侧
+各经过一次网卡。归因总量以机器物理账本为上限，差额作为未归因流量；物理账本和未归因
+流量才是容量核算边界。
+
+#### 预测模型与每日快照
+
+期末预计 P50 = 本期已用 + 近期日均 × 剩余天数：
+
+- 近期日均取最近 28 天中记录完整的日子，每早 4 天权重减半，可以跨越周期边界。
+- 跨日失联补报的字节平摊到失联的各天。
+- 失联一整天以上后重启、换网卡或更换 Agent 状态时，相关日子不参与日均。
+
+P90 = 本期已用 + 日均 × 剩余天数 × (1 + q)。q 是同一方法在账本历史上「预测之后 h 天」的相对误差 90% 分位，h 为剩余天数。q 按以下顺序取：
+
+1. 本机回测，样本至少 20 个且不少于 8 × h。
+2. 全部机器的回测，可退到不短于 h/2 的天数。
+3. 默认 +50%。
+
+记账晚于期初与本期校准，或缺口可能改变本期总量时，接口返回 `needs_calibration`；页面不再判「余量充足」，改为「待校准」。
+
+Console 每小时把当天还没有记录的机器预测写入 `node_traffic_forecasts`，每台机器每个 UTC 日一行，当天第一次记录为准，保留 800 天。周期结束后，页面显示该周期每日 P50 的平均偏差和 P90 覆盖次数。
+
+已有环境与上文同样在停写和备份后执行 `psql -v app_role=<应用角色> -f scripts/compat-traffic-forecast.sql`，脚本只新增这张表，故意拒绝重复执行；之后按目标二进制更新 version 1 的 SQLx SHA-384。旧 Console 不读这张表，回退时可以保留，但要恢复旧 checksum。
+
+上线后核对：
+- 机器详情的近期日均、P90 误差来源、待校准状态。
+- 次日起 `node_traffic_forecasts` 每台已记账机器一行。
+
 ### 持久证书签发任务
 
 证书扫描从进程内任务改为数据库持久队列和带代次的租约；新安装的默认续签提前量由
@@ -279,6 +394,51 @@ COMMIT;
 回滚保留可空列；旧程序忽略它，恢复旧二进制前必须核对并恢复其迁移 checksum。
 Agent 和 Xray 发布仍需要独立授权、灰度与观察，不能因部署 Console 自动执行。
 
+### 用户自助转发兼容
+
+用户转发增加独立的授权、完整期望状态、收敛状态和用量账本；不进入修订模型，也不复用
+订阅流量账本。已有环境部署对应 Console 前先停止旧 Console 写入，完成备份并记录原
+`0001` checksum，再以应用角色运行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-user-forwarding.sql
+```
+
+脚本故意不使用 `IF NOT EXISTS`，重复或部分执行会停止并要求人工核对。确认六张表、四个
+业务索引、外键/约束、identity 序列所有者均与 `0001_init.sql` 一致，并审查本次 `0001`
+没有其它未兼容差异后，才把 `_sqlx_migrations` version 1 更新为目标二进制内嵌的
+SHA-384。不能只为消除 checksum 错误而修改迁移记录。
+
+发布顺序为数据库兼容 → Console → Xray 配置发布（加入默认直连出站）→ Agent 26 灰度。
+Agent 26 之前不会创建动态转发入站，Console 应持续显示待收敛；不可把 Console 部署当成
+Agent/Xray 发布授权。回滚前先撤销授权并等待节点报告空期望，再回退 Agent；保留新增表和
+历史用量，恢复旧 Console 前还须恢复与旧二进制匹配的 migration checksum。
+
+若数据库已安装首版用户转发表，需要在部署支持双协议默认值的 Console 前停止旧 Console
+写入，并额外运行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-forwarding-dual-protocol.sql
+```
+
+脚本只调整新授权的 UDP 默认值，并把监听端口唯一约束拆成 TCP、UDP 两个协议空间；不会
+静默修改现有授权。确认旧索引 `forwarding_rules_active_port` 已消失、两个新唯一索引的谓词
+与 `0001_init.sql` 一致，再更新 migration checksum。回滚旧 Console 前必须恢复旧索引；若
+同号 TCP/UDP 规则已经创建，应先停用或改端口，否则旧索引无法重建。
+
+若数据库已存在用户转发表，需要在部署采用 `30000–59999`、100 条规则并默认允许内部目标
+的 Console 前停止旧 Console 写入，并额外运行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-forwarding-entitlement-defaults.sql
+```
+
+脚本只修改以后新插入授权所使用的列默认值，不回填或放宽任何现有授权。确认六个列默认值
+与 `0001_init.sql` 一致、并审查本次 `0001` 的其它差异后，再更新 migration checksum。
+
 ### 机器事故通知中心兼容
 
 通知中心为操作者增加持久已读游标，为离线事件保存最后联系时间，并将 Webhook
@@ -463,6 +623,18 @@ Console 启动时根据 `BROCADE_NOTIFICATION_WEBHOOK_URL` 收敛通道状态：
 
 ## 上传与原子替换
 
+生产 Console 应由 `brocade-console.socket` 持有监听端口，service 的 `[Unit]` 同时包含
+`Requires=brocade-console.socket` 和 `After=brocade-console.socket`。socket 的
+`ListenStream` 必须与 `BROCADE_ADMIN_BIND` 完全一致，默认单监听部署只传一个 fd；分离
+Agent 入口时应再传一个与 `BROCADE_AGENT_BIND` 一致的 fd。二进制会拒绝数量、地址、类型
+或监听状态不匹配的描述符，不会静默回退到另一个端口。
+
+发布期间只重启 `brocade-console.service`，不要停止、重启或 disable socket。这样旧进程
+退出后到新进程完成数据库初始化期间，新 TCP 连接留在内核 backlog；它不能延长已经建立
+连接的应用层超时，因此仍须保留 Agent 的有界 Load 补报作为较长维护窗口的第二层保护。
+首次从旧的直接绑定 service 迁移到 socket activation 时，必须先停旧服务释放端口，再
+启动 socket 和 service；记录这一次不可避免的短维护窗口并验证后续 restart 不再关闭端口。
+
 先上传到临时路径并核对摘要，之后才在目标机安装。上传过程不应覆盖正在运行的二进制。
 
 ```sh
@@ -492,6 +664,7 @@ ssh deploy@console.example.net '
 
 ```sh
 sudo systemctl is-active brocade-console
+sudo systemctl is-active brocade-console.socket
 sudo journalctl -u brocade-console -n 100 --no-pager
 curl --fail https://console.example.net/healthz
 sha256sum /opt/brocade/brocade-console

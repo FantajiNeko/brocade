@@ -65,6 +65,11 @@ const usage = (user: string, gib: number) => ({
 });
 
 const clients: QueryClient[] = [];
+const isForwardingRead = (path: string) => /^\/users\/[^/]+\/[^/]+\/forwarding$/.test(path);
+const forwardingEmpty = (path: string) => {
+  const [, , tenantId, userId] = path.split('/');
+  return { tenant_id: tenantId, user_id: userId, entitlements: [], rules: [] };
+};
 beforeEach(() => {
   vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   vi.stubGlobal(
@@ -72,6 +77,11 @@ beforeEach(() => {
     vi.fn(async (input: RequestInfo | URL) => {
       if (String(input) === '/grant-probes/capability') {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
+      }
+      if (isForwardingRead(String(input))) return Response.json(forwardingEmpty(String(input)));
+      if (String(input).endsWith('/realtime/snapshot')) return Response.json({ policy: { enabled: true }, nodes: [] });
+      if (String(input).endsWith('/realtime/history')) {
+        return Response.json({ range_start_unix_secs: 0, range_end_unix_secs: 3_600, nodes: [], series: [] });
       }
       // 详情打开即读取离线来源；默认没有离线记录
       const history = String(input).match(/^\/users\/([^/]+)\/([^/]+)\/presence-history$/);
@@ -89,12 +99,18 @@ beforeEach(() => {
   );
 });
 
-// 详情打开后的后台读取只有拨测能力和当前用户的离线来源，其余请求都来自显式操作。
+// 详情打开后的后台读取只有拨测能力、转发授权、当前用户的离线来源与实时流量（快照和近 1 小时），
+// 其余请求都来自显式操作。
 const backgroundReadsOnly = () =>
   vi
     .mocked(fetch)
     .mock.calls.every(
-      ([input]) => String(input) === '/grant-probes/capability' || String(input).endsWith('/presence-history'),
+      ([input]) =>
+        String(input) === '/grant-probes/capability' ||
+        String(input).endsWith('/presence-history') ||
+        String(input).endsWith('/realtime/snapshot') ||
+        String(input).endsWith('/realtime/history') ||
+        isForwardingRead(String(input)),
     );
 const readingOf = (card: HTMLElement) => card.querySelector('header .rt')?.textContent;
 const two = (value: number) => String(value).padStart(2, '0');
@@ -117,7 +133,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(role: AdminRole = 'system-admin') {
+function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 'alice' : 'operator') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
   clients.push(client);
   client.setQueryData(['snapshot'], snapshot);
@@ -189,7 +205,7 @@ function mount(role: AdminRole = 'system-admin') {
       <SessionProvider
         value={{
           who: {
-            operator_id: role === 'user' ? 'alice' : 'operator',
+            operator_id: operatorId,
             role,
             tenant_scope: null,
             token_prefix: null,
@@ -216,6 +232,45 @@ function mount(role: AdminRole = 'system-admin') {
 }
 
 describe('user roster rows', () => {
+  it('counts forwarding in user totals but does not apply it to line quotas', async () => {
+    const { view, row, selectUser, client } = mount();
+    await act(async () => {
+      client.setQueryData(['usage-monthly'], {
+        views: [usage('alice', 1)],
+        forwarding: [
+          {
+            tenant_id: tenant,
+            user_id: 'alice',
+            node_id: 'n1',
+            rule_id: 7,
+            rule_name: 'Web',
+            uplink_bytes: 0,
+            downlink_bytes: 2 * GiB,
+            has_gap: false,
+          },
+        ],
+      });
+      selectUser('alice');
+    });
+    expect(row('alice').querySelector('.user-row-usage')?.textContent).toContain('3');
+    expect(row('alice').querySelector('.user-row-quota')?.textContent).toContain('余裕');
+    expect(view.getByRole('region', { name: '本月用量' }).textContent).toContain('转发 2.00 GiB');
+    expect(
+      view.getByRole('region', { name: '本月用量' }).querySelector('.user-usage-hero-value')?.textContent,
+    ).toContain('3');
+  });
+  it('hides forwarding from the public visitor without starting its protected request', async () => {
+    const { view, selectUser } = mount('readonly', 'public');
+
+    await act(async () => {
+      selectUser('alice');
+      await Promise.resolve();
+    });
+
+    expect(view.queryByText('转发入口')).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => isForwardingRead(String(input)))).toBe(false);
+  });
+
   it.each([
     [0, '余裕'],
     [49.99, '余裕'],
@@ -327,6 +382,7 @@ describe('user roster rows', () => {
       if (path === '/grant-probes/capability') {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
       }
+      if (isForwardingRead(path)) return Response.json(forwardingEmpty(path));
       if (path === historyPath) {
         return Response.json({
           tenant_id: tenant,
@@ -339,7 +395,10 @@ describe('user roster rows', () => {
             offlineSource('8.8.8.8', today + 60_000, ['hysteria2']),
             offlineSource('9.9.9.9', today - 12 * HOUR, ['vless']),
             offlineSource('2001:db8::5', today - 60 * HOUR, ['anytls']),
+            offlineSource('3.3.3.3', today - 4 * 24 * HOUR, ['vless']),
+            offlineSource('2.2.2.2', today - 6 * 24 * HOUR, ['anytls']),
             offlineSource('4.4.4.4', today - 20 * 24 * HOUR, ['vless']),
+            offlineSource('5.5.5.5', today - 25 * 24 * HOUR, ['vless']),
           ],
         });
       }
@@ -351,11 +410,12 @@ describe('user roster rows', () => {
 
     expect(await within(card).findByText('8.8.8.8')).toBeTruthy();
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === historyPath)).toHaveLength(1);
-    expect(readingOf(card)).toBe('在线 1 · 30 天 5 个地址');
+    expect(readingOf(card)).toBe('在线 1 · 30 天 8 个地址');
     expect([...card.querySelectorAll('.user-presence-day')].map(day => day.textContent)).toEqual([
       '在线',
       '今天',
       '昨天',
+      '7 天内',
     ]);
     const recent = view.getByText('8.8.8.8').closest<HTMLElement>('.user-presence-row')!;
     expect(recent.classList.contains('off')).toBe(true);
@@ -370,10 +430,11 @@ describe('user roster rows', () => {
     expect(within(recent).getByText('Hysteria2')).toBeTruthy();
     expect(within(recent).getByRole('button', { name: '复制历史来源 IP 8.8.8.8' })).toBeTruthy();
     expect(within(card).getByText('9.9.9.9')).toBeTruthy();
-    expect(within(card).queryByText('2001:db8::5')).toBeNull();
+    expect(within(card).getByText('2001:db8::5')).toBeTruthy();
     expect(within(card).queryByText('4.4.4.4')).toBeNull();
+    expect(within(card).queryByText('5.5.5.5')).toBeNull();
 
-    const older = within(card).getByRole('button', { name: '显示更早的 2 个来源' });
+    const older = within(card).getByRole('button', { name: '显示其余 2 个历史来源' });
     expect(older.getAttribute('aria-expanded')).toBe('false');
     fireEvent.click(older);
     expect([...card.querySelectorAll('.user-presence-day')].map(day => day.textContent)).toEqual([
@@ -389,7 +450,7 @@ describe('user roster rows', () => {
     expect(oldest.querySelector('.user-presence-time')?.textContent).toBe(
       `${two(oldestDay.getMonth() + 1)}-${two(oldestDay.getDate())}`,
     );
-    fireEvent.click(within(card).getByRole('button', { name: '收起更早的来源' }));
+    fireEvent.click(within(card).getByRole('button', { name: '收起历史来源' }));
     expect(within(card).queryByText('4.4.4.4')).toBeNull();
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === historyPath)).toHaveLength(1);
   });
@@ -402,6 +463,7 @@ describe('user roster rows', () => {
       if (path === '/grant-probes/capability') {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
       }
+      if (isForwardingRead(path)) return Response.json(forwardingEmpty(path));
       if (path === historyPath) {
         return Response.json({
           tenant_id: tenant,
@@ -777,6 +839,7 @@ describe('user roster rows', () => {
       if (path === '/grant-probes/capability') {
         return Promise.resolve(Response.json({ available: false, reason: '测试中不发起拨测' }));
       }
+      if (isForwardingRead(path)) return Promise.resolve(Response.json(forwardingEmpty(path)));
       if (path === `/users/${tenant}/alice/direct-login`) return pending;
       return Promise.reject(new Error(`unexpected ${path}`));
     });
@@ -791,5 +854,49 @@ describe('user roster rows', () => {
         true,
       ),
     );
+  });
+
+  it.each(['user', 'readonly', 'editor', 'publisher'] as AdminRole[])('hides realtime user rates from %s', role => {
+    const { view } = mount(role);
+    expect(view.queryByRole('region', { name: '用户实时流量' })).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/realtime/'))).toBe(false);
+  });
+
+  it('shows realtime user rates only to administrators', () => {
+    const { view } = mount();
+    expect(view.getByRole('region', { name: '用户实时流量' })).toBeTruthy();
+  });
+
+  it('lays out issued direct-login credentials with separately named copy actions', async () => {
+    const originalFetch = fetch;
+    const uuid = '11111111-2222-4333-8444-555555555555';
+    const token = 'broc_login_fixture_credential_only';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === `/users/${tenant}/alice/direct-login`)
+          return Promise.resolve(Response.json({ operator_id: 'alice', uuid, token, sessions_revoked: 0 }));
+        if (String(input) === '/users?include_disabled=true') return Promise.resolve(Response.json({ users }));
+        if (String(input) === '/model/snapshot') return Promise.resolve(Response.json(snapshot));
+        return originalFetch(input, init);
+      }),
+    );
+    const { view } = mount();
+    fireEvent.click(view.getByRole('button', { name: '更多操作' }));
+    fireEvent.click(view.getByRole('menuitem', { name: /生成直达登录页/ }));
+    const dialog = await view.findByRole('dialog', { name: 'alice 的直达登录页面' });
+    expect(within(dialog).getByRole('button', { name: '复制链接' })).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: '复制 UUID' })).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: '复制 TOKEN' })).toBeTruthy();
+    expect(dialog.querySelector('.user-direct-login-field.primary code')?.textContent).toContain(`${uuid}/${token}`);
+    expect(dialog.querySelectorAll('.user-direct-login-credentials .user-direct-login-field')).toHaveLength(2);
+    fireEvent.click(within(dialog).getByRole('button', { name: '我已保存' }));
+    await vi.waitFor(() => expect(view.queryByRole('dialog', { name: 'alice 的直达登录页面' })).toBeNull());
+  });
+
+  it('never subscribes to user rates as a visitor', () => {
+    const { view } = mount('readonly', 'public');
+    expect(view.queryByRole('region', { name: '用户实时流量' })).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/realtime/'))).toBe(false);
   });
 });

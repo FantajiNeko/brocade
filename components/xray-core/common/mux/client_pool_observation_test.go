@@ -149,6 +149,30 @@ func TestMuxSnapshotUsesReverseHealthVocabularyAndPoolDimensions(t *testing.T) {
 	}
 }
 
+func TestMuxSnapshotKeepsOnlyABoundedEventTail(t *testing.T) {
+	r := &muxObservationRegistry
+	r.Lock()
+	originalEvents, originalSequence := r.events, r.seq
+	r.events, r.seq = nil, 0
+	r.Unlock()
+	t.Cleanup(func() {
+		r.Lock()
+		r.events, r.seq = originalEvents, originalSequence
+		r.Unlock()
+	})
+
+	for i := 0; i < muxWorkerEventLimit+5; i++ {
+		appendMuxWorkerEvent(MuxWorkerSnapshot{WorkerID: uint64(i + 1)}, "READY", time.UnixMilli(int64(i)))
+	}
+	report := GetMuxSnapshot()
+	if len(report.Events) != muxWorkerEventLimit {
+		t.Fatalf("event tail length = %d, want %d", len(report.Events), muxWorkerEventLimit)
+	}
+	if report.Events[0].Sequence != 6 || report.Events[len(report.Events)-1].Sequence != muxWorkerEventLimit+5 {
+		t.Fatalf("event tail sequences = %d..%d", report.Events[0].Sequence, report.Events[len(report.Events)-1].Sequence)
+	}
+}
+
 func TestRoutineMuxProbeStaysReadyButHasNoDispatchCapacity(t *testing.T) {
 	clock := newFakePoolClock()
 	cfg := testPoolConfig()

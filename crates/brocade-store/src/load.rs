@@ -161,6 +161,11 @@ pub fn columnar_overview(view: NodeLoadView) -> NodeLoadOverviewView {
 /// every "latest N" query, permanently. That is worse than dropping the round.
 const MAX_CLOCK_SKEW_SECS: i64 = 600;
 
+/// Agents retain at most one hour of completed windows. Permit enough extra transport/clock
+/// margin for that bounded queue to drain after maintenance, while still rejecting arbitrary old
+/// telemetry that could bypass the raw-history lifecycle.
+const MAX_REPLAY_AGE_SECS: i64 = 2 * 3600;
+
 /// How many windows one report may carry. A round produces one; more means the agent is catching
 /// up after failing to send. Beyond this it is not catching up, it is confused.
 const MAX_SAMPLES_PER_REPORT: usize = 60;
@@ -315,19 +320,14 @@ pub async fn record_load_report(
         )));
     }
 
-    // Signed rather than abs(): the sign says which side runs ahead, and the value is stored
-    // (see `upsert_host_facts`) so the UI can show the drift without re-measuring.
-    let (skew_secs,): (i64,) =
-        sqlx::query_as("SELECT $1::bigint - extract(epoch FROM now())::bigint")
-            .bind(request.read_at_unix_secs)
-            .fetch_one(pool)
-            .await?;
-    if skew_secs.abs() > MAX_CLOCK_SKEW_SECS {
-        return Err(StoreError::InvalidData(format!(
-            "load report clock skew {}s exceeds {MAX_CLOCK_SKEW_SECS}s; check the node's clock",
-            skew_secs.abs()
-        )));
-    }
+    let server_now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(pool)
+        .await?;
+    let timing = classify_report_time(
+        request.read_at_unix_secs,
+        request.sent_at_unix_secs,
+        server_now,
+    )?;
 
     let mut tx = pool.begin().await?;
     let sealed_through = load_rollup::lock_node(&mut tx, node_id).await?;
@@ -375,14 +375,23 @@ pub async fn record_load_report(
         }
     }
 
-    let latest = upsert_host_facts(
-        &mut tx,
-        node_id,
-        &request.host,
-        request.read_at_unix_secs,
-        skew_secs,
-    )
-    .await?;
+    // A delayed replay fills time-series history only. Its host/process snapshot is also old, and
+    // treating transport age as clock skew would briefly replace the live status with a false
+    // one-hour drift while the queue drains. The first fresh report after recovery owns current
+    // state; the timestamp guard in `upsert_host_facts` still makes duplicate retries harmless.
+    let latest = match timing {
+        ReportTiming::Fresh { clock_skew_secs } => {
+            upsert_host_facts(
+                &mut tx,
+                node_id,
+                &request.host,
+                request.read_at_unix_secs,
+                clock_skew_secs,
+            )
+            .await?
+        }
+        ReportTiming::Replay => false,
+    };
     if latest {
         replace_process_state(
             &mut tx,
@@ -402,6 +411,49 @@ pub async fn record_load_report(
         skipped_samples,
         rejected_hops,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportTiming {
+    Fresh { clock_skew_secs: i64 },
+    Replay,
+}
+
+fn classify_report_time(
+    read_at: i64,
+    sent_at: Option<i64>,
+    server_now: i64,
+) -> Result<ReportTiming> {
+    let delivery_clock = sent_at.unwrap_or(read_at);
+    if delivery_clock <= 0 {
+        return Err(StoreError::InvalidData(
+            "load report sent_at must be positive unix seconds".to_owned(),
+        ));
+    }
+    let clock_skew_secs = delivery_clock.saturating_sub(server_now);
+    if clock_skew_secs.abs() > MAX_CLOCK_SKEW_SECS {
+        return Err(StoreError::InvalidData(format!(
+            "load report clock skew is {}s, over the {MAX_CLOCK_SKEW_SECS}s limit; check the node's clock",
+            clock_skew_secs.saturating_abs()
+        )));
+    }
+    let sample_age = read_at.saturating_sub(server_now);
+    if sample_age > MAX_CLOCK_SKEW_SECS {
+        return Err(StoreError::InvalidData(format!(
+            "load report sample is {sample_age}s ahead, over the {MAX_CLOCK_SKEW_SECS}s limit"
+        )));
+    }
+    if sample_age < -MAX_REPLAY_AGE_SECS {
+        return Err(StoreError::InvalidData(format!(
+            "load report is {}s old, over the {MAX_REPLAY_AGE_SECS}s replay limit",
+            sample_age.saturating_abs()
+        )));
+    }
+    if sample_age < -MAX_CLOCK_SKEW_SECS {
+        Ok(ReportTiming::Replay)
+    } else {
+        Ok(ReportTiming::Fresh { clock_skew_secs })
+    }
 }
 
 async fn advance_cpu_steal_state(
@@ -2435,6 +2487,34 @@ mod tests {
             network_detail: None,
             uptime_secs: 10,
         }
+    }
+
+    #[test]
+    fn report_time_accepts_a_bounded_delayed_replay_without_calling_it_clock_skew() {
+        assert_eq!(
+            classify_report_time(6_400, Some(10_000), 10_000).unwrap(),
+            ReportTiming::Replay
+        );
+        assert_eq!(
+            classify_report_time(9_500, Some(10_000), 10_000).unwrap(),
+            ReportTiming::Fresh { clock_skew_secs: 0 }
+        );
+    }
+
+    #[test]
+    fn report_time_rejects_unbounded_history_and_future_clock_drift() {
+        assert!(classify_report_time(2_799, Some(10_000), 10_000)
+            .unwrap_err()
+            .to_string()
+            .contains("replay limit"));
+        assert!(classify_report_time(10_601, Some(10_000), 10_000)
+            .unwrap_err()
+            .to_string()
+            .contains("sample is"));
+        assert!(classify_report_time(9_500, Some(9_399), 10_000)
+            .unwrap_err()
+            .to_string()
+            .contains("clock skew"));
     }
 
     fn steal_observation(start: i64, value: f32) -> CpuStealObservation {

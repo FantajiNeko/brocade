@@ -89,6 +89,12 @@ function deployment(last: DeploymentTargetDetail[], overrides: Partial<Deploymen
     rollback_of_deployment_id: null,
     sync_of_deployment_id: null,
     divergence_cleared_at: null,
+    wave_progress: [
+      { wave: 0, entered_at: '2026-10-09T10:30:00Z' },
+      { wave: 1, entered_at: '2026-10-09T10:30:00.500Z' },
+      { wave: 2, entered_at: '2026-10-09T10:30:01Z' },
+      { wave: 3, entered_at: '2026-10-09T10:30:02Z' },
+    ],
     targets: [
       target('sg-edge-1', 0, ['sync-grants'], 'succeeded'),
       target('hk-edge-2', 0, ['apply-wire-guard'], 'succeeded'),
@@ -167,8 +173,14 @@ describe('执行进度', () => {
     expect(first.classList.contains('ok')).toBe(true);
     expect(within(first).getByText('mo-edge-1')).toBeTruthy();
     expect(first.textContent).not.toContain('成功');
-    expect(first.querySelector('.cgp-time')?.getAttribute('dateTime')).toBe('2026-10-09T10:30:02.000Z');
+    expect(first.querySelector('.cgp-time')?.getAttribute('dateTime')).toBe('2026-10-09T10:30:01.000Z');
+    expect(first.querySelector('.cgp-time')?.getAttribute('title')).toContain('开始时间：');
     expect(first.querySelector('.cgp-state')?.textContent).toBe('');
+    // wave 3 已进入但一台尚未领取，仍立即显示控制面时间，而不是等 dispatched_at。
+    const second = stepRow(view.container, '第 2 步');
+    expect(second.querySelector('.cgp-time')?.getAttribute('dateTime')).toBe('2026-10-09T10:30:02.000Z');
+    expect(second.querySelector('.cgp-mobile-time')?.textContent).toContain('开始 ');
+    expect(line.querySelector('.cgp-end')).toBeNull();
   });
 
   it('机器名前是地区旗；没有地区的机器留出同宽的空位', () => {
@@ -266,5 +278,13 @@ describe('执行进度', () => {
     expect(view.container.querySelector('.cg-main > section.cg-sec .cg-meta')?.textContent).toBe(
       '7 / 7 台完成 · 用时 27 秒',
     );
+    const end = view.container.querySelector<HTMLElement>('.cgp-line > .cgp-end')!;
+    expect(end).toBeTruthy();
+    expect(end.querySelector('.cgp-title b')?.textContent).toBe('结束');
+    expect(end.querySelector('.cgp-time')?.getAttribute('dateTime')).toBe('2026-10-09T10:30:27.000Z');
+    expect(end.querySelector('.cgp-time')?.getAttribute('title')).toContain('结束时间：');
+    expect(end.querySelector('.cgp-mobile-time')?.textContent).toContain('结束 ');
+    expect(end.querySelector('.cgp-state')?.textContent).toBe('成功');
+    expect(end).toBe(view.container.querySelector('.cgp-line > li:last-child'));
   });
 });

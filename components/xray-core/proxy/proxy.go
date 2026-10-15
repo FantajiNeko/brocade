@@ -14,7 +14,6 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/app/dispatcher"
@@ -1075,29 +1074,30 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	readerConn, readCounter, _ := UnwrapRawConn(readerConn)
 	writerConn, _, writeCounter := UnwrapRawConn(writerConn)
 	reader := buf.NewReader(readerConn)
+	activity := rawCopyActivity{timer: timer, inboundTimer: inTimer}
 	inbound := session.InboundFromContext(ctx)
 	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedTransport)
-		return readV(ctx, reader, writer, timer, readCounter)
+		return readV(ctx, reader, writer, activity, readCounter)
 	}
 	tc, ok := writerConn.(*net.TCPConn)
 	if !ok || readerConn == nil || writerConn == nil {
 		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedRawConnectionUnavailable)
-		return readV(ctx, reader, writer, timer, readCounter)
+		return readV(ctx, reader, writer, activity, readCounter)
 	}
 	if inbound == nil || inbound.CanSpliceCopy.Load() == session.SpliceCopyDisabled {
 		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedInboundIneligible)
-		return readV(ctx, reader, writer, timer, readCounter)
+		return readV(ctx, reader, writer, activity, readCounter)
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedMissingOutbound)
-		return readV(ctx, reader, writer, timer, readCounter)
+		return readV(ctx, reader, writer, activity, readCounter)
 	}
 	for _, ob := range outbounds {
 		if ob.CanSpliceCopy.Load() == session.SpliceCopyDisabled {
 			SetSpliceNotUsedReason(inbound, session.SpliceNotUsedOutboundIneligible)
-			return readV(ctx, reader, writer, timer, readCounter)
+			return readV(ctx, reader, writer, activity, readCounter)
 		}
 	}
 
@@ -1114,40 +1114,39 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				inbound.SpliceMetrics.MarkSplice()
 			}
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
-			//runtime.Gosched() // necessary
-			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
-			if inTimer != nil {
-				inTimer.SetTimeout(24 * time.Hour)
-			}
-			for {
-				limited := &io.LimitedReader{R: readerConn, N: spliceAccountingChunk}
-				written, err := tc.ReadFrom(limited)
+			// Even unmetered streams need per-pump progress: an upload EOF may
+			// shorten the idle timeout while this download is still active.
+			// Preserve that policy instead of replacing it when splice starts.
+			handled, err := copyAccountedSplice(readerConn, tc, func(written int64) {
 				if readCounter != nil {
-					readCounter.Add(written) // outbound stats
+					readCounter.Add(written)
 				}
 				if writeCounter != nil {
-					writeCounter.Add(written) // inbound stats
+					writeCounter.Add(written)
 				}
 				if statWriter != nil {
-					statWriter.Counter.Add(written) // user stats
+					statWriter.Counter.Add(written)
 				}
 				if inbound.SpliceMetrics != nil {
 					inbound.SpliceMetrics.AddSpliceBytes(written)
 				}
-				if err != nil && errors.Cause(err) != io.EOF {
-					return err
-				}
-				if err != nil || written < spliceAccountingChunk {
-					return nil
-				}
+				activity.Update()
+			})
+			if handled {
+				return err
 			}
+			if err != nil {
+				errors.LogWarningInner(ctx, err, "progress-reporting splice unavailable; using buffered copy")
+			}
+			SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedTransport)
+			return readV(ctx, reader, writer, activity, readCounter)
 		}
 		buffer, err := reader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
 			if readCounter != nil {
 				readCounter.Add(int64(buffer.Len()))
 			}
-			timer.Update()
+			activity.Update()
 			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
 				setSpliceEndedReason(inbound)
 				return werr
@@ -1163,9 +1162,19 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	}
 }
 
-// spliceAccountingChunk keeps byte counters observable during long downloads
-// while amortizing the accounting work over large zero-copy transfers.
-const spliceAccountingChunk int64 = 64 << 20
+// A raw copy bypasses both handlers' ordinary buffered activity reporting.
+// Keep both deadlines alive only while bytes actually make progress.
+type rawCopyActivity struct {
+	timer        *signal.ActivityTimer
+	inboundTimer *signal.ActivityTimer
+}
+
+func (a rawCopyActivity) Update() {
+	a.timer.Update()
+	if a.inboundTimer != nil && a.inboundTimer != a.timer {
+		a.inboundTimer.Update()
+	}
+}
 
 // SetSpliceNotUsedReason records why a protocol connection did not enter the
 // raw splice path. It is a no-op for protocols without splice metrics.

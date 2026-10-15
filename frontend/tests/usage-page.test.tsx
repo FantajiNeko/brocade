@@ -40,6 +40,38 @@ function json(body: unknown) {
 }
 
 describe('usage month view', () => {
+  it('includes forwarding-only users and distinguishes source totals without inventing a line', async () => {
+    const queryClient = client();
+    queryClient.setQueryData(['usage-monthly'], {
+      month_start: '2026-09-01 00:00:00',
+      month_end: '2026-10-01 00:00:00',
+      views: [],
+      forwarding: [
+        {
+          tenant_id: 'platform',
+          user_id: 'alice',
+          node_id: 'n1',
+          rule_id: 7,
+          rule_name: 'Web',
+          uplink_bytes: 1024,
+          downlink_bytes: 2048,
+          has_gap: false,
+        },
+      ],
+      days: [{ day: '2026-09-01', uplink_bytes: 1024, downlink_bytes: 2048, has_gap: false }],
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <UsagePane />
+      </QueryClientProvider>,
+    );
+    const ledger = view.getByLabelText('2026 年 9 月用量概览');
+    expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('3 KiB');
+    expect(readingOf(ledger, '接入')).toBe('0 B');
+    expect(readingOf(ledger, '转发')).toBe('3 KiB');
+    expect(readingOf(ledger, '活跃用户')).toBe('1');
+    expect(readingOf(ledger, '线路')).toBe('0');
+  });
   it('keeps the mounted panel and current reading visible while another month loads', async () => {
     let finishPreviousMonth: ((response: Response) => void) | undefined;
     const previousMonth = new Promise<Response>(resolve => {
@@ -309,5 +341,29 @@ describe('usage month view', () => {
     expect(readingOf(ledger, '日均')).toBe('—');
     expect(readingOf(ledger, '峰值日')).toBe('—');
     expect(within(ledger).queryByRole('button')).toBeNull();
+  });
+});
+
+describe('usage isolation', () => {
+  const monthly = {
+    month_start: '2026-10-01 00:00:00',
+    month_end: '2026-11-01 00:00:00',
+    views: [],
+    days: [],
+  };
+  it('does not expose or request the fleet model in the user-facing usage view', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === '/usage/monthly-summary') return json(monthly);
+      throw new Error(`unexpected request: ${String(input)}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = render(
+      <QueryClientProvider client={client()}>
+        <UsagePane />
+      </QueryClientProvider>,
+    );
+    await view.findByLabelText('2026 年 10 月用量概览');
+    expect(view.queryByText('流量预测')).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

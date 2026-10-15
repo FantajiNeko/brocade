@@ -13,6 +13,7 @@ export type NavKey =
   | 'topo'
   | 'settings'
   | 'usage'
+  | 'capacity'
   // 修改自身的登录密码。它不是功能页面而是身份区的操作，因此顶栏和「⋯」的
   // 页面列表中都不包含它——入口位于「⋯」的下半部分，与退出相邻。
   | 'password';
@@ -28,6 +29,7 @@ export const NAV_KEYS = [
   'topo',
   'settings',
   'usage',
+  'capacity',
   'password',
 ] as const satisfies readonly NavKey[];
 

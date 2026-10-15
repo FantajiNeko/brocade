@@ -38,19 +38,20 @@ use brocade_store::{
     CreateTenantRequest, CreateUserRequest, CreateXrayReleaseRequest, DeleteFrontRequest,
     HopInRequest, HopWireRequest, HostNetworkTuning, IsolateDeploymentTargetRequest,
     IsolateNodeRequest, IssuedCertificate, LinkProbe, LinkProbeRequest, LinkProbeStatus,
-    LoadSeriesQuery, ModelOp, NodeDesiredDeployment, NodeTrafficCycleKind, PgStore,
-    PingProbeFamily, PingProbeKind, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
-    PingProbeSkipReason, PingProbeTarget, ProbeTransport, ProvisionNodeRequest,
-    PublicIpObservationOutcome, PutStepRequest, RegisterWarpBindingRequest,
-    RemoveRetiredNodesRequest, RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest,
-    SetUserPasswordRequest, StepAcceptRequest, StoreError, TargetApplyResult,
-    TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
-    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateNodeTrafficRequest,
-    UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
-    UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest,
-    UserAccountType, UserDirectLoginRequest, UserPresenceState, VerifyDeploymentRequest,
-    WiresRequest, XrayBuildInfo, XrayReleaseArtifact, XrayReleaseOutcome, XrayReleaseReport,
-    XrayReleaseStatus, XrayReleaseTargetStatus, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
+    LoadSeriesQuery, MachineTrafficAccuracy, MachineTrafficBandBasis, MachineTrafficConfidence,
+    ModelOp, NodeDesiredDeployment, NodeTrafficCycleKind, PgStore, PingProbeFamily, PingProbeKind,
+    PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeSkipReason,
+    PingProbeTarget, ProbeTransport, ProvisionNodeRequest, PublicIpObservationOutcome,
+    PutStepRequest, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
+    RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest, SetUserPasswordRequest,
+    StepAcceptRequest, StoreError, TargetApplyResult, TargetConvergenceReport, TransportRequest,
+    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    UpdateNodeTrafficRequest, UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest,
+    UpdateUserStatusRequest, UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter,
+    UsageReportRequest, UserAccountType, UserDirectLoginRequest, UserPresenceState,
+    VerifyDeploymentRequest, WiresRequest, XrayBuildInfo, XrayReleaseArtifact, XrayReleaseOutcome,
+    XrayReleaseReport, XrayReleaseStatus, XrayReleaseTargetStatus, ENROLLMENT_TOKEN_PREFIX,
+    NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -1980,6 +1981,10 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn external_vless_xhttp_round_trips() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -1993,10 +1998,15 @@ async fn external_vless_xhttp_round_trips() {
         address: "upload.vendor.example".to_owned(),
         port: 443,
         protocol: ExternalOutboundProtocol::Vless {
+            final_mask: Some(json!({
+                "tcp": [{ "type": "salamander", "settings": { "password": "mask-secret" } }],
+                "udp": []
+            })),
             credential: "6f9d1a8e-2b3c-4d5e-8f70-1a2b3c4d5e6f".to_owned(),
             encryption: "none".to_owned(),
             flow: None,
             transport: ExternalVlessTransport::Xhttp(ExternalVlessXhttp {
+                extra: Some(json!({ "noSSEHeader": true, "xPaddingKey": "padding-secret" })),
                 path: "/upload".to_owned(),
                 host: Some("upload.vendor.example".to_owned()),
                 mux: Some(4),
@@ -2005,6 +2015,10 @@ async fn external_vless_xhttp_round_trips() {
                     address: "download.vendor.example".to_owned(),
                     port: 8443,
                     security: ExternalOutboundSecurity::Tls {
+                        alpn: vec!["h2".to_owned()],
+                        ech_config_list: Some("download-ech".to_owned()),
+                        pinned_peer_cert_sha256: Some("11".repeat(32)),
+                        verify_peer_cert_by_name: Some("download-cert.vendor.example".to_owned()),
                         server_name: "download.vendor.example".to_owned(),
                         fingerprint: "chrome".to_owned(),
                     },
@@ -2016,6 +2030,8 @@ async fn external_vless_xhttp_round_trips() {
             }),
         },
         security: ExternalOutboundSecurity::Reality {
+            mldsa65_verify: None,
+            spider_x: Some("/search".to_owned()),
             server_name: "www.example.com".to_owned(),
             public_key: "reality-public-key".to_owned(),
             short_id: "0123abcd".to_owned(),
@@ -2042,15 +2058,41 @@ async fn external_vless_xhttp_round_trips() {
     .unwrap()
     .try_get("protocol_options")
     .unwrap();
-    assert_eq!(options["transport"]["t"], "xhttp");
-    assert_eq!(options["transport"]["v"]["path"], "/upload");
-    assert_eq!(
-        options["transport"]["v"]["download"]["address"],
-        "download.vendor.example"
+    assert!(options["brocade_sealed"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("v1.")));
+    assert!(!options.to_string().contains("mask-secret"));
+    assert!(!options.to_string().contains("padding-secret"));
+    let stored_snapshot: serde_json::Value = sqlx::query_scalar(
+        "SELECT snapshot FROM model_snapshots ORDER BY revision_id DESC LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        stored_snapshot["external_outbounds"][0]["protocol"]["v"]["options_sealed"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("v1."))
     );
+    assert!(!stored_snapshot.to_string().contains("mask-secret"));
+    assert!(!stored_snapshot.to_string().contains("padding-secret"));
 
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
     assert_eq!(snapshot.external_outbounds[0].protocol, request.protocol);
+    let redacted = db
+        .store
+        .redacted_snapshot(&system_admin(), None)
+        .await
+        .unwrap();
+    let vless = &redacted.snapshot["external_outbounds"][0]["protocol"]["v"];
+    assert_eq!(
+        vless["final_mask"]["tcp"][0]["settings"]["password"],
+        "<redacted>"
+    );
+    assert_eq!(
+        vless["transport"]["v"]["extra"]["xPaddingKey"],
+        "<redacted>"
+    );
 }
 
 #[tokio::test]
@@ -2581,6 +2623,7 @@ async fn deployment_schema_matches_convergence_design() {
     assert_column_missing(db.pool(), "node_lifecycle_state", "completed_by").await;
     assert_column_missing(db.pool(), "node_lifecycle_state", "reason").await;
     assert_table_exists(db.pool(), "deployment_wave_confirmations").await;
+    assert_table_exists(db.pool(), "deployment_wave_progress").await;
     assert_table_exists(db.pool(), "subscription_serving_state").await;
     assert_table_exists(db.pool(), "subscription_client_snapshots").await;
     assert_table_exists(db.pool(), "subscription_client_state").await;
@@ -3229,6 +3272,181 @@ async fn usage_node_series_honours_exact_history_boundaries() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_traffic_history_groups_windows_and_honours_scope() {
+    use brocade_store::{StoreError, UserTrafficHistoryScope};
+
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.other', 'Platform Other')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (tenant_id, id, uuid)
+         VALUES ('platform.other', 'bob', '7f0bdc55-55c4-4b9e-9b8e-4f62e6c1a9d0')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // alice moves bytes through two grants in the last window; an old window and bob's window
+    // check the range and the tenant filter.
+    for (end, tenant, user, ingress, up, down) in [
+        (
+            now - 90,
+            "platform.acme",
+            "alice",
+            "ing-a1b2",
+            100_i64,
+            200_i64,
+        ),
+        (now - 30, "platform.acme", "alice", "ing-a1b2", 10, 20),
+        (now - 30, "platform.acme", "alice", "ing-c3d4", 1, 2),
+        (now - 30, "platform.other", "bob", "ing-e5f6", 5, 6),
+        (now - 4_000, "platform.acme", "alice", "ing-a1b2", 7, 7),
+    ] {
+        sqlx::query(
+            "INSERT INTO usage_samples (
+                window_start, window_end, node_id, tenant_id, user_id, ingress_id,
+                app_id, grant_label, uplink_bytes, downlink_bytes, has_gap
+             ) VALUES (
+                to_timestamp($1), to_timestamp($2), 'n1', $3, $4, $5,
+                'app-main', $4 || '@' || $3 || '#' || $5, $6, $7, FALSE
+             )",
+        )
+        .bind((end - 30) as f64)
+        .bind(end as f64)
+        .bind(tenant)
+        .bind(user)
+        .bind(ingress)
+        .bind(up)
+        .bind(down)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    // The machine delivered three reports; the middle one carried no user bytes.
+    for end in [now - 90, now - 60, now - 30] {
+        sqlx::query(
+            "INSERT INTO usage_node_windows (
+                node_id, tenant_id, window_end, user_uplink_bytes, user_downlink_bytes,
+                relay_uplink_bytes, relay_downlink_bytes
+             ) VALUES ('n1', 'platform.acme', to_timestamp($1), 0, 0, 0, 0)",
+        )
+        .bind(end as f64)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    let machine = db
+        .store
+        .list_user_traffic_history(&system_admin(), UserTrafficHistoryScope::Node("n1"), 3_600)
+        .await
+        .unwrap();
+    assert_eq!(
+        machine.range_end_unix_secs - machine.range_start_unix_secs,
+        3_600
+    );
+    assert_eq!(machine.nodes.len(), 1);
+    assert_eq!(machine.nodes[0].node_id, "n1");
+    assert_eq!(
+        machine.nodes[0].window_ends_unix_secs,
+        vec![now - 90, now - 60, now - 30],
+        "idle windows stay listed so the card can tell idle from uncollected"
+    );
+    let users = machine
+        .series
+        .iter()
+        .map(|series| {
+            (
+                series.tenant_id.as_str(),
+                series.user_id.as_str(),
+                series.points.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users,
+        vec![
+            (
+                "platform.acme",
+                "alice",
+                vec![(now - 90, 100, 200), (now - 30, 11, 22)]
+            ),
+            ("platform.other", "bob", vec![(now - 30, 5, 6)]),
+        ],
+        "grants are summed per user and the out-of-range window is excluded"
+    );
+
+    let scoped = db
+        .store
+        .list_user_traffic_history(
+            &tenant_admin("platform.acme"),
+            UserTrafficHistoryScope::Node("n1"),
+            3_600,
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped.series.len(), 1);
+    assert_eq!(scoped.series[0].user_id, "alice");
+
+    let refused = db
+        .store
+        .list_user_traffic_history(
+            &publisher("platform.acme"),
+            UserTrafficHistoryScope::Node("n1"),
+            3_600,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, StoreError::Forbidden(_)), "{refused:?}");
+
+    let alice = db
+        .store
+        .list_user_traffic_history(
+            &tenant_admin("platform.acme"),
+            UserTrafficHistoryScope::User {
+                tenant_id: "platform.acme",
+                user_id: "alice",
+            },
+            3_600,
+        )
+        .await
+        .unwrap();
+    assert_eq!(alice.series.len(), 1);
+    assert_eq!(alice.series[0].node_id, "n1");
+    assert_eq!(alice.series[0].points.len(), 2);
+    assert_eq!(
+        alice.nodes.len(),
+        1,
+        "the granted machine is listed with its windows"
+    );
+    assert_eq!(alice.nodes[0].window_ends_unix_secs.len(), 3);
+
+    let outside = db
+        .store
+        .list_user_traffic_history(
+            &tenant_admin("platform.acme"),
+            UserTrafficHistoryScope::User {
+                tenant_id: "platform.other",
+                user_id: "bob",
+            },
+            3_600,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(outside, StoreError::Forbidden(_)), "{outside:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn usage_detail_retention_keeps_daily_node_rollups() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -3598,12 +3816,17 @@ async fn front_save_updates_subscriptions_without_creating_a_deployment() {
                     address: "vendor.example".to_owned(),
                     port: 443,
                     protocol: ExternalOutboundProtocol::Vless {
+                        final_mask: None,
                         credential: "00000000-0000-4000-8000-000000000001".to_owned(),
                         encryption: "none".to_owned(),
                         flow: None,
                         transport: ExternalVlessTransport::Raw,
                     },
                     security: ExternalOutboundSecurity::Tls {
+                        alpn: Vec::new(),
+                        ech_config_list: None,
+                        pinned_peer_cert_sha256: None,
+                        verify_peer_cert_by_name: None,
                         server_name: "vendor.example".to_owned(),
                         fingerprint: "chrome".to_owned(),
                     },
@@ -4613,9 +4836,11 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 spool: SpoolBacklog {
                     observation: 3,
                     usage: 41,
+                    load: 17,
                     dropped: 1_480,
                     usage_dropped: Some(1_400),
                     observation_dropped: Some(80),
+                    load_dropped: Some(0),
                 },
             },
         )
@@ -4691,9 +4916,11 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 spool: SpoolBacklog {
                     observation: 0,
                     usage: 0,
+                    load: 0,
                     dropped: 1_480,
                     usage_dropped: Some(1_400),
                     observation_dropped: Some(80),
+                    load_dropped: Some(0),
                 },
             },
         )
@@ -5721,9 +5948,11 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
+            load: 0,
             dropped: 0,
             usage_dropped: Some(0),
             observation_dropped: Some(0),
+            load_dropped: Some(0),
         },
     };
 
@@ -5781,9 +6010,11 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
             spool: SpoolBacklog {
                 observation: 0,
                 usage: 0,
+                load: 0,
                 dropped: 0,
                 usage_dropped: Some(0),
                 observation_dropped: Some(0),
+                load_dropped: Some(0),
             },
         }
     }
@@ -6251,9 +6482,11 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
+            load: 0,
             dropped: 0,
             usage_dropped: Some(0),
             observation_dropped: Some(0),
+            load_dropped: Some(0),
         },
     };
 
@@ -11666,30 +11899,71 @@ async fn load_desired_for_node_gates_later_waves_until_current_wave_finishes() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     insert_second_node(db.pool()).await;
+    let admin = system_admin();
 
     let created = db
         .store
-        .create_deployment(
-            &system_admin(),
-            create_deployment_request(1, "desired-waves"),
-        )
+        .create_deployment(&admin, create_deployment_request(1, "desired-waves"))
         .await
         .unwrap();
 
-    let n1 = db.store.load_desired_for_node("n1").await.unwrap();
+    let initial = db
+        .store
+        .deployment_detail(&admin, created.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(initial.wave_progress.len(), 1);
+    assert_eq!(initial.wave_progress[0].wave, 1);
+    assert_eq!(initial.wave_progress[0].entered_at, initial.created_at);
+    assert_eq!(
+        initial.started_at.as_deref(),
+        Some(initial.wave_progress[0].entered_at.as_str())
+    );
+    assert!(
+        initial
+            .targets
+            .iter()
+            .all(|target| target.dispatched_at.is_none()),
+        "control-plane stage start must exist before an agent claims work"
+    );
+
+    let n1 = db.store.claim_desired_for_node("n1").await.unwrap();
     let n2 = db.store.load_desired_for_node("n2").await.unwrap();
     assert!(n1.is_some(), "wave 1 target should be visible");
     assert!(n2.is_none(), "wave 2 target must not be visible yet");
 
-    sqlx::query(
-        "UPDATE deployment_targets
-         SET status = 'succeeded'
-         WHERE deployment_id = $1 AND node_id = 'n1'",
-    )
-    .bind(created.deployment_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let after_claim = db
+        .store
+        .deployment_detail(&admin, created.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(after_claim.wave_progress, initial.wave_progress);
+
+    db.store
+        .report_target_result(applied_report(&n1.unwrap()))
+        .await
+        .unwrap();
+
+    let waiting_confirmation = db
+        .store
+        .deployment_detail(&admin, created.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(waiting_confirmation.wave_progress.len(), 2);
+    let wave_2_entered_at = waiting_confirmation
+        .wave_progress
+        .iter()
+        .find(|progress| progress.wave == 2)
+        .expect("wave 2 should enter before its confirmation or node claim")
+        .entered_at
+        .clone();
+    assert!(waiting_confirmation
+        .targets
+        .iter()
+        .find(|target| target.node_id == "n2")
+        .expect("n2 target")
+        .dispatched_at
+        .is_none());
 
     let n2 = db.store.load_desired_for_node("n2").await.unwrap();
     assert!(
@@ -11699,12 +11973,7 @@ async fn load_desired_for_node_gates_later_waves_until_current_wave_finishes() {
 
     let confirmed = db
         .store
-        .confirm_deployment_wave(
-            &system_admin(),
-            created.deployment_id,
-            2,
-            Some("tester".to_owned()),
-        )
+        .confirm_deployment_wave(&admin, created.deployment_id, 2, Some("tester".to_owned()))
         .await
         .unwrap();
     assert!(confirmed.confirmed);
@@ -11712,11 +11981,27 @@ async fn load_desired_for_node_gates_later_waves_until_current_wave_finishes() {
 
     let n2 = db
         .store
-        .load_desired_for_node("n2")
+        .claim_desired_for_node("n2")
         .await
         .unwrap()
         .expect("wave 2 target should become visible after confirmation");
     assert_eq!(n2.wave, 2);
+
+    let after_wave_2_claim = db
+        .store
+        .deployment_detail(&admin, created.deployment_id, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_wave_2_claim
+            .wave_progress
+            .iter()
+            .find(|progress| progress.wave == 2)
+            .expect("wave 2 progress")
+            .entered_at,
+        wave_2_entered_at,
+        "confirmation and node claims must not overwrite the stage entry time"
+    );
 }
 
 /// A release records a digest per artifact and the machine fetches the content by that digest.
@@ -12483,6 +12768,7 @@ fn current_usage(
 ) -> UsageReportRequest {
     UsageReportRequest {
         agent_instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        zero_windows: Vec::new(),
         sequence,
         usage_generation_id: generation_id,
         read_at_unix_secs: read_at,
@@ -12714,6 +13000,108 @@ async fn zero_user_windows_keep_exact_machine_points_without_detail_rows() {
         .await
         .unwrap();
     assert_eq!(own.nodes[0].buckets.len(), 4);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn managed_restart_keeps_cumulative_bytes_and_certifies_zero_coverage() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    db.store
+        .record_usage_report(
+            "n1",
+            current_usage(generation, 1, base, "journal:stable", 100, 200),
+        )
+        .await
+        .unwrap();
+    db.store
+        .record_usage_report(
+            "n1",
+            current_usage(generation, 2, base + 15, "journal:stable", 150, 300),
+        )
+        .await
+        .unwrap();
+    let mut restarted = current_usage(generation, 3, base + 60, "journal:stable", 180, 500);
+    restarted.xray_started_at_unix_secs = base + 40;
+    restarted
+        .zero_windows
+        .push(brocade_deployment::protocol::UsageZeroWindow {
+            start_unix_millis: (base + 20) * 1000,
+            end_unix_millis: (base + 40) * 1000,
+        });
+    let result = db
+        .store
+        .record_usage_report("n1", restarted.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.gap_samples, 0);
+    assert_eq!(result.window_start_unix_secs, Some(base + 15));
+    assert_eq!(result.zero_windows.len(), 1);
+    let fresh_store = PgStore::from_pool(db.pool().clone());
+    let replay = fresh_store
+        .record_usage_report("n1", restarted)
+        .await
+        .unwrap();
+    assert!(replay.duplicate);
+    assert_eq!(replay.zero_windows, result.zero_windows);
+    let totals: (i64, i64) = sqlx::query_as(
+        "SELECT sum(uplink_bytes)::bigint,sum(downlink_bytes)::bigint FROM usage_rollups",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        totals,
+        (80, 300),
+        "tail bytes are included exactly once, not rebilled after restart"
+    );
+    let history = db
+        .store
+        .list_user_traffic_history(
+            &system_admin(),
+            brocade_store::UserTrafficHistoryScope::Node("n1"),
+            3600,
+        )
+        .await
+        .unwrap();
+    assert!(history.nodes[0].windows.contains(&(base + 15, base + 60)));
+    assert!(history.nodes[0]
+        .zero_windows
+        .contains(&((base + 20) * 1000, (base + 40) * 1000)));
+    assert!(history.series[0]
+        .windows
+        .contains(&(base + 15, base + 60, 30, 200)));
+    let mut empty = current_usage(generation, 4, base + 75, "journal:stable", 0, 0);
+    empty.counters.clear();
+    let result = db.store.record_usage_report("n1", empty).await.unwrap();
+    assert_eq!(result.window_start_unix_secs, Some(base + 60));
+    let history = db
+        .store
+        .list_user_traffic_history(
+            &system_admin(),
+            brocade_store::UserTrafficHistoryScope::Node("n1"),
+            3600,
+        )
+        .await
+        .unwrap();
+    assert!(
+        history.nodes[0].windows.contains(&(base + 60, base + 75)),
+        "empty valid reports are zero, not missing"
+    );
+    let mut invalid = current_usage(generation, 5, base + 80, "journal:stable", 180, 500);
+    invalid
+        .zero_windows
+        .push(brocade_deployment::protocol::UsageZeroWindow {
+            start_unix_millis: (base + 90) * 1000,
+            end_unix_millis: (base + 100) * 1000,
+        });
+    assert!(db.store.record_usage_report("n1", invalid).await.is_err());
 }
 
 #[tokio::test]
@@ -13215,6 +13603,7 @@ async fn first_report_after_new_authorization_counts_the_complete_counter() {
             "n1",
             UsageReportRequest {
                 agent_instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
+                zero_windows: Vec::new(),
                 sequence: 1,
                 usage_generation_id: generation,
                 xray_epoch: "boot-a:100".to_owned(),
@@ -16579,6 +16968,7 @@ fn minute_load_sample(start: i64) -> LoadSample {
 fn minute_load_report(now: i64, samples: Vec<LoadSample>) -> LoadReportRequest {
     LoadReportRequest {
         read_at_unix_secs: now,
+        sent_at_unix_secs: Some(now),
         btime_unix_secs: now - 36000,
         host: serde_json::from_value(json!({
             "kernel": "test", "cpu_model": "test", "cores": 2, "cc_algo": "bbr",
@@ -17403,6 +17793,7 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
     };
     let report = LoadReportRequest {
         read_at_unix_secs: now,
+        sent_at_unix_secs: Some(now),
         btime_unix_secs: now - 3600,
         host: HostFacts {
             kernel: "6.8.0".to_owned(),
@@ -17577,6 +17968,7 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
             ..sample
         },
     ];
+    let mut delayed_report = history_report.clone();
     let accepted = db
         .store
         .record_load_report("net-observe", history_report)
@@ -17602,6 +17994,30 @@ async fn deep_network_observation_round_trips_as_one_optional_window_detail() {
     let json = serde_json::to_string(listed).unwrap();
     assert!(!json.contains("cpu_detail"));
     assert!(!json.contains("network_detail"));
+
+    delayed_report.read_at_unix_secs = now - 900;
+    delayed_report.host.kernel = "stale-replay-must-not-win".to_owned();
+    delayed_report.samples = vec![LoadSample {
+        window_start_unix_secs: now - 930,
+        window_end_unix_secs: now - 900,
+        ..delayed_report.samples[0].clone()
+    }];
+    let replayed = db
+        .store
+        .record_load_report("net-observe", delayed_report)
+        .await
+        .unwrap();
+    assert_eq!(replayed.accepted_samples, 1);
+    let current_host: serde_json::Value = sqlx::query_scalar(
+        "SELECT load_host_facts FROM node_agent_state WHERE node_id = 'net-observe'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        current_host["kernel"], "6.8.0",
+        "historical replay must fill the series without replacing current host facts"
+    );
 }
 
 #[tokio::test]
@@ -17683,6 +18099,7 @@ async fn sustained_cpu_steal_opens_deduplicates_and_recovers_one_machine_inciden
     };
     let report = |read_at_unix_secs: i64, samples: Vec<LoadSample>| LoadReportRequest {
         read_at_unix_secs,
+        sent_at_unix_secs: Some(read_at_unix_secs),
         btime_unix_secs: now - 3600,
         host: host.clone(),
         samples,
@@ -22412,6 +22829,887 @@ async fn insert_minimal_fixture(pool: &PgPool) {
     .unwrap();
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forwarding_authorization_reconcile_and_usage_are_durable() {
+    use brocade_deployment::protocol::{
+        ForwardingProtocol, ForwardingReconcileReport, ForwardingUsageCounter,
+        ForwardingUsageReportRequest,
+    };
+    use brocade_store::{ForwardingEntitlementWrite, ForwardingRuleWrite};
+
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let admin = system_admin();
+
+    let granted = db
+        .store
+        .set_forwarding_entitlement(
+            &admin,
+            "platform.acme",
+            "alice",
+            "n1",
+            ForwardingEntitlementWrite {
+                enabled: true,
+                tcp_allowed: true,
+                udp_allowed: true,
+                listen_port_start: 10_000,
+                listen_port_end: 20_100,
+                max_rules: 2,
+                allow_private_targets: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(granted.entitlements.len(), 1);
+
+    let write = ForwardingRuleWrite {
+        node_id: "n1".to_owned(),
+        name: "Web".to_owned(),
+        protocol: ForwardingProtocol::Tcp,
+        listen_port: 20_042,
+        target_host: "1.1.1.1".to_owned(),
+        target_port: 443,
+        enabled: true,
+    };
+    let created = db
+        .store
+        .create_forwarding_rule(&admin, "platform.acme", "alice", write.clone())
+        .await
+        .unwrap();
+    let rule = created.rules.first().unwrap();
+    assert_eq!(rule.runtime_status, "pending");
+    let rule_id = rule.id;
+    assert!(matches!(
+        db.store
+            .delete_forwarding_entitlement(&admin, "platform.acme", "alice", "n1")
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let mut static_conflict = write.clone();
+    static_conflict.listen_port = 10_085;
+    assert!(matches!(
+        db.store
+            .create_forwarding_rule(&admin, "platform.acme", "alice", static_conflict)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        db.store
+            .create_forwarding_rule(&admin, "platform.acme", "alice", write)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let udp_write = ForwardingRuleWrite {
+        node_id: "n1".to_owned(),
+        name: "DNS".to_owned(),
+        protocol: ForwardingProtocol::Udp,
+        listen_port: 20_042,
+        target_host: "1.1.1.1".to_owned(),
+        target_port: 53,
+        enabled: true,
+    };
+    let udp_created = db
+        .store
+        .create_forwarding_rule(&admin, "platform.acme", "alice", udp_write)
+        .await
+        .unwrap();
+    let udp_rule_id = udp_created
+        .rules
+        .iter()
+        .find(|rule| rule.protocol == ForwardingProtocol::Udp)
+        .unwrap()
+        .id;
+
+    let desired = db.store.forwarding_desired_for_node("n1").await.unwrap();
+    assert_eq!(desired.rules.len(), 2);
+    assert_eq!(desired.rules[0].id, rule_id);
+    assert!(matches!(
+        db.store
+            .record_forwarding_reconcile(
+                "n1",
+                ForwardingReconcileReport {
+                    generation: desired.generation,
+                    applied_rule_ids: vec![],
+                    error: None,
+                },
+            )
+            .await,
+        Err(StoreError::InvalidData(_))
+    ));
+    db.store
+        .record_forwarding_reconcile(
+            "n1",
+            ForwardingReconcileReport {
+                generation: desired.generation,
+                applied_rule_ids: vec![rule_id, udp_rule_id],
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .forwarding_overview(&admin, "platform.acme", "alice")
+            .await
+            .unwrap()
+            .rules[0]
+            .runtime_status,
+        "active"
+    );
+
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let report = |sequence, uplink_bytes, downlink_bytes| ForwardingUsageReportRequest {
+        agent_instance_id: "agent-1".to_owned(),
+        sequence,
+        read_at_unix_secs: now - 30 + i64::try_from(sequence).unwrap() * 15,
+        xray_epoch: "xray-1".to_owned(),
+        counters: vec![ForwardingUsageCounter {
+            rule_id,
+            uplink_bytes,
+            downlink_bytes,
+        }],
+    };
+    let baseline = db
+        .store
+        .record_forwarding_usage("n1", report(1, 100, 200))
+        .await
+        .unwrap();
+    assert_eq!(baseline.inserted_samples, 1);
+    let delta = db
+        .store
+        .record_forwarding_usage("n1", report(2, 140, 260))
+        .await
+        .unwrap();
+    assert_eq!(delta.inserted_samples, 1);
+    let duplicate = db
+        .store
+        .record_forwarding_usage("n1", report(2, 140, 260))
+        .await
+        .unwrap();
+    assert!(duplicate.duplicate);
+    let overview = db
+        .store
+        .forwarding_overview(&admin, "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_eq!(overview.rules[0].uplink_bytes, 140);
+    assert_eq!(overview.rules[0].downlink_bytes, 260);
+
+    assert!(matches!(
+        db.store
+            .set_forwarding_entitlement(
+                &admin,
+                "platform.acme",
+                "alice",
+                "n1",
+                ForwardingEntitlementWrite {
+                    enabled: true,
+                    tcp_allowed: false,
+                    udp_allowed: true,
+                    listen_port_start: 10_000,
+                    listen_port_end: 20_100,
+                    max_rules: 2,
+                    allow_private_targets: false,
+                },
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    db.store
+        .set_forwarding_entitlement(
+            &admin,
+            "platform.acme",
+            "alice",
+            "n1",
+            ForwardingEntitlementWrite {
+                enabled: false,
+                tcp_allowed: true,
+                udp_allowed: true,
+                listen_port_start: 10_000,
+                listen_port_end: 20_100,
+                max_rules: 2,
+                allow_private_targets: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .forwarding_desired_for_node("n1")
+        .await
+        .unwrap()
+        .rules
+        .is_empty());
+    let revoked = db.store.forwarding_desired_for_node("n1").await.unwrap();
+    let residual = ForwardingReconcileReport {
+        generation: revoked.generation,
+        applied_rule_ids: vec![rule_id, udp_rule_id],
+        error: Some("rule removal failed; retrying next round".to_owned()),
+    };
+    db.store
+        .record_forwarding_reconcile("n1", residual.clone())
+        .await
+        .unwrap();
+    let state: (String, serde_json::Value) = sqlx::query_as(
+        "SELECT reconcile_status, applied_rule_ids FROM forwarding_node_state WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state.0, "error");
+    assert_eq!(state.1, serde_json::json!([rule_id, udp_rule_id]));
+    assert!(matches!(
+        db.store
+            .record_forwarding_reconcile(
+                "n1",
+                ForwardingReconcileReport {
+                    error: None,
+                    ..residual
+                }
+            )
+            .await,
+        Err(StoreError::InvalidData(_))
+    ));
+    db.store
+        .record_forwarding_reconcile(
+            "n1",
+            ForwardingReconcileReport {
+                generation: revoked.generation,
+                applied_rule_ids: vec![],
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let removed = db
+        .store
+        .delete_forwarding_entitlement(&admin, "platform.acme", "alice", "n1")
+        .await
+        .unwrap();
+    assert!(removed.entitlements.is_empty());
+    assert!(removed.rules.is_empty());
+    assert!(db
+        .store
+        .forwarding_desired_for_node("n1")
+        .await
+        .unwrap()
+        .rules
+        .is_empty());
+    assert!(sqlx::query_scalar::<_, Option<String>>(
+        "SELECT deleted_at::text FROM forwarding_rules WHERE id = $1",
+    )
+    .bind(rule_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .is_some());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM forwarding_usage_samples WHERE rule_id = $1",
+        )
+        .bind(rule_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forwarding_entitlement_can_authorize_a_private_target() {
+    use brocade_deployment::protocol::ForwardingProtocol;
+    use brocade_store::{ForwardingEntitlementWrite, ForwardingRuleWrite};
+
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let admin = system_admin();
+    let entitlement = |allow_private_targets| ForwardingEntitlementWrite {
+        enabled: true,
+        tcp_allowed: true,
+        udp_allowed: true,
+        listen_port_start: 40_000,
+        listen_port_end: 49_999,
+        max_rules: 4,
+        allow_private_targets,
+    };
+    db.store
+        .set_forwarding_entitlement(&admin, "platform.acme", "alice", "n1", entitlement(false))
+        .await
+        .unwrap();
+    let private_rule = ForwardingRuleWrite {
+        node_id: "n1".to_owned(),
+        name: "Private service".to_owned(),
+        protocol: ForwardingProtocol::TcpUdp,
+        listen_port: 40_042,
+        target_host: "10.0.0.8".to_owned(),
+        target_port: 443,
+        enabled: true,
+    };
+    assert!(matches!(
+        db.store
+            .create_forwarding_rule(&admin, "platform.acme", "alice", private_rule.clone())
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+
+    let overview = db
+        .store
+        .set_forwarding_entitlement(&admin, "platform.acme", "alice", "n1", entitlement(true))
+        .await
+        .unwrap();
+    assert!(overview.entitlements[0].allow_private_targets);
+    let created = db
+        .store
+        .create_forwarding_rule(&admin, "platform.acme", "alice", private_rule)
+        .await
+        .unwrap();
+    assert_eq!(created.rules[0].target_host, "10.0.0.8");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forwarding_traffic_integrates_users_machines_and_survives_lifecycle() {
+    use brocade_deployment::protocol::{
+        ForwardingProtocol, ForwardingUsageCounter, ForwardingUsageReportRequest,
+    };
+    use brocade_store::{ForwardingEntitlementWrite, ForwardingRuleWrite, UserTrafficHistoryScope};
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("DELETE FROM grants")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let admin = system_admin();
+    sqlx::query("INSERT INTO nodes(id,tenant_id,name,public_ipv4,overlay_addr,wg_private_key,wg_public_key,wg_listen_port,api_port,overlay,egress_allowed,dns_kind,dns_servers)
+        VALUES('n2','platform.acme','Node 2','n2.example.net','10.66.0.2','private-2','public-2',51820,10085,true,true,'servers','[\"1.1.1.1\"]')").execute(db.pool()).await.unwrap();
+    let entitlement = ForwardingEntitlementWrite {
+        enabled: true,
+        tcp_allowed: true,
+        udp_allowed: true,
+        listen_port_start: 20000,
+        listen_port_end: 21000,
+        max_rules: 4,
+        allow_private_targets: false,
+    };
+    for node in ["n1", "n2"] {
+        db.store
+            .set_forwarding_entitlement(&admin, "platform.acme", "alice", node, entitlement.clone())
+            .await
+            .unwrap();
+    }
+    let mut write = ForwardingRuleWrite {
+        node_id: "n1".to_owned(),
+        name: "Forward".to_owned(),
+        protocol: ForwardingProtocol::TcpUdp,
+        listen_port: 20042,
+        target_host: "1.1.1.1".to_owned(),
+        target_port: 443,
+        enabled: true,
+    };
+    let created = db
+        .store
+        .create_forwarding_rule(&admin, "platform.acme", "alice", write.clone())
+        .await
+        .unwrap();
+    let rule_id = created.rules[0].id;
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE forwarding_rule_nodes SET assigned_at=to_timestamp($1) WHERE rule_id=$2")
+        .bind((now - 150) as f64)
+        .bind(rule_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let report =
+        |instance: &str, seq: u64, at: i64, up: u64, down: u64| ForwardingUsageReportRequest {
+            agent_instance_id: instance.to_owned(),
+            sequence: seq,
+            read_at_unix_secs: at,
+            xray_epoch: "durable-epoch".to_owned(),
+            counters: vec![ForwardingUsageCounter {
+                rule_id,
+                uplink_bytes: up,
+                downlink_bytes: down,
+            }],
+        };
+    assert_eq!(
+        db.store
+            .record_forwarding_usage("n1", report("a", 1, now - 135, 100, 200))
+            .await
+            .unwrap()
+            .inserted_samples,
+        1
+    );
+    assert_eq!(
+        db.store
+            .record_forwarding_usage("n1", report("b", 1, now - 120, 140, 260))
+            .await
+            .unwrap()
+            .inserted_samples,
+        1
+    );
+    assert!(
+        db.store
+            .record_forwarding_usage("n1", report("b", 1, now - 120, 140, 260))
+            .await
+            .unwrap()
+            .duplicate
+    );
+    assert!(matches!(
+        db.store
+            .record_forwarding_usage("n1", report("b", 1, now - 120, 141, 260))
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        db.store
+            .record_forwarding_usage("n1", report("b", 2, now - 130, 9999, 9999))
+            .await
+            .unwrap()
+            .skipped_counters,
+        1
+    );
+    let r3 = report("b", 3, now - 105, 200, 400);
+    let r4 = report("b", 4, now - 90, 250, 500);
+    let (a, b) = tokio::join!(
+        db.store.record_forwarding_usage("n1", r3),
+        db.store.record_forwarding_usage("n1", r4)
+    );
+    a.unwrap();
+    b.unwrap();
+    let desired_before = db.store.forwarding_desired_for_node("n1").await.unwrap();
+    let targets = db
+        .store
+        .user_realtime_targets(&admin, "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_eq!(targets.len(), 1); // No grants: a forwarding-only user still has a live target.
+    assert!(targets[0].labels.is_empty());
+    assert_eq!(targets[0].forwarding[0].rule_id, rule_id);
+    assert_eq!(
+        db.store.forwarding_desired_for_node("n1").await.unwrap(),
+        desired_before
+    );
+    assert!(matches!(
+        db.store
+            .user_realtime_targets(&tenant_admin("platform.other"), "platform.acme", "alice")
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    assert!(matches!(
+        db.store
+            .user_realtime_targets(&publisher("platform.acme"), "platform.acme", "alice")
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    write.node_id = "n2".to_owned();
+    db.store
+        .update_forwarding_rule(&admin, "platform.acme", "alice", rule_id, write)
+        .await
+        .unwrap();
+    db.store
+        .record_forwarding_usage("n1", report("b", 5, now - 75, 300, 600))
+        .await
+        .unwrap();
+    db.store
+        .record_forwarding_usage("n2", report("c", 1, now - 60, 30, 70))
+        .await
+        .unwrap();
+    db.store
+        .delete_forwarding_rule(&admin, "platform.acme", "alice", rule_id)
+        .await
+        .unwrap();
+    db.store
+        .record_forwarding_usage("n2", report("c", 2, now - 45, 50, 100))
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .user_realtime_targets(&admin, "platform.acme", "alice")
+        .await
+        .unwrap()
+        .is_empty());
+    let mut reset = report("b", 6, now - 30, 5, 10);
+    reset.xray_epoch = "new-epoch".to_owned();
+    db.store.record_forwarding_usage("n1", reset).await.unwrap();
+    let monthly = db.store.list_monthly_usage_summary(&admin).await.unwrap();
+    assert!(monthly.views.is_empty());
+    assert_eq!(
+        monthly
+            .forwarding
+            .iter()
+            .map(|r| r.uplink_bytes)
+            .sum::<u64>(),
+        355
+    );
+    assert_eq!(
+        monthly
+            .forwarding
+            .iter()
+            .map(|r| r.downlink_bytes)
+            .sum::<u64>(),
+        710
+    );
+    assert_eq!(
+        monthly
+            .days
+            .iter()
+            .map(|r| r.uplink_bytes + r.downlink_bytes)
+            .sum::<u64>(),
+        1065
+    );
+    assert!(monthly.forwarding.iter().any(|r| r.has_gap));
+    let scoped = db
+        .store
+        .list_monthly_usage_summary(&tenant_admin("platform.other"))
+        .await
+        .unwrap();
+    assert!(scoped.forwarding.is_empty() && scoped.days.is_empty());
+    let machines = db
+        .store
+        .list_usage_node_series(&admin, 3600, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        machines
+            .nodes
+            .iter()
+            .map(|n| n.month_forwarding_uplink_bytes + n.month_forwarding_downlink_bytes)
+            .sum::<u64>(),
+        1065
+    );
+    assert!(machines.nodes.iter().any(|n| n.month_has_gap));
+    let history = db
+        .store
+        .list_user_traffic_history(
+            &admin,
+            UserTrafficHistoryScope::User {
+                tenant_id: "platform.acme",
+                user_id: "alice",
+            },
+            3600,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.nodes.len(), 2);
+    assert!(history
+        .nodes
+        .iter()
+        .any(|n| !n.forwarding_windows.is_empty()));
+    assert!(history.series.iter().all(|s| s.forwarding));
+    assert_eq!(
+        history
+            .series
+            .iter()
+            .map(|s| s.windows.iter().map(|w| w.2 + w.3).sum::<u64>()
+                + s.unplaced_uplink_bytes
+                + s.unplaced_downlink_bytes)
+            .sum::<u64>(),
+        1065
+    );
+    // Fine data can expire without removing user/machine totals or moving the counter baseline.
+    sqlx::query("UPDATE forwarding_usage_samples SET read_at=now()-interval '40 days'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.prune_usage_samples(30).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM forwarding_usage_samples")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.store
+            .list_monthly_usage_summary(&admin)
+            .await
+            .unwrap()
+            .forwarding
+            .iter()
+            .map(|r| r.uplink_bytes + r.downlink_bytes)
+            .sum::<u64>(),
+        1065
+    );
+    db.store
+        .record_forwarding_usage("n2", report("c", 3, now - 15, 55, 110))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .list_monthly_usage_summary(&admin)
+            .await
+            .unwrap()
+            .forwarding
+            .iter()
+            .map(|r| r.uplink_bytes + r.downlink_bytes)
+            .sum::<u64>(),
+        1080
+    );
+    let reading = |sequence, rx_bytes, tx_bytes| NodeTrafficReading {
+        meter_id: "0123456789abcdef0123456789abcdef".to_owned(),
+        sequence,
+        interface: "eth0".to_owned(),
+        boot_id: "11111111-2222-3333-4444-555555555555".to_owned(),
+        rx_bytes,
+        tx_bytes,
+        discontinuities: 0,
+    };
+    db.store
+        .record_node_traffic("n1", now - 5, &reading(1, 0, 0))
+        .await
+        .unwrap();
+    db.store
+        .record_node_traffic("n1", now - 4, &reading(2, 10000, 20000))
+        .await
+        .unwrap();
+    let forecast = db.store.machine_traffic_model(&admin).await.unwrap();
+    let machine = forecast.nodes.iter().find(|n| n.node_id == "n1").unwrap();
+    assert_eq!(machine.used_bytes, "30000"); // Logical forwarding is never added to physical bytes.
+    assert_eq!(machine.users[0].user_id, "alice");
+    assert!(machine.users[0].apps.contains(&"转发".to_owned()));
+    assert!(machine.users[0].attributed_bytes.parse::<u64>().unwrap() <= 30000);
+    sqlx::query("INSERT INTO usage_rollups(tenant_id,user_id,app_id,period_start,period_end,uplink_bytes,downlink_bytes)
+        VALUES('platform.acme','alice','app-main',date_trunc('day',now() AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong',
+        (date_trunc('day',now() AT TIME ZONE 'Asia/Hong_Kong')+interval '1 day') AT TIME ZONE 'Asia/Hong_Kong',123,456)")
+        .execute(db.pool()).await.unwrap();
+    let mixed = db.store.list_monthly_usage_summary(&admin).await.unwrap();
+    assert_eq!(
+        mixed
+            .views
+            .iter()
+            .map(|v| v.uplink_bytes + v.downlink_bytes)
+            .sum::<u64>(),
+        579
+    );
+    assert_eq!(
+        mixed
+            .days
+            .iter()
+            .map(|v| v.uplink_bytes + v.downlink_bytes)
+            .sum::<u64>(),
+        1659
+    );
+    sqlx::query("INSERT INTO forwarding_usage_rollups(period_start,node_id,tenant_id,user_id,rule_id,uplink_bytes,downlink_bytes,has_gap)
+        VALUES((date_trunc('month',now() AT TIME ZONE 'Asia/Hong_Kong')-interval '1 day') AT TIME ZONE 'Asia/Hong_Kong',
+        'n1','platform.acme','alice',$1,500,600,false)").bind(rule_id).execute(db.pool()).await.unwrap();
+    let previous = db
+        .store
+        .list_monthly_usage_summary_for_offset(&admin, -1)
+        .await
+        .unwrap();
+    assert_eq!(
+        previous
+            .forwarding
+            .iter()
+            .map(|v| v.uplink_bytes + v.downlink_bytes)
+            .sum::<u64>(),
+        1100
+    );
+    assert_eq!(
+        previous
+            .days
+            .iter()
+            .map(|v| v.uplink_bytes + v.downlink_bytes)
+            .sum::<u64>(),
+        1100
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forwarding_traffic_compatibility_preserves_legacy_bytes_and_unknown_intervals() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let rule_id:i64=sqlx::query_scalar("INSERT INTO forwarding_rules(tenant_id,user_id,node_id,name,protocol,listen_port,target_host,target_port)
+        VALUES('platform.acme','alice','n1','Legacy','tcp',20042,'1.1.1.1',443) RETURNING id").fetch_one(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO forwarding_usage_samples(node_id,rule_id,tenant_id,user_id,read_at,uplink_bytes,downlink_bytes)
+        VALUES('n1',$1,'platform.acme','alice',now()-interval '60 seconds',10,20),('n1',$1,'platform.acme','alice',now()-interval '30 seconds',30,40)")
+        .bind(rule_id).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO forwarding_usage_counter_heads(node_id,rule_id,agent_instance_id,xray_epoch,uplink_bytes,downlink_bytes,read_at)
+        VALUES('n1',$1,'legacy','epoch',40,60,now()-interval '30 seconds')").bind(rule_id).execute(db.pool()).await.unwrap();
+    // Reconstruct the installed pre-feature schema, only inside this disposable database.
+    sqlx::raw_sql(
+        "DROP TABLE forwarding_rule_nodes,forwarding_usage_windows,forwarding_usage_rollups;
+        DROP INDEX forwarding_usage_samples_by_node;
+        ALTER TABLE forwarding_usage_report_receipts DROP COLUMN payload_sha256;
+        ALTER TABLE forwarding_usage_counter_heads DROP COLUMN sequence,DROP COLUMN has_gap;
+        ALTER TABLE forwarding_usage_samples DROP COLUMN window_start,DROP COLUMN has_gap;",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let schema = include_str!("../migrations/0001_init.sql")
+        .split("-- BEGIN FORWARDING TRAFFIC PROJECTIONS")
+        .nth(1)
+        .unwrap()
+        .split("-- END FORWARDING TRAFFIC PROJECTIONS")
+        .next()
+        .unwrap();
+    let script = include_str!("../../../scripts/compat-forwarding-traffic.sql")
+        .replace("\\set ON_ERROR_STOP on", "")
+        .replace("SET LOCAL ROLE :\"app_role\";", "SET LOCAL ROLE postgres;")
+        .replace("\\i :schema_file", schema);
+    sqlx::raw_sql(&script).execute(db.pool()).await.unwrap();
+    let monthly = db
+        .store
+        .list_monthly_usage_summary(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(monthly.forwarding[0].uplink_bytes, 40);
+    assert_eq!(monthly.forwarding[0].downlink_bytes, 60);
+    assert_eq!(
+        monthly
+            .days
+            .iter()
+            .map(|r| r.uplink_bytes + r.downlink_bytes)
+            .sum::<u64>(),
+        100
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM forwarding_rule_nodes")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM forwarding_usage_windows")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    let history = db
+        .store
+        .list_user_traffic_history(
+            &system_admin(),
+            brocade_store::UserTrafficHistoryScope::Node("n1"),
+            3600,
+        )
+        .await
+        .unwrap();
+    let series = &history.series[0];
+    assert!(series.points.is_empty() && series.windows.is_empty());
+    assert_eq!(
+        (series.unplaced_uplink_bytes, series.unplaced_downlink_bytes),
+        (40, 60)
+    );
+    // Receipt expiry and a same-second terminal read must not lose or double-count the tail.
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let report = |seq, up, down| brocade_deployment::protocol::ForwardingUsageReportRequest {
+        agent_instance_id: "new-agent".to_owned(),
+        sequence: seq,
+        read_at_unix_secs: now - 15,
+        xray_epoch: "epoch".to_owned(),
+        counters: vec![brocade_deployment::protocol::ForwardingUsageCounter {
+            rule_id,
+            uplink_bytes: up,
+            downlink_bytes: down,
+        }],
+    };
+    db.store
+        .record_forwarding_usage("n1", report(1, 50, 80))
+        .await
+        .unwrap();
+    db.store
+        .record_forwarding_usage("n1", report(2, 55, 90))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM forwarding_usage_report_receipts")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .record_forwarding_usage("n1", report(2, 55, 90))
+            .await
+            .unwrap()
+            .skipped_counters,
+        1
+    );
+    let sum = db
+        .store
+        .list_monthly_usage_summary(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(
+        sum.forwarding
+            .iter()
+            .map(|r| r.uplink_bytes + r.downlink_bytes)
+            .sum::<u64>(),
+        145
+    );
+    let mut regression = report(3, 1, 2);
+    regression.read_at_unix_secs = now - 10;
+    assert_eq!(
+        db.store
+            .record_forwarding_usage("n1", regression)
+            .await
+            .unwrap()
+            .skipped_counters,
+        1
+    );
+    let after = db
+        .store
+        .list_monthly_usage_summary(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(
+        after
+            .forwarding
+            .iter()
+            .map(|r| r.uplink_bytes + r.downlink_bytes)
+            .sum::<u64>(),
+        145
+    );
+    assert!(after.forwarding.iter().any(|r| r.has_gap));
+    let mut recovered = report(4, 56, 92);
+    recovered.read_at_unix_secs = now - 5;
+    db.store
+        .record_forwarding_usage("n1", recovered)
+        .await
+        .unwrap();
+    let after = db
+        .store
+        .list_monthly_usage_summary(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(
+        after
+            .forwarding
+            .iter()
+            .map(|r| r.uplink_bytes + r.downlink_bytes)
+            .sum::<u64>(),
+        148
+    );
+    assert!(sqlx::query_scalar::<_,bool>("SELECT window_start IS NULL AND has_gap FROM forwarding_usage_samples ORDER BY id DESC LIMIT 1").fetch_one(db.pool()).await.unwrap());
+}
+
 async fn insert_front_target_fixture(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO chains (id, app_id, tenant_id, name, position)
@@ -23688,6 +24986,10 @@ async fn proxy_outbound_anytls_and_deletion_are_sealed_scoped_and_reference_safe
             credential: "anytls-secret".to_owned(),
         },
         security: ExternalOutboundSecurity::Tls {
+            alpn: Vec::new(),
+            ech_config_list: None,
+            pinned_peer_cert_sha256: None,
+            verify_peer_cert_by_name: None,
             server_name: "edge.example.com".to_owned(),
             fingerprint: "chrome".to_owned(),
         },
@@ -24037,6 +25339,7 @@ async fn reverse_health_settings_round_trip_and_validate() {
 }
 
 #[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -24097,6 +25400,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
                 cycle_kind: NodeTrafficCycleKind::Monthly,
                 reset_month: None,
                 reset_day: 1,
+                quota_bytes: Some("10995116277760".to_owned()),
                 calibrated_total_bytes: Some("1073741824".to_owned()),
             },
         )
@@ -24109,6 +25413,46 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .find(|node| node.node_id == "n1")
         .unwrap();
     assert_eq!(calibrated.total_bytes, "1073741824");
+    assert_eq!(calibrated.quota_bytes.as_deref(), Some("10995116277760"));
+    let capacity = db
+        .store
+        .machine_traffic_model(&system_admin())
+        .await
+        .unwrap();
+    let capacity = capacity
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(capacity.quota_bytes.as_deref(), Some("10995116277760"));
+    // Seconds of tracking: no complete day yet, so the rate is the 300 bytes over the one-hour
+    // floor, and no machine has history for a measured error.
+    assert_eq!(
+        (capacity.daily_rate_bytes.as_str(), capacity.rate_days),
+        ("7200", 0)
+    );
+    assert_eq!(capacity.band.basis, MachineTrafficBandBasis::Default);
+    assert_eq!(capacity.confidence, MachineTrafficConfidence::Low);
+    assert!(
+        !capacity.needs_calibration,
+        "the calibration follows the late tracking start"
+    );
+    // The chart reads the same ledger the totals use: one UTC day holding the 300 accounted
+    // bytes, in whichever window that day falls, plus the anchors that explain the total.
+    let ledger = capacity
+        .days
+        .iter()
+        .chain(&capacity.previous_days)
+        .map(|day| (day.day_start_unix_secs, day.bytes.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(ledger, vec![((now - 3).div_euclid(86_400) * 86_400, "300")]);
+    assert_eq!(
+        capacity.previous_period_start_unix_secs,
+        2 * capacity.period_start_unix_secs - capacity.period_end_unix_secs
+    );
+    assert_eq!(capacity.tracking_started_at_unix_secs, Some(now - 4));
+    assert!(capacity.calibrated_at_unix_secs.is_some());
+    assert_eq!(capacity.gap_reason, None);
     assert!(
         !calibrated.has_gap,
         "calibration clears only preceding uncertainty"
@@ -24133,6 +25477,206 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
     assert_eq!(after.total_bytes, "1073741944");
     assert!(after.has_gap, "a reboot after calibration remains visible");
     assert_eq!(after.last_gap_reason.as_deref(), Some("machine-reboot"));
+    // The Agent reported right up to the reboot, so the forecast keeps trusting the total.
+    let capacity = db
+        .store
+        .machine_traffic_model(&system_admin())
+        .await
+        .unwrap();
+    let capacity = capacity
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert!(!capacity.needs_calibration);
+    assert_eq!(capacity.gap_reason, None);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn machine_traffic_forecasts_are_recorded_daily_and_reviewed_after_the_period() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let (today, this_start, previous_start): (i64, i64, i64) = sqlx::query_as(
+        "SELECT extract(epoch FROM (now() AT TIME ZONE 'UTC')::date::timestamp
+                    AT TIME ZONE 'UTC')::bigint,
+                extract(epoch FROM date_trunc('month', (now() AT TIME ZONE 'UTC')::date::timestamp)
+                    AT TIME ZONE 'UTC')::bigint,
+                extract(epoch FROM (date_trunc('month', (now() AT TIME ZONE 'UTC')::date::timestamp)
+                    - interval '1 month') AT TIME ZONE 'UTC')::bigint",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let day = 86_400;
+    let previous_days = (this_start - previous_start) / day;
+    // Seventy days of 1000 bytes, tracked from the first of them; the meter matches the ledger.
+    sqlx::query(
+        "INSERT INTO node_traffic_daily (node_id, day, rx_bytes, tx_bytes)
+         SELECT 'n1', (now() AT TIME ZONE 'UTC')::date - back, 600, 400
+           FROM generate_series(0, 69) AS back",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_traffic_state (
+            node_id, meter_id, sequence, interface, boot_id, agent_rx_bytes, agent_tx_bytes,
+            accounted_rx_bytes, accounted_tx_bytes, discontinuities, tracking_started_at,
+            last_reported_at
+         ) VALUES (
+            'n1', '0123456789abcdef0123456789abcdef', 1, 'eth0',
+            '11111111-2222-3333-4444-555555555555', 0, 0, 42000, 28000, 0,
+            ((now() AT TIME ZONE 'UTC')::date - 69)::timestamp AT TIME ZONE 'UTC', now()
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // A reboot between two reporting days loses nothing a calibration would need to restore.
+    sqlx::query(
+        "INSERT INTO node_traffic_gaps (node_id, occurred_at, reason)
+         VALUES ('n1', now() - interval '1 minute', 'machine-reboot')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // Three forecasts recorded during the previous month, and one old enough to be pruned.
+    let actual = previous_days * 1000;
+    for (offset, p50, p90) in [
+        (0, actual * 11 / 10, actual * 12 / 10),
+        (1, actual * 9 / 10, actual * 95 / 100),
+        (2, actual, actual),
+    ] {
+        sqlx::query(
+            "INSERT INTO node_traffic_forecasts (
+                node_id, day, taken_at, period_start, period_end, used_bytes, p50_bytes, p90_bytes
+             ) VALUES (
+                'n1', (to_timestamp($1) AT TIME ZONE 'UTC')::date + $2::int, now(),
+                (to_timestamp($1) AT TIME ZONE 'UTC')::date,
+                (to_timestamp($3) AT TIME ZONE 'UTC')::date, 0, $4, $5
+             )",
+        )
+        .bind(previous_start as f64)
+        .bind(offset)
+        .bind(this_start as f64)
+        .bind(p50)
+        .bind(p90)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO node_traffic_forecasts (
+            node_id, day, taken_at, period_start, period_end, used_bytes, p50_bytes, p90_bytes
+         ) VALUES (
+            'n1', (now() AT TIME ZONE 'UTC')::date - 900, now() - interval '900 days',
+            (now() AT TIME ZONE 'UTC')::date - 930, (now() AT TIME ZONE 'UTC')::date - 900,
+            0, 1, 1
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let model = db
+        .store
+        .machine_traffic_model(&system_admin())
+        .await
+        .unwrap();
+    let node = model
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(
+        (node.daily_rate_bytes.as_str(), node.rate_days),
+        ("1000", 28)
+    );
+    assert!(!node.needs_calibration);
+    assert_eq!(node.gap_reason, None);
+    assert_eq!(
+        node.last_period_accuracy,
+        Some(MachineTrafficAccuracy {
+            period_start_unix_secs: previous_start,
+            period_end_unix_secs: this_start,
+            actual_bytes: actual.to_string(),
+            forecasts: 3,
+            // (10% + 10% + 0%) / 3
+            p50_error_basis_points: 667,
+            p90_covered: 2,
+        })
+    );
+    let outside = db
+        .store
+        .machine_traffic_model(&tenant_admin("platform.other"))
+        .await
+        .unwrap();
+    assert!(outside.nodes.is_empty());
+
+    assert_eq!(
+        db.store.record_machine_traffic_forecasts().await.unwrap(),
+        1
+    );
+    assert_eq!(
+        db.store.record_machine_traffic_forecasts().await.unwrap(),
+        0,
+        "the first record of a day stands"
+    );
+    let (used, p50, p90): (String, String, String) = sqlx::query_as(
+        "SELECT used_bytes::text, p50_bytes::text, p90_bytes::text
+           FROM node_traffic_forecasts
+          WHERE node_id = 'n1' AND day = (now() AT TIME ZONE 'UTC')::date",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(used, node.used_bytes);
+    assert!(p50.parse::<u64>().unwrap() >= used.parse::<u64>().unwrap());
+    assert!(p90.parse::<u64>().unwrap() >= p50.parse::<u64>().unwrap());
+    assert_eq!(
+        db.store.prune_machine_traffic_forecasts(800).await.unwrap(),
+        1
+    );
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM node_traffic_forecasts")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(kept, 4);
+
+    // A calibration inside the closed period sets its total: the target plus what the meter
+    // accounted from then until the period ended.
+    let calibrated_at = previous_start + 5 * day;
+    sqlx::query(
+        "INSERT INTO node_traffic_calibrations (
+            node_id, calibrated_at, target_total_bytes, accounted_total_bytes, calibrated_by
+         ) VALUES ('n1', to_timestamp($1), 50000, $2, 'test')",
+    )
+    .bind(calibrated_at as f64)
+    .bind((calibrated_at - (today - 69 * day)) / day * 1000)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let model = db
+        .store
+        .machine_traffic_model(&system_admin())
+        .await
+        .unwrap();
+    let node = model
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(
+        node.last_period_accuracy
+            .as_ref()
+            .map(|accuracy| accuracy.actual_bytes.clone()),
+        Some((50_000 + (previous_days - 5) * 1000).to_string())
+    );
 }
 
 #[tokio::test]

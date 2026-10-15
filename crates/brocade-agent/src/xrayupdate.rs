@@ -534,7 +534,12 @@ fn perform_update_at_target(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Err(error) = crate::collect_usage_report(options) {
-        crate::warn(format!("xray-update: 重启前用量采集失败：{error}"));
+        return failure_report(
+            options,
+            offer,
+            XrayReleaseOutcome::FailedRecovered,
+            format!("重启前用量未能可靠落盘，没有替换 Xray：{error}"),
+        );
     }
     let attempted = replace_executable(candidate, target)
         .and_then(|()| start_and_restore_runtime(options, offer.sha256.as_str()));

@@ -5,6 +5,11 @@
 //! Reset dates and calibrations are presentation/accounting anchors; neither asks an Agent to zero
 //! its durable meter, so policy edits and control-plane outages cannot break continuity.
 
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use brocade_deployment::protocol::NodeTrafficReading;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -35,6 +40,8 @@ pub struct NodeTrafficItem {
     pub cycle_kind: NodeTrafficCycleKind,
     pub reset_month: Option<u8>,
     pub reset_day: u8,
+    /// Provider allowance for this reset cycle. NULL means the allowance has not been configured.
+    pub quota_bytes: Option<String>,
     pub period_start_unix_secs: i64,
     pub period_end_unix_secs: i64,
     /// Decimal strings keep byte totals exact in JavaScript beyond Number.MAX_SAFE_INTEGER.
@@ -61,9 +68,140 @@ pub struct UpdateNodeTrafficRequest {
     /// Required for yearly and forbidden for monthly.
     pub reset_month: Option<u8>,
     pub reset_day: u8,
+    /// Exact positive byte count, or NULL to remove the provider allowance.
+    #[serde(default)]
+    pub quota_bytes: Option<String>,
     /// When present, append a total-only calibration at the server's current UTC time.
     #[serde(default)]
     pub calibrated_total_bytes: Option<String>,
+}
+
+/// Where the error quantile that widens P50 into P90 came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineTrafficBandBasis {
+    /// This machine's own backtests over the remaining horizon.
+    Node,
+    /// Backtests pooled over every machine in scope.
+    Fleet,
+    /// No machine in scope has enough history yet; a fixed upper error stands in.
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineTrafficBand {
+    pub basis: MachineTrafficBandBasis,
+    /// Days ahead that the backtests forecast. A fleet basis may use a shorter horizon than the
+    /// remaining days when history is short, but never less than half of them.
+    pub horizon_days: u32,
+    /// Backtests behind the quantile; zero for the default.
+    pub samples: u32,
+    /// 90th percentile of `actual / forecast - 1` for the remaining traffic, floored at zero.
+    pub upper_error_basis_points: u32,
+}
+
+/// The daily forecasts recorded during the latest closed period, compared with its final total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineTrafficAccuracy {
+    pub period_start_unix_secs: i64,
+    pub period_end_unix_secs: i64,
+    pub actual_bytes: String,
+    pub forecasts: u32,
+    /// Mean of `|P50 - actual| / actual` over those forecasts.
+    pub p50_error_basis_points: u32,
+    /// Forecasts whose P90 the final total did not exceed.
+    pub p90_covered: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineTrafficConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineTrafficUser {
+    pub tenant_id: String,
+    pub user_id: String,
+    /// Estimated machine footprint for this user's logical payload over the current topology.
+    /// A forwarded byte crosses the machine NIC twice, so the basis is
+    /// `(uplink + downlink) * 2`, bounded by the observed physical total. This is not a user
+    /// billing counter.
+    pub attributed_bytes: String,
+    pub projected_bytes: String,
+    pub share_basis_points: u16,
+    pub apps: Vec<String>,
+}
+
+/// Physical NIC bytes the ledger accounted to one UTC day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineTrafficDay {
+    pub day_start_unix_secs: i64,
+    pub bytes: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineTrafficModelNode {
+    pub node_id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub cycle_kind: NodeTrafficCycleKind,
+    pub reset_month: Option<u8>,
+    pub reset_day: u8,
+    pub period_start_unix_secs: i64,
+    pub period_end_unix_secs: i64,
+    /// Start of the equal-length window that ends at `period_start_unix_secs`. It supplies
+    /// `previous_period_bytes` and `previous_days`.
+    pub previous_period_start_unix_secs: i64,
+    pub quota_bytes: Option<String>,
+    pub used_bytes: String,
+    pub previous_period_bytes: String,
+    /// The rest of the period is expected at this many bytes per day: complete days of the last
+    /// 28, weighted so that a day counts half as much as one four days newer. Before the first
+    /// complete day it is the average since tracking began.
+    pub daily_rate_bytes: String,
+    /// Complete days behind `daily_rate_bytes`; zero means the average since tracking began.
+    pub rate_days: u32,
+    /// `used_bytes + daily_rate_bytes * remaining days`.
+    pub projected_p50_bytes: String,
+    /// P50 with its remaining part raised by `band.upper_error_basis_points`.
+    pub projected_p90_bytes: String,
+    pub band: MachineTrafficBand,
+    pub confidence: MachineTrafficConfidence,
+    /// `used_bytes` is missing traffic only a calibration can restore: tracking began after the
+    /// later of the period start and the latest calibration, or the gap below may have lost bytes
+    /// or carried the previous period's bytes into this one.
+    pub needs_calibration: bool,
+    /// Ledger days inside the current period, oldest first; a day without accounted bytes is
+    /// absent. Without a calibration they sum to `used_bytes`; a calibration replaces the total
+    /// from `calibrated_at_unix_secs` on, so `used_bytes` stays authoritative.
+    pub days: Vec<MachineTrafficDay>,
+    /// Ledger days inside the previous window, oldest first.
+    pub previous_days: Vec<MachineTrafficDay>,
+    pub tracking_started_at_unix_secs: Option<i64>,
+    /// Latest calibration inside the current period.
+    pub calibrated_at_unix_secs: Option<i64>,
+    /// Latest gap since the later of the period start and that calibration that may have changed
+    /// the period total. A gap whose previous UTC day still has reports is left out: the Agent
+    /// persists its meter every ten seconds, so it loses at most the samples after that report.
+    pub gap_at_unix_secs: Option<i64>,
+    pub gap_reason: Option<String>,
+    /// Absent until a period with recorded daily forecasts has closed.
+    pub last_period_accuracy: Option<MachineTrafficAccuracy>,
+    pub users: Vec<MachineTrafficUser>,
+    pub unattributed_bytes: String,
+    pub projected_unattributed_bytes: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineTrafficModelView {
+    pub generated_at_unix_secs: i64,
+    /// Physical accounting is authoritative. User attribution is deliberately identified as an
+    /// estimate because relay counters do not contain a user identity.
+    pub attribution: String,
+    pub nodes: Vec<MachineTrafficModelNode>,
 }
 
 fn valid_policy(request: &UpdateNodeTrafficRequest) -> Result<()> {
@@ -71,6 +209,11 @@ fn valid_policy(request: &UpdateNodeTrafficRequest) -> Result<()> {
         return Err(StoreError::InvalidData(
             "流量重置日期需在 1–31 日之间".to_owned(),
         ));
+    }
+    if let Some(quota) = request.quota_bytes.as_deref() {
+        if parse_decimal_u64(quota, "机器流量配额")? == 0 {
+            return Err(StoreError::InvalidData("机器流量配额必须大于零".to_owned()));
+        }
     }
     match (&request.cycle_kind, request.reset_month) {
         (NodeTrafficCycleKind::Monthly, None) => Ok(()),
@@ -137,6 +280,46 @@ fn validate_reading(reading: &NodeTrafficReading) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Why a reading could not simply extend the ledger; stored in `node_traffic_gaps.reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GapReason {
+    MeterReplaced,
+    MachineReboot,
+    InterfaceChanged,
+    CounterRegressed,
+    AgentDiscontinuity,
+    ReportGap,
+}
+
+impl GapReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MeterReplaced => "meter-replaced",
+            Self::MachineReboot => "machine-reboot",
+            Self::InterfaceChanged => "interface-changed",
+            Self::CounterRegressed => "counter-regressed",
+            Self::AgentDiscontinuity => "agent-discontinuity",
+            Self::ReportGap => "report-gap",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        Ok(match value {
+            "meter-replaced" => Self::MeterReplaced,
+            "machine-reboot" => Self::MachineReboot,
+            "interface-changed" => Self::InterfaceChanged,
+            "counter-regressed" => Self::CounterRegressed,
+            "agent-discontinuity" => Self::AgentDiscontinuity,
+            "report-gap" => Self::ReportGap,
+            other => {
+                return Err(StoreError::InvalidData(format!(
+                    "invalid node traffic gap reason {other}"
+                )))
+            }
+        })
+    }
 }
 
 fn crosses_unobserved_utc_day(previous: i64, current: i64) -> bool {
@@ -214,9 +397,9 @@ pub async fn record_node_traffic(
         None => (
             0,
             0,
-            (reading.discontinuities > 0).then_some("agent-discontinuity"),
+            (reading.discontinuities > 0).then_some(GapReason::AgentDiscontinuity),
         ),
-        Some(old) if old.meter_id != reading.meter_id => (0, 0, Some("meter-replaced")),
+        Some(old) if old.meter_id != reading.meter_id => (0, 0, Some(GapReason::MeterReplaced)),
         Some(old) => {
             let rx = reading.rx_bytes.checked_sub(old.rx_bytes);
             let tx = reading.tx_bytes.checked_sub(old.tx_bytes);
@@ -226,13 +409,13 @@ pub async fn record_node_traffic(
                 rx.unwrap_or(0),
                 tx.unwrap_or(0),
                 if regressed {
-                    Some("counter-regressed")
+                    Some(GapReason::CounterRegressed)
                 } else if old.boot_id != reading.boot_id {
-                    Some("machine-reboot")
+                    Some(GapReason::MachineReboot)
                 } else if old.interface != reading.interface {
-                    Some("interface-changed")
+                    Some(GapReason::InterfaceChanged)
                 } else if discontinuity_changed {
-                    Some("agent-discontinuity")
+                    Some(GapReason::AgentDiscontinuity)
                 } else {
                     None
                 },
@@ -248,7 +431,7 @@ pub async fn record_node_traffic(
             crosses_unobserved_utc_day(old.last_reported_at_unix_secs, observed_at_unix_secs)
         })
     {
-        gap_reason = Some("report-gap");
+        gap_reason = Some(GapReason::ReportGap);
     }
 
     if previous.is_none() {
@@ -330,7 +513,7 @@ async fn insert_gap(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
     observed_at_unix_secs: i64,
-    reason: &str,
+    reason: GapReason,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO node_traffic_gaps (node_id, occurred_at, reason)
@@ -338,7 +521,7 @@ async fn insert_gap(
     )
     .bind(node_id)
     .bind(observed_at_unix_secs as f64)
-    .bind(reason)
+    .bind(reason.as_str())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -361,6 +544,11 @@ pub async fn update_node_traffic(
         .as_deref()
         .map(|value| parse_decimal_u64(value, "当前流量校准值"))
         .transpose()?;
+    let quota = request
+        .quota_bytes
+        .as_deref()
+        .map(|value| parse_decimal_u64(value, "机器流量配额"))
+        .transpose()?;
     let mut tx = pool.begin().await?;
     let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM nodes WHERE id = $1)")
         .bind(node_id)
@@ -371,12 +559,13 @@ pub async fn update_node_traffic(
     }
     sqlx::query(
         "INSERT INTO node_traffic_policy (
-            node_id, cycle_kind, reset_month, reset_day, updated_at, updated_by
-         ) VALUES ($1, $2, $3, $4, now(), $5)
+            node_id, cycle_kind, reset_month, reset_day, quota_bytes, updated_at, updated_by
+         ) VALUES ($1, $2, $3, $4, $5::numeric, now(), $6)
          ON CONFLICT (node_id) DO UPDATE SET
             cycle_kind = EXCLUDED.cycle_kind,
             reset_month = EXCLUDED.reset_month,
             reset_day = EXCLUDED.reset_day,
+            quota_bytes = EXCLUDED.quota_bytes,
             updated_at = EXCLUDED.updated_at,
             updated_by = EXCLUDED.updated_by",
     )
@@ -384,6 +573,7 @@ pub async fn update_node_traffic(
     .bind(request.cycle_kind.as_str())
     .bind(request.reset_month.map(i32::from))
     .bind(i32::from(request.reset_day))
+    .bind(quota.map(|value| value.to_string()))
     .bind(actor.operator_id())
     .execute(&mut *tx)
     .await?;
@@ -444,6 +634,7 @@ pub async fn load_node_traffic(pool: &PgPool, actor: &AdminContext) -> Result<No
                 reset_day: u8::try_from(row.try_get::<i32, _>("reset_day")?).map_err(|_| {
                     StoreError::InvalidData("traffic reset day is invalid".to_owned())
                 })?,
+                quota_bytes: row.try_get("quota_bytes")?,
                 period_start_unix_secs: row.try_get("period_start_unix_secs")?,
                 period_end_unix_secs: row.try_get("period_end_unix_secs")?,
                 rx_bytes: row.try_get("rx_bytes")?,
@@ -462,12 +653,993 @@ pub async fn load_node_traffic(pool: &PgPool, actor: &AdminContext) -> Result<No
     Ok(NodeTrafficView { nodes })
 }
 
+fn mul_div(value: u64, numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    let scaled = u128::from(value)
+        .saturating_mul(u128::from(numerator))
+        .saturating_add(u128::from(denominator) / 2)
+        / u128::from(denominator);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+/// Ledger days in `[from, to)`, keeping the ascending order of the query.
+fn ledger_window(days: &[(i64, u64)], from: i64, to: i64) -> Vec<MachineTrafficDay> {
+    days.iter()
+        .filter(|(day, _)| *day >= from && *day < to)
+        .map(|(day, bytes)| MachineTrafficDay {
+            day_start_unix_secs: *day,
+            bytes: bytes.to_string(),
+        })
+        .collect()
+}
+
+fn attributable_physical_bytes(physical: u64, logical: u64, has_user_demand: bool) -> u64 {
+    if !has_user_demand {
+        return 0;
+    }
+    // Proxy payload enters and leaves the same machine. The NIC ledger therefore sees each
+    // logical byte twice: once on the client-facing leg and once on the next-hop-facing leg.
+    physical.min(logical.saturating_mul(2))
+}
+
+const DAY: i64 = 86_400;
+/// A complete day's weight in the daily rate halves every this many days. Backtests on synthetic
+/// fleets with level shifts, weekly cycles and daily noise had their lowest error between three
+/// and five days; shorter chases noise, longer lags a new heavy user.
+const RATE_HALF_LIFE_DAYS: f64 = 4.0;
+/// Older days no longer enter the daily rate; their weight would be below one percent.
+const RATE_WINDOW_DAYS: usize = 28;
+/// Fewer observed days than this leave the rate to chance: confidence is low.
+const RATE_DAYS_FEW: usize = 3;
+/// Observed days a rate needs before a backtest uses it or confidence can be high.
+const RATE_DAYS_ENOUGH: usize = 7;
+/// An error quantile needs this many backtests...
+const BAND_MIN_SAMPLES: usize = 20;
+/// ...and as many as this many non-overlapping horizons would give. Origins one day apart share
+/// most of a long horizon, so a count alone overstates what a short history knows.
+const BAND_MIN_WINDOWS: usize = 8;
+/// Fleet history may stand in for a horizon at most this many times its own length.
+const BAND_MAX_STRETCH: usize = 2;
+/// Upper error before any machine in scope has enough history.
+const BAND_DEFAULT_UPPER_ERROR: f64 = 0.5;
+const FORECAST_ACTOR: &str = "system:traffic-forecast";
+/// Daily forecasts stay long enough to review a yearly period after it closes.
+pub const MACHINE_TRAFFIC_FORECAST_RETENTION_DAYS: u32 = 800;
+
+#[derive(Debug, Clone, Copy)]
+struct TrafficGap {
+    occurred_at: i64,
+    reason: GapReason,
+}
+
+/// One complete UTC day as the daily rate sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RateDay {
+    Observed(f64),
+    /// Bytes are missing, or cannot be told apart from a neighbouring day's.
+    Unobserved,
+}
+
+/// The period, tracking and calibration instants a machine's forecast is judged against.
+#[derive(Debug, Clone, Copy)]
+struct PeriodAnchors {
+    start: i64,
+    end: i64,
+    tracking_started_at: Option<i64>,
+    calibrated_at: Option<i64>,
+}
+
+fn day_start(unix_secs: i64) -> i64 {
+    unix_secs.div_euclid(DAY) * DAY
+}
+
+/// Ledger byte counts are far below 2^53, where `f64` stops being exact.
+fn bytes_f64(bytes: u64) -> f64 {
+    bytes as f64
+}
+
+/// Bytes from a non-negative estimate. `as` saturates at `u64::MAX`; a negative or NaN estimate
+/// is no traffic.
+fn estimated_bytes(value: f64) -> u64 {
+    if value > 0.0 {
+        value.round() as u64
+    } else {
+        0
+    }
+}
+
+fn basis_points(ratio: f64) -> u32 {
+    u32::try_from(estimated_bytes(ratio * 10_000.0)).unwrap_or(u32::MAX)
+}
+
+fn ledger_bytes(ledger: &[(i64, u64)], day: i64) -> u64 {
+    ledger
+        .binary_search_by_key(&day, |(ledger_day, _)| *ledger_day)
+        .map_or(0, |index| ledger[index].1)
+}
+
+/// The last UTC day before `day` with accounted bytes, or the day before tracking began.
+///
+/// Every reporting day carries at least the Agent's own control traffic, so the days in between
+/// are days on which the Console heard nothing from this machine.
+fn last_reported_day(ledger: &[(i64, u64)], day: i64, tracking_started_at: i64) -> i64 {
+    let floor = day_start(tracking_started_at) - DAY;
+    ledger
+        .partition_point(|(ledger_day, _)| *ledger_day < day)
+        .checked_sub(1)
+        .map_or(floor, |index| ledger[index].0.max(floor))
+}
+
+/// Whether a gap may have changed the total of the period starting at `period_start`.
+fn gap_changes_total(
+    gap: TrafficGap,
+    ledger: &[(i64, u64)],
+    tracking_started_at: i64,
+    period_start: i64,
+) -> bool {
+    let day = day_start(gap.occurred_at);
+    let reported = last_reported_day(ledger, day, tracking_started_at);
+    match gap.reason {
+        // Absolute counters keep every byte across an outage. Only an outage that may span the
+        // reset moves the previous period's bytes into this one.
+        GapReason::ReportGap => reported < period_start && day >= period_start,
+        // The bytes after the last durable sample are lost. While the Agent still reported the
+        // day before, that is at most its final samples; after a silent day it may be days.
+        _ => reported < day - DAY,
+    }
+}
+
+fn day_index(first: i64, today: i64, day: i64) -> Option<usize> {
+    if day < first || day >= today {
+        return None;
+    }
+    usize::try_from((day - first) / DAY).ok()
+}
+
+/// Complete UTC days from the first fully tracked day through yesterday.
+///
+/// An outage that crossed midnight books its deferred bytes on the day reporting resumed; they
+/// are spread evenly over the outage instead. Days around a gap that may have lost bytes are left
+/// out, so neither a lump nor a hole reads as a change in traffic.
+fn daily_series(
+    ledger: &[(i64, u64)],
+    gaps: &[TrafficGap],
+    tracking_started_at: i64,
+    today: i64,
+) -> Vec<RateDay> {
+    let first = if tracking_started_at.rem_euclid(DAY) == 0 {
+        tracking_started_at
+    } else {
+        day_start(tracking_started_at) + DAY
+    };
+    let count = usize::try_from((today - first).div_euclid(DAY)).unwrap_or(0);
+    let mut days = vec![RateDay::Observed(0.0); count];
+    for &(day, bytes) in ledger {
+        if let Some(index) = day_index(first, today, day) {
+            days[index] = RateDay::Observed(bytes_f64(bytes));
+        }
+    }
+    let mut set = |day: i64, value: RateDay| {
+        if let Some(index) = day_index(first, today, day) {
+            if days[index] != RateDay::Unobserved {
+                days[index] = value;
+            }
+        }
+    };
+    for gap in gaps {
+        let day = day_start(gap.occurred_at);
+        let reported = last_reported_day(ledger, day, tracking_started_at);
+        let silent = (day - reported) / DAY - 1;
+        if gap.reason == GapReason::ReportGap {
+            if day < today {
+                let share = bytes_f64(ledger_bytes(ledger, day)) / (silent + 1) as f64;
+                for offset in 1..=silent + 1 {
+                    set(reported + offset * DAY, RateDay::Observed(share));
+                }
+            } else {
+                // Reporting resumed today; the outage's bytes sit in today's partial day.
+                for offset in 1..=silent {
+                    set(reported + offset * DAY, RateDay::Unobserved);
+                }
+            }
+        } else if silent > 0 {
+            for offset in 0..=silent + 1 {
+                set(reported + offset * DAY, RateDay::Unobserved);
+            }
+        }
+    }
+    days
+}
+
+/// Weights of the daily rate by age in days, newest first.
+fn rate_weights() -> [f64; RATE_WINDOW_DAYS] {
+    std::array::from_fn(|age| 0.5_f64.powf(age as f64 / RATE_HALF_LIFE_DAYS))
+}
+
+/// Weighted daily bytes over the observed days of the window that ends before `end`, and how many
+/// days were observed.
+fn recent_rate(
+    days: &[RateDay],
+    end: usize,
+    weights: &[f64; RATE_WINDOW_DAYS],
+) -> Option<(f64, usize)> {
+    let start = end.saturating_sub(RATE_WINDOW_DAYS);
+    let (mut weighted, mut total, mut observed) = (0.0, 0.0, 0);
+    for (day, weight) in days[start..end].iter().rev().zip(weights) {
+        if let RateDay::Observed(bytes) = day {
+            weighted += weight * bytes;
+            total += weight;
+            observed += 1;
+        }
+    }
+    (observed > 0).then(|| (weighted / total, observed))
+}
+
+/// Average bytes per day since tracking began, for a machine without an observed complete day in
+/// the window. The first hour is too volatile to scale up, so it counts as at least an hour.
+fn rate_since(ledger: &[(i64, u64)], tracking_started_at: i64, now: i64) -> f64 {
+    let from = day_start(tracking_started_at);
+    let bytes = ledger
+        .iter()
+        .filter(|(day, _)| *day >= from)
+        .fold(0_u64, |sum, (_, bytes)| sum.saturating_add(*bytes));
+    let elapsed = now.saturating_sub(tracking_started_at).max(3_600);
+    bytes_f64(bytes) / elapsed as f64 * DAY as f64
+}
+
+/// What a backtest at any horizon needs from one machine's complete days.
+struct Backtest {
+    /// The rate a forecast made at the start of each day would have used, when its window held
+    /// enough observed days.
+    rates: Vec<Option<f64>>,
+    /// Prefix sums of observed bytes and of unobserved days.
+    bytes: Vec<f64>,
+    unobserved: Vec<usize>,
+}
+
+impl Backtest {
+    fn new(days: &[RateDay], weights: &[f64; RATE_WINDOW_DAYS]) -> Self {
+        let rates = (0..days.len())
+            .map(|origin| {
+                recent_rate(days, origin, weights)
+                    .filter(|(rate, observed)| *observed >= RATE_DAYS_ENOUGH && *rate > 0.0)
+                    .map(|(rate, _)| rate)
+            })
+            .collect();
+        let (mut sum, mut missing) = (0.0, 0);
+        let mut bytes = Vec::with_capacity(days.len() + 1);
+        let mut unobserved = Vec::with_capacity(days.len() + 1);
+        bytes.push(sum);
+        unobserved.push(missing);
+        for day in days {
+            match day {
+                RateDay::Observed(value) => sum += value,
+                RateDay::Unobserved => missing += 1,
+            }
+            bytes.push(sum);
+            unobserved.push(missing);
+        }
+        Self {
+            rates,
+            bytes,
+            unobserved,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rates.len()
+    }
+
+    /// `actual / forecast - 1` for every origin whose next `horizon` days were all observed.
+    fn errors(&self, horizon: usize) -> impl Iterator<Item = f64> + '_ {
+        let origins = (self.len() + 1).saturating_sub(horizon);
+        (0..origins).filter_map(move |origin| {
+            let rate = self.rates[origin]?;
+            let end = origin + horizon;
+            if self.unobserved[end] != self.unobserved[origin] {
+                return None;
+            }
+            Some((self.bytes[end] - self.bytes[origin]) / (rate * horizon as f64) - 1.0)
+        })
+    }
+}
+
+/// Backtests pooled over every machine in scope, computed once per horizon.
+struct FleetBacktests<'a> {
+    machines: Vec<&'a Backtest>,
+    longest: usize,
+    pooled: HashMap<usize, Vec<f64>>,
+}
+
+impl<'a> FleetBacktests<'a> {
+    fn new(machines: Vec<&'a Backtest>) -> Self {
+        let longest = machines
+            .iter()
+            .map(|machine| machine.len())
+            .max()
+            .unwrap_or(0);
+        Self {
+            machines,
+            longest,
+            pooled: HashMap::new(),
+        }
+    }
+
+    fn errors(&mut self, horizon: usize) -> &[f64] {
+        // An origin needs a full rate window before it and the whole horizon after it.
+        if horizon + RATE_DAYS_ENOUGH > self.longest {
+            return &[];
+        }
+        let machines = &self.machines;
+        self.pooled.entry(horizon).or_insert_with(|| {
+            machines
+                .iter()
+                .flat_map(|machine| machine.errors(horizon))
+                .collect()
+        })
+    }
+}
+
+fn enough_backtests(samples: usize, horizon: usize) -> bool {
+    samples >= BAND_MIN_SAMPLES && samples >= BAND_MIN_WINDOWS * horizon
+}
+
+/// Conformal 90% upper error: the ⌈0.9·(n + 1)⌉-th smallest of n backtests, floored at zero.
+/// The extra rank keeps the bound from claiming more than a finite history shows.
+fn upper_error(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = ((sorted.len() + 1) * 9).div_ceil(10).min(sorted.len());
+    sorted
+        .get(rank.saturating_sub(1))
+        .map_or(0.0, |error| error.max(0.0))
+}
+
+fn measured_band(
+    basis: MachineTrafficBandBasis,
+    horizon: usize,
+    samples: &[f64],
+) -> (MachineTrafficBand, f64) {
+    let upper = upper_error(samples);
+    (
+        MachineTrafficBand {
+            basis,
+            horizon_days: u32::try_from(horizon).unwrap_or(u32::MAX),
+            samples: u32::try_from(samples.len()).unwrap_or(u32::MAX),
+            upper_error_basis_points: basis_points(upper),
+        },
+        upper,
+    )
+}
+
+/// The upper error for the rest of the period: this machine's backtests when they cover enough
+/// independent horizons, else the fleet's at this horizon or the longest one with enough history
+/// down to half of it, else the default.
+fn forecast_band(
+    own: &Backtest,
+    fleet: &mut FleetBacktests<'_>,
+    remaining_days: f64,
+) -> (MachineTrafficBand, f64) {
+    // A partial day still needs a forecast of one.
+    let horizon = (remaining_days.ceil() as usize).max(1);
+    let own_errors = own.errors(horizon).collect::<Vec<_>>();
+    if enough_backtests(own_errors.len(), horizon) {
+        return measured_band(MachineTrafficBandBasis::Node, horizon, &own_errors);
+    }
+    for candidate in (horizon.div_ceil(BAND_MAX_STRETCH)..=horizon).rev() {
+        let pooled = fleet.errors(candidate);
+        if enough_backtests(pooled.len(), candidate) {
+            return measured_band(MachineTrafficBandBasis::Fleet, candidate, pooled);
+        }
+    }
+    (
+        MachineTrafficBand {
+            basis: MachineTrafficBandBasis::Default,
+            horizon_days: u32::try_from(horizon).unwrap_or(u32::MAX),
+            samples: 0,
+            upper_error_basis_points: basis_points(BAND_DEFAULT_UPPER_ERROR),
+        },
+        BAND_DEFAULT_UPPER_ERROR,
+    )
+}
+
+/// One machine's rate and completeness, before the fleet's backtests are known.
+struct NodeForecast {
+    backtest: Backtest,
+    daily_rate: f64,
+    rate_days: usize,
+    remaining_days: f64,
+    needs_calibration: bool,
+    gap: Option<TrafficGap>,
+}
+
+fn prepare_forecast(
+    anchors: PeriodAnchors,
+    ledger: &[(i64, u64)],
+    gaps: &[TrafficGap],
+    now: i64,
+    weights: &[f64; RATE_WINDOW_DAYS],
+) -> NodeForecast {
+    let remaining_days = (anchors.end - now.clamp(anchors.start, anchors.end)) as f64 / DAY as f64;
+    let Some(tracking_started_at) = anchors.tracking_started_at else {
+        // Nothing reported yet: there is no rate, and no tracked total a calibration could repair.
+        return NodeForecast {
+            backtest: Backtest::new(&[], weights),
+            daily_rate: 0.0,
+            rate_days: 0,
+            remaining_days,
+            needs_calibration: false,
+            gap: None,
+        };
+    };
+    let days = daily_series(ledger, gaps, tracking_started_at, day_start(now));
+    let (daily_rate, rate_days) = recent_rate(&days, days.len(), weights)
+        .unwrap_or_else(|| (rate_since(ledger, tracking_started_at, now), 0));
+    // A calibration fixes the total at its own instant; only what follows can unsettle it again.
+    let anchor = anchors
+        .calibrated_at
+        .map_or(anchors.start, |at| at.max(anchors.start));
+    let gap = gaps
+        .iter()
+        .rev()
+        .filter(|gap| gap.occurred_at >= anchor && gap.occurred_at < anchors.end)
+        .find(|gap| gap_changes_total(**gap, ledger, tracking_started_at, anchors.start))
+        .copied();
+    NodeForecast {
+        backtest: Backtest::new(&days, weights),
+        daily_rate,
+        rate_days,
+        remaining_days,
+        needs_calibration: tracking_started_at > anchor || gap.is_some(),
+        gap,
+    }
+}
+
+/// `used` is known; only the remaining days are forecast, so both values meet `used` at the end.
+fn project(used: u64, daily_rate: f64, remaining_days: f64, upper_error: f64) -> (u64, u64) {
+    let remaining = daily_rate * remaining_days;
+    let p50 = used.saturating_add(estimated_bytes(remaining));
+    let p90 = used.saturating_add(estimated_bytes(remaining * (1.0 + upper_error)));
+    (p50, p90.max(p50))
+}
+
+fn forecast_confidence(
+    needs_calibration: bool,
+    rate_days: usize,
+    basis: MachineTrafficBandBasis,
+) -> MachineTrafficConfidence {
+    if needs_calibration || rate_days < RATE_DAYS_FEW || basis == MachineTrafficBandBasis::Default {
+        MachineTrafficConfidence::Low
+    } else if rate_days < RATE_DAYS_ENOUGH || basis == MachineTrafficBandBasis::Fleet {
+        MachineTrafficConfidence::Medium
+    } else {
+        MachineTrafficConfidence::High
+    }
+}
+
+#[derive(Default)]
+struct UserDemand {
+    bytes: u64,
+    apps: BTreeSet<String>,
+}
+
+struct EligibleUserUsage {
+    period_start: i64,
+    tenant_id: String,
+    user_id: String,
+    app_label: String,
+    bytes: u64,
+}
+
+/// Capacity planning joins two deliberately different ledgers:
+///
+/// * physical NIC bytes decide whether the provider allowance is at risk;
+/// * `(user uplink + user downlink) * 2` estimates the machine footprint because forwarded
+///   payload crosses the NIC on both legs; user counters then distribute that work across users
+///   eligible to traverse the node in the current topology.
+///
+/// Relay counters contain no user identity, so attribution is a bounded proportional estimate and
+/// any physical remainder stays visible instead of being silently charged to a user.
+///
+/// The rest of the period is forecast from the recent daily rate. The P90 error comes from
+/// backtests of the same method on the ledger, so the forecast and its error stay consistent.
+pub async fn load_machine_traffic_model(
+    pool: &PgPool,
+    actor: &AdminContext,
+) -> Result<MachineTrafficModelView> {
+    let traffic = load_node_traffic(pool, actor).await?;
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StoreError::InvalidData("system clock is before unix epoch".to_owned()))?
+            .as_secs(),
+    )
+    .map_err(|_| StoreError::InvalidData("system clock exceeds i64 unix time".to_owned()))?;
+    let tenant_scope = actor.tenant_scope();
+    let tenant_pattern = actor.tenant_scope_like_pattern();
+
+    let physical_rows = sqlx::query(
+        "SELECT d.node_id,
+                extract(epoch FROM d.day::timestamp AT TIME ZONE 'UTC')::bigint AS day_start,
+                (d.rx_bytes + d.tx_bytes)::text AS bytes
+           FROM node_traffic_daily AS d
+           JOIN nodes AS n ON n.id = d.node_id
+          WHERE d.day >= (now() AT TIME ZONE 'UTC')::date - 740
+            AND ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\')
+          ORDER BY d.node_id, d.day",
+    )
+    .bind(tenant_scope)
+    .bind(&tenant_pattern)
+    .fetch_all(pool)
+    .await?;
+    let mut physical_days: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
+    for row in physical_rows {
+        let node_id: String = row.try_get("node_id")?;
+        physical_days
+            .entry(node_id)
+            .or_default()
+            .push((row.try_get("day_start")?, parse_u64_column(&row, "bytes")?));
+    }
+
+    let gap_rows = sqlx::query(
+        "SELECT g.node_id,
+                extract(epoch FROM g.occurred_at)::bigint AS occurred_at,
+                g.reason
+           FROM node_traffic_gaps AS g
+           JOIN nodes AS n ON n.id = g.node_id
+          WHERE g.occurred_at >= now() - interval '740 days'
+            AND ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\')
+          ORDER BY g.node_id, g.occurred_at, g.id",
+    )
+    .bind(tenant_scope)
+    .bind(&tenant_pattern)
+    .fetch_all(pool)
+    .await?;
+    let mut gaps_by_node: HashMap<String, Vec<TrafficGap>> = HashMap::new();
+    for row in gap_rows {
+        let node_id: String = row.try_get("node_id")?;
+        gaps_by_node.entry(node_id).or_default().push(TrafficGap {
+            occurred_at: row.try_get("occurred_at")?,
+            reason: GapReason::parse(&row.try_get::<String, _>("reason")?)?,
+        });
+    }
+
+    // A user's app usage is copied only onto nodes their current grant can traverse. UNION removes
+    // the ingress from the step branch where it is also represented as a chain member.
+    let demand_rows = sqlx::query(
+        "WITH eligible AS (
+             SELECT g.tenant_id, g.user_id, g.app_id, i.node_id
+               FROM grants AS g
+               JOIN ingresses AS i ON i.id = g.ingress_id
+             UNION
+             SELECT g.tenant_id, g.user_id, g.app_id, s.node_id
+               FROM grants AS g
+               JOIN ingresses AS i ON i.id = g.ingress_id
+               JOIN steps AS s ON s.chain_id = i.chain_id
+         )
+         SELECT e.node_id, e.tenant_id, e.user_id, e.app_id,
+                COALESCE(a.label, e.app_id) AS app_label,
+                extract(epoch FROM u.period_start)::bigint AS period_start,
+                (u.uplink_bytes + u.downlink_bytes)::text AS bytes
+           FROM eligible AS e
+           JOIN usage_rollups AS u
+             ON u.tenant_id = e.tenant_id
+            AND u.user_id = e.user_id
+            AND u.app_id = e.app_id
+           LEFT JOIN apps AS a ON a.id = e.app_id
+          WHERE u.period_start >= now() - interval '370 days'
+            AND ($1::text IS NULL OR e.tenant_id = $1 OR e.tenant_id LIKE $2 ESCAPE '\\')
+          ORDER BY e.node_id, e.tenant_id, e.user_id, u.period_start",
+    )
+    .bind(tenant_scope)
+    .bind(&tenant_pattern)
+    .fetch_all(pool)
+    .await?;
+    let mut demand_by_node: HashMap<String, Vec<EligibleUserUsage>> = HashMap::new();
+    for row in demand_rows {
+        let node_id: String = row.try_get("node_id")?;
+        demand_by_node
+            .entry(node_id)
+            .or_default()
+            .push(EligibleUserUsage {
+                period_start: row.try_get("period_start")?,
+                tenant_id: row.try_get("tenant_id")?,
+                user_id: row.try_get("user_id")?,
+                app_label: row.try_get("app_label")?,
+                bytes: parse_u64_column(&row, "bytes")?,
+            });
+    }
+
+    let logical_rows = sqlx::query(
+        "SELECT r.node_id,
+                extract(epoch FROM r.period_start)::bigint AS period_start,
+                (r.user_uplink_bytes + r.user_downlink_bytes
+                 + r.relay_uplink_bytes + r.relay_downlink_bytes)::text AS bytes
+           FROM usage_node_rollups AS r
+           JOIN nodes AS n ON n.id = r.node_id
+          WHERE r.period_start >= now() - interval '370 days'
+            AND ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\')
+          ORDER BY r.node_id, r.period_start",
+    )
+    .bind(tenant_scope)
+    .bind(&tenant_pattern)
+    .fetch_all(pool)
+    .await?;
+    let mut logical_by_node: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
+    for row in logical_rows {
+        let node_id: String = row.try_get("node_id")?;
+        logical_by_node.entry(node_id).or_default().push((
+            row.try_get("period_start")?,
+            parse_u64_column(&row, "bytes")?,
+        ));
+    }
+    // Forwarding is attributed directly on its entry machine; never project it through grants
+    // or add it to the already complete physical NIC ledger.
+    let forwarding_rows = sqlx::query(
+        "SELECT r.node_id,r.tenant_id,r.user_id,extract(epoch FROM r.period_start)::bigint AS period_start,
+                sum(r.uplink_bytes+r.downlink_bytes)::text AS bytes
+         FROM forwarding_usage_rollups r JOIN nodes n ON n.id=r.node_id
+         WHERE r.period_start >= now()-interval '370 days'
+           AND ($1::text IS NULL OR r.tenant_id=$1 OR r.tenant_id LIKE $2 ESCAPE '\\')
+         GROUP BY r.node_id,r.tenant_id,r.user_id,r.period_start ORDER BY r.node_id,r.period_start",
+    ).bind(tenant_scope).bind(&tenant_pattern).fetch_all(pool).await?;
+    for row in forwarding_rows {
+        let node_id: String = row.try_get("node_id")?;
+        let period_start = row.try_get("period_start")?;
+        let bytes = parse_u64_column(&row, "bytes")?;
+        demand_by_node
+            .entry(node_id.clone())
+            .or_default()
+            .push(EligibleUserUsage {
+                period_start,
+                tenant_id: row.try_get("tenant_id")?,
+                user_id: row.try_get("user_id")?,
+                app_label: "转发".to_owned(),
+                bytes,
+            });
+        logical_by_node
+            .entry(node_id)
+            .or_default()
+            .push((period_start, bytes));
+    }
+
+    let mut accuracy =
+        load_forecast_accuracy(pool, tenant_scope, tenant_pattern.as_deref()).await?;
+
+    let weights = rate_weights();
+    let forecasts = traffic
+        .nodes
+        .iter()
+        .map(|item| {
+            prepare_forecast(
+                PeriodAnchors {
+                    start: item.period_start_unix_secs,
+                    end: item.period_end_unix_secs,
+                    tracking_started_at: item.tracking_started_at_unix_secs,
+                    calibrated_at: item.calibrated_at_unix_secs,
+                },
+                physical_days
+                    .get(&item.node_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                gaps_by_node
+                    .get(&item.node_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                now,
+                &weights,
+            )
+        })
+        .collect::<Vec<_>>();
+    // Machines with too little history of their own borrow the error of the whole scope.
+    let bands = {
+        let mut fleet = FleetBacktests::new(
+            forecasts
+                .iter()
+                .map(|forecast| &forecast.backtest)
+                .collect(),
+        );
+        forecasts
+            .iter()
+            .map(|forecast| forecast_band(&forecast.backtest, &mut fleet, forecast.remaining_days))
+            .collect::<Vec<_>>()
+    };
+
+    let mut nodes = Vec::with_capacity(traffic.nodes.len());
+    for ((item, forecast), (band, upper)) in traffic.nodes.into_iter().zip(forecasts).zip(bands) {
+        let start = item.period_start_unix_secs;
+        let end = item.period_end_unix_secs;
+        let duration = end.saturating_sub(start).max(DAY);
+        let previous_start = start.saturating_sub(duration);
+        let days = physical_days
+            .get(&item.node_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let current_days = ledger_window(days, start, end);
+        let previous_days = ledger_window(days, previous_start, start);
+        let previous_total = days
+            .iter()
+            .filter(|(day, _)| *day >= previous_start && *day < start)
+            .fold(0_u64, |sum, (_, value)| sum.saturating_add(*value));
+        let used = parse_decimal_u64(&item.total_bytes, "机器物理流量")?;
+        let (p50, p90) = project(used, forecast.daily_rate, forecast.remaining_days, upper);
+
+        let mut user_demand: BTreeMap<(String, String), UserDemand> = BTreeMap::new();
+        for usage in demand_by_node
+            .get(&item.node_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            if usage.period_start < start || usage.period_start >= end {
+                continue;
+            }
+            let demand = user_demand
+                .entry((usage.tenant_id.clone(), usage.user_id.clone()))
+                .or_default();
+            demand.bytes = demand.bytes.saturating_add(usage.bytes);
+            demand.apps.insert(usage.app_label.clone());
+        }
+        let total_demand = user_demand
+            .values()
+            .fold(0_u64, |sum, demand| sum.saturating_add(demand.bytes));
+        let logical = logical_by_node
+            .get(&item.node_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|(period, _)| *period >= start && *period < end)
+            .fold(0_u64, |sum, (_, value)| sum.saturating_add(*value));
+        let attributable = attributable_physical_bytes(used, logical, total_demand > 0);
+        let mut attributed_sum = 0_u64;
+        let mut users = user_demand
+            .into_iter()
+            .filter(|(_, demand)| demand.bytes > 0)
+            .map(|((tenant_id, user_id), demand)| {
+                let attributed = mul_div(attributable, demand.bytes, total_demand);
+                attributed_sum = attributed_sum.saturating_add(attributed);
+                let projected = mul_div(p50, attributed, used);
+                MachineTrafficUser {
+                    tenant_id,
+                    user_id,
+                    attributed_bytes: attributed.to_string(),
+                    projected_bytes: projected.to_string(),
+                    share_basis_points: u16::try_from(mul_div(attributed, 10_000, used))
+                        .unwrap_or(10_000),
+                    apps: demand.apps.into_iter().collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        users.sort_by(|left, right| {
+            parse_decimal_u64(&right.attributed_bytes, "用户归因流量")
+                .unwrap_or(0)
+                .cmp(&parse_decimal_u64(&left.attributed_bytes, "用户归因流量").unwrap_or(0))
+                .then_with(|| left.tenant_id.cmp(&right.tenant_id))
+                .then_with(|| left.user_id.cmp(&right.user_id))
+        });
+        let unattributed = used.saturating_sub(attributed_sum.min(used));
+        let projected_unattributed = p50.saturating_sub(users.iter().fold(0_u64, |sum, user| {
+            sum.saturating_add(
+                parse_decimal_u64(&user.projected_bytes, "用户预测流量").unwrap_or(0),
+            )
+        }));
+        let confidence =
+            forecast_confidence(forecast.needs_calibration, forecast.rate_days, band.basis);
+        let last_period_accuracy = accuracy.remove(&item.node_id);
+        nodes.push(MachineTrafficModelNode {
+            node_id: item.node_id,
+            tenant_id: item.tenant_id,
+            name: item.name,
+            cycle_kind: item.cycle_kind,
+            reset_month: item.reset_month,
+            reset_day: item.reset_day,
+            period_start_unix_secs: start,
+            period_end_unix_secs: end,
+            previous_period_start_unix_secs: previous_start,
+            quota_bytes: item.quota_bytes,
+            used_bytes: used.to_string(),
+            previous_period_bytes: previous_total.to_string(),
+            daily_rate_bytes: estimated_bytes(forecast.daily_rate).to_string(),
+            rate_days: u32::try_from(forecast.rate_days).unwrap_or(u32::MAX),
+            projected_p50_bytes: p50.to_string(),
+            projected_p90_bytes: p90.to_string(),
+            band,
+            confidence,
+            needs_calibration: forecast.needs_calibration,
+            days: current_days,
+            previous_days,
+            tracking_started_at_unix_secs: item.tracking_started_at_unix_secs,
+            calibrated_at_unix_secs: item.calibrated_at_unix_secs,
+            gap_at_unix_secs: forecast.gap.map(|gap| gap.occurred_at),
+            gap_reason: forecast.gap.map(|gap| gap.reason.as_str().to_owned()),
+            last_period_accuracy,
+            users,
+            unattributed_bytes: unattributed.to_string(),
+            projected_unattributed_bytes: projected_unattributed.to_string(),
+        });
+    }
+    Ok(MachineTrafficModelView {
+        generated_at_unix_secs: now,
+        attribution: "current_topology_proportional".to_owned(),
+        nodes,
+    })
+}
+
+/// Accuracy of each machine's latest closed period that has recorded forecasts. The final total
+/// follows the same rule as the live view: the period's ledger, or the latest calibration in the
+/// period plus what the meter accounted from it to the period end.
+async fn load_forecast_accuracy(
+    pool: &PgPool,
+    tenant_scope: Option<&str>,
+    tenant_pattern: Option<&str>,
+) -> Result<HashMap<String, MachineTrafficAccuracy>> {
+    let rows = sqlx::query(
+        "WITH latest AS (
+             SELECT DISTINCT ON (f.node_id) f.node_id, f.period_start, f.period_end
+               FROM node_traffic_forecasts AS f
+               JOIN nodes AS n ON n.id = f.node_id
+              WHERE f.period_end <= (now() AT TIME ZONE 'UTC')::date
+                AND ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\')
+              ORDER BY f.node_id, f.period_end DESC, f.period_start DESC
+         ), closing AS (
+             SELECT latest.*,
+                    CASE WHEN calibration.target_total_bytes IS NOT NULL
+                         THEN calibration.target_total_bytes + GREATEST(
+                                  COALESCE(state.accounted_rx_bytes + state.accounted_tx_bytes, 0)
+                                  - COALESCE(later.bytes, 0)
+                                  - calibration.accounted_total_bytes, 0)
+                         ELSE COALESCE(within.bytes, 0)
+                    END AS actual_bytes
+               FROM latest
+               LEFT JOIN node_traffic_state AS state ON state.node_id = latest.node_id
+               LEFT JOIN LATERAL (
+                   SELECT sum(day.rx_bytes + day.tx_bytes) AS bytes
+                     FROM node_traffic_daily AS day
+                    WHERE day.node_id = latest.node_id
+                      AND day.day >= latest.period_start
+                      AND day.day < latest.period_end
+               ) AS within ON TRUE
+               LEFT JOIN LATERAL (
+                   SELECT sum(day.rx_bytes + day.tx_bytes) AS bytes
+                     FROM node_traffic_daily AS day
+                    WHERE day.node_id = latest.node_id
+                      AND day.day >= latest.period_end
+               ) AS later ON TRUE
+               LEFT JOIN LATERAL (
+                   SELECT item.target_total_bytes, item.accounted_total_bytes
+                     FROM node_traffic_calibrations AS item
+                    WHERE item.node_id = latest.node_id
+                      AND item.calibrated_at >= latest.period_start::timestamp AT TIME ZONE 'UTC'
+                      AND item.calibrated_at < latest.period_end::timestamp AT TIME ZONE 'UTC'
+                    ORDER BY item.calibrated_at DESC, item.id DESC
+                    LIMIT 1
+               ) AS calibration ON TRUE
+         )
+         SELECT closing.node_id,
+                extract(epoch FROM closing.period_start::timestamp AT TIME ZONE 'UTC')::bigint
+                    AS period_start_unix_secs,
+                extract(epoch FROM closing.period_end::timestamp AT TIME ZONE 'UTC')::bigint
+                    AS period_end_unix_secs,
+                closing.actual_bytes::text AS actual_bytes,
+                count(*) AS forecasts,
+                round(avg(abs(f.p50_bytes - closing.actual_bytes) / closing.actual_bytes)
+                      * 10000)::bigint AS p50_error_basis_points,
+                count(*) FILTER (WHERE closing.actual_bytes <= f.p90_bytes) AS p90_covered
+           FROM closing
+           JOIN node_traffic_forecasts AS f
+             ON f.node_id = closing.node_id
+            AND f.period_start = closing.period_start
+            AND f.period_end = closing.period_end
+          WHERE closing.actual_bytes > 0
+          GROUP BY closing.node_id, closing.period_start, closing.period_end,
+                   closing.actual_bytes",
+    )
+    .bind(tenant_scope)
+    .bind(tenant_pattern)
+    .fetch_all(pool)
+    .await?;
+    let count = |row: &sqlx::postgres::PgRow, name: &str| -> Result<u32> {
+        u32::try_from(row.try_get::<i64, _>(name)?)
+            .map_err(|_| StoreError::InvalidData(format!("forecast accuracy {name} out of range")))
+    };
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get("node_id")?,
+                MachineTrafficAccuracy {
+                    period_start_unix_secs: row.try_get("period_start_unix_secs")?,
+                    period_end_unix_secs: row.try_get("period_end_unix_secs")?,
+                    actual_bytes: row.try_get("actual_bytes")?,
+                    forecasts: count(row, "forecasts")?,
+                    p50_error_basis_points: count(row, "p50_error_basis_points")?,
+                    p90_covered: count(row, "p90_covered")?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Record today's forecast of every measured machine, once per UTC day. The first record of a
+/// day stands, so the history shows what operators saw rather than a later revision.
+pub async fn record_machine_traffic_forecasts(pool: &PgPool) -> Result<u64> {
+    let view =
+        load_machine_traffic_model(pool, &AdminContext::system_admin(FORECAST_ACTOR)).await?;
+    let measured = view
+        .nodes
+        .iter()
+        .filter(|node| node.tracking_started_at_unix_secs.is_some())
+        .collect::<Vec<_>>();
+    if measured.is_empty() {
+        return Ok(0);
+    }
+    let column = |value: fn(&MachineTrafficModelNode) -> String| {
+        measured.iter().map(|&node| value(node)).collect::<Vec<_>>()
+    };
+    let inserted = sqlx::query(
+        "INSERT INTO node_traffic_forecasts (
+            node_id, day, taken_at, period_start, period_end,
+            quota_bytes, used_bytes, p50_bytes, p90_bytes
+         )
+         SELECT item.node_id,
+                (to_timestamp($1) AT TIME ZONE 'UTC')::date,
+                to_timestamp($1),
+                (to_timestamp(item.period_start) AT TIME ZONE 'UTC')::date,
+                (to_timestamp(item.period_end) AT TIME ZONE 'UTC')::date,
+                item.quota::numeric, item.used::numeric, item.p50::numeric, item.p90::numeric
+           FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[],
+                       $7::text[], $8::text[])
+                AS item(node_id, period_start, period_end, quota, used, p50, p90)
+         ON CONFLICT (node_id, day) DO NOTHING",
+    )
+    .bind(view.generated_at_unix_secs as f64)
+    .bind(column(|node| node.node_id.clone()))
+    .bind(
+        measured
+            .iter()
+            .map(|node| node.period_start_unix_secs)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        measured
+            .iter()
+            .map(|node| node.period_end_unix_secs)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        measured
+            .iter()
+            .map(|node| node.quota_bytes.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind(column(|node| node.used_bytes.clone()))
+    .bind(column(|node| node.projected_p50_bytes.clone()))
+    .bind(column(|node| node.projected_p90_bytes.clone()))
+    .execute(pool)
+    .await?;
+    Ok(inserted.rows_affected())
+}
+
+pub async fn prune_machine_traffic_forecasts(pool: &PgPool, retain_days: u32) -> Result<u64> {
+    let retain_days = i32::try_from(retain_days)
+        .map_err(|_| StoreError::InvalidData("forecast retention exceeds i32 days".to_owned()))?;
+    let deleted = sqlx::query(
+        "DELETE FROM node_traffic_forecasts
+          WHERE day < (now() AT TIME ZONE 'UTC')::date - $1",
+    )
+    .bind(retain_days)
+    .execute(pool)
+    .await?;
+    Ok(deleted.rows_affected())
+}
+
 const NODE_TRAFFIC_VIEW_SQL: &str = r#"
 WITH policies AS (
     SELECT n.id AS node_id, n.tenant_id, n.name,
            COALESCE(p.cycle_kind, 'monthly') AS cycle_kind,
            p.reset_month,
            COALESCE(p.reset_day, 1) AS reset_day,
+           p.quota_bytes,
            (now() AT TIME ZONE 'UTC')::date AS today
       FROM nodes AS n
       LEFT JOIN node_traffic_policy AS p ON p.node_id = n.id
@@ -529,6 +1701,7 @@ WITH policies AS (
       FROM periods
 )
 SELECT b.node_id, b.tenant_id, b.name, b.cycle_kind, b.reset_month, b.reset_day,
+       b.quota_bytes::text AS quota_bytes,
        extract(epoch FROM b.period_start::timestamp AT TIME ZONE 'UTC')::bigint
            AS period_start_unix_secs,
        extract(epoch FROM b.period_end::timestamp AT TIME ZONE 'UTC')::bigint
@@ -597,6 +1770,7 @@ mod tests {
             cycle_kind: NodeTrafficCycleKind::Monthly,
             reset_month: None,
             reset_day: 31,
+            quota_bytes: Some("10995116277760".to_owned()),
             calibrated_total_bytes: None,
         })
         .is_ok());
@@ -604,6 +1778,7 @@ mod tests {
             cycle_kind: NodeTrafficCycleKind::Yearly,
             reset_month: Some(2),
             reset_day: 29,
+            quota_bytes: None,
             calibrated_total_bytes: Some("1099511627776".to_owned()),
         })
         .is_ok());
@@ -611,9 +1786,326 @@ mod tests {
             cycle_kind: NodeTrafficCycleKind::Monthly,
             reset_month: Some(1),
             reset_day: 1,
+            quota_bytes: None,
             calibrated_total_bytes: None,
         })
         .is_err());
+    }
+
+    const D: u64 = 100 << 30;
+
+    fn steady(from: i64, to: i64, bytes: u64) -> Vec<(i64, u64)> {
+        (from..to).map(|day| (day * DAY, bytes)).collect()
+    }
+
+    fn gap(day: f64, reason: GapReason) -> TrafficGap {
+        TrafficGap {
+            occurred_at: (day * DAY as f64) as i64,
+            reason,
+        }
+    }
+
+    fn observed(days: &[RateDay]) -> Vec<Option<u64>> {
+        days.iter()
+            .map(|day| match day {
+                RateDay::Observed(bytes) => Some(estimated_bytes(*bytes)),
+                RateDay::Unobserved => None,
+            })
+            .collect()
+    }
+
+    fn anchors(start: i64, tracking_started_at: f64) -> PeriodAnchors {
+        PeriodAnchors {
+            start: start * DAY,
+            end: (start + 30) * DAY,
+            tracking_started_at: Some((tracking_started_at * DAY as f64) as i64),
+            calibrated_at: None,
+        }
+    }
+
+    #[test]
+    fn the_daily_series_covers_complete_tracked_days_before_today() {
+        let ledger = steady(10, 16, D);
+        let midday = 10 * DAY + 3_600;
+        assert_eq!(
+            observed(&daily_series(&ledger, &[], midday, 15 * DAY)),
+            vec![Some(D); 4],
+            "the partial tracking day and today stay out"
+        );
+        assert_eq!(daily_series(&ledger, &[], 10 * DAY, 15 * DAY).len(), 5);
+        assert!(daily_series(&ledger, &[], midday, 11 * DAY).is_empty());
+    }
+
+    #[test]
+    fn an_outage_spreads_its_deferred_bytes_over_the_silent_days() {
+        let mut ledger = steady(0, 5, D);
+        ledger.extend([(7 * DAY, 3 * D), (8 * DAY, D)]);
+        let outage = [gap(7.01, GapReason::ReportGap)];
+        assert_eq!(
+            observed(&daily_series(&ledger, &outage, 0, 9 * DAY)),
+            vec![Some(D); 9]
+        );
+        // Resumed today: the bytes sit in today's partial day, so the silent days are unknown.
+        let resumed = [gap(7.01, GapReason::ReportGap)];
+        let mut days = vec![Some(D); 5];
+        days.extend([None, None]);
+        assert_eq!(
+            observed(&daily_series(&steady(0, 5, D), &resumed, 0, 7 * DAY)),
+            days
+        );
+    }
+
+    #[test]
+    fn only_a_gap_after_a_silent_day_hides_days_from_the_rate() {
+        let mut ledger = steady(0, 5, D);
+        ledger.extend([(6 * DAY, D / 2), (7 * DAY, D)]);
+        let reboot = [gap(6.1, GapReason::MachineReboot)];
+        assert_eq!(
+            observed(&daily_series(&ledger, &reboot, 0, 8 * DAY)),
+            vec![
+                Some(D),
+                Some(D),
+                Some(D),
+                Some(D),
+                None,
+                None,
+                None,
+                Some(D)
+            ]
+        );
+        let reported_daily = steady(0, 8, D);
+        assert_eq!(
+            observed(&daily_series(&reported_daily, &reboot, 0, 8 * DAY)),
+            vec![Some(D); 8]
+        );
+    }
+
+    #[test]
+    fn a_gap_changes_the_total_only_when_bytes_may_be_lost_or_misplaced() {
+        let period_start = 30 * DAY;
+        let changes = |ledger: &[(i64, u64)], gap: TrafficGap| {
+            gap_changes_total(gap, ledger, 0, period_start)
+        };
+        let daily = steady(0, 40, D);
+        assert!(!changes(&daily, gap(35.1, GapReason::MachineReboot)));
+        assert!(!changes(&daily, gap(35.1, GapReason::MeterReplaced)));
+        let silent = steady(0, 34, D);
+        assert!(changes(&silent, gap(35.1, GapReason::MachineReboot)));
+        assert!(changes(&silent, gap(35.1, GapReason::MeterReplaced)));
+        // Absolute counters keep an outage's bytes; only crossing the reset misplaces them.
+        assert!(!changes(&steady(0, 33, D), gap(33.1, GapReason::ReportGap)));
+        assert!(changes(&steady(0, 30, D), gap(30.01, GapReason::ReportGap)));
+        assert!(changes(&steady(0, 29, D), gap(32.5, GapReason::ReportGap)));
+    }
+
+    #[test]
+    fn the_daily_rate_favours_recent_complete_days_inside_the_window() {
+        let weights = rate_weights();
+        let rate = |days: &[RateDay]| recent_rate(days, days.len(), &weights).unwrap();
+        let steady_days = vec![RateDay::Observed(1_000.0); 40];
+        assert!((rate(&steady_days).0 - 1_000.0).abs() < 1e-6);
+        assert_eq!(rate(&steady_days).1, RATE_WINDOW_DAYS);
+
+        let mut newest = steady_days.clone();
+        newest[39] = RateDay::Observed(2_000.0);
+        let mut older = steady_days.clone();
+        older[19] = RateDay::Observed(2_000.0);
+        assert!(rate(&newest).0 > rate(&older).0);
+        assert!(rate(&older).0 > 1_000.0);
+
+        let mut beyond = steady_days.clone();
+        beyond[..12].fill(RateDay::Observed(9_000.0));
+        assert!((rate(&beyond).0 - 1_000.0).abs() < 1e-6);
+
+        let mut holes = steady_days;
+        holes[35] = RateDay::Unobserved;
+        holes[30] = RateDay::Unobserved;
+        assert!((rate(&holes).0 - 1_000.0).abs() < 1e-6);
+        assert_eq!(rate(&holes).1, RATE_WINDOW_DAYS - 2);
+        assert_eq!(recent_rate(&[RateDay::Unobserved; 3], 3, &weights), None);
+    }
+
+    #[test]
+    fn the_projection_meets_used_at_the_period_end() {
+        assert_eq!(project(1_000, 100.0, 0.0, 0.3), (1_000, 1_000));
+        assert_eq!(project(1_000, 100.0, 2.5, 0.2), (1_250, 1_300));
+        assert_eq!(project(1_000, 100.0, 2.5, 0.0), (1_250, 1_250));
+        assert_eq!(project(u64::MAX, 1e30, 30.0, 0.5), (u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn the_upper_error_takes_the_conformal_rank() {
+        let samples = (0..20).map(|n| f64::from(n) / 100.0).collect::<Vec<_>>();
+        // ⌈0.9 × 21⌉ = 19: the 19th smallest of 20.
+        assert!((upper_error(&samples) - 0.18).abs() < 1e-12);
+        assert_eq!(upper_error(&[-0.3, -0.2]), 0.0);
+        assert_eq!(upper_error(&[]), 0.0);
+    }
+
+    #[test]
+    fn the_band_prefers_own_history_then_the_fleet_then_the_default() {
+        let weights = rate_weights();
+        let machine =
+            |days: usize| Backtest::new(&vec![RateDay::Observed(1_000.0); days], &weights);
+        let long = machine(120);
+        let short = machine(10);
+        let empty = machine(0);
+
+        let mut fleet = FleetBacktests::new(vec![&long, &short]);
+        let (band, upper) = forecast_band(&long, &mut fleet, 2.4);
+        assert_eq!(
+            (band.basis, band.horizon_days, band.upper_error_basis_points),
+            (MachineTrafficBandBasis::Node, 3, 0)
+        );
+        assert_eq!(upper, 0.0);
+        let (band, _) = forecast_band(&short, &mut fleet, 2.4);
+        assert_eq!(
+            (band.basis, band.horizon_days),
+            (MachineTrafficBandBasis::Fleet, 3)
+        );
+
+        // Thirty days of history cannot back a 20-day horizon, but 17 days is within reach.
+        let month = (0..20).map(|_| machine(30)).collect::<Vec<_>>();
+        let mut fleet = FleetBacktests::new(month.iter().collect());
+        let (band, _) = forecast_band(&empty, &mut fleet, 20.0);
+        assert_eq!(
+            (band.basis, band.horizon_days),
+            (MachineTrafficBandBasis::Fleet, 17)
+        );
+
+        let fortnight = (0..20).map(|_| machine(15)).collect::<Vec<_>>();
+        let mut fleet = FleetBacktests::new(fortnight.iter().collect());
+        let (band, upper) = forecast_band(&empty, &mut fleet, 20.0);
+        assert_eq!(
+            (band.basis, band.samples, band.upper_error_basis_points),
+            (MachineTrafficBandBasis::Default, 0, 5_000)
+        );
+        assert_eq!(upper, BAND_DEFAULT_UPPER_ERROR);
+    }
+
+    #[test]
+    fn confidence_needs_a_complete_total_recent_days_and_own_history() {
+        use MachineTrafficBandBasis::{Default, Fleet, Node};
+        use MachineTrafficConfidence::{High, Low, Medium};
+        assert_eq!(forecast_confidence(false, 7, Node), High);
+        assert_eq!(forecast_confidence(false, 28, Fleet), Medium);
+        assert_eq!(forecast_confidence(false, 3, Node), Medium);
+        assert_eq!(forecast_confidence(false, 2, Node), Low);
+        assert_eq!(forecast_confidence(false, 28, Default), Low);
+        assert_eq!(forecast_confidence(true, 28, Node), Low);
+    }
+
+    #[test]
+    fn a_partly_tracked_previous_period_does_not_inflate_the_forecast() {
+        // Tracking began halfway through the previous period. The old previous-shape estimate put
+        // P50 at five times the real total here.
+        let ledger = steady(20, 51, D);
+        let now = 50 * DAY + DAY / 5;
+        let forecast = prepare_forecast(anchors(30, 20.5), &ledger, &[], now, &rate_weights());
+        assert_eq!(forecast.rate_days, RATE_WINDOW_DAYS);
+        assert!(!forecast.needs_calibration);
+        let used = 20 * D + D / 5;
+        let (p50, _) = project(used, forecast.daily_rate, forecast.remaining_days, 0.0);
+        assert_eq!(p50, 30 * D);
+    }
+
+    #[test]
+    fn tracking_inside_the_period_keeps_its_rate_and_asks_for_calibration() {
+        // The period average would spread two tracked days over twelve: P50 = 5 days' traffic.
+        let ledger = vec![(10 * DAY, D / 2), (11 * DAY, D)];
+        let forecast = prepare_forecast(anchors(0, 10.5), &ledger, &[], 12 * DAY, &rate_weights());
+        assert_eq!((forecast.rate_days, forecast.daily_rate), (1, D as f64));
+        assert!(forecast.needs_calibration);
+        let (p50, _) = project(D / 2 + D, forecast.daily_rate, forecast.remaining_days, 0.0);
+        assert_eq!(p50, D / 2 + 19 * D);
+
+        // A calibration after tracking began makes the total whole again.
+        let mut calibrated = anchors(0, 10.5);
+        calibrated.calibrated_at = Some(11 * DAY);
+        let forecast = prepare_forecast(calibrated, &ledger, &[], 12 * DAY, &rate_weights());
+        assert!(!forecast.needs_calibration);
+    }
+
+    #[test]
+    fn a_step_up_in_traffic_reaches_the_forecast_within_days() {
+        // From day 15 a new heavy user doubles the traffic; the allowance is 40 days' worth.
+        let mut ledger = steady(-30, 15, D);
+        ledger.extend(steady(15, 20, 2 * D));
+        let forecast = prepare_forecast(anchors(0, -30.0), &ledger, &[], 20 * DAY, &rate_weights());
+        let used = 15 * D + 10 * D;
+        let (p50, _) = project(used, forecast.daily_rate, forecast.remaining_days, 0.0);
+        // The period average says 37.5 days' worth and would not warn until day 23.
+        assert!(p50 > 40 * D, "{p50}");
+    }
+
+    #[test]
+    fn the_first_day_of_a_period_uses_the_complete_days_before_it() {
+        let ledger = steady(-30, 1, D);
+        let now = DAY / 2;
+        let forecast = prepare_forecast(anchors(0, -30.0), &ledger, &[], now, &rate_weights());
+        let (p50, _) = project(D / 2, forecast.daily_rate, forecast.remaining_days, 0.0);
+        assert_eq!(p50, 30 * D);
+    }
+
+    #[test]
+    fn only_gaps_that_may_change_the_total_ask_for_calibration() {
+        let weights = rate_weights();
+        let daily = steady(-30, 10, D);
+        let reboot = [gap(5.2, GapReason::MachineReboot)];
+        let forecast = prepare_forecast(anchors(0, -30.0), &daily, &reboot, 10 * DAY, &weights);
+        assert!(!forecast.needs_calibration);
+        assert!(forecast.gap.is_none());
+
+        let mut silent = steady(-30, 4, D);
+        silent.extend(steady(5, 10, D));
+        let forecast = prepare_forecast(anchors(0, -30.0), &silent, &reboot, 10 * DAY, &weights);
+        assert!(forecast.needs_calibration);
+        assert_eq!(
+            forecast.gap.map(|gap| gap.reason),
+            Some(GapReason::MachineReboot)
+        );
+
+        let mut calibrated = anchors(0, -30.0);
+        calibrated.calibrated_at = Some(6 * DAY);
+        let forecast = prepare_forecast(calibrated, &silent, &reboot, 10 * DAY, &weights);
+        assert!(!forecast.needs_calibration);
+    }
+
+    #[test]
+    fn ledger_window_is_half_open_and_keeps_exact_bytes() {
+        let day = 86_400;
+        let ledger = [
+            (9 * day, 1),
+            (10 * day, 2),
+            (11 * day, u64::MAX),
+            (12 * day, 4),
+        ];
+        assert_eq!(
+            ledger_window(&ledger, 10 * day, 12 * day),
+            vec![
+                MachineTrafficDay {
+                    day_start_unix_secs: 10 * day,
+                    bytes: "2".to_owned(),
+                },
+                MachineTrafficDay {
+                    day_start_unix_secs: 11 * day,
+                    bytes: u64::MAX.to_string(),
+                },
+            ]
+        );
+        assert!(ledger_window(&ledger, 13 * day, 14 * day).is_empty());
+    }
+
+    #[test]
+    fn user_machine_footprint_doubles_combined_uplink_and_downlink() {
+        // `logical` is already uplink + downlink. Forwarding crosses the NIC on both legs.
+        assert_eq!(attributable_physical_bytes(1_000, 300, true), 600);
+        assert_eq!(attributable_physical_bytes(500, 300, true), 500);
+        assert_eq!(attributable_physical_bytes(1_000, 300, false), 0);
+        assert_eq!(
+            attributable_physical_bytes(u64::MAX, u64::MAX, true),
+            u64::MAX
+        );
     }
 
     #[test]

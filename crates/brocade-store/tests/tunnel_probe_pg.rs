@@ -1,8 +1,9 @@
 use brocade_core::model::{ExternalOutboundProtocol, ExternalOutboundSecurity};
 use brocade_store::{
     AdminContext, AdminRole, CreateTenantRequest, ModelOp, PgStore, StoreError,
-    TunnelProbeCompletion, TunnelProbeJobStatus, TunnelProbePhase, TunnelProbeResultStatus,
-    TunnelProbeSource, TunnelProbeTrigger, UpdateTunnelProbePolicy, UpsertExternalOutboundRequest,
+    TunnelProbeCompletion, TunnelProbeHealthReason, TunnelProbeJobStatus, TunnelProbePhase,
+    TunnelProbeResultStatus, TunnelProbeSource, TunnelProbeTrigger, UpdateTunnelProbePolicy,
+    UpsertExternalOutboundRequest,
 };
 use sqlx::{PgPool, Row};
 use testcontainers::{runners::AsyncRunner, ImageExt};
@@ -271,6 +272,17 @@ async fn tunnel_probe_policy_queue_claim_cancel_and_history_are_durable() {
     assert_eq!(view.summary.total, 1);
     assert_eq!(view.summary.succeeded, 1);
     assert_eq!(view.summary.p50_ms, Some(42));
+    assert_eq!(view.slow_ttfb_ms, 300);
+    assert_eq!(view.bucket_secs, 360, "24 hours are sampled in 240 buckets");
+    assert_eq!(
+        (
+            view.summary.timeouts,
+            view.summary.connect_failures,
+            view.summary.target_failures,
+            view.summary.exit_ips,
+        ),
+        (0, 0, 0, 1)
+    );
     assert_eq!(view.points.len(), 1);
     assert_eq!(view.recent_runs[0].http_status, Some(204));
 
@@ -298,6 +310,13 @@ async fn tunnel_probe_policy_queue_claim_cancel_and_history_are_durable() {
         .find(|item| item.outbound_id == "custom-1111-1111")
         .expect("new tunnel is listed");
     assert_eq!(listed.policy.as_ref().unwrap().timeout_secs, 5);
+    assert_eq!(
+        listed.health_reason,
+        Some(TunnelProbeHealthReason::Healthy {
+            max_ttfb_ms: Some(42),
+            samples: 1,
+        })
+    );
 
     let (cancel_me, reused) = db
         .store
@@ -782,6 +801,8 @@ async fn manual_draft_probe_freezes_an_encrypted_source_without_affecting_servin
         "draft failures do not enter Serving metrics"
     );
     assert_eq!(view.summary.succeeded, 1);
+    assert_eq!(view.summary.connect_failures, 0);
+    assert_eq!(view.summary.exit_ips, 1);
     assert_eq!(view.points.len(), 1);
     assert!(view
         .recent_runs

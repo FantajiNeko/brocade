@@ -184,7 +184,12 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			if c, err := stats.GetOrRegisterCounter(d.stats, name); err != nil {
+				errors.LogErrorInner(ctx, err, "cannot initialize user accounting")
+				common.Interrupt(uplinkWriter)
+				common.Interrupt(downlinkWriter)
+				return inboundLink, outboundLink
+			} else if c != nil {
 				inboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  inboundLink.Writer,
@@ -193,7 +198,12 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		}
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			if c, err := stats.GetOrRegisterCounter(d.stats, name); err != nil {
+				errors.LogErrorInner(ctx, err, "cannot initialize user accounting")
+				common.Interrupt(uplinkWriter)
+				common.Interrupt(downlinkWriter)
+				return inboundLink, outboundLink
+			} else if c != nil {
 				outboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  outboundLink.Writer,
@@ -216,19 +226,30 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 		user = sessionInbound.User
 	}
 
-	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+	reader := link.Reader
+	link.Reader = &buf.TimeoutWrapperReader{Reader: reader}
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
+			if c, err := stats.GetOrRegisterCounter(statsManager, name); err != nil {
+				errors.LogErrorInner(ctx, err, "cannot initialize user accounting")
+				common.Interrupt(reader)
+				common.Interrupt(link.Writer)
+				return link
+			} else if c != nil {
 				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
 			}
 		}
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(statsManager, name); c != nil {
+			if c, err := stats.GetOrRegisterCounter(statsManager, name); err != nil {
+				errors.LogErrorInner(ctx, err, "cannot initialize user accounting")
+				common.Interrupt(reader)
+				common.Interrupt(link.Writer)
+				return link
+			} else if c != nil {
 				link.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  link.Writer,

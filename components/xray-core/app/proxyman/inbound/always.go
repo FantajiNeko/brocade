@@ -18,7 +18,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func getStatCounter(v *core.Instance, tag string) (stats.Counter, stats.Counter) {
+func getStatCounter(v *core.Instance, tag string) (stats.Counter, stats.Counter, error) {
 	var uplinkCounter stats.Counter
 	var downlinkCounter stats.Counter
 
@@ -26,7 +26,10 @@ func getStatCounter(v *core.Instance, tag string) (stats.Counter, stats.Counter)
 	if len(tag) > 0 && policy.ForSystem().Stats.InboundUplink {
 		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
 		name := "inbound>>>" + tag + ">>>traffic>>>uplink"
-		c, _ := stats.GetOrRegisterCounter(statsManager, name)
+		c, err := stats.GetOrRegisterCounter(statsManager, name)
+		if err != nil {
+			return nil, nil, err
+		}
 		if c != nil {
 			uplinkCounter = c
 		}
@@ -34,13 +37,16 @@ func getStatCounter(v *core.Instance, tag string) (stats.Counter, stats.Counter)
 	if len(tag) > 0 && policy.ForSystem().Stats.InboundDownlink {
 		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
 		name := "inbound>>>" + tag + ">>>traffic>>>downlink"
-		c, _ := stats.GetOrRegisterCounter(statsManager, name)
+		c, err := stats.GetOrRegisterCounter(statsManager, name)
+		if err != nil {
+			return nil, nil, err
+		}
 		if c != nil {
 			downlinkCounter = c
 		}
 	}
 
-	return uplinkCounter, downlinkCounter
+	return uplinkCounter, downlinkCounter, nil
 }
 
 type AlwaysOnInboundHandler struct {
@@ -83,7 +89,10 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		tag:            tag,
 	}
 
-	uplinkCounter, downlinkCounter := getStatCounter(core.MustFromContext(ctx), tag)
+	uplinkCounter, downlinkCounter, err := getStatCounter(core.MustFromContext(ctx), tag)
+	if err != nil {
+		return nil, errors.New("cannot initialize inbound accounting").Base(err)
+	}
 
 	nl := p.Network()
 	pl := receiverConfig.PortList

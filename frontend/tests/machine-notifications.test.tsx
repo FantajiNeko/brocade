@@ -307,7 +307,7 @@ it('在全局通知气泡显示事故，打开后持久标记已读并可进入�
   expect(onNode).toHaveBeenCalledWith('hk-1');
 });
 
-it('默认只显示十条通知，点查看更多后展示其余内容', () => {
+it('公网地址变化默认只显示三条，独立展开和收起其余内容', () => {
   const manyIpEvents: MachineEventList = {
     ...recoveredFleetEvent,
     latest_event_id: 18,
@@ -335,10 +335,11 @@ it('默认只显示十条通知，点查看更多后展示其余内容', () => {
   );
 
   fireEvent.click(screen.getByRole('button', { name: '机器通知' }));
-  expect(screen.getAllByRole('button', { name: /机器 \d/ })).toHaveLength(10);
-  fireEvent.click(screen.getByRole('button', { name: '查看更多 2 条' }));
+  expect(screen.getAllByRole('button', { name: /机器 \d/ })).toHaveLength(3);
+  fireEvent.click(screen.getByRole('button', { name: '查看其余 9 条' }));
   expect(screen.getAllByRole('button', { name: /机器 \d/ })).toHaveLength(12);
-  expect(screen.getByRole('button', { name: '收起' })).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: '收起到最近 3 条' }));
+  expect(screen.getAllByRole('button', { name: /机器 \d/ })).toHaveLength(3);
 });
 
 it('访客读取独立的脱敏缓存且不会提交已读游标', async () => {

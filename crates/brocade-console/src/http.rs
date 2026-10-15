@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     env, fmt, fs,
     net::IpAddr,
@@ -36,7 +36,8 @@ use brocade_core::{
 use brocade_deployment::plan::DeploymentKind;
 use brocade_deployment::protocol::{
     AgentObservationRequest, AgentRealtimeSample, DeploymentWaveConfirmationRequest,
-    NodePublicIpObservation, NodeRuntimeReport, RouteIpReport, TargetConvergenceReport,
+    ForwardingReconcileReport, ForwardingUsageReportRequest, NodePublicIpObservation,
+    NodeRuntimeReport, RouteIpReport, TargetConvergenceReport,
     UpdateRealtimeTelemetryPolicyRequest, UsageReportRequest, VpngateCatalogSyncAssignment,
     VpngateCatalogSyncFailure, VpngateIpIntelligenceAssignment, VpngateIpIntelligenceReport,
     VpngatePoolReport, VpngateProbeReport, VpngateReconcileReport, XrayReleaseOffer,
@@ -49,20 +50,21 @@ use brocade_store::{
     CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest,
     CreateIngressRequest, CreateRollbackRequest, CreateTenantRequest, CreateUserRequest,
     CreateXrayReleaseRequest, DeleteFrontRequest, DistributionSettings, E2eProbeItem,
-    E2eProbeRequest, HostNetworkTuning, IsolateDeploymentTargetRequest, IsolateNodeRequest,
-    LinkHealthRequest, LinkProbeRequest, LoadReportRequest, LoadSeriesQuery, ModelOp,
-    NodeLifecyclePhase, PgStore, PhantunBinaries, PingProbeReportRequest, PingProbeSettings,
-    ProvisionNodeRequest, ProvisionNodeResult, ProvisionedNode, RegisterWarpBindingRequest,
-    RemoveRetiredNodesRequest, RemoveWarpBindingRequest, RequestVpngatePoolSwitch,
-    SetUserAppQuotaRequest, SetUserPasswordRequest, StoreError, SystemInitRequest,
-    TunnelProbeSource, UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    E2eProbeRequest, ForwardingEntitlementWrite, ForwardingRuleWrite, HostNetworkTuning,
+    IsolateDeploymentTargetRequest, IsolateNodeRequest, LinkHealthRequest, LinkProbeRequest,
+    LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
+    PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
+    ProvisionedNode, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
+    RemoveWarpBindingRequest, RequestVpngatePoolSwitch, SetUserAppQuotaRequest,
+    SetUserPasswordRequest, StoreError, SystemInitRequest, TunnelProbeSource,
+    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
     UpdateNodeStatusRequest, UpdateNodeTrafficRequest, UpdateTunnelProbePolicy,
     UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateVpngateCatalogSettings,
     UpdateVpngateIntelligenceCredentials, UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode,
     UpdateVpngateProbeSettings, UpdateWarpBindingRequest, UserDirectLoginRequest,
-    VerifyDeploymentRequest, VpngateAdmissionPolicy, VpngateIntelligencePolicy,
-    VpngateProbeNodeOrigin, VpngateServerPageRequest, VpngateSyncClaim, XrayBuildInfo,
-    XrayReleaseArtifact, XrayReleaseSummary, PUBLIC_OPERATOR_ID,
+    UserTrafficHistoryScope, VerifyDeploymentRequest, VpngateAdmissionPolicy,
+    VpngateIntelligencePolicy, VpngateProbeNodeOrigin, VpngateServerPageRequest, VpngateSyncClaim,
+    XrayBuildInfo, XrayReleaseArtifact, XrayReleaseSummary, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -766,8 +768,11 @@ fn role_masks_assets(role: AdminRole) -> bool {
 /// what it serves is the desired state a machine converges to, and an agent handed
 /// `123.123.***.***` would write it into wg0 and take the backbone down.
 async fn mask_assets(request: Request, next: Next) -> Response {
-    let self_response = request_admin().is_some_and(|admin| admin.role == AdminRole::User)
-        && self_route_may_hold_secrets(request.method(), request.uri().path());
+    let self_response = request_admin().is_some_and(|admin| {
+        admin.role == AdminRole::User
+            && (self_route_may_hold_secrets(request.method(), request.uri().path())
+                || forwarding_route_is_for_self(&admin, request.method(), request.uri().path()))
+    });
     let response = next.run(request).await;
     if !response_is_json(&response) {
         return response;
@@ -778,6 +783,32 @@ async fn mask_assets(request: Request, next: Next) -> Response {
         return response;
     }
     mask_response_body(response).await
+}
+
+fn forwarding_route_is_for_self(
+    admin: &AuthenticatedAdmin,
+    method: &axum::http::Method,
+    path: &str,
+) -> bool {
+    if method != axum::http::Method::GET
+        && method != axum::http::Method::POST
+        && method != axum::http::Method::PUT
+        && method != axum::http::Method::DELETE
+    {
+        return false;
+    }
+    let Some(user) = admin.self_user.as_ref() else {
+        return false;
+    };
+    let Some(rest) = path.strip_prefix("/users/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(tenant), Some(user_id), Some("forwarding"))
+            if tenant == user.tenant_id && user_id == user.user_id
+    )
 }
 
 fn self_route_may_hold_secrets(method: &axum::http::Method, path: &str) -> bool {
@@ -894,6 +925,27 @@ fn user_may(method: &axum::http::Method, path: &str) -> bool {
         || ((method == axum::http::Method::GET || method == axum::http::Method::DELETE)
             && is_grant_probe_job_path(path))
         || (method == axum::http::Method::GET && is_grant_probe_events_path(path))
+        || is_user_forwarding_path(method, path)
+}
+
+fn is_user_forwarding_path(method: &axum::http::Method, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/users/") else {
+        return false;
+    };
+    let parts = rest.split('/').collect::<Vec<_>>();
+    if parts.len() < 3 || parts[0].is_empty() || parts[1].is_empty() || parts[2] != "forwarding" {
+        return false;
+    }
+    match parts.as_slice() {
+        [_, _, "forwarding"] => {
+            method == axum::http::Method::GET || method == axum::http::Method::POST
+        }
+        [_, _, "forwarding", rule_id] => {
+            rule_id.parse::<i64>().is_ok()
+                && (method == axum::http::Method::PUT || method == axum::http::Method::DELETE)
+        }
+        _ => false,
+    }
 }
 
 fn is_user_grant_probe_plan_path(path: &str) -> bool {
@@ -1088,6 +1140,10 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/realtime/nodes/{node_id}/snapshot",
             get(realtime_node_snapshot),
         )
+        .route(
+            "/realtime/nodes/{node_id}/user-history",
+            get(realtime_node_user_history),
+        )
         // Active connection observation is operational state: agents read it immediately and it
         // never becomes part of a release revision.
         .route(
@@ -1120,6 +1176,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         // Physical interface accounting is live operational state. Policy and calibration apply
         // immediately and never create a model revision or deployment.
         .route("/node-traffic", get(get_node_traffic))
+        .route("/usage/machine-model", get(get_machine_traffic_model))
         .route("/node-traffic/nodes/{node_id}", put(update_node_traffic))
         // Alongside /distribution and for the same reason: no revision and no release. Separate
         // from it because the two are read on different schedules by different callers.
@@ -1257,6 +1314,18 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/users", get(list_users).post(create_user))
         .route("/users/presence", get(list_user_presence))
         .route(
+            "/users/{tenant_id}/{user_id}/realtime/events",
+            get(realtime_user_events),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/realtime/snapshot",
+            get(realtime_user_snapshot),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/realtime/history",
+            get(realtime_user_history),
+        )
+        .route(
             "/users/{tenant_id}/{user_id}/presence-history",
             get(user_online_source_history),
         )
@@ -1287,6 +1356,18 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/users/{tenant_id}/{user_id}/status",
             put(update_user_status),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/forwarding",
+            get(user_forwarding_overview).post(create_user_forwarding_rule),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/forwarding/{rule_id}",
+            put(update_user_forwarding_rule).delete(delete_user_forwarding_rule),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/forwarding-nodes/{node_id}",
+            put(set_user_forwarding_entitlement).delete(delete_user_forwarding_entitlement),
         )
         .route(
             "/users/{tenant_id}/{user_id}/grant-probes",
@@ -1569,6 +1650,15 @@ fn agent_routes() -> Router<AppState> {
             post(agent_xray_release_report),
         )
         .route("/agent/v1/usage", post(agent_usage))
+        .route(
+            "/agent/v1/forwarding/desired",
+            get(agent_forwarding_desired),
+        )
+        .route(
+            "/agent/v1/forwarding/reconcile",
+            post(agent_forwarding_reconcile),
+        )
+        .route("/agent/v1/forwarding/usage", post(agent_forwarding_usage))
         .route("/agent/v1/load", post(agent_load))
         .route("/agent/v1/realtime", get(agent_realtime))
         .route(
@@ -2407,12 +2497,13 @@ async fn realtime_node_events(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let (subscription, mask_assets) = realtime_node_subscription(&state, &headers, node_id).await?;
+    let (subscription, mask_assets, mode) =
+        realtime_node_subscription(&state, &headers, node_id).await?;
     Ok(realtime_stream_response(
         subscription,
         state.shutdown,
         mask_assets,
-        RealtimeStreamMode::Node,
+        mode,
     ))
 }
 
@@ -2426,11 +2517,12 @@ async fn realtime_node_snapshot(
     Path(node_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let (subscription, _) = realtime_node_subscription(&state, &headers, node_id).await?;
-    let payload = json!({
+    let (subscription, _, mode) = realtime_node_subscription(&state, &headers, node_id).await?;
+    let mut payload = json!({
         "policy": &subscription.policy,
         "nodes": &subscription.snapshots,
     });
+    filter_realtime_user_traffic(&mut payload, &mode);
     let mut response = Json(payload).into_response();
     response
         .headers_mut()
@@ -2442,7 +2534,11 @@ async fn realtime_node_subscription(
     state: &AppState,
     headers: &HeaderMap,
     node_id: String,
-) -> ApiResult<(crate::realtime::RealtimeSubscription, bool)> {
+) -> ApiResult<(
+    crate::realtime::RealtimeSubscription,
+    bool,
+    RealtimeStreamMode,
+)> {
     let admin = require_admin_context(state, headers, AdminPermission::Read).await?;
     let visible = state.store.list_node_agent_states(&admin).await?;
     let Some(node) = visible.nodes.iter().find(|node| node.node_id == node_id) else {
@@ -2456,10 +2552,174 @@ async fn realtime_node_subscription(
             node.lifecycle_phase
         ))));
     }
+    let user_traffic = admin.can_view_user_realtime_traffic();
+    let forwarding = if user_traffic {
+        state
+            .store
+            .node_forwarding_realtime_targets(&admin, &node_id)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let forwarding_expected = !forwarding.is_empty();
+    let subscription = if user_traffic {
+        state
+            .realtime
+            .subscribe_with_forwarding(node_id, forwarding)
+            .await
+    } else {
+        state.realtime.subscribe_diagnostics(vec![node_id]).await
+    };
     Ok((
-        state.realtime.subscribe(vec![node_id]).await,
+        subscription,
         role_masks_assets(admin.role()),
+        RealtimeStreamMode::Node {
+            user_traffic,
+            tenant_scope: admin.tenant_scope().map(str::to_owned),
+            forwarding_expected,
+        },
     ))
+}
+
+async fn realtime_user_subscription(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_id: String,
+    user_id: String,
+) -> ApiResult<(crate::realtime::RealtimeSubscription, RealtimeStreamMode)> {
+    let admin = require_admin_context(state, headers, AdminPermission::Read).await?;
+    let targets = state
+        .store
+        .user_realtime_targets(&admin, &tenant_id, &user_id)
+        .await?;
+    let ingress_ids = targets
+        .iter()
+        .flat_map(|target| target.labels.iter())
+        .filter_map(|label| {
+            brocade_core::model::parse_grant_label(label).map(|(_, _, ingress)| ingress.to_owned())
+        })
+        .collect();
+    let forwarding_rule_ids = targets
+        .iter()
+        .map(|target| {
+            (
+                target.node_id.clone(),
+                target
+                    .forwarding
+                    .iter()
+                    .map(|target| target.rule_id)
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok((
+        state.realtime.subscribe_user_targets(targets).await,
+        RealtimeStreamMode::User {
+            tenant_id,
+            user_id,
+            ingress_ids,
+            forwarding_rule_ids,
+        },
+    ))
+}
+
+async fn realtime_user_events(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (subscription, mode) =
+        realtime_user_subscription(&state, &headers, tenant_id, user_id).await?;
+    Ok(realtime_stream_response(
+        subscription,
+        state.shutdown,
+        false,
+        mode,
+    ))
+}
+
+async fn realtime_user_snapshot(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (subscription, mode) =
+        realtime_user_subscription(&state, &headers, tenant_id, user_id).await?;
+    let mut payload = json!({ "policy": subscription.policy, "nodes": subscription.snapshots });
+    filter_realtime_user_traffic(&mut payload, &mode);
+    let mut response = Json(payload).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct UserTrafficHistoryQuery {
+    /// Range ending now, in seconds. The store clamps it to the card's one-hour view.
+    window_secs: Option<u32>,
+}
+
+const USER_TRAFFIC_HISTORY_DEFAULT_SECS: u32 = 3_600;
+
+/// The accounting windows that open the machine page's user-traffic card. Unlike the live
+/// stream this reads durable history, so a stopped machine stays readable while it is visible.
+async fn realtime_node_user_history(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<UserTrafficHistoryQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let visible = state.store.list_node_agent_states(&admin).await?;
+    if !visible.nodes.iter().any(|node| node.node_id == node_id) {
+        return Err(ApiError::Store(StoreError::NotFound(format!(
+            "node {node_id}"
+        ))));
+    }
+    let history = state
+        .store
+        .list_user_traffic_history(
+            &admin,
+            UserTrafficHistoryScope::Node(&node_id),
+            query
+                .window_secs
+                .unwrap_or(USER_TRAFFIC_HISTORY_DEFAULT_SECS),
+        )
+        .await?;
+    Ok(no_store_json(history))
+}
+
+async fn realtime_user_history(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<UserTrafficHistoryQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let history = state
+        .store
+        .list_user_traffic_history(
+            &admin,
+            UserTrafficHistoryScope::User {
+                tenant_id: &tenant_id,
+                user_id: &user_id,
+            },
+            query
+                .window_secs
+                .unwrap_or(USER_TRAFFIC_HISTORY_DEFAULT_SECS),
+        )
+        .await?;
+    Ok(no_store_json(history))
+}
+
+/// Recent history changes every 30 seconds; a cached copy would hide the newest window.
+fn no_store_json(value: impl Serialize) -> Response {
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn realtime_fleet_events(
@@ -2484,24 +2744,141 @@ async fn realtime_events_response(
     mask_assets: bool,
 ) -> ApiResult<Response> {
     Ok(realtime_stream_response(
-        state.realtime.subscribe(nodes).await,
+        state.realtime.subscribe_nic(nodes).await,
         state.shutdown.clone(),
         mask_assets,
         RealtimeStreamMode::Fleet,
     ))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RealtimeStreamMode {
     /// A machine page needs worker diagnostics, but their freshness budget is much looser than
-    /// the one-second NIC rate. Complete snapshots are therefore capped at one per five seconds.
-    Node,
+    /// the one-second NIC rate. Protocol 25 Agents already emit heavy diagnostics every five
+    /// seconds; the shorter Console coalescing floor keeps legacy Agents bounded without dropping
+    /// a current Agent frame merely because the two five-second clocks differ by a few millis.
+    Node {
+        user_traffic: bool,
+        tenant_scope: Option<String>,
+        forwarding_expected: bool,
+    },
     /// The global header consumes only NIC rates. Worker snapshots can be hundreds of kilobytes
     /// and are never useful to that consumer.
     Fleet,
+    User {
+        tenant_id: String,
+        user_id: String,
+        ingress_ids: HashSet<String>,
+        forwarding_rule_ids: HashMap<String, HashSet<i64>>,
+    },
 }
 
-const REALTIME_DIAGNOSTICS_INTERVAL_MILLIS: i64 = 5_000;
+/// Never trust the Agent's combined watcher selection as the HTTP authorization boundary. The
+/// process-local ring can hold all users from another administrator's concurrent machine view.
+fn filter_realtime_user_traffic(value: &mut Value, mode: &RealtimeStreamMode) {
+    if let Some(nodes) = value.get_mut("nodes").and_then(Value::as_array_mut) {
+        for node in nodes {
+            if let Some(samples) = node.get_mut("samples").and_then(Value::as_array_mut) {
+                for event in samples {
+                    filter_realtime_user_traffic(event, mode);
+                }
+            }
+        }
+        return;
+    }
+    let node_id = value
+        .get("node_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(sample) = value.get_mut("sample").and_then(Value::as_object_mut) else {
+        return;
+    };
+    match mode {
+        RealtimeStreamMode::Fleet
+        | RealtimeStreamMode::Node {
+            user_traffic: false,
+            ..
+        } => {
+            sample.remove("user_traffic");
+        }
+        RealtimeStreamMode::Node {
+            tenant_scope,
+            forwarding_expected,
+            ..
+        } => {
+            if let Some(report) = sample
+                .get_mut("user_traffic")
+                .and_then(Value::as_object_mut)
+            {
+                report.insert(
+                    "forwarding_expected".to_owned(),
+                    Value::Bool(*forwarding_expected),
+                );
+            }
+            if let Some(scope) = tenant_scope {
+                if let Some(users) = sample
+                    .get_mut("user_traffic")
+                    .and_then(|report| report.get_mut("users"))
+                    .and_then(Value::as_array_mut)
+                {
+                    users.retain(|user| {
+                        user.get("tenant_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|tenant| brocade_store::tenant_in_scope(tenant, scope))
+                    });
+                }
+            }
+        }
+        RealtimeStreamMode::User {
+            tenant_id,
+            user_id,
+            ingress_ids,
+            forwarding_rule_ids,
+        } => {
+            // Forwarding capability and ownership are machine-local. One user's forwarding
+            // entry must not make their unrelated access machines appear incomplete.
+            let forwarding_rules = node_id
+                .as_deref()
+                .and_then(|node_id| forwarding_rule_ids.get(node_id));
+            // The user card consumes only this rate report. Do not fan machine NIC counters or
+            // worker diagnostics out through a user-scoped endpoint.
+            sample.retain(|key, _| {
+                matches!(
+                    key.as_str(),
+                    "sequence" | "sampled_at_unix_millis" | "user_traffic"
+                )
+            });
+            if let Some(report) = sample
+                .get_mut("user_traffic")
+                .and_then(Value::as_object_mut)
+            {
+                report.insert("all_users".to_owned(), Value::Bool(false));
+                report.insert(
+                    "forwarding_expected".to_owned(),
+                    Value::Bool(forwarding_rules.is_some_and(|rules| !rules.is_empty())),
+                );
+                if let Some(users) = report.get_mut("users").and_then(Value::as_array_mut) {
+                    users.retain(|user| {
+                        user.get("tenant_id").and_then(Value::as_str) == Some(tenant_id)
+                            && user.get("user_id").and_then(Value::as_str) == Some(user_id)
+                            && (user
+                                .get("ingress_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| ingress_ids.contains(id))
+                                || user
+                                    .get("forwarding_rule_id")
+                                    .and_then(Value::as_i64)
+                                    .is_some_and(|id| {
+                                        forwarding_rules.is_some_and(|rules| rules.contains(&id))
+                                    }))
+                    });
+                }
+            }
+        }
+    }
+}
+
+const REALTIME_DIAGNOSTICS_COALESCE_MILLIS: i64 = 4_000;
 
 fn omit_realtime_diagnostics(value: &mut Value, mark_unchanged: bool) {
     let Some(sample) = value.get_mut("sample").and_then(Value::as_object_mut) else {
@@ -2509,6 +2886,7 @@ fn omit_realtime_diagnostics(value: &mut Value, mark_unchanged: bool) {
     };
     sample.remove("reverse_health");
     sample.remove("mux");
+    sample.remove("mux_unchanged");
     sample.remove("vpngate");
     if mark_unchanged {
         sample.insert("diagnostics_unchanged".to_owned(), Value::Bool(true));
@@ -2534,7 +2912,7 @@ fn omit_snapshot_diagnostics(value: &mut Value) {
 fn diagnostics_due(last_sent: &mut HashMap<String, i64>, node_id: &str, received_at: i64) -> bool {
     if last_sent.get(node_id).is_some_and(|previous| {
         received_at >= *previous
-            && received_at.saturating_sub(*previous) < REALTIME_DIAGNOSTICS_INTERVAL_MILLIS
+            && received_at.saturating_sub(*previous) < REALTIME_DIAGNOSTICS_COALESCE_MILLIS
     }) {
         return false;
     }
@@ -2551,7 +2929,7 @@ fn realtime_stream_response(
     mode: RealtimeStreamMode,
 ) -> Response {
     let mut diagnostics_sent_at = HashMap::new();
-    if mode == RealtimeStreamMode::Node {
+    if matches!(mode, RealtimeStreamMode::Node { .. }) {
         for node in &subscription.snapshots {
             if let Some(latest) = node.samples.last() {
                 diagnostics_sent_at.insert(node.node_id.clone(), latest.received_at_unix_millis);
@@ -2563,6 +2941,7 @@ fn realtime_stream_response(
     if mode == RealtimeStreamMode::Fleet {
         omit_snapshot_diagnostics(&mut initial_value);
     }
+    filter_realtime_user_traffic(&mut initial_value, &mode);
     if mask_assets {
         mask_realtime_vpngate(&mut initial_value);
     }
@@ -2584,16 +2963,24 @@ fn realtime_stream_response(
         // whole-variable capture; the regression test below pins it.
         let mut subscription = subscription;
         yield Ok::<Event, Infallible>(initial);
+        // A new HTTP lease rechecks the cookie, role, tenant scope and current grants. Keep live
+        // views bounded in time so revoking an administrator does not leave an old stream open.
+        let reauthorize = tokio::time::sleep(Duration::from_secs(60));
+        tokio::pin!(reauthorize);
         loop {
             let received = tokio::select! {
                 event = subscription.events.recv() => event,
                 _ = shutdown.requested() => break,
+                _ = &mut reauthorize => {
+                    yield Ok(Event::default().event("reset").data("authorization_refresh"));
+                    break;
+                },
             };
             match received {
                 Ok(event) if subscription.visible_nodes.contains(event.node_id()) => {
                     let (name, mut value) = match event {
                         crate::realtime::RealtimeBroadcast::Sample(value) => {
-                            let omit = mode == RealtimeStreamMode::Fleet
+                            let omit = !matches!(mode, RealtimeStreamMode::Node { .. })
                                 || value.sample.diagnostics_unchanged
                                 || !diagnostics_due(
                                     &mut diagnostics_sent_at,
@@ -2604,13 +2991,14 @@ fn realtime_stream_response(
                             if omit {
                                 omit_realtime_diagnostics(
                                     &mut serialized,
-                                    mode == RealtimeStreamMode::Node,
+                                    matches!(mode, RealtimeStreamMode::Node { .. }),
                                 );
                             }
                             ("sample", serialized)
                         }
                         crate::realtime::RealtimeBroadcast::Status(value) => ("status", json!(value)),
                     };
+                    filter_realtime_user_traffic(&mut value, &mode);
                     if mask_assets {
                         mask_realtime_vpngate(&mut value);
                     }
@@ -2897,6 +3285,20 @@ async fn get_node_traffic(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(Json(state.store.node_traffic(&admin).await?).into_response())
+}
+
+async fn get_machine_traffic_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    // Deliberately absent from public_may: visitors and self-service users must neither see the
+    // fleet capacity tab nor turn a guessed URL into a cross-machine allocation export.
+    let authenticated = require_admin(&state, &headers, AdminPermission::Read).await?;
+    if authenticated.role == AdminRole::User {
+        return Err(ApiError::Forbidden);
+    }
+    let admin = AdminContext::from_authenticated(&authenticated);
+    Ok(Json(state.store.machine_traffic_model(&admin).await?).into_response())
 }
 
 async fn update_node_traffic(
@@ -4218,6 +4620,87 @@ async fn list_users(
             query.tenant_id.as_deref(),
             query.include_disabled.unwrap_or(false),
         )
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn user_forwarding_overview(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .forwarding_overview(&admin, &tenant_id, &user_id)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn set_user_forwarding_entitlement(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id, node_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ForwardingEntitlementWrite>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .set_forwarding_entitlement(&admin, &tenant_id, &user_id, &node_id, request)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn delete_user_forwarding_entitlement(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id, node_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .delete_forwarding_entitlement(&admin, &tenant_id, &user_id, &node_id)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn create_user_forwarding_rule(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ForwardingRuleWrite>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .create_forwarding_rule(&admin, &tenant_id, &user_id, request)
+        .await?;
+    Ok((StatusCode::CREATED, Json(result)).into_response())
+}
+
+async fn update_user_forwarding_rule(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id, rule_id)): Path<(String, String, i64)>,
+    headers: HeaderMap,
+    Json(request): Json<ForwardingRuleWrite>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .update_forwarding_rule(&admin, &tenant_id, &user_id, rule_id, request)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn delete_user_forwarding_rule(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id, rule_id)): Path<(String, String, i64)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .delete_forwarding_rule(&admin, &tenant_id, &user_id, rule_id)
         .await?;
     Ok(Json(result).into_response())
 }
@@ -6474,12 +6957,60 @@ async fn agent_usage(
     Ok(Json(result).into_response())
 }
 
+async fn agent_forwarding_desired(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if agent_protocol_version(&headers)
+        .is_none_or(|version| version < brocade_deployment::protocol::FORWARDING_PROTOCOL_VERSION)
+    {
+        return Err(ApiError::Store(StoreError::Unsupported(
+            "agent does not support forwarding desired state".to_owned(),
+        )));
+    }
+    let desired = state
+        .store
+        .forwarding_desired_for_node(&node.node_id)
+        .await?;
+    Ok(Json(desired).into_response())
+}
+
+async fn agent_forwarding_reconcile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<ForwardingReconcileReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    let desired = state
+        .store
+        .record_forwarding_reconcile(&node.node_id, report)
+        .await?;
+    Ok(Json(desired).into_response())
+}
+
+async fn agent_forwarding_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<ForwardingUsageReportRequest>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    let result = state
+        .store
+        .record_forwarding_usage(&node.node_id, report)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
 /// Host load and per-hop link quality. As with usage, `node_id` comes from the token rather than
 /// from whatever the body claims to be.
 ///
-/// A 4xx here is final and the agent discards the round. There is no spool behind this endpoint,
-/// for the reason given on `LoadReportResult`: a stale CPU reading has no value, and a retry
-/// queue for it would be a file that can fill a disk.
+/// The Agent keeps a bounded one-hour disk spool behind this endpoint. Storage deduplicates by
+/// node/window, accepts delayed history without replacing current host/process state, and returns
+/// 4xx only when retrying the same body cannot make it valid.
 async fn agent_load(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6528,7 +7059,7 @@ async fn serve_agent_realtime(
 ) {
     let mut session = realtime.register_agent(node_id.clone()).await;
     let session_id = session.session;
-    let initial = *session.commands.borrow_and_update();
+    let initial = session.commands.borrow_and_update().clone();
     let Ok(initial) = serde_json::to_string(&initial) else {
         realtime.unregister_agent(&node_id, session_id).await;
         return;
@@ -6564,7 +7095,7 @@ async fn serve_agent_realtime(
             }
             changed = session.commands.changed() => {
                 if changed.is_err() { break; }
-                let command = *session.commands.borrow_and_update();
+                let command = session.commands.borrow_and_update().clone();
                 let Ok(text) = serde_json::to_string(&command) else { break };
                 if socket.send(WebSocketMessage::Text(text.into())).await.is_err() {
                     break;
@@ -7976,6 +8507,7 @@ mod tests {
         assert_eq!(sample["rx_bytes_per_sec"], 12);
         assert!(sample.get("reverse_health").is_none());
         assert!(sample.get("mux").is_none());
+        assert!(sample.get("mux_unchanged").is_none());
         assert!(sample.get("vpngate").is_none());
         assert!(sample.get("diagnostics_unchanged").is_none());
     }
@@ -7984,8 +8516,12 @@ mod tests {
     fn node_realtime_projection_caps_complete_diagnostics_without_clock_lockout() {
         let mut sent = std::collections::HashMap::new();
         assert!(super::diagnostics_due(&mut sent, "n1", 10_000));
-        assert!(!super::diagnostics_due(&mut sent, "n1", 14_999));
-        assert!(super::diagnostics_due(&mut sent, "n1", 15_000));
+        assert!(!super::diagnostics_due(&mut sent, "n1", 13_999));
+        assert!(super::diagnostics_due(&mut sent, "n1", 14_000));
+        // A nominal five-second Agent diagnostic must survive small scheduling drift instead of
+        // being discarded until the following frame and pushing VPN Gate against its stale limit.
+        assert!(super::diagnostics_due(&mut sent, "n2", 20_000));
+        assert!(super::diagnostics_due(&mut sent, "n2", 24_999));
         // A wall-clock correction must not suppress diagnostics until the old timestamp catches up.
         assert!(super::diagnostics_due(&mut sent, "n1", 12_000));
     }
@@ -8008,7 +8544,11 @@ mod tests {
             realtime.subscribe(vec!["n1".to_owned()]).await,
             crate::lifecycle::ShutdownSignal::new(),
             false,
-            super::RealtimeStreamMode::Node,
+            super::RealtimeStreamMode::Node {
+                forwarding_expected: false,
+                user_traffic: true,
+                tenant_scope: None,
+            },
         );
         // 让任何已经排上的释放任务先跑完，再断言——否则「还没来得及释放」会被误读成「没释放」。
         for _ in 0..8 {
@@ -8044,7 +8584,11 @@ mod tests {
             realtime.subscribe(vec!["n1".to_owned()]).await,
             shutdown.clone(),
             false,
-            super::RealtimeStreamMode::Node,
+            super::RealtimeStreamMode::Node {
+                forwarding_expected: false,
+                user_traffic: true,
+                tenant_scope: None,
+            },
         );
         let mut body = response.into_body().into_data_stream();
 
@@ -8088,6 +8632,173 @@ mod tests {
         assert_eq!(
             value["sample"]["mux"]["events"][0]["reason"],
             "transport_closed"
+        );
+    }
+
+    #[test]
+    fn realtime_user_projection_filters_concurrent_watchers_and_non_administrators() {
+        let event = serde_json::json!({ "sample": {
+            "sequence": 1, "sampled_at_unix_millis": 1000,
+            "rx_bytes_per_sec": 9000, "mux": { "workers": [1] },
+            "user_traffic": { "state": "ready", "all_users": true, "users": [
+                { "tenant_id": "platform.acme", "user_id": "alice", "ingress_id": "entry", "uplink_bytes_per_sec": 10 },
+                { "tenant_id": "platform.acme", "user_id": "alice", "ingress_id": "revoked", "uplink_bytes_per_sec": 20 },
+                { "tenant_id": "platform.acme", "user_id": "bob", "ingress_id": "entry", "uplink_bytes_per_sec": 30 },
+                { "tenant_id": "platform.other", "user_id": "alice", "ingress_id": "entry", "uplink_bytes_per_sec": 40 }
+            ] }
+        } });
+        for mode in [
+            super::RealtimeStreamMode::Fleet,
+            super::RealtimeStreamMode::Node {
+                forwarding_expected: false,
+                user_traffic: false,
+                tenant_scope: None,
+            },
+        ] {
+            let mut value = serde_json::json!({ "nodes": [{ "samples": [event.clone()] }] });
+            super::filter_realtime_user_traffic(&mut value, &mode);
+            assert!(value["nodes"][0]["samples"][0]["sample"]
+                .get("user_traffic")
+                .is_none());
+        }
+        let mut scoped = event.clone();
+        super::filter_realtime_user_traffic(
+            &mut scoped,
+            &super::RealtimeStreamMode::Node {
+                forwarding_expected: false,
+                user_traffic: true,
+                tenant_scope: Some("platform.acme".to_owned()),
+            },
+        );
+        assert_eq!(
+            scoped["sample"]["user_traffic"]["users"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let mut user = event;
+        super::filter_realtime_user_traffic(
+            &mut user,
+            &super::RealtimeStreamMode::User {
+                forwarding_rule_ids: Default::default(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+                ingress_ids: std::collections::HashSet::from(["entry".to_owned()]),
+            },
+        );
+        assert_eq!(
+            user["sample"]["user_traffic"]["users"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(user["sample"]["user_traffic"]["all_users"], false);
+        assert!(user["sample"].get("rx_bytes_per_sec").is_none());
+        assert!(user["sample"].get("mux").is_none());
+    }
+
+    #[test]
+    fn forwarding_realtime_projection_checks_owner_and_rule_and_marks_old_agents() {
+        let event = serde_json::json!({"node_id":"entry-node","sample":{"user_traffic":{"state":"ready","all_users":true,"users":[
+            {"tenant_id":"platform.acme","user_id":"alice","forwarding_rule_id":7},
+            {"tenant_id":"platform.acme","user_id":"alice","forwarding_rule_id":8},
+            {"tenant_id":"platform.acme","user_id":"bob","forwarding_rule_id":7},
+            {"tenant_id":"platform.other","user_id":"alice","forwarding_rule_id":7}
+        ]}}});
+        let mut value = event.clone();
+        super::filter_realtime_user_traffic(
+            &mut value,
+            &super::RealtimeStreamMode::User {
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+                ingress_ids: Default::default(),
+                forwarding_rule_ids: std::collections::HashMap::from([(
+                    "entry-node".to_owned(),
+                    std::collections::HashSet::from([7]),
+                )]),
+            },
+        );
+        assert_eq!(
+            value["sample"]["user_traffic"]["users"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(value["sample"]["user_traffic"]["forwarding_expected"], true);
+        let mut non_admin = event;
+        super::filter_realtime_user_traffic(
+            &mut non_admin,
+            &super::RealtimeStreamMode::Node {
+                user_traffic: false,
+                tenant_scope: None,
+                forwarding_expected: false,
+            },
+        );
+        assert!(non_admin["sample"].get("user_traffic").is_none());
+    }
+
+    #[test]
+    fn user_forwarding_projection_is_scoped_to_each_machine_in_snapshots_and_events() {
+        let event = |node_id| {
+            serde_json::json!({
+                "node_id": node_id,
+                "sample": {"user_traffic": {"state":"ready", "users":[
+                    {"tenant_id":"platform.acme","user_id":"alice","ingress_id":"entry"},
+                    {"tenant_id":"platform.acme","user_id":"alice","forwarding_rule_id":7}
+                ]}}
+            })
+        };
+        let mode = super::RealtimeStreamMode::User {
+            tenant_id: "platform.acme".to_owned(),
+            user_id: "alice".to_owned(),
+            ingress_ids: std::collections::HashSet::from(["entry".to_owned()]),
+            forwarding_rule_ids: std::collections::HashMap::from([
+                (
+                    "forward-entry".to_owned(),
+                    std::collections::HashSet::from([7]),
+                ),
+                ("access-entry".to_owned(), Default::default()),
+            ]),
+        };
+        let mut snapshot = serde_json::json!({"nodes":[
+            {"node_id":"forward-entry","samples":[event("forward-entry")]},
+            {"node_id":"access-entry","samples":[event("access-entry")]}
+        ]});
+        super::filter_realtime_user_traffic(&mut snapshot, &mode);
+        for (index, node_id, expected, rows) in
+            [(0, "forward-entry", true, 2), (1, "access-entry", false, 1)]
+        {
+            let projected = &snapshot["nodes"][index]["samples"][0];
+            assert_eq!(
+                projected["sample"]["user_traffic"]["forwarding_expected"],
+                expected
+            );
+            assert_eq!(
+                projected["sample"]["user_traffic"]["users"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                rows
+            );
+            let mut live = event(node_id);
+            super::filter_realtime_user_traffic(&mut live, &mode);
+            assert_eq!(&live, projected);
+        }
+        let mut unassigned = event("other-node");
+        super::filter_realtime_user_traffic(&mut unassigned, &mode);
+        assert_eq!(
+            unassigned["sample"]["user_traffic"]["forwarding_expected"],
+            false
+        );
+        assert_eq!(
+            unassigned["sample"]["user_traffic"]["users"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -8387,6 +9098,9 @@ mod tests {
             "/vpngate/settings",
             "/vpngate/countries/JP/servers/extra",
             "/nodes/hk-01/public-ip-history/extra",
+            "/usage/machine-model",
+            "/realtime/nodes/hk-01/user-history",
+            "/users/platform.acme/alice/realtime/history",
         ] {
             assert!(!public_may(&Method::GET, path), "should refuse GET {path}");
         }
@@ -8486,6 +9200,22 @@ mod tests {
             &Method::POST,
             "/users/platform.acme/alice/front-probes"
         ));
+        assert!(user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/forwarding"
+        ));
+        assert!(user_may(
+            &Method::POST,
+            "/users/platform.acme/alice/forwarding"
+        ));
+        assert!(user_may(
+            &Method::PUT,
+            "/users/platform.acme/alice/forwarding/42"
+        ));
+        assert!(user_may(
+            &Method::DELETE,
+            "/users/platform.acme/alice/forwarding/42"
+        ));
         assert!(user_may(&Method::GET, "/grant-probes/p1"));
         assert!(user_may(&Method::DELETE, "/grant-probes/p1"));
         assert!(user_may(&Method::GET, "/grant-probes/p1/events"));
@@ -8511,6 +9241,18 @@ mod tests {
         assert!(!user_may(
             &Method::GET,
             "/users/platform.acme/alice/front-probes"
+        ));
+        assert!(!user_may(
+            &Method::PUT,
+            "/users/platform.acme/alice/forwarding-nodes/n1"
+        ));
+        assert!(!user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/forwarding/not-a-rule"
+        ));
+        assert!(!user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/forwarding/42/extra"
         ));
         assert!(!user_may(
             &Method::POST,

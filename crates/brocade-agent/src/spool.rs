@@ -1,11 +1,11 @@
 //! On-disk retry spools, and the runtime observation reporting that hangs off
 //! them.
 //!
-//! Both spools (usage, convergence results) share one mechanism: write to disk,
-//! then send. Whatever cannot reach the control plane must not be lost —
-//! convergence already happened on this machine, and that result is its only
-//! record.
+//! Usage, convergence results and recent host-load windows share one mechanism: write to disk,
+//! then send. Their overflow policies differ: accounting never evicts a checkpoint, while
+//! operational observations keep a bounded recent history.
 use std::{
+    borrow::Cow,
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -22,11 +22,9 @@ use crate::{
 
 /// One on-disk retry spool.
 ///
-/// Two users, sharing the property that a locally established fact must survive a
-/// network outage: a lost usage reading is traffic given away, a lost convergence
-/// result is a distribution lease waited out for nothing. They differ only in
-/// filename, endpoint, and depth, hence one descriptor rather than two copies —
-/// two copies eventually get fixed on one side only.
+/// All users share the property that a locally established fact must survive at least a normal
+/// control-plane outage. They differ in endpoint, depth and overflow policy, hence one descriptor
+/// rather than several copies which eventually get fixed on only one side.
 #[derive(Clone, Copy)]
 pub(crate) struct Spool {
     pub(crate) file: &'static str,
@@ -41,10 +39,9 @@ pub(crate) struct Spool {
     pub(crate) terminal_statuses: &'static [u16],
 }
 
-/// Spool depth. One long outage must not fill the disk, and an old reading loses
-/// value quickly: the counters are cumulative, so as long as any newer reading
-/// gets through, the dropped windows merge into one long window with every byte
-/// still accounted for — only the time resolution coarsens.
+/// Bounded accounting spool. Never evict an old epoch/generation's final checkpoint: a newer
+/// process or namespace cannot recover its ownership or bytes. Backpressure stops destructive
+/// changes; continuous data-plane counters can catch up once reporting recovers.
 pub(crate) const USAGE_SPOOL: Spool = Spool {
     file: "usage.spool.jsonl",
     endpoint: "/agent/v1/usage",
@@ -52,7 +49,19 @@ pub(crate) const USAGE_SPOOL: Spool = Spool {
     what: "usage",
     unit: "读数",
     dropped_kind: DroppedKind::Usage,
-    terminal_statuses: &[400, 410, 422],
+    terminal_statuses: &[],
+};
+
+/// Forwarding counters use a separate endpoint and ownership ledger but the same cumulative-
+/// counter durability rule as subscription usage.
+pub(crate) const FORWARDING_USAGE_SPOOL: Spool = Spool {
+    file: "forwarding-usage.spool.jsonl",
+    endpoint: "/agent/v1/forwarding/usage",
+    max: 720,
+    what: "forwarding usage",
+    unit: "读数",
+    dropped_kind: DroppedKind::Usage,
+    terminal_statuses: &[],
 };
 
 /// The observation spool is far shorter than the usage one because it cannot
@@ -71,10 +80,24 @@ pub(crate) const OBSERVATION_SPOOL: Spool = Spool {
     terminal_statuses: &[400, 404, 409, 410, 422],
 };
 
+/// Thirty-second host windows retained across a Console maintenance window. Two hours of old CPU
+/// state would be misleading and would race the control plane's one-hour raw-history compactor, so
+/// this deliberately keeps only the most recent hour (120 complete windows).
+pub(crate) const LOAD_SPOOL: Spool = Spool {
+    file: "load.spool.jsonl",
+    endpoint: "/agent/v1/load",
+    max: 120,
+    what: "load",
+    unit: "个指标窗口",
+    dropped_kind: DroppedKind::Load,
+    terminal_statuses: &[400, 404, 410, 422],
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DroppedKind {
     Usage,
     Observation,
+    Load,
 }
 
 impl DroppedKind {
@@ -82,6 +105,7 @@ impl DroppedKind {
         match self {
             Self::Usage => "spool-dropped-usage",
             Self::Observation => "spool-dropped-observation",
+            Self::Load => "spool-dropped-load",
         }
     }
 }
@@ -99,9 +123,11 @@ const LOCAL_RECONCILE_FILE: &str = "local-reconcile.json";
 // exist on paper while still letting a slow POST move the sampling clock.
 static USAGE_FILE_LOCK: Mutex<()> = Mutex::new(());
 static OBSERVATION_FILE_LOCK: Mutex<()> = Mutex::new(());
+static LOAD_FILE_LOCK: Mutex<()> = Mutex::new(());
 static OTHER_FILE_LOCK: Mutex<()> = Mutex::new(());
 static USAGE_DRAIN_LOCK: Mutex<()> = Mutex::new(());
 static OBSERVATION_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+static LOAD_DRAIN_LOCK: Mutex<()> = Mutex::new(());
 static OTHER_DRAIN_LOCK: Mutex<()> = Mutex::new(());
 static DROPPED_LOCK: Mutex<()> = Mutex::new(());
 
@@ -109,6 +135,7 @@ fn file_lock(spool: Spool) -> &'static Mutex<()> {
     match spool.file {
         file if file == USAGE_SPOOL.file => &USAGE_FILE_LOCK,
         file if file == OBSERVATION_SPOOL.file => &OBSERVATION_FILE_LOCK,
+        file if file == LOAD_SPOOL.file => &LOAD_FILE_LOCK,
         _ => &OTHER_FILE_LOCK,
     }
 }
@@ -117,6 +144,7 @@ fn drain_lock(spool: Spool) -> &'static Mutex<()> {
     match spool.file {
         file if file == USAGE_SPOOL.file => &USAGE_DRAIN_LOCK,
         file if file == OBSERVATION_SPOOL.file => &OBSERVATION_DRAIN_LOCK,
+        file if file == LOAD_SPOOL.file => &LOAD_DRAIN_LOCK,
         _ => &OTHER_DRAIN_LOCK,
     }
 }
@@ -284,14 +312,22 @@ pub(crate) fn collect_runtime_report(
 pub(crate) fn collect_spool_backlog(state_dir: &Path) -> Result<SpoolBacklog, String> {
     let usage_dropped = read_dropped(DroppedKind::Usage, state_dir);
     let observation_dropped = read_dropped(DroppedKind::Observation, state_dir);
+    let load_dropped = read_dropped(DroppedKind::Load, state_dir);
     Ok(SpoolBacklog {
         observation: spool_read(OBSERVATION_SPOOL, state_dir)?.len() as u32,
-        usage: spool_read(USAGE_SPOOL, state_dir)?.len() as u32,
+        load: spool_read(LOAD_SPOOL, state_dir)?.len() as u32,
+        usage: spool_read(USAGE_SPOOL, state_dir)?
+            .len()
+            .saturating_add(spool_read(FORWARDING_USAGE_SPOOL, state_dir)?.len())
+            .try_into()
+            .unwrap_or(u32::MAX),
         dropped: read_legacy_dropped(state_dir)
             .saturating_add(usage_dropped)
-            .saturating_add(observation_dropped),
+            .saturating_add(observation_dropped)
+            .saturating_add(load_dropped),
         usage_dropped: Some(usage_dropped),
         observation_dropped: Some(observation_dropped),
+        load_dropped: Some(load_dropped),
     })
 }
 
@@ -340,6 +376,12 @@ pub(crate) fn spool_push<T: serde::Serialize>(
     let mut lines = spool_read_unlocked(spool, state_dir)?;
     lines.push(serde_json::to_string(item).map_err(|error| error.to_string())?);
     if lines.len() > spool.max {
+        if spool.dropped_kind == DroppedKind::Usage {
+            return Err(format!(
+                "{}: accounting queue is full ({}); preserved all checkpoints",
+                spool.what, spool.max
+            ));
+        }
         let dropped = lines.len() - spool.max;
         eprintln!(
             "{}: 队列超过 {} 条，丢掉最旧的 {dropped} {}",
@@ -347,7 +389,7 @@ pub(crate) fn spool_push<T: serde::Serialize>(
         );
         lines.drain(..dropped);
         // A drop must leave a durable, correctly classified trace. Lost usage makes accounting
-        // incomplete; a lost observation instead makes release evidence incomplete.
+        // incomplete; observations distinguish release evidence from host-history windows.
         bump_dropped(spool.dropped_kind, state_dir, dropped as u64);
     }
     spool_write_unlocked(spool, state_dir, &lines)
@@ -404,7 +446,8 @@ pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<bool, Strin
     let mut sent = 0;
     let mut failure = None;
     for line in &lines {
-        match client.request("POST", spool.endpoint, &options.token, Some(line)) {
+        let body = body_for_attempt(spool, line)?;
+        match client.request("POST", spool.endpoint, &options.token, Some(&body)) {
             Ok(response) if (200..300).contains(&response.status) => {
                 sent += 1;
                 println!("{}", response.body);
@@ -456,6 +499,31 @@ pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<bool, Strin
     }
 }
 
+/// Load queue age is not clock skew. Stamp the actual attempt time without rewriting the durable
+/// line: a retry gets a fresh value, while the original sampling time and deduplication key stay
+/// byte-for-byte stable. Other spool protocols retain their exact serialized body.
+fn body_for_attempt<'a>(spool: Spool, line: &'a str) -> Result<Cow<'a, str>, String> {
+    if spool.file != LOAD_SPOOL.file {
+        return Ok(Cow::Borrowed(line));
+    }
+    let mut value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        // Let the control plane make the existing terminal-4xx decision for a corrupt line. A
+        // local parse failure must not pin every valid report behind it forever.
+        Err(_) => return Ok(Cow::Borrowed(line)),
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(Cow::Borrowed(line));
+    };
+    object.insert(
+        "sent_at_unix_secs".to_owned(),
+        serde_json::Value::from(current_unix_secs()?),
+    );
+    serde_json::to_string(&value)
+        .map(Cow::Owned)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -471,8 +539,8 @@ mod tests {
     use crate::options::{ApplyMode, Options};
 
     use super::{
-        collect_spool_backlog, first_line, observe_wg_backend, read_dropped, spool_drain,
-        spool_push, spool_read, DroppedKind, Spool, OBSERVATION_SPOOL,
+        body_for_attempt, collect_spool_backlog, first_line, observe_wg_backend, read_dropped,
+        spool_drain, spool_push, spool_read, DroppedKind, Spool, LOAD_SPOOL, OBSERVATION_SPOOL,
     };
 
     const TEST_SPOOL: Spool = Spool {
@@ -600,6 +668,7 @@ mod tests {
             "服务端永久拒绝也必须进入对应的丢失计数"
         );
         assert_eq!(read_dropped(DroppedKind::Usage, &dir), 0);
+        assert_eq!(read_dropped(DroppedKind::Load, &dir), 0);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -621,14 +690,11 @@ mod tests {
 
     #[test]
     fn usage_never_discards_auth_throttle_timeout_or_conflict_responses() {
-        for status in [401, 403, 404, 408, 409, 425, 429] {
+        for status in [400, 401, 403, 404, 408, 409, 410, 422, 425, 429] {
             assert!(
                 !super::USAGE_SPOOL.terminal_statuses.contains(&status),
                 "HTTP {status} can recover with the same queued body"
             );
-        }
-        for status in [400, 410, 422] {
-            assert!(super::USAGE_SPOOL.terminal_statuses.contains(&status));
         }
     }
 
@@ -735,16 +801,11 @@ mod tests {
         let dir = state_dir("dropped");
         assert_eq!(read_dropped(DroppedKind::Usage, &dir), 0);
         assert_eq!(read_dropped(DroppedKind::Observation, &dir), 0);
+        assert_eq!(read_dropped(DroppedKind::Load, &dir), 0);
 
-        let tiny = Spool {
-            file: "tiny.spool.jsonl",
-            max: 2,
-            dropped_kind: DroppedKind::Usage,
-            ..TEST_SPOOL
-        };
-        for n in 0..5 {
-            spool_push(tiny, &dir, &serde_json::json!({ "n": n })).unwrap();
-        }
+        // Historical/permanently rejected losses remain durable even though new accounting
+        // queues now apply backpressure instead of evicting an epoch's final checkpoint.
+        super::bump_dropped(DroppedKind::Usage, &dir, 3);
         assert_eq!(read_dropped(DroppedKind::Usage, &dir), 3);
         assert_eq!(read_dropped(DroppedKind::Observation, &dir), 0);
 
@@ -764,8 +825,75 @@ mod tests {
         assert_eq!(backlog.dropped, 5, "旧控制面仍能看到全部丢弃");
         assert_eq!(backlog.usage_dropped, Some(3));
         assert_eq!(backlog.observation_dropped, Some(2));
+        assert_eq!(backlog.load_dropped, Some(0));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_accounting_queue_keeps_every_old_checkpoint() {
+        let dir = state_dir("usage-full");
+        let tiny = Spool {
+            file: "tiny.spool.jsonl",
+            max: 2,
+            dropped_kind: DroppedKind::Usage,
+            ..TEST_SPOOL
+        };
+        spool_push(
+            tiny,
+            &dir,
+            &serde_json::json!({"epoch": "old", "counter": 100}),
+        )
+        .unwrap();
+        spool_push(
+            tiny,
+            &dir,
+            &serde_json::json!({"epoch": "new", "counter": 20}),
+        )
+        .unwrap();
+        let before = spool_read(tiny, &dir).unwrap();
+        assert!(spool_push(
+            tiny,
+            &dir,
+            &serde_json::json!({"epoch": "new", "counter": 30})
+        )
+        .is_err());
+        assert_eq!(spool_read(tiny, &dir).unwrap(), before);
+        assert_eq!(read_dropped(DroppedKind::Usage, &dir), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_queue_keeps_only_the_latest_one_hundred_twenty_windows() {
+        let dir = state_dir("load-bounded");
+        for n in 0..125 {
+            spool_push(LOAD_SPOOL, &dir, &serde_json::json!({ "window": n })).unwrap();
+        }
+
+        let queued = spool_read(LOAD_SPOOL, &dir).unwrap();
+        assert_eq!(queued.len(), 120);
+        assert!(queued.first().unwrap().contains("\"window\":5"));
+        assert!(queued.last().unwrap().contains("\"window\":124"));
+        let backlog = collect_spool_backlog(&dir).unwrap();
+        assert_eq!(backlog.load, 120);
+        assert_eq!(backlog.load_dropped, Some(5));
+        assert_eq!(backlog.dropped, 5);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn each_load_delivery_attempt_gets_a_fresh_clock_sample_without_mutating_the_queue() {
+        let queued = r#"{"read_at_unix_secs":1,"sent_at_unix_secs":1}"#;
+        let before = crate::current_unix_secs().unwrap();
+        let outgoing = body_for_attempt(LOAD_SPOOL, queued).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&outgoing).unwrap();
+        assert!(value["sent_at_unix_secs"].as_i64().unwrap() >= before);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(queued).unwrap()["sent_at_unix_secs"],
+            1,
+            "the durable line keeps the original sampling payload"
+        );
     }
 
     #[test]
@@ -777,6 +905,7 @@ mod tests {
         assert_eq!(backlog.dropped, 7);
         assert_eq!(backlog.usage_dropped, Some(0));
         assert_eq!(backlog.observation_dropped, Some(0));
+        assert_eq!(backlog.load_dropped, Some(0));
 
         let _ = fs::remove_dir_all(dir);
     }

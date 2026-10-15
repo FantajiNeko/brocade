@@ -81,7 +81,8 @@ import {
 } from '../api';
 import { fetchPreviewStatus } from '../preview/api';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
-import { can, isVisitor, useSession } from '../session';
+import { can, canViewUserRealtimeTraffic, isVisitor, useSession } from '../session';
+import { NodeUserTrafficCard } from '../user-traffic-realtime';
 import { Ago, Confirm, Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
@@ -109,6 +110,7 @@ import {
 import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { RegionFlag } from '../ui/region-flag';
+import { trafficGapReason } from '../ui/traffic-gap';
 import {
   navigate,
   navigateInPlace,
@@ -1853,25 +1855,6 @@ export function exactBytes(value: string): string {
   return `${whole}.${fraction} ${unit.name}`;
 }
 
-function trafficGapReason(reason: string | null): string {
-  switch (reason) {
-    case 'machine-reboot':
-      return '机器重启';
-    case 'interface-changed':
-      return '默认网卡变化';
-    case 'counter-regressed':
-      return '网卡计数回退';
-    case 'meter-replaced':
-      return 'Agent 流量状态已更换';
-    case 'agent-discontinuity':
-      return 'Agent 检测到计数中断';
-    case 'report-gap':
-      return '控制面跨日失联';
-    default:
-      return '采集从本期中途开始';
-  }
-}
-
 function NicMonthTotal({
   traffic,
   pending,
@@ -1995,11 +1978,18 @@ export function useHopStats(nodeId: string, artifactReadable = true) {
 }
 
 /** 把 usage 桶落到请求区间内的绝对 30 秒网格。无桶表示该窗口没有转发字节，按 0 处理。 */
-function usageRoleTimeline(
+export function usageRoleTimeline(
   series: UsageNodeSeries | undefined,
   rangeStartUnixSecs: number,
   rangeEndUnixSecs: number,
-): { timesUnixSecs: number[]; user: number[]; relay: number[] } {
+): {
+  timesUnixSecs: number[];
+  user: number[];
+  relay: number[];
+  forwarding: (number | null)[];
+  forwardingTimes: number[];
+  forwardingStarts: number[];
+} {
   const slots = Math.max(1, Math.ceil((rangeEndUnixSecs - rangeStartUnixSecs) / GRID_SECS));
   const endKey = Math.floor(rangeEndUnixSecs / GRID_SECS) * GRID_SECS;
   const startKey = endKey - (slots - 1) * GRID_SECS;
@@ -2014,11 +2004,33 @@ function usageRoleTimeline(
     user[index] += ((bucket.user_uplink_bytes + bucket.user_downlink_bytes) * 8) / GRID_SECS;
     relay[index] += ((bucket.relay_uplink_bytes + bucket.relay_downlink_bytes) * 8) / GRID_SECS;
   }
-  return { timesUnixSecs, user, relay };
+  const forwardingByEnd = new Map<number, { start: number; rate: number | null }>();
+  for (const window of series?.forwarding ?? []) {
+    const start = Date.parse(window.window_start) / 1000;
+    const end = Date.parse(window.window_end) / 1000;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    const previous = forwardingByEnd.get(end);
+    forwardingByEnd.set(end, {
+      start: Math.max(start, previous?.start ?? start),
+      rate:
+        window.has_gap || previous?.rate === null
+          ? null
+          : (previous?.rate ?? 0) + ((window.uplink_bytes + window.downlink_bytes) * 8) / (end - start),
+    });
+  }
+  const forwardingEntries = [...forwardingByEnd.entries()].sort(([a], [b]) => a - b);
+  return {
+    timesUnixSecs,
+    user,
+    relay,
+    forwarding: forwardingEntries.map(([, v]) => v.rate),
+    forwardingTimes: forwardingEntries.map(([end]) => end),
+    forwardingStarts: forwardingEntries.map(([, v]) => v.start),
+  };
 }
 
-/* 网卡吞吐与 XRAY 承载吞吐堆进一个面板。两者同窗口、同粒度、用 group 联动十字线，但口径
- * 不同：网卡按方向（接收/发送）统计全部流量，XRAY 按角色（用户/中继）只统计 xray 转发的
+/* 网卡吞吐与 XRAY 承载吞吐堆进一个面板。共享范围并用 group 联动十字线，但使用各自真实窗口。
+ * 网卡按方向（接收/发送）统计全部流量，XRAY 按角色（接入/中继/转发）只统计 xray 承载的
  * 字节——不能合并进一张图，各自的 Y 轴与图例保持这个差异可见，所以是同卡内的两张图。
  * node-load 与 usage 两个查询的 queryKey 都与页面其它处一致，React Query 去重、不多发请求。 */
 export function ThroughputPanel({
@@ -2093,7 +2105,14 @@ export function ThroughputPanel({
 
   // XRAY：按角色只统计 xray 转发的字节。
   const mine = usage.data?.nodes.find(n => n.node_id === nodeId);
-  const { timesUnixSecs: xrayTimes, user, relay } = usageRoleTimeline(mine, rangeStart, rangeEnd);
+  const {
+    timesUnixSecs: xrayTimes,
+    user,
+    relay,
+    forwarding,
+    forwardingTimes,
+    forwardingStarts,
+  } = usageRoleTimeline(mine, rangeStart, rangeEnd);
   const monthTotal = mine ? monthBytes(mine) : 0;
 
   /* 每块图一个单位：标题栏写它，图例按它读数，图内的刻度和 tooltip 走同一次 throughputAxis
@@ -2102,7 +2121,7 @@ export function ThroughputPanel({
     nicRx.length > 0 ? nicRx : [latestNic?.nic_rx_bps ?? null],
     nicTx.length > 0 ? nicTx : [latestNic?.nic_tx_bps ?? null],
   ).unit;
-  const xrayUnit = throughputAxis(user, relay).unit;
+  const xrayUnit = throughputAxis([...user, ...forwarding], relay).unit;
   const ThroughputChart = observationModules?.ThroughputChart ?? LazyThroughputChart;
 
   return (
@@ -2155,11 +2174,18 @@ export function ThroughputPanel({
             <footer className="load-network-legend" aria-label="XRAY 流量图例">
               <span className="rx">
                 <i />
-                用户 <b>{xrayUnit.read(user[user.length - 1])}</b>
+                接入 <b>{xrayUnit.read(user[user.length - 1])}</b>
               </span>
               <span className="tx">
                 <i />
                 中继 <b>{xrayUnit.read(relay[relay.length - 1])}</b>
+              </span>
+              <span className="forwarding">
+                <i />
+                转发{' '}
+                <b>
+                  {forwarding[forwarding.length - 1] == null ? '—' : xrayUnit.read(forwarding[forwarding.length - 1]!)}
+                </b>
               </span>
             </footer>
           </div>
@@ -2170,8 +2196,12 @@ export function ThroughputPanel({
               rangeEndUnixSecs={rangeEnd}
               rx={user}
               tx={relay}
-              rxName="用户"
+              rxName="接入"
               txName="中继"
+              third={forwarding}
+              thirdName="转发"
+              thirdTimesUnixSecs={forwardingTimes}
+              thirdWindowStartsUnixSecs={forwardingStarts}
               group={group}
             />
           </Suspense>
@@ -3319,6 +3349,7 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
         cycle_kind: shown.cycle_kind,
         reset_month: shown.cycle_kind === 'yearly' ? resetMonth : null,
         reset_day: resetDay,
+        quota_bytes: mine?.quota_bytes ?? null,
         calibrated_total_bytes: calibration,
       }),
     onSuccess: view => {
@@ -3814,10 +3845,12 @@ const XRAY_GEODATA_MIN: [number, number] = [26, 4];
 function spoolDropCounts(spool: NonNullable<NodeAgentStateItem['spool_backlog']>) {
   const usage = Math.max(0, spool.usage_dropped ?? 0);
   const observation = Math.max(0, spool.observation_dropped ?? 0);
+  const load = Math.max(0, spool.load_dropped ?? 0);
   return {
     usage,
     observation,
-    unclassified: Math.max(0, spool.dropped - usage - observation),
+    load,
+    unclassified: Math.max(0, spool.dropped - usage - observation - load),
   };
 }
 
@@ -3938,6 +3971,13 @@ export function runtimeFindings(
         tone: 'warn',
         chip: `丢了 ${dropped.observation.toLocaleString()} 条收敛结果`,
         text: <>Agent 已执行但结果被控制面永久拒绝；发布可能缺少执行证据，但这不代表流量丢失。</>,
+      });
+    }
+    if (dropped.load > 0) {
+      out.push({
+        tone: 'warn',
+        chip: `丢了 ${dropped.load.toLocaleString()} 个指标窗口`,
+        text: <>Console 不可达超过本机一小时队列，较早的 CPU、内存、磁盘和网卡速率窗口无法补回。</>,
       });
     }
     if (dropped.unclassified > 0) {
@@ -4223,8 +4263,12 @@ function PingLegendItem({
   target,
   color,
   family,
+  pressed,
+  onToggle,
 }: PingBlockTarget & {
   family: PingProbeFamily;
+  pressed: boolean;
+  onToggle: () => void;
 }) {
   const series = target[family]!;
   const loss = pingLossStats(series.samples);
@@ -4237,8 +4281,16 @@ function PingLegendItem({
   const title =
     `${PING_FAMILY_LABEL[family]} ${series.address}\n所选时段丢包率：${lossText}（丢包 ${loss.lost} / 已探测 ${loss.attempted}）` +
     `\n未探测：${skipped}${reason ? `（${pingSkipReasonText(reason, family)}）` : ''}\n最新样本：${sampledAt}`;
+  const accessibleDetail = reason ? `未探测：${pingSkipReasonText(reason, family)}` : `丢包率 ${lossText}`;
   return (
-    <span title={title}>
+    <button
+      type="button"
+      className="ping-probe-legend-item"
+      title={title}
+      aria-label={`${target.name}曲线，${accessibleDetail}`}
+      aria-pressed={pressed}
+      onClick={onToggle}
+    >
       <i style={{ background: `var(${PING_SERIES_CSS[color % PING_SERIES_CSS.length]})` }} />
       <span className="ping-probe-name">{target.name}</span>
       <b
@@ -4249,13 +4301,23 @@ function PingLegendItem({
       >
         {reason ? pingSkipReasonShort(reason, family) : lossText}
       </b>
-    </span>
+    </button>
   );
 }
 
 /** The shown family's legend: the first targets by block position, and「+N」for the rest. 「+N」
  * takes the loss color of the targets it folds, which the legend would otherwise hide. */
-function PingProbeLegend({ targets, family }: { targets: PingBlockTarget[]; family: PingProbeFamily }) {
+function PingProbeLegend({
+  targets,
+  family,
+  focusedLine,
+  onFocusLine,
+}: {
+  targets: PingBlockTarget[];
+  family: PingProbeFamily;
+  focusedLine: string | null;
+  onFocusLine: (name: string) => void;
+}) {
   const entries = targets.filter(({ target }) => target[family]);
   const shown = entries.slice(0, PING_LEGEND_LIMIT);
   const hidden = entries.slice(PING_LEGEND_LIMIT).map(({ target }) => ({
@@ -4269,9 +4331,19 @@ function PingProbeLegend({ targets, family }: { targets: PingBlockTarget[]; fami
       ? `未列出的目标有丢包：\n${lossy.map(entry => `${entry.name} ${pingLossText(entry.loss.percent)}`).join('\n')}`
       : `未列出：${hidden.map(entry => entry.name).join('、')}`;
   return (
-    <footer className="load-network-legend ping-probe-legend" aria-label="Ping 图例">
+    <footer
+      className="load-network-legend ping-probe-legend"
+      aria-label="Ping 图例"
+      data-focused={focusedLine ? '' : undefined}
+    >
       {shown.map(entry => (
-        <PingLegendItem key={entry.color} {...entry} family={family} />
+        <PingLegendItem
+          key={entry.color}
+          {...entry}
+          family={family}
+          pressed={entry.target.name === focusedLine}
+          onToggle={() => onFocusLine(entry.target.name)}
+        />
       ))}
       {hidden.length > 0 && (
         <span className={moreTone ? `ping-probe-more ${moreTone}` : 'ping-probe-more'} title={moreTitle}>
@@ -4403,6 +4475,8 @@ function PingProbeBlock({
     [targets, family],
   );
   const bodyRef = useRef<HTMLDivElement>(null);
+  const [focusedLine, setFocusedLine] = useState<string | null>(null);
+  const activeLine = focusedLine && lines.some(line => line.name === focusedLine) ? focusedLine : null;
   useFamilySwitchFade(bodyRef, family);
   const label = `${protocol.toUpperCase()} PING`;
   const hasSamples = lines.some(line => line.samples.length > 0);
@@ -4417,7 +4491,14 @@ function PingProbeBlock({
         {/* 量纲跟着图走：没画图时刻度也不存在，标题栏就不该挂一个单位。
             时延轴永远是毫秒（见 observeMsUnit），所以这里不必反算值轴。 */}
         {hasSamples && <span className="chart-unit">({OBSERVE_MS_UNIT})</span>}
-        {targets.length > 0 && <PingProbeLegend targets={targets} family={family} />}
+        {targets.length > 0 && (
+          <PingProbeLegend
+            targets={targets}
+            family={family}
+            focusedLine={activeLine}
+            onFocusLine={name => setFocusedLine(current => (current === name ? null : name))}
+          />
+        )}
         {corner}
       </div>
       <div className="ping-probe-body" ref={bodyRef}>
@@ -4431,7 +4512,7 @@ function PingProbeBlock({
           </p>
         ) : hasSamples ? (
           <Suspense fallback={<ObservationReading ChartLoading={observationModules.ObservationChartLoading} />}>
-            <PingLatencyChart lines={lines} family={family} bounds={bounds} group={group} />
+            <PingLatencyChart lines={lines} family={family} bounds={bounds} group={group} focusedLine={activeLine} />
           </Suspense>
         ) : (
           <p className="note ping-probe-empty">Ping 落点已配置，但 Agent 尚未上报样本。</p>
@@ -4684,7 +4765,7 @@ function AgentCard({
             '上报积压',
             node.spool_backlog ? (
               <>
-                {node.spool_backlog.observation + node.spool_backlog.usage}
+                {node.spool_backlog.observation + node.spool_backlog.usage + (node.spool_backlog.load ?? 0)}
                 <span className="nd-rt-u">条</span>
                 <span className="dim"> · 丢弃 </span>
                 {node.spool_backlog.dropped > 0 ? (
@@ -5915,6 +5996,7 @@ function NodeDetail({
           {/* Mux 与反向隧道来自同一条节点实时流，只建立一个 EventSource。两张卡都只在对应
               快照存在时渲染；计数基线留在浏览器内，不进入遥测历史或数据库。 */}
           <NodeRealtimeProvider nodeId={id}>
+            {canViewUserRealtimeTraffic(who) && <NodeUserTrafficCard nodeId={id} />}
             <VpngateObservationCard nodeId={id} />
             <MuxObservationCard nodeId={id} nodeName={nodeNameOf} chainName={chainNameOf} />
             <ReverseHealthCard nodeId={id} nodeName={nodeNameOf} chainName={chainNameOf} />

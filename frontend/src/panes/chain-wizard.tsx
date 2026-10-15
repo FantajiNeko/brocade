@@ -46,6 +46,7 @@ import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader }
 import { Icon, type IconName } from '../ui/icons';
 import { SUBSCRIPTION_COUNTRY_CODES, subscriptionCountryLabel } from '../ui/subscription-country';
 import { vpngateNodeEligibility } from '../vpngate-capability';
+import { mtprotoNodeEligibility } from '../mtproto-capability';
 import { useUnsavedChanges } from '../ui/navigation-guard';
 import {
   wizardDefaultListenerWire,
@@ -90,12 +91,14 @@ const VLESS_PORT_BASE = 13443;
 const ANYTLS_PORT_BASE = 14443;
 const HY2_PORT_BASE = 30000;
 const HY2_HOP_SPAN = 100;
+const MTPROTO_PORT_BASE = 28800;
 
 export const NEW_CHAIN_PROTOCOL_DEFAULTS = {
   vless: true,
   vlessEncryption: false,
   anytls: true,
   hysteria2: true,
+  mtproto: false,
 } as const;
 
 interface TcpListenerChoice {
@@ -141,7 +144,9 @@ export function newChainWires({
   vless,
   anytls,
   hysteria2,
+  mtproto = false,
   anytlsPort,
+  mtprotoPort = MTPROTO_PORT_BASE,
   anytlsPaddingScheme = [],
   hy2Start,
   hy2End,
@@ -154,7 +159,9 @@ export function newChainWires({
   vless: boolean;
   anytls: boolean;
   hysteria2: boolean;
+  mtproto?: boolean;
   anytlsPort: number;
+  mtprotoPort?: number;
   anytlsPaddingScheme?: string[];
   hy2Start: number;
   hy2End: number;
@@ -197,6 +204,7 @@ export function newChainWires({
           masquerade: { kind: 'not-found' },
         }
       : null,
+    mtproto: mtproto ? { port: mtprotoPort } : null,
   };
 }
 
@@ -231,6 +239,7 @@ function WizardProtocolTile({
   expanded,
   onExpand,
   portRange = false,
+  disabled = false,
 }: {
   name: string;
   note: string;
@@ -242,6 +251,7 @@ function WizardProtocolTile({
   expanded?: boolean;
   onExpand?: () => void;
   portRange?: boolean;
+  disabled?: boolean;
 }) {
   const checkboxId = useId();
   return (
@@ -251,6 +261,7 @@ function WizardProtocolTile({
         type="checkbox"
         aria-label={name}
         checked={enabled}
+        disabled={disabled}
         onChange={event => onToggle(event.target.checked)}
       />
       <label className="protocol-choice-copy" htmlFor={checkboxId}>
@@ -347,6 +358,7 @@ export function ChainWizard({
   const [vlessEnabled, setVlessEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.vless);
   const [anyTlsEnabled, setAnyTlsEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.anytls);
   const [hy2Enabled, setHy2Enabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.hysteria2);
+  const [mtprotoEnabled, setMtProtoEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.mtproto);
   const [customRealityDest, setCustomRealityDest] = useState('');
   const [customRealityNames, setCustomRealityNames] = useState('');
   const [customRealityFingerprint, setCustomRealityFingerprint] = useState('chrome');
@@ -363,6 +375,7 @@ export function ChainWizard({
   const headCertificateNode = snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === head?.node_id);
   const headCertificate = headCertificateNode?.certificate_name ?? null;
   const headCertificateLabel = nodeCertificateLabel(headCertificateNode?.certificate_track);
+  const mtprotoUnavailable = head ? mtprotoNodeEligibility(head).reason : '先选择入口节点';
   // The ordinary case requires no extra choice: a managed node already belongs to the default
   // certificate group, so REALITY borrows that exact local identity. The selector remains visible
   // for an operator who wants the global/custom target instead.
@@ -413,6 +426,7 @@ export function ChainWizard({
   const [portRaw, setPort] = useState<string | null>(null);
   const [encryptionPortRaw, setEncryptionPort] = useState<string | null>(null);
   const [anyTlsPortRaw, setAnyTlsPort] = useState<string | null>(null);
+  const [mtprotoPortRaw, setMtProtoPort] = useState<string | null>(null);
   const [hy2StartRaw, setHy2Start] = useState<string | null>(null);
   const [hy2EndRaw, setHy2End] = useState<string | null>(null);
 
@@ -473,8 +487,27 @@ export function ChainWizard({
     autoEncryptionPort += 1;
   const encryptionPortText = encryptionPortRaw ?? String(autoEncryptionPort);
   const encryptionPort = Number(encryptionPortText);
+  let autoMtProtoPort = freePortAcross(
+    taken,
+    [head?.node_id ?? ''],
+    settings.data?.ports?.mtproto_base || MTPROTO_PORT_BASE,
+  );
+  while (
+    autoMtProtoPort < 65536 &&
+    ((vlessEnabled && autoMtProtoPort === port) ||
+      (encryptionEnabled && autoMtProtoPort === encryptionPort) ||
+      (anyTlsEnabled && autoMtProtoPort === anyTlsPort) ||
+      taken.get(head?.node_id ?? '')?.has(autoMtProtoPort))
+  )
+    autoMtProtoPort += 1;
+  const mtprotoPortText = mtprotoPortRaw ?? String(autoMtProtoPort);
+  const mtprotoPort = Number(mtprotoPortText);
   const enabledProtocolCount =
-    Number(vlessEnabled) + Number(anyTlsEnabled) + Number(hy2Enabled) + Number(encryptionEnabled);
+    Number(vlessEnabled) +
+    Number(anyTlsEnabled) +
+    Number(hy2Enabled) +
+    Number(encryptionEnabled) +
+    Number(mtprotoEnabled);
   const wires = newChainWires({
     vlessEncryption: encryptionEnabled,
     vlessEncryptionPort: encryptionPort,
@@ -482,7 +515,9 @@ export function ChainWizard({
     vless: vlessEnabled,
     anytls: anyTlsEnabled,
     hysteria2: hy2Enabled,
+    mtproto: mtprotoEnabled,
     anytlsPort: anyTlsPort,
+    mtprotoPort,
     anytlsPaddingScheme:
       paddingMode === 'custom'
         ? customPadding
@@ -499,6 +534,7 @@ export function ChainWizard({
   if (vlessEnabled) entryTcpListeners.push({ label: 'VLESS · REALITY', port });
   if (encryptionEnabled) entryTcpListeners.push({ label: 'VLESS · Encryption', port: encryptionPort });
   if (anyTlsEnabled) entryTcpListeners.push({ label: 'AnyTLS', port: anyTlsPort });
+  if (mtprotoEnabled) entryTcpListeners.push({ label: 'MTProxy', port: mtprotoPort });
   const entryPortCollision = entryTcpPortCollision(entryTcpListeners);
   const entryPortIssues = entryTcpListeners.flatMap(listener => {
     if (!Number.isInteger(listener.port) || listener.port < 1 || listener.port > 65_535) {
@@ -693,12 +729,14 @@ export function ChainWizard({
     vlessEnabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.vless ||
     anyTlsEnabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.anytls ||
     hy2Enabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.hysteria2 ||
+    mtprotoEnabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.mtproto ||
     customRealityDest !== '' ||
     customRealityNames !== '' ||
     customRealityFingerprint !== 'chrome' ||
     portRaw !== null ||
     encryptionPortRaw !== null ||
     anyTlsPortRaw !== null ||
+    mtprotoPortRaw !== null ||
     hy2StartRaw !== null ||
     hy2EndRaw !== null ||
     pickedUsers.size > 0;
@@ -775,6 +813,7 @@ export function ChainWizard({
       encryptionEnabled && 'VLESS · Encryption',
       anyTlsEnabled && 'AnyTLS',
       hy2Enabled && 'Hysteria 2',
+      mtprotoEnabled && 'MTProxy',
     ].filter(Boolean);
     list.push({
       op: 'upsert_ingress',
@@ -864,6 +903,7 @@ export function ChainWizard({
           ...(wires.vless_encryption ? { vless_encryption: {} } : {}),
           ...(wires.anytls ? { anytls: {} } : {}),
           ...(wires.hysteria2 ? { hysteria2: {} } : {}),
+          ...(wires.mtproto ? { mtproto: {} } : {}),
         },
         guard: {
           no_private: true,
@@ -940,6 +980,7 @@ export function ChainWizard({
     chainClash,
     ingressClash,
     enabledProtocolCount === 0 ? '至少开启一个接入协议' : null,
+    mtprotoEnabled ? mtprotoUnavailable : null,
     anyTlsEnabled && paddingMode === 'custom' && !customPadding.trim() ? '填写 AnyTLS Padding 规则' : null,
     hy2Enabled && Boolean(hy2Up.trim()) !== Boolean(hy2Down.trim()) ? 'Hysteria 2 上下行带宽需同时填写' : null,
     entryPortCollision,
@@ -1420,6 +1461,27 @@ export function ChainWizard({
                   }
                   expanded={openProtocol === 'hy2'}
                   onExpand={() => setOpenProtocol(openProtocol === 'hy2' ? null : 'hy2')}
+                />
+                <WizardProtocolTile
+                  name="MTProxy"
+                  note={mtprotoUnavailable ?? 'Telegram 代理；要求网卡直配公网 IPv4。'}
+                  icon="telegram"
+                  enabled={mtprotoEnabled}
+                  disabled={!mtprotoEnabled && mtprotoUnavailable !== null}
+                  onToggle={setMtProtoEnabled}
+                  port={
+                    <>
+                      <span>TCP</span>
+                      <input
+                        className="f mono"
+                        inputMode="numeric"
+                        aria-label="MTProxy 监听端口"
+                        value={mtprotoPortText}
+                        onChange={event => setMtProtoPort(event.target.value)}
+                        disabled={!mtprotoEnabled}
+                      />
+                    </>
+                  }
                 />
               </div>
               {enabledProtocolCount === 0 && (

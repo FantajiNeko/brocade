@@ -2,6 +2,7 @@ package mtproto
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"slices"
@@ -12,6 +13,24 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	featurestats "github.com/xtls/xray-core/features/stats"
 )
+
+type unavailableAccounting struct{ featurestats.NoopManager }
+
+func (unavailableAccounting) RegisterCounter(string) (featurestats.Counter, error) {
+	return nil, errors.New("fixture accounting storage unavailable")
+}
+
+func TestAccountConnectionRejectsUnavailableRequiredAccounting(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	_, _, err := accountConnection(unavailableAccounting{}, nil,
+		policy.Session{Stats: policy.Stats{UserUplink: true, UserDownlink: true}},
+		"fixture#entry", "203.0.113.1", server)
+	if err == nil {
+		t.Fatal("accepted an unmetered connection")
+	}
+}
 
 func TestAccountConnectionPublishesUserTrafficAndOnlineProtocol(t *testing.T) {
 	manager, err := appstats.NewManager(context.Background(), nil)
@@ -25,7 +44,7 @@ func TestAccountConnectionPublishesUserTrafficAndOnlineProtocol(t *testing.T) {
 		email    = "alice@example.test#ing-main"
 		sourceIP = "203.0.113.10"
 	)
-	accounted, stopAccounting := accountConnection(
+	accounted, stopAccounting, err := accountConnection(
 		manager,
 		newOnlineObservationTracker(100*time.Millisecond, 16),
 		policy.Session{Stats: policy.Stats{UserUplink: true, UserDownlink: true, UserOnline: true}},
@@ -33,6 +52,9 @@ func TestAccountConnectionPublishesUserTrafficAndOnlineProtocol(t *testing.T) {
 		sourceIP,
 		server,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer accounted.Close()
 
 	online := manager.GetOnlineMap("user>>>" + email + ">>>online")
@@ -104,7 +126,7 @@ func TestAccountConnectionRespectsDisabledUserStats(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	accounted, stopAccounting := accountConnection(
+	accounted, stopAccounting, err := accountConnection(
 		manager,
 		newOnlineObservationTracker(time.Minute, 16),
 		policy.Session{},
@@ -112,6 +134,9 @@ func TestAccountConnectionRespectsDisabledUserStats(t *testing.T) {
 		"203.0.113.10",
 		server,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer stopAccounting()
 
 	if accounted != server {

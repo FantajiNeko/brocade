@@ -98,3 +98,100 @@ it('shows both backend roles, failover reason and replenishment counters', () =>
   expect(screen.getByText('切换完成')).toBeTruthy();
   expect(screen.getAllByText('出口黑洞').length).toBeGreaterThan(0);
 });
+
+it('treats an old initial VPN Gate snapshot as warm-up before declaring it stale', () => {
+  render(<VpngateObservationCard nodeId="node-a" />);
+  const now = Date.now();
+  act(() =>
+    Events.current.send('sample', {
+      node_id: 'node-a',
+      received_at_unix_millis: now,
+      sample: {
+        sampled_at_unix_millis: now,
+        vpngate: {
+          boot_id: 'boot-a',
+          sequence: 1,
+          sampled_at_unix_millis: now - 16_000,
+          pools: [
+            {
+              outbound_id: 'vpngate-us',
+              country_code: 'US',
+              state: 'healthy',
+              ready_standbys: 1,
+              candidate_count: 16,
+              consecutive_failures: 0,
+              probes: 1,
+              probe_failures: 0,
+              failovers: 0,
+              refill_attempts: 0,
+              refill_failures: 0,
+              refill_backoff_remaining_millis: 0,
+            },
+          ],
+          backends: [],
+          events: [],
+        },
+      },
+    }),
+  );
+
+  expect(screen.getByRole('status').textContent).toBe('正在获取实时状态…');
+  expect(screen.queryByText(/正在同步实时数据/)).toBeNull();
+  expect(screen.getByLabelText('VPN Gate 实时路径').textContent).not.toContain('出口池');
+  expect(screen.getByLabelText('VPN Gate 实时路径').textContent).not.toContain('vpngate-us');
+  expect(screen.queryByText(/实时数据连接已中断/)).toBeNull();
+
+  act(() => vi.advanceTimersByTime(16_000));
+  expect(screen.getByText(/实时数据连接已中断，或数据已超过 15 秒未更新/)).toBeTruthy();
+});
+
+it('keeps a fresh report live through a transient fallback polling failure', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('temporary proxy failure')));
+  render(<VpngateObservationCard nodeId="node-a" />);
+  const now = Date.now();
+  act(() =>
+    Events.current.send('sample', {
+      node_id: 'node-a',
+      received_at_unix_millis: now,
+      sample: {
+        sampled_at_unix_millis: now,
+        vpngate: {
+          boot_id: 'boot-a',
+          sequence: 1,
+          sampled_at_unix_millis: now,
+          pools: [
+            {
+              outbound_id: 'vpngate-us',
+              country_code: 'US',
+              state: 'healthy',
+              ready_standbys: 1,
+              candidate_count: 16,
+              consecutive_failures: 0,
+              probes: 1,
+              probe_failures: 0,
+              failovers: 0,
+              refill_attempts: 0,
+              refill_failures: 0,
+              refill_backoff_remaining_millis: 0,
+            },
+          ],
+          backends: [],
+          events: [],
+        },
+      },
+    }),
+  );
+  expect(screen.queryByText(/实时数据连接已中断/)).toBeNull();
+
+  await act(async () => {
+    Events.current.onerror?.();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(screen.queryByText(/实时数据连接已中断/)).toBeNull();
+
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(16_000);
+  });
+  expect(screen.getByText(/实时数据连接已中断，或数据已超过 15 秒未更新/)).toBeTruthy();
+});

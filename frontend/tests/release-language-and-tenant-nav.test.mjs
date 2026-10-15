@@ -54,15 +54,22 @@ test('隧道页位于线路前并接入主导航、路由和页面容器', () =>
   assert.match(panes, /TunnelsPane|case 'tab:tunnels'/);
 });
 
-test('手机顶栏保留机器、线路和用量，其他页面收入账户菜单', () => {
+test('流量预测是管理员独立页面，手机端从账户菜单进入', () => {
+  const nav = shell.match(/const NAV: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
   const mobileNav = shell.match(/const MOBILE_NAV = ([^;]+);/)?.[1] ?? '';
   const mobileMore = shell.match(/const MOBILE_MORE = ([\s\S]*?);\n/)?.[1] ?? '';
+  const routable = state.match(/export const NAV_KEYS = \[([\s\S]*?)\n\]/)?.[1] ?? '';
   assert.match(mobileNav, /f\.key === 'nodes'/);
   assert.match(mobileNav, /f\.key === 'chains'/);
   assert.match(mobileNav, /f\.key === 'usage'/);
-  assert.doesNotMatch(mobileNav, /users|tunnels|deploy/);
-  for (const key of ['users', 'tunnels', 'deploy']) assert.match(mobileMore, new RegExp(`f\\.key === '${key}'`));
+  assert.doesNotMatch(mobileNav, /users|tunnels|deploy|capacity/);
+  for (const key of ['users', 'tunnels', 'deploy', 'capacity'])
+    assert.match(mobileMore, new RegExp(`f\\.key === '${key}'`));
   assert.doesNotMatch(mobileMore, /usage/);
+  assert.match(nav, /key: 'capacity'[\s\S]*?label: '预测'[\s\S]*?hideFromPublic: true/);
+  assert.match(routable, /'capacity'/);
+  assert.match(panes, /CapacityPane|case 'tab:capacity'/);
+  assert.doesNotMatch(usage, /MachineCapacity|机器配额|usage-machine-model/);
 });
 
 test('账户牌打开更多菜单，菜单项使用一致图标并标出展开与当前页状态', () => {

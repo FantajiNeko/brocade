@@ -243,7 +243,7 @@ export function MuxObservationCard({
   nodeName?: (id: string) => string;
   chainName?: (app: string | null, chain: string) => string | null;
 }) {
-  const { last, now, connected } = useNodeRealtime(nodeId);
+  const { last, now, connected, observingSince } = useNodeRealtime(nodeId);
   const report = last?.event.sample.mux as Report | null | undefined;
   const deltaOf = useObservationBaselines(report);
   const nodeAge = report && last ? last.event.sample.sampled_at_unix_millis - report.sampled_at_unix_ms : Infinity;
@@ -255,9 +255,29 @@ export function MuxObservationCard({
     arrivedAge > STALE_MS ||
     now - last.event.received_at_unix_millis > STALE_MS ||
     nodeAge > STALE_MS;
+  // The realtime feed is demand-driven. Its initial snapshot can legitimately contain the last
+  // report from before this page subscribed while Agent prepares the first fresh diagnostic frame.
+  const warming = stale && connected && now - observingSince <= STALE_MS;
 
   // 没有启用 worker pool 的出站不会注册观测对象，也不为它占一张空卡。
   if (!report || report.pools.length === 0) return null;
+
+  // Agent 刚开始按需采样时，Console 可能先补发上一帧。旧读数此时既不代表实时状态，
+  // 也不应以问号形式铺满整卡；保留卡片位置，只表达当前正在取得首个有效快照。
+  if (warming) {
+    return (
+      <div className="panel ov-card ov-mux-card" aria-label="Mux 连接复用">
+        <header>
+          <PanelTitle of="outbound">Mux 连接复用</PanelTitle>
+          <span className="sp" />
+          <span className="hint">每秒采样 · 实时计算</span>
+        </header>
+        <p className="rt-dx" role="status">
+          正在获取实时状态…
+        </p>
+      </div>
+    );
+  }
 
   const workersByPool = new Map<string, Worker[]>();
   for (const worker of report.workers) {
@@ -328,7 +348,7 @@ export function MuxObservationCard({
       )}
 
       {stale && (
-        <p className="rt-dx">
+        <p className="rt-dx bad">
           实时数据连接已中断，或数据已超过 15 秒未更新。当前展示最近一次有效快照，不代表实时状态。
         </p>
       )}

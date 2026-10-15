@@ -590,6 +590,10 @@ export function ThroughputChart({
   tx,
   rxName,
   txName,
+  third,
+  thirdName,
+  thirdTimesUnixSecs,
+  thirdWindowStartsUnixSecs,
   group,
 }: {
   /** 每个速率点对应的真实窗口结束时间。 */
@@ -604,6 +608,10 @@ export function ThroughputChart({
   tx: (number | null)[];
   rxName: string;
   txName: string;
+  third?: (number | null)[];
+  thirdName?: string;
+  thirdTimesUnixSecs?: number[];
+  thirdWindowStartsUnixSecs?: number[];
   group?: string;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
@@ -648,6 +656,10 @@ export function ThroughputChart({
       tx,
       rxName,
       txName,
+      third,
+      thirdName,
+      thirdTimesUnixSecs,
+      thirdWindowStartsUnixSecs,
       group,
       themeName,
       paletteKey,
@@ -656,7 +668,7 @@ export function ThroughputChart({
     lastSig.current = sig;
     const css = getComputedStyle(document.documentElement);
     const cv = (name: string) => css.getPropertyValue(name).trim();
-    const colors = observeColors(themeName, cv).slice(0, 2);
+    const colors = observeColors(themeName, cv).slice(0, third ? 3 : 2);
     const ink = cv('--ink');
     const ink3 = cv('--ink-3');
     const ink4 = cv('--ink-4');
@@ -664,7 +676,7 @@ export function ThroughputChart({
     const lineSoft = cv('--line-soft');
     const glass = cv('--glass-strong');
 
-    const { axis: valueAxis, unit } = throughputAxis(rx, tx);
+    const { axis: valueAxis, unit } = throughputAxis(third ? [...rx, ...third] : rx, tx);
     const xMin = rangeStartUnixSecs * 1000;
     const xMax = rangeEndUnixSecs * 1000;
     // x 轴刻度落在墙钟整点上（observeTimeAxes），tooltip 到秒。
@@ -676,7 +688,13 @@ export function ThroughputChart({
         hour12: false,
       });
 
-    const mk = (name: string, data: (number | null)[], color: string) => ({
+    const mk = (
+      name: string,
+      data: (number | null)[],
+      color: string,
+      times = timesUnixSecs,
+      starts = windowStartsUnixSecs,
+    ) => ({
       name,
       type: 'line' as const,
       symbol: 'circle',
@@ -685,10 +703,9 @@ export function ThroughputChart({
       smooth: false,
       connectNulls: false,
       lineStyle: observeSeriesLine(color),
-      areaStyle: observeAreaStyle(color, themeName, { count: 2, paper: cv('--card') }),
+      areaStyle: observeAreaStyle(color, themeName, { count: third ? 3 : 2, paper: cv('--card') }),
       itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
-      emphasis: { disabled: true },
-      data: observeSeriesData(timesUnixSecs, data, { windowStartsUnixSecs }),
+      data: observeSeriesData(times, data, { windowStartsUnixSecs: starts }),
     });
 
     chart.setOption(
@@ -739,7 +756,13 @@ export function ThroughputChart({
           axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: unit.text },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
-        series: [mk(rxName, rx, colors[0]), mk(txName, tx, colors[1])],
+        series: [
+          mk(rxName, rx, colors[0]),
+          mk(txName, tx, colors[1]),
+          ...(third && thirdName
+            ? [mk(thirdName, third, colors[2], thirdTimesUnixSecs, thirdWindowStartsUnixSecs)]
+            : []),
+        ],
       },
       true,
     );
@@ -760,6 +783,10 @@ export function ThroughputChart({
     windowStartsUnixSecs,
     tx,
     txName,
+    third,
+    thirdName,
+    thirdTimesUnixSecs,
+    thirdWindowStartsUnixSecs,
   ]);
 
   return <ObserveBrushPlot className="ndtp-ec" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />;
@@ -1035,7 +1062,6 @@ function HistoryChart({
             opacity: 1,
           },
           itemStyle: { color: colors[index], borderColor: glass, borderWidth: 1.5 },
-          emphasis: { disabled: true },
           data: observeSeriesData(times, lineSeries.values, { windowStartsUnixSecs: windowStarts }),
           markLine:
             index === 0 && threshold

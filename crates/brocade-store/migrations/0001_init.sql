@@ -1542,6 +1542,18 @@ CREATE TABLE deployment_target_state (
     CONSTRAINT deployment_target_state_deployment_id_node_id_fkey FOREIGN KEY (deployment_id, node_id) REFERENCES deployment_targets(deployment_id, node_id) ON DELETE CASCADE
 );
 
+-- A wave enters the execution timeline before an Agent claims any target. Keeping this control-
+-- plane event separate from deployment_target_state.dispatched_at prevents a slow poll or a lease
+-- refresh from rewriting the time shown to operators.
+CREATE TABLE deployment_wave_progress (
+    deployment_id BIGINT NOT NULL,
+    wave INTEGER NOT NULL,
+    entered_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT deployment_wave_progress_wave_check CHECK ((wave >= 0)),
+    CONSTRAINT deployment_wave_progress_pkey PRIMARY KEY (deployment_id, wave),
+    CONSTRAINT deployment_wave_progress_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES deployments(id) ON DELETE CASCADE
+);
+
 -- Operational progress is deliberately separate from nodes.retired_at. The latter is revisioned
 -- model intent; this row says how far the agent has converged that intent and never enters a model
 -- snapshot. Every node has a row, created by the insert trigger alongside the node itself.
@@ -2273,6 +2285,179 @@ CREATE TABLE grants (
     CONSTRAINT grants_tenant_id_user_id_fkey FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE RESTRICT
 );
 
+-- User-managed L4 forwarding is operational desired state, deliberately separate from revisioned
+-- ingress grants. An entitlement says where a user may listen; rules under it can then converge
+-- without manufacturing a model revision or restarting Xray.
+CREATE TABLE forwarding_entitlements (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    tcp_allowed BOOLEAN DEFAULT true NOT NULL,
+    udp_allowed BOOLEAN DEFAULT true NOT NULL,
+    listen_port_start INTEGER DEFAULT 30000 NOT NULL,
+    listen_port_end INTEGER DEFAULT 59999 NOT NULL,
+    max_rules INTEGER DEFAULT 100 NOT NULL,
+    allow_private_targets BOOLEAN DEFAULT true NOT NULL,
+    enabled BOOLEAN DEFAULT true NOT NULL,
+    updated_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT forwarding_entitlements_pkey PRIMARY KEY (tenant_id, user_id, node_id),
+    CONSTRAINT forwarding_entitlements_user_fkey FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT forwarding_entitlements_node_fkey FOREIGN KEY (node_id)
+        REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT forwarding_entitlements_port_range CHECK (
+        listen_port_start BETWEEN 1024 AND 65535
+        AND listen_port_end BETWEEN listen_port_start AND 65535
+    ),
+    CONSTRAINT forwarding_entitlements_max_rules CHECK (max_rules BETWEEN 1 AND 256),
+    CONSTRAINT forwarding_entitlements_protocol CHECK (tcp_allowed OR udp_allowed)
+);
+
+CREATE TABLE forwarding_node_state (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    desired_generation BIGINT DEFAULT 0 NOT NULL,
+    applied_generation BIGINT,
+    reconcile_status TEXT DEFAULT 'pending' NOT NULL,
+    applied_rule_ids JSONB DEFAULT '[]'::jsonb NOT NULL,
+    last_error TEXT,
+    reported_at TIMESTAMPTZ,
+    CONSTRAINT forwarding_node_state_generation CHECK (desired_generation >= 0),
+    CONSTRAINT forwarding_node_state_applied_generation CHECK (
+        applied_generation IS NULL OR applied_generation >= 0
+    ),
+    CONSTRAINT forwarding_node_state_status CHECK (
+        reconcile_status IN ('pending', 'converged', 'error')
+    ),
+    CONSTRAINT forwarding_node_state_applied_rules CHECK (jsonb_typeof(applied_rule_ids) = 'array')
+);
+
+CREATE TABLE forwarding_rules (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    listen_port INTEGER NOT NULL,
+    target_host TEXT NOT NULL,
+    target_port INTEGER NOT NULL,
+    enabled BOOLEAN DEFAULT true NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT forwarding_rules_user_fkey FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users(tenant_id, id) ON DELETE RESTRICT,
+    CONSTRAINT forwarding_rules_node_fkey FOREIGN KEY (node_id)
+        REFERENCES nodes(id) ON DELETE RESTRICT,
+    CONSTRAINT forwarding_rules_protocol CHECK (protocol IN ('tcp', 'udp', 'tcp_udp')),
+    CONSTRAINT forwarding_rules_listen_port CHECK (listen_port BETWEEN 1 AND 65535),
+    CONSTRAINT forwarding_rules_target_port CHECK (target_port BETWEEN 1 AND 65535),
+    CONSTRAINT forwarding_rules_name_shape CHECK (length(btrim(name)) BETWEEN 1 AND 80),
+    CONSTRAINT forwarding_rules_target_shape CHECK (length(btrim(target_host)) BETWEEN 1 AND 253)
+);
+
+CREATE UNIQUE INDEX forwarding_rules_active_tcp_port
+    ON forwarding_rules (node_id, listen_port)
+    WHERE deleted_at IS NULL AND enabled AND protocol IN ('tcp', 'tcp_udp');
+
+CREATE UNIQUE INDEX forwarding_rules_active_udp_port
+    ON forwarding_rules (node_id, listen_port)
+    WHERE deleted_at IS NULL AND enabled AND protocol IN ('udp', 'tcp_udp');
+
+CREATE INDEX forwarding_rules_by_user
+    ON forwarding_rules (tenant_id, user_id, created_at, id)
+    WHERE deleted_at IS NULL;
+
+CREATE TABLE forwarding_usage_report_receipts (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    agent_instance_id TEXT NOT NULL,
+    sequence BIGINT NOT NULL,
+    result JSONB NOT NULL,
+    payload_sha256 TEXT,
+    received_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT forwarding_usage_report_receipts_pkey
+        PRIMARY KEY (node_id, agent_instance_id, sequence),
+    CONSTRAINT forwarding_usage_report_receipts_sequence CHECK (sequence >= 0),
+    CONSTRAINT forwarding_usage_report_receipts_result CHECK (jsonb_typeof(result) = 'object')
+);
+
+CREATE TABLE forwarding_usage_counter_heads (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    rule_id BIGINT NOT NULL REFERENCES forwarding_rules(id) ON DELETE RESTRICT,
+    agent_instance_id TEXT NOT NULL,
+    xray_epoch TEXT NOT NULL,
+    uplink_bytes BIGINT NOT NULL,
+    downlink_bytes BIGINT NOT NULL,
+    read_at TIMESTAMPTZ NOT NULL,
+    sequence BIGINT,
+    has_gap BOOLEAN DEFAULT false NOT NULL,
+    CONSTRAINT forwarding_usage_counter_heads_pkey PRIMARY KEY (node_id, rule_id),
+    CONSTRAINT forwarding_usage_counter_heads_uplink CHECK (uplink_bytes >= 0),
+    CONSTRAINT forwarding_usage_counter_heads_downlink CHECK (downlink_bytes >= 0)
+);
+
+CREATE TABLE forwarding_usage_samples (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    rule_id BIGINT NOT NULL REFERENCES forwarding_rules(id) ON DELETE RESTRICT,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    read_at TIMESTAMPTZ NOT NULL,
+    window_start TIMESTAMPTZ,
+    has_gap BOOLEAN DEFAULT false NOT NULL,
+    uplink_bytes BIGINT NOT NULL,
+    downlink_bytes BIGINT NOT NULL,
+    CONSTRAINT forwarding_usage_samples_user_fkey FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users(tenant_id, id) ON DELETE RESTRICT,
+    CONSTRAINT forwarding_usage_samples_uplink CHECK (uplink_bytes >= 0),
+    CONSTRAINT forwarding_usage_samples_downlink CHECK (downlink_bytes >= 0)
+);
+
+CREATE INDEX forwarding_usage_samples_by_user
+    ON forwarding_usage_samples (tenant_id, user_id, read_at DESC);
+
+-- BEGIN FORWARDING TRAFFIC PROJECTIONS
+CREATE TABLE forwarding_rule_nodes (
+    rule_id BIGINT NOT NULL REFERENCES forwarding_rules(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    assigned_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    PRIMARY KEY (rule_id, node_id)
+);
+CREATE TABLE forwarding_usage_windows (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    window_start TIMESTAMPTZ NOT NULL,
+    window_end TIMESTAMPTZ NOT NULL,
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    has_gap BOOLEAN NOT NULL,
+    PRIMARY KEY (node_id, tenant_id, window_start, window_end),
+    CHECK (window_start < window_end)
+);
+CREATE TABLE forwarding_usage_rollups (
+    period_start TIMESTAMPTZ NOT NULL,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    rule_id BIGINT NOT NULL REFERENCES forwarding_rules(id) ON DELETE RESTRICT,
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    has_gap BOOLEAN NOT NULL,
+    PRIMARY KEY (period_start, node_id, tenant_id, user_id, rule_id),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE RESTRICT
+);
+CREATE INDEX forwarding_usage_rollups_by_user
+    ON forwarding_usage_rollups (tenant_id, user_id, period_start);
+CREATE INDEX forwarding_usage_rollups_by_node
+    ON forwarding_usage_rollups (node_id, period_start);
+CREATE INDEX forwarding_usage_rollups_by_rule
+    ON forwarding_usage_rollups (rule_id, period_start);
+CREATE INDEX forwarding_usage_samples_by_node
+    ON forwarding_usage_samples (node_id, read_at);
+-- END FORWARDING TRAFFIC PROJECTIONS
+
 CREATE TABLE invoices (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY,
     billing_period_id BIGINT NOT NULL,
@@ -2786,6 +2971,9 @@ CREATE TABLE node_traffic_policy (
     cycle_kind TEXT DEFAULT 'monthly' NOT NULL,
     reset_month INTEGER,
     reset_day INTEGER DEFAULT 1 NOT NULL,
+    -- Provider-side allowance for this reset cycle. NULL deliberately means "not configured":
+    -- zero is not a usable quota and must never make a machine look exhausted by default.
+    quota_bytes NUMERIC(20,0),
     updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     updated_by TEXT NOT NULL,
     CONSTRAINT node_traffic_policy_pkey PRIMARY KEY (node_id),
@@ -2796,6 +2984,7 @@ CREATE TABLE node_traffic_policy (
         OR (cycle_kind = 'yearly' AND reset_month BETWEEN 1 AND 12)
     ),
     CONSTRAINT node_traffic_policy_reset_day CHECK (reset_day BETWEEN 1 AND 31),
+    CONSTRAINT node_traffic_policy_quota_bytes_positive CHECK (quota_bytes IS NULL OR quota_bytes > 0),
     CONSTRAINT node_traffic_policy_updated_by_shape CHECK (length(btrim(updated_by)) BETWEEN 1 AND 256)
 );
 
@@ -2869,6 +3058,27 @@ CREATE TABLE node_traffic_calibrations (
 
 CREATE INDEX node_traffic_calibrations_node_time_idx
     ON node_traffic_calibrations (node_id, calibrated_at DESC, id DESC);
+
+-- One capacity forecast per machine and UTC day, as the forecast page showed it. Comparing a
+-- closed period's forecasts with its final total measures the model; nothing here is accounting.
+CREATE TABLE node_traffic_forecasts (
+    node_id TEXT NOT NULL,
+    day DATE NOT NULL,
+    taken_at TIMESTAMPTZ NOT NULL,
+    period_start DATE NOT NULL,
+    period_end DATE NOT NULL,
+    quota_bytes NUMERIC(20,0),
+    used_bytes NUMERIC(20,0) NOT NULL,
+    p50_bytes NUMERIC(20,0) NOT NULL,
+    p90_bytes NUMERIC(20,0) NOT NULL,
+    CONSTRAINT node_traffic_forecasts_pkey PRIMARY KEY (node_id, day),
+    CONSTRAINT node_traffic_forecasts_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT node_traffic_forecasts_period CHECK (period_end > period_start),
+    CONSTRAINT node_traffic_forecasts_quota_positive CHECK (quota_bytes IS NULL OR quota_bytes > 0),
+    CONSTRAINT node_traffic_forecasts_ordered CHECK (
+        used_bytes >= 0 AND p50_bytes >= used_bytes AND p90_bytes >= p50_bytes
+    )
+);
 
 -- Binary release metadata is shared by Agent and Xray; executable bytes are never archived here.
 -- BEGIN BINARY RELEASE SCHEMA

@@ -13,6 +13,7 @@ export function routeForViewer(location: Loc, who: Whoami): Loc {
   const fallback: Loc = { nav: who.role === 'user' ? 'users' : 'nodes' };
 
   if ((location.nav === 'settings' || location.nav === 'deploy') && !can(who.role, 'edit')) return fallback;
+  if (location.nav === 'capacity' && (who.role === 'user' || isPublic(who))) return fallback;
   if (location.nav === 'password' && isPublic(who)) return fallback;
 
   const page = location.drill?.p;

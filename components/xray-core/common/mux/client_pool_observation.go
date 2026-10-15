@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// Current workers carry the actionable state. Keep only a short transition tail so polling the
+// observation service cannot make idle Mux pools emit a six-figure JSON document.
+const muxWorkerEventLimit = 32
+
 // MuxWorkerPoolConfigSnapshot is the effective policy owned by one outbound picker. Keeping it
 // beside the readings makes a hot-swapped, draining picker distinguishable from its replacement.
 type MuxWorkerPoolConfigSnapshot struct {
@@ -346,9 +350,9 @@ func appendMuxWorkerEvent(snapshot MuxWorkerSnapshot, from string, now time.Time
 	r.Lock()
 	r.seq++
 	event := MuxWorkerEvent{Sequence: r.seq, AtUnixMS: now.UnixMilli(), From: from, MuxWorkerSnapshot: snapshot}
-	if len(r.events) == 256 {
+	if len(r.events) == muxWorkerEventLimit {
 		copy(r.events, r.events[1:])
-		r.events = r.events[:255]
+		r.events = r.events[:muxWorkerEventLimit-1]
 	}
 	r.events = append(r.events, event)
 	r.Unlock()

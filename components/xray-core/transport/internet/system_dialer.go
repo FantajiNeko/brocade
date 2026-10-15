@@ -64,6 +64,9 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		if err != nil {
 			return nil, err
 		}
+		if err := checkDialIP(ctx, destAddr.IP); err != nil {
+			return nil, err
+		}
 		lc.Control = func(network, address string, c syscall.RawConn) error {
 			for _, ctl := range Controllers {
 				if err := ctl(network, address, c); err != nil {
@@ -117,11 +120,17 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		KeepAliveConfig: keepAliveConfig,
 	}
 
-	if sockopt != nil || len(Controllers) > 0 {
+	_, hasIPBlocker := ctx.Value(ipBlockerKey{}).(ipBlocker)
+	if sockopt != nil || len(Controllers) > 0 || hasIPBlocker {
 		if sockopt != nil && sockopt.TcpMptcp {
 			dialer.SetMultipathTCP(true)
 		}
 		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			if hasIPBlocker {
+				if err := checkDialAddress(ctx, address); err != nil {
+					return err
+				}
+			}
 			for _, ctl := range Controllers {
 				if err := ctl(network, address, c); err != nil {
 					errors.LogInfoInner(ctx, err, "failed to apply external controller")

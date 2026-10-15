@@ -9,15 +9,15 @@ use crate::artifacts::{
         TunnelProbeArtifact, INBOUND_TAG as PROBE_INBOUND_TAG, OUTBOUND_TAG as PROBE_OUTBOUND_TAG,
     },
     xray::{
-        XrayArtifact, XrayConfig, XrayDnsServer, XrayHopInboundWire, XrayHopOutboundWire,
-        XrayInbound, XrayIngressSecurity, XrayMatchCondition, XrayMux, XrayOutbound, XrayPolicy,
-        XrayRoutingRule, XrayStream,
+        XrayArtifact, XrayConfig, XrayDnsServer, XrayFreedomAddressPolicy, XrayHopInboundWire,
+        XrayHopOutboundWire, XrayInbound, XrayIngressSecurity, XrayMatchCondition, XrayMux,
+        XrayOutbound, XrayPolicy, XrayRoutingRule, XrayStream,
     },
 };
 use crate::model::{
-    AnyTlsMasquerade, ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessTransport,
-    ExternalVlessXhttp, ExternalVlessXhttpDownload, HysteriaBbrProfile, HysteriaCongestion,
-    HysteriaMasquerade, HysteriaObfs, XhttpTuning, XhttpXmux, XhttpXmuxRange,
+    AnyTlsMasquerade, ExternalOutboundProtocol, ExternalOutboundSecurity, ExternalVlessGrpcMode,
+    ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload, HysteriaBbrProfile,
+    HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, XhttpTuning, XhttpXmux, XhttpXmuxRange,
 };
 
 /// Backlog offered by TCP listeners for TCP Fast Open requests.
@@ -1034,6 +1034,7 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                 ExternalOutboundProtocol::Wireguard { .. } | ExternalOutboundProtocol::Warp { .. }
             );
             let mut vless_transport = None;
+            let mut vless_final_mask = None;
             let (protocol_name, settings) = match protocol {
                 ExternalOutboundProtocol::Anytls { credential } => (
                     "anytls",
@@ -1044,8 +1045,10 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                     encryption,
                     flow,
                     transport,
+                    final_mask,
                 } => {
                     vless_transport = Some(transport);
+                    vless_final_mask = final_mask.as_ref();
                     let mut settings = json!({
                         "address": address,
                         "port": port,
@@ -1128,10 +1131,16 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                     ("socks", json!({ "address": address, "port": port }))
                 }
             };
-            let stream_settings = match vless_transport {
+            let mut stream_settings = match vless_transport {
                 Some(transport) => external_vless_stream_settings(transport, security),
                 None => external_stream_settings("tcp", security),
             };
+            if let Some(final_mask) = vless_final_mask {
+                stream_settings
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("finalmask".to_owned(), final_mask.clone());
+            }
             let mut value = json!({
                 "tag": tag,
                 "protocol": protocol_name,
@@ -1149,7 +1158,7 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             tag,
             send_through,
             domain_strategy,
-            allow_private,
+            address_policy,
         } => {
             let mut object = Map::new();
             object.insert("tag".to_owned(), json!(tag));
@@ -1162,11 +1171,12 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             // (`infra/conf/freedom.go`), so the older key works on both sides of that
             // rename while the newer one would not.
             let mut settings = json!({ "domainStrategy": domain_strategy });
-            if *allow_private {
-                // An explicit empty list disables Xray's protocol-based default private
-                // matcher. Omitting the key does not mean empty: VLESS, VMess, Trojan,
-                // Hysteria and WireGuard inbounds all acquire the implicit matcher.
-                settings["ipsBlocked"] = json!([]);
+            match address_policy {
+                XrayFreedomAddressPolicy::Default => {}
+                XrayFreedomAddressPolicy::AllowPrivate => settings["ipsBlocked"] = json!([]),
+                XrayFreedomAddressPolicy::BlockPrivate => {
+                    settings["ipsBlocked"] = json!(crate::forwarding::BLOCKED_TARGET_CIDRS);
+                }
             }
             object.insert("settings".to_owned(), settings);
             Value::Object(object)
@@ -1205,6 +1215,82 @@ fn external_vless_stream_settings(
 ) -> Value {
     match transport {
         ExternalVlessTransport::Raw => external_stream_settings("tcp", security),
+        ExternalVlessTransport::Kcp(kcp) => {
+            let mut stream = external_stream_settings("kcp", security);
+            let mut settings = Map::new();
+            if let Some(mtu) = kcp.mtu {
+                settings.insert("mtu".to_owned(), json!(mtu));
+            }
+            if let Some(tti) = kcp.tti {
+                settings.insert("tti".to_owned(), json!(tti));
+            }
+            stream
+                .as_object_mut()
+                .unwrap()
+                .insert("kcpSettings".to_owned(), Value::Object(settings));
+            stream
+        }
+        ExternalVlessTransport::Websocket(websocket) => {
+            let mut stream = external_stream_settings("ws", security);
+            let mut settings = json!({ "path": websocket.path });
+            if let Some(host) = &websocket.host {
+                settings
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("host".to_owned(), json!(host));
+            }
+            stream
+                .as_object_mut()
+                .unwrap()
+                .insert("wsSettings".to_owned(), settings);
+            stream
+        }
+        ExternalVlessTransport::Http(http) => {
+            let mut stream = external_stream_settings("xhttp", security);
+            let mut settings =
+                external_xhttp_base(&http.path, http.host.as_deref(), None, Some("stream-one"));
+            settings
+                .as_object_mut()
+                .unwrap()
+                .insert("extra".to_owned(), json!({ "noGRPCHeader": true }));
+            stream
+                .as_object_mut()
+                .unwrap()
+                .insert("xhttpSettings".to_owned(), settings);
+            stream
+        }
+        ExternalVlessTransport::Grpc(grpc) => {
+            let mut stream = external_stream_settings("grpc", security);
+            let mut settings = Map::new();
+            settings.insert("serviceName".to_owned(), json!(grpc.service_name));
+            settings.insert(
+                "multiMode".to_owned(),
+                json!(matches!(grpc.mode, ExternalVlessGrpcMode::Multi)),
+            );
+            if let Some(authority) = &grpc.authority {
+                settings.insert("authority".to_owned(), json!(authority));
+            }
+            stream
+                .as_object_mut()
+                .unwrap()
+                .insert("grpcSettings".to_owned(), Value::Object(settings));
+            stream
+        }
+        ExternalVlessTransport::HttpUpgrade(http_upgrade) => {
+            let mut stream = external_stream_settings("httpupgrade", security);
+            let mut settings = json!({ "path": http_upgrade.path });
+            if let Some(host) = &http_upgrade.host {
+                settings
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("host".to_owned(), json!(host));
+            }
+            stream
+                .as_object_mut()
+                .unwrap()
+                .insert("httpupgradeSettings".to_owned(), settings);
+            stream
+        }
         ExternalVlessTransport::Xhttp(xhttp) => {
             let mut stream = external_stream_settings("xhttp", security);
             stream
@@ -1226,32 +1312,54 @@ fn external_stream_settings(network: &str, security: &ExternalOutboundSecurity) 
         ExternalOutboundSecurity::Tls {
             server_name,
             fingerprint,
+            alpn,
+            ech_config_list,
+            pinned_peer_cert_sha256,
+            verify_peer_cert_by_name,
         } => {
             stream.insert("security".to_owned(), json!("tls"));
-            stream.insert(
-                "tlsSettings".to_owned(),
-                json!({
-                    "serverName": server_name,
-                    "fingerprint": fingerprint,
-                }),
-            );
+            let mut settings = Map::new();
+            settings.insert("serverName".to_owned(), json!(server_name));
+            settings.insert("fingerprint".to_owned(), json!(fingerprint));
+            if !alpn.is_empty() {
+                settings.insert("alpn".to_owned(), json!(alpn));
+            }
+            if let Some(ech) = ech_config_list {
+                settings.insert("echConfigList".to_owned(), json!(ech));
+            }
+            if let Some(pins) = pinned_peer_cert_sha256 {
+                settings.insert("pinnedPeerCertSha256".to_owned(), json!(pins));
+            }
+            if let Some(names) = verify_peer_cert_by_name {
+                settings.insert("verifyPeerCertByName".to_owned(), json!(names));
+            }
+            stream.insert("tlsSettings".to_owned(), Value::Object(settings));
         }
         ExternalOutboundSecurity::Reality {
             server_name,
             public_key,
             short_id,
             fingerprint,
+            mldsa65_verify,
+            spider_x,
         } => {
             stream.insert("security".to_owned(), json!("reality"));
-            stream.insert(
-                "realitySettings".to_owned(),
-                json!({
-                    "serverName": server_name,
-                    "publicKey": public_key,
-                    "shortId": short_id,
-                    "fingerprint": fingerprint,
-                }),
-            );
+            let mut settings = Map::new();
+            settings.insert("serverName".to_owned(), json!(server_name));
+            settings.insert("password".to_owned(), json!(public_key));
+            // `publicKey` remains accepted by older Xray builds while current Xray renamed the
+            // same client value to `password`. Emitting both keeps rollback artifacts portable;
+            // current Xray gives the identical `password` value precedence.
+            settings.insert("publicKey".to_owned(), json!(public_key));
+            settings.insert("shortId".to_owned(), json!(short_id));
+            settings.insert("fingerprint".to_owned(), json!(fingerprint));
+            if let Some(verify) = mldsa65_verify {
+                settings.insert("mldsa65Verify".to_owned(), json!(verify));
+            }
+            if let Some(spider) = spider_x {
+                settings.insert("spiderX".to_owned(), json!(spider));
+            }
+            stream.insert("realitySettings".to_owned(), Value::Object(settings));
         }
     }
     Value::Object(stream)
@@ -1261,10 +1369,26 @@ fn external_xhttp_settings(xhttp: &ExternalVlessXhttp) -> Value {
     let mut settings = external_xhttp_base(
         &xhttp.path,
         xhttp.host.as_deref(),
-        xhttp.mux,
+        xhttp.extra.is_none().then_some(xhttp.mux).flatten(),
         xhttp.mode.as_str(),
     );
-    if let Some(download) = &xhttp.download {
+    if let Some(raw_extra) = xhttp.extra.as_ref().and_then(Value::as_object) {
+        let mut extra = raw_extra.clone();
+        if let Some(mux) = xhttp.mux {
+            extra
+                .entry("xmux".to_owned())
+                .or_insert_with(|| xhttp_xmux(&XhttpXmux::with_concurrency(mux)));
+        }
+        if let Some(download) = &xhttp.download {
+            extra
+                .entry("downloadSettings".to_owned())
+                .or_insert_with(|| external_xhttp_download_settings(download));
+        }
+        settings
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".to_owned(), Value::Object(extra));
+    } else if let Some(download) = &xhttp.download {
         settings.as_object_mut().unwrap().insert(
             "downloadSettings".to_owned(),
             external_xhttp_download_settings(download),
@@ -1479,12 +1603,31 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_guard_is_explicit_and_internal_default_is_preserved() {
+        for (policy, expected) in [
+            (
+                XrayFreedomAddressPolicy::BlockPrivate,
+                Some(json!(crate::forwarding::BLOCKED_TARGET_CIDRS)),
+            ),
+            (XrayFreedomAddressPolicy::Default, None),
+        ] {
+            let value = outbound(&XrayOutbound::Freedom {
+                tag: "direct".to_owned(),
+                send_through: None,
+                domain_strategy: "UseIP".to_owned(),
+                address_policy: policy,
+            });
+            assert_eq!(value["settings"].get("ipsBlocked"), expected.as_ref());
+        }
+    }
+
+    #[test]
     fn business_egress_can_honor_an_ingress_that_allows_private_targets() {
         let value = outbound(&XrayOutbound::Freedom {
             tag: "out:egress".to_owned(),
             send_through: None,
             domain_strategy: "UseIP".to_owned(),
-            allow_private: true,
+            address_policy: XrayFreedomAddressPolicy::AllowPrivate,
         });
 
         assert_eq!(value["settings"]["ipsBlocked"], json!([]));

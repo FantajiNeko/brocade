@@ -12,6 +12,7 @@ const PANE_LOADERS = {
   users: () => import('./users'),
   deploy: () => import('./deploy'),
   usage: () => import('./usage'),
+  capacity: () => import('./capacity'),
   settings: () => import('./settings'),
   password: () => import('./password'),
   topo: () => import('../topo/canvas'),

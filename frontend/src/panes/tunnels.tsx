@@ -1,10 +1,10 @@
-import { lazy, Suspense, useMemo, useState } from 'react';
+import { Fragment, lazy, Suspense, useMemo, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  ApiError,
   fetchDeployments,
   fetchNodes,
   fetchSnapshot,
-  fetchTunnelProbe,
   fetchTunnelProbeCapability,
   removeWarpBinding,
   updateWarpBinding,
@@ -12,6 +12,7 @@ import {
   type DeploymentListItem,
   type ConsoleSnapshot,
   type ExternalOutbound,
+  type ExternalVlessTransport,
   type ExternalWarpBinding,
   type NodeAgentStateItem,
   type SnapshotApp,
@@ -29,7 +30,16 @@ import { navigate, navigateInPlace, returnTo } from '../forge/route';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { WarpRegistrationAction, useWarpRegistrationAvailability } from '../warp-registration';
-import { TunnelProbePanel } from '../tunnel-probe';
+import {
+  TunnelProbePanel,
+  tunnelExitRun,
+  tunnelProbeStatus,
+  useTunnelProbeChart,
+  useTunnelProbeView,
+  type TunnelProbeStatus,
+  type TunnelProbeTone,
+} from '../tunnel-probe';
+import { CopyButton, copyStateIcon } from '../ui/copy-button';
 import { isVpngateOutbound } from '../vpngate-selection';
 import { VpngateProviderSection } from './vpngate-provider';
 
@@ -1205,32 +1215,134 @@ function WarpTunnelDetail({
   );
 }
 
+/** One row of a custom tunnel's connection table. Credentials arrive sealed and are only named. */
+type ConnectionFact = { label: string; value: string; copy?: boolean; dim?: boolean };
+
+const TRANSPORT_NAME: Record<ExternalVlessTransport['t'], string> = {
+  raw: 'TCP',
+  kcp: 'mKCP',
+  websocket: 'WebSocket',
+  http: 'HTTP/2',
+  grpc: 'gRPC',
+  http_upgrade: 'HTTPUpgrade',
+  xhttp: 'XHTTP',
+};
+
+const sealedText = (credential: string) => (credential ? '已密封' : '未设置');
+
+const usesVlessEncryption = (tunnel: ExternalOutbound) =>
+  tunnel.protocol.t === 'vless' && tunnel.protocol.v.encryption !== 'none';
+
+/** VLESS Encryption, Shadowsocks and WireGuard secure the payload themselves; the rest name the
+ * TLS or REALITY layer they ride on. */
+const carriesTransportSecurity = (tunnel: ExternalOutbound) =>
+  !usesVlessEncryption(tunnel) && tunnel.protocol.t !== 'shadowsocks2022' && tunnel.protocol.t !== 'wireguard';
+
+/** Protocol, transport and security in the order a share link states them, for the page header. */
+function tunnelStackText(tunnel: ExternalOutbound): string {
+  const parts = [protocolName(tunnel)];
+  if (tunnel.protocol.t === 'vless') parts.push(TRANSPORT_NAME[tunnel.protocol.v.transport.t]);
+  if (carriesTransportSecurity(tunnel) && tunnel.security.t !== 'none') parts.push(tunnel.security.t.toUpperCase());
+  return parts.join(' · ');
+}
+
+function connectionFacts(tunnel: ExternalOutbound): ConnectionFact[] {
+  const facts: ConnectionFact[] = [
+    { label: '地址', value: endpoint(tunnel), copy: true },
+    { label: '协议', value: protocolName(tunnel) },
+  ];
+  const protocol = tunnel.protocol;
+  switch (protocol.t) {
+    case 'vless': {
+      facts.push({ label: 'UUID', value: sealedText(protocol.v.credential), dim: true });
+      if (protocol.v.encryption !== 'none') facts.push({ label: '加密', value: protocol.v.encryption.split('.')[0] });
+      if (protocol.v.flow) facts.push({ label: '流控', value: protocol.v.flow });
+      const transport = protocol.v.transport;
+      facts.push({ label: '传输', value: TRANSPORT_NAME[transport.t] });
+      if (transport.t === 'grpc') {
+        facts.push({ label: '服务名', value: transport.v.service_name });
+      } else if (transport.t !== 'raw' && transport.t !== 'kcp') {
+        facts.push({ label: '路径', value: transport.v.path, copy: true });
+        if (transport.v.host) facts.push({ label: 'Host', value: transport.v.host });
+      }
+      break;
+    }
+    case 'shadowsocks2022':
+      facts.push(
+        { label: '加密方式', value: protocol.v.method },
+        { label: '密码', value: sealedText(protocol.v.credential), dim: true },
+      );
+      break;
+    case 'socks5':
+    case 'http_connect':
+      if (protocol.v.username) facts.push({ label: '用户名', value: protocol.v.username });
+      facts.push({ label: '密码', value: sealedText(protocol.v.credential), dim: true });
+      break;
+    case 'anytls':
+      facts.push({ label: '密码', value: sealedText(protocol.v.credential), dim: true });
+      break;
+    case 'wireguard':
+      facts.push(
+        { label: '私钥', value: sealedText(protocol.v.credential), dim: true },
+        { label: '对端公钥', value: protocol.v.peer_public_key, copy: true },
+        { label: '本地地址', value: protocol.v.local_addresses.join(', ') || '—' },
+        { label: 'MTU', value: String(protocol.v.mtu) },
+      );
+      break;
+    case 'warp':
+    case 'vpngate':
+      // Both have their own detail pages.
+      break;
+  }
+  if (carriesTransportSecurity(tunnel)) {
+    const security = tunnel.security;
+    facts.push({ label: '传输安全', value: security.t === 'none' ? '无' : security.t.toUpperCase() });
+    if (security.t !== 'none') {
+      facts.push({ label: 'SNI', value: security.v.server_name || '—' });
+      facts.push({ label: '指纹', value: security.v.fingerprint || '—' });
+    }
+    if (security.t === 'tls' && security.v.alpn?.length)
+      facts.push({ label: 'ALPN', value: security.v.alpn.join(', ') });
+    if (security.t === 'reality') {
+      facts.push({ label: '公钥', value: security.v.public_key, copy: true });
+      if (security.v.short_id) facts.push({ label: 'Short ID', value: security.v.short_id });
+    }
+  }
+  return facts;
+}
+
+const HEAD_CHIP: Partial<Record<TunnelProbeStatus['key'], string>> = {
+  degraded: 'st-gold',
+  down: 'st-halted',
+  paused: 'st-pending',
+  unknown: 'st-pending',
+  unpublished: 'st-pending',
+};
+const NODE_LAMP: Record<TunnelProbeTone, string> = { ok: '', warn: 'warn', err: 'bad', idle: 'idle' };
+
 function TunnelDetail({ tunnelId }: { tunnelId: string }) {
   const { who } = useSession();
   const editable = can(who.role, 'edit');
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: fetchSnapshot });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const draftEntries = useSyncExternalStore(draft.subscribe, draft.snapshot);
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [windowSecs, setWindowSecs] = useState(86_400);
   const tunnel = (snapshot.data?.snapshot.external_outbounds ?? []).find(candidate => candidate.id === tunnelId);
   const probeEnabled = tunnel != null && !isVpngateOutbound(tunnel) && tunnel.protocol.t !== 'warp';
-  const initialProbe = useQuery({
-    queryKey: ['tunnel-probe', tunnel?.tenant, tunnel?.id, 86_400],
-    queryFn: () => fetchTunnelProbe(tunnel!.tenant, tunnel!.id, 86_400),
-    enabled: probeEnabled,
-    staleTime: 15_000,
-    retry: false,
-  });
-  const initialProbeCapability = useQuery({
+  const probe = useTunnelProbeView(tunnel?.tenant ?? '', tunnel?.id ?? '', windowSecs, probeEnabled);
+  const probeCapability = useQuery({
     queryKey: ['tunnel-probe-capability'],
     queryFn: fetchTunnelProbeCapability,
     enabled: probeEnabled && editable,
     staleTime: 60_000,
     retry: false,
   });
+  const chart = useTunnelProbeChart(probeEnabled);
   const apps = snapshot.data?.snapshot.apps ?? [];
   const nodeList = (nodes.data?.nodes ?? []).filter(node => node.tenant_id === tunnel?.tenant && !node.retired_at);
-  const nodeName = new Map((nodes.data?.nodes ?? []).map(node => [node.node_id, node.name]));
+  const nodeById = new Map((nodes.data?.nodes ?? []).map(node => [node.node_id, node]));
   const references = apps.flatMap(app =>
     app.steps
       .filter(step => step.rules.some(rule => rule.a.t === 'proxy' && rule.a.outbound === tunnelId))
@@ -1249,8 +1361,9 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
   if (
     snapshot.isPending ||
     nodes.isPending ||
-    (probeEnabled && initialProbe.isPending) ||
-    (probeEnabled && editable && initialProbeCapability.isPending)
+    (probeEnabled && probe.isPending) ||
+    (probeEnabled && editable && probeCapability.isPending) ||
+    (probeEnabled && chart.status === 'pending')
   )
     return <Loading variant="config-detail" sheeted />;
   if (snapshot.error) return <ErrorBox error={snapshot.error} />;
@@ -1277,7 +1390,6 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
   }
 
   const isWarp = tunnel.protocol.t === 'warp';
-  const usesVlessEncryption = tunnel.protocol.t === 'vless' && tunnel.protocol.v.encryption !== 'none';
   if (isWarp) {
     return (
       <WarpTunnelDetail
@@ -1296,85 +1408,154 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
       />
     );
   }
+
+  // The panel reports a failed read itself; the header then claims no status at all.
+  const missing = probe.error instanceof ApiError && probe.error.status === 404;
+  const view = probe.data ?? null;
+  const status = probe.error && !missing ? null : tunnelProbeStatus(missing ? null : view);
+  const exit = missing ? null : tunnelExitRun(view);
+  const tone = status?.tone ?? 'idle';
+  const chip = status ? HEAD_CHIP[status.key] : undefined;
+  const draftChanged = draftEntries.some(
+    entry =>
+      entry.op.op === 'upsert_external_outbound' &&
+      entry.op.outbound.tenant_id === tunnel.tenant &&
+      entry.op.outbound.id === tunnel.id,
+  );
+  const referencedChains = new Set(references.map(reference => `${reference.app}\u0000${reference.chainId}`)).size;
+  const referencedNodes = new Set(references.map(reference => reference.node)).size;
+
   return (
-    <div className="nd-sheet nd-page tunnel-detail-page">
-      {/* 自铺 sheet 对齐机器详情：连续纸 + 纸内页头横梁 + 纸身；工作区不再额外包纸。 */}
+    <div className="nd-sheet nd-page tnd-page">
+      {/* 自铺 sheet 对齐机器详情：连续纸 + 纸内页头 + 纸身；工作区不再额外包纸。 */}
       <div className="fg-sheet nd-paper">
-        <header className="nd-page-head tunnel-detail-head">
-          <div className="nd-page-identity">
-            <span className="tunnel-detail-icon">
-              <Icon of="tunnels" size={15} />
-            </span>
-            <h1 className="nd-id nd-name">{tunnel.name}</h1>
-          </div>
-          <div className="tunnel-head-meta">
-            <span>{protocolName(tunnel)}</span>
-            <span>
-              <b>{references.length}</b> 处引用
-            </span>
+        <header className="nd-page-head tnd-head">
+          <div className="nd-page-identity tnd-identity">
+            {/* 出口国旗与机器详情的地区旗同一底板；还没有出口读数时退回隧道图标。 */}
+            {exit?.exit_loc ? (
+              <span className="nd-idplate" title={`出口 ${exit.exit_loc}`}>
+                <span className="nd-idplate-clip">
+                  <RegionFlag code={exit.exit_loc} square />
+                </span>
+                <i className={`node-lamp ${NODE_LAMP[tone]}`} title={status?.word} aria-label={status?.word} />
+              </span>
+            ) : (
+              <span className="cg-plate tnd-plate">
+                <Icon of="tunnels" size={15} />
+                <i className={`cg-lamp ${tone}`} title={status?.word} aria-label={status?.word} />
+              </span>
+            )}
+            <div className="nd-ident-text">
+              <div className="nd-ident-row">
+                <h1 className="nd-id nd-name">{tunnel.name}</h1>
+                {status && chip && <span className={`st ${chip}`}>{status.word}</span>}
+              </div>
+              <span className="nd-ident-meta">
+                {tunnelStackText(tunnel)} · {endpoint(tunnel)}
+              </span>
+            </div>
           </div>
           <div className="nd-acts">
-            <button className="btn danger" disabled={!editable} onClick={() => setDeleting(true)}>
-              删除
-            </button>
-            <button className="btn" disabled={!editable} onClick={() => setEditing(true)}>
+            <button className="btn" type="button" disabled={!editable} onClick={() => setEditing(true)}>
               编辑
+            </button>
+            <button className="btn danger" type="button" disabled={!editable} onClick={() => setDeleting(true)}>
+              删除
             </button>
           </div>
         </header>
 
-        <div className="nd-paper-body tunnel-detail-body">
-          {/* 连接事实条：把散落的连接参数收成一行 */}
-          <dl className="tunnel-strip">
-            <div>
-              <dt>Endpoint</dt>
-              <dd className="mono">{endpoint(tunnel)}</dd>
-            </div>
-            <div>
-              <dt>协议</dt>
-              <dd>{protocolName(tunnel)}</dd>
-            </div>
-            {usesVlessEncryption ? null : tunnel.protocol.t === 'shadowsocks2022' ? (
-              <div>
-                <dt>加密方式</dt>
-                <dd className="mono">{tunnel.protocol.v.method}</dd>
-              </div>
-            ) : (
-              <div>
-                <dt>传输安全</dt>
-                <dd>{tunnel.security.t.toUpperCase()}</dd>
-              </div>
-            )}
-          </dl>
+        <div className="nd-paper-body tnd-body">
+          <div className="tnd-main">
+            <TunnelProbePanel
+              tenantId={tunnel.tenant}
+              outboundId={tunnel.id}
+              draftSupported
+              editable={editable}
+              windowSecs={windowSecs}
+              onWindowChange={setWindowSecs}
+            />
 
-          <TunnelProbePanel tenantId={tunnel.tenant} outboundId={tunnel.id} draftSupported editable={editable} />
-
-          {/* 规则引用：每项跳转到对应线路 */}
-          <section className="panel config-panel tunnel-panel">
-            <header>
-              <PanelTitle of="chains">规则引用</PanelTitle>
-              <span className="hint">{new Set(references.map(reference => reference.node)).size} 台机器</span>
-            </header>
-            <div className="tunnel-ref-list">
+            {/* 规则引用：每项跳转到对应线路 */}
+            <section className="panel config-panel cg-sec tnd-refs">
+              <header>
+                <PanelTitle of="chains">规则引用</PanelTitle>
+                {references.length > 0 && (
+                  <span className="cg-meta">
+                    {status?.key === 'down' ? (
+                      <span>
+                        <b className="err">{referencedChains}</b> 条线路受影响 · <b>{referencedNodes}</b> 台机器
+                      </span>
+                    ) : (
+                      <span>
+                        <b>{referencedChains}</b> 条线路 · <b>{referencedNodes}</b> 台机器
+                      </span>
+                    )}
+                  </span>
+                )}
+              </header>
               {references.length === 0 ? (
-                <p className="dim">尚未被任何规则使用；不会下发到机器。</p>
+                <p className="tnd-none">尚未被任何规则使用；不会下发到机器。</p>
               ) : (
-                references.map(reference => (
-                  <button
-                    key={`${reference.app}/${reference.chainId}/${reference.node}`}
-                    className="tunnel-ref-row"
-                    onClick={() => openChain(reference.app, reference.chainId)}
-                  >
-                    <b>{reference.chain}</b>
-                    <small>
-                      {reference.project} · {nodeName.get(reference.node) || reference.node}
-                    </small>
-                    <span className="tunnel-ref-go">›</span>
-                  </button>
-                ))
+                <div className="tnd-refrows">
+                  {references.map(reference => {
+                    const node = nodeById.get(reference.node);
+                    return (
+                      <button
+                        key={`${reference.app}/${reference.chainId}/${reference.node}`}
+                        className="tnd-ref"
+                        type="button"
+                        onClick={() => openChain(reference.app, reference.chainId)}
+                      >
+                        <span className="cgo-main">
+                          <b>{reference.chain}</b>
+                          <small>{reference.project}</small>
+                        </span>
+                        <span className="tnd-refnode">
+                          <RegionFlag code={node?.public_ipv4_country} />
+                          <span>{node?.name || reference.node}</span>
+                          <span className="mono">{reference.node}</span>
+                        </span>
+                        <span className="tnd-go" aria-hidden>
+                          ›
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
               )}
-            </div>
-          </section>
+            </section>
+          </div>
+
+          <aside className="tnd-aside">
+            <section className="panel config-panel cg-sec tnd-conn">
+              <header>
+                <PanelTitle of="tunnels">连接</PanelTitle>
+                {draftChanged ? (
+                  <span className="cg-meta warn">草稿已修改</span>
+                ) : status?.key === 'unpublished' ? (
+                  <span className="cg-meta">仅在草稿</span>
+                ) : null}
+              </header>
+              <dl className="cg-kv tnd-kv">
+                {connectionFacts(tunnel).map(fact => (
+                  <Fragment key={fact.label}>
+                    <dt>{fact.label}</dt>
+                    <dd className={fact.dim ? 'dim' : undefined}>
+                      <span className="tnd-kv-value" title={fact.value}>
+                        {fact.value}
+                      </span>
+                      {fact.copy && (
+                        <CopyButton className="tnd-copy" text={fact.value} iconOnly label={`复制${fact.label}`}>
+                          {state => <Icon of={copyStateIcon(state)} size={12} />}
+                        </CopyButton>
+                      )}
+                    </dd>
+                  </Fragment>
+                ))}
+              </dl>
+            </section>
+          </aside>
         </div>
       </div>
 
