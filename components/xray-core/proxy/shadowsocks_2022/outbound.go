@@ -90,9 +90,12 @@ func (o *Outbound) Process(ctx context.Context, link *transport.Link, dialer int
 	if err != nil {
 		return errors.New("failed to connect to server").Base(err)
 	}
+	defer connection.Close()
 
 	if session.TimeoutOnlyFromContext(ctx) {
-		ctx, _ = context.WithCancel(context.Background())
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(context.Background())
+		defer cancel()
 	}
 
 	if network == net.Network_TCP {

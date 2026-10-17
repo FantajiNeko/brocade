@@ -83,3 +83,8 @@ description = "DNS: Avoid passing domain to WriteTo func (#6163)"
 commit = "540b9070f5bc0e67a04341f11bde598153957b91"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6688"
 description = "Transport: Bind the UDP outbound socket in the destination family (#6688)"
+
+[[backports]]
+commit = "2776ea6d7426e1d024924df02d749d7021b2747f"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6698"
+description = "SS2022 outbound: Close connection to server on early returns (#6698)"
