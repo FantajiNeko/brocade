@@ -61,6 +61,14 @@ jobs:
       - name: Prepare pinned Xray assets
         run: sh "$GITHUB_WORKSPACE/scripts/prepare-xray-assets.sh"
 
+      - name: QUIC sniffing compatibility, fuzz seeds and races
+        run: |
+          go test -race ./common/protocol/quic -count=3 -timeout=2m
+          go vet ./common/protocol/quic
+
+      - name: QUIC Initial parser fuzz
+        run: go test ./common/protocol/quic -run '^$' -fuzz '^FuzzSniffQUIC$' -fuzztime=10s -timeout=2m
+
       - name: ActivityTimer deterministic concurrency regressions
         run: go test -race ./common/signal -run '^TestActivityTimerConcurrent' -count=100 -timeout=1m
 

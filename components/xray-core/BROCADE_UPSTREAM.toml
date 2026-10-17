@@ -16,3 +16,14 @@ sniffing_failure_routing = true
 secure_dokodemo_splice = true
 legacy_agent_vision_splice = true
 online_source_protocols = true
+
+# Selected upstream backports; the full-tree baseline above remains unchanged.
+[[backports]]
+commit = "8f15190c230fe6975c9b18e31316c6bc494f3863"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6471"
+description = "Reject truncated QUIC header-protection samples before slicing"
+
+[[backports]]
+commit = "d9c54026c5ff1652d8fc2e58ffd06706dd27a6a6"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6695"
+description = "Sniff QUIC v2 Initial packets and recover SNI alongside v1 and draft-29"
