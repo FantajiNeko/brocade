@@ -45,6 +45,7 @@ var (
 	globalDialerAccess sync.Mutex
 )
 
+// getHTTPClient returns a retained client. Release it after its last use.
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
@@ -77,6 +78,8 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
+	// Reserve it while selection is locked: another dial may immediately retire it.
+	xmuxClient.retain()
 	return xmuxClient.XmuxConn.(DialerClient), xmuxClient
 }
 
@@ -460,14 +463,26 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			}
 			if xmuxClient != nil {
 				xmuxClient.DoneRunning()
+				xmuxClient.release()
 			}
 			if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
 				xmuxClient2.DoneRunning()
+			}
+			if xmuxClient2 != nil && transportConfiguration.DownloadSettings != nil {
+				xmuxClient2.release()
 			}
 		},
 	}
 
 	var err error
+	defer func() {
+		if err != nil {
+			conn.onClose()
+			common.Close(conn.reader)
+			common.Close(conn.writer)
+			reader.Close()
+		}
+	}()
 	if mode == "stream-one" {
 		requestURL.Path = transportConfiguration.GetNormalizedPath()
 		if xmuxClient != nil {
@@ -517,12 +532,21 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		maxUploadSize,
 	}
 
+	// The uploader can outlive splitConn.Close while queued writes finish.
+	if xmuxClient != nil {
+		xmuxClient.retain()
+	}
 	go func() {
 		var seq int64
 		var lastWrite time.Time
 
 		dynamicHTTPClient := httpClient
 		dynamicXmuxClient := xmuxClient
+		defer func() {
+			if dynamicXmuxClient != nil {
+				dynamicXmuxClient.release()
+			}
+		}()
 		for {
 			// by offloading the uploads into a buffered pipe, multiple conn.Write
 			// calls get automatically batched together into larger POST requests.
@@ -559,10 +583,18 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 				if dynamicXmuxClient != nil && (dynamicXmuxClient.LeftRequests.Add(-1) <= 0 ||
 					(dynamicXmuxClient.UnreusableAt != time.Time{} && lastWrite.After(dynamicXmuxClient.UnreusableAt))) {
+					previous := dynamicXmuxClient
 					dynamicHTTPClient, dynamicXmuxClient = getHTTPClient(ctx, dest, streamSettings)
+					previous.release()
 				}
 
-				go func(hClient DialerClient) {
+				if dynamicXmuxClient != nil {
+					dynamicXmuxClient.retain()
+				}
+				go func(hClient DialerClient, lease *XmuxClient) {
+					if lease != nil {
+						defer lease.release()
+					}
 					err := hClient.PostPacket(
 						ctx,
 						requestURL.String(),
@@ -576,7 +608,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 						uploadPipeReader.Interrupt()
 						doSplit.Store(false)
 					}
-				}(dynamicHTTPClient)
+				}(dynamicHTTPClient, dynamicXmuxClient)
 
 				if _, ok := dynamicHTTPClient.(*DefaultDialerClient); ok {
 					<-wroteRequest.Wait()

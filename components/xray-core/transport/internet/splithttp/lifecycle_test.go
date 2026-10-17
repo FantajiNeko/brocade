@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -186,5 +188,52 @@ func TestUploadQueueConcurrentClose(t *testing.T) {
 		if body.closed.Load() != 1 {
 			t.Fatalf("body closed %d times", body.closed.Load())
 		}
+	}
+}
+
+func TestRetiredXmuxWaitsForPacketReferences(t *testing.T) {
+	conn := &closingXmuxConn{}
+	client := &XmuxClient{XmuxConn: conn}
+	// One uploader reference and two outstanding packet requests.
+	for range 3 {
+		client.retain()
+	}
+	client.NotUsed.Store(true)
+	client.maybeClose()
+	client.release()
+	if conn.closed.Load() != 0 {
+		t.Fatal("retirement closed outstanding packets")
+	}
+	var group sync.WaitGroup
+	group.Add(2)
+	for range 2 {
+		go func() { defer group.Done(); client.release() }()
+	}
+	group.Wait()
+	if conn.closed.Load() != 1 {
+		t.Fatalf("retired transport closed %d times", conn.closed.Load())
+	}
+}
+
+func TestInvalidDialReleasesXmuxReservation(t *testing.T) {
+	settings := &internet.MemoryStreamConfig{
+		ProtocolName:     "splithttp",
+		ProtocolSettings: &Config{Host: "bad host", Mode: "stream-one"},
+	}
+	dest := xnet.TCPDestination(xnet.LocalHostIP, 1)
+	if conn, err := Dial(context.Background(), dest, settings); err == nil {
+		conn.Close()
+		t.Fatal("invalid host accepted")
+	}
+	globalDialerAccess.Lock()
+	manager := globalDialerMap[dialerConf{dest, settings}]
+	delete(globalDialerMap, dialerConf{dest, settings})
+	globalDialerAccess.Unlock()
+	if manager == nil || len(manager.xmuxClients) != 1 {
+		t.Fatal("expected one acquired transport")
+	}
+	client := manager.xmuxClients[0]
+	if client.Running.Load() != 0 || client.references.Load() != 0 {
+		t.Fatalf("failed dial leaked running=%d references=%d", client.Running.Load(), client.references.Load())
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"math"
 	"math/big"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +24,8 @@ type XmuxClient struct {
 	LeftRequests atomic.Int32
 	UnreusableAt time.Time
 	NotUsed      atomic.Bool
+	references   atomic.Int32
+	closeOnce    sync.Once
 }
 
 func (c *XmuxClient) AddRunning() {
@@ -34,10 +37,20 @@ func (c *XmuxClient) DoneRunning() {
 	c.maybeClose()
 }
 
+// References protect acquired clients and in-flight packet requests without
+// changing Running, which controls the number of multiplexed streams.
+// Retain only while selecting under the manager lock or holding a reference.
+func (c *XmuxClient) retain() { c.references.Add(1) }
+
+func (c *XmuxClient) release() {
+	c.references.Add(-1)
+	c.maybeClose()
+}
+
 // close the XmuxConn if it is not used and has no running requests
 func (c *XmuxClient) maybeClose() {
-	if c.NotUsed.Load() && c.Running.Load() <= 0 {
-		common.Close(c.XmuxConn)
+	if c.NotUsed.Load() && c.Running.Load() <= 0 && c.references.Load() == 0 {
+		c.closeOnce.Do(func() { common.Close(c.XmuxConn) })
 	}
 }
 
