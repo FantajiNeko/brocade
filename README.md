@@ -102,7 +102,7 @@ VPN Gate 候选不使用 Brocade 合成的“综合质量分”。Agent 先完�
 
 WARP 使用 Xray MASQUE 出站，默认 HTTP/3（UDP/443），也可在隧道参数中选择 HTTP/2（TCP/443）；两者都承载 TCP/UDP 业务，不自动互相回退。Endpoint 默认 `162.159.198.2:443`，TLS SNI 固定为 `consumer-masque.cloudflareclient.com`；设备使用 P-256 密钥认证并校验注册返回的服务端公钥。隧道内 DNS 默认 `1.1.1.1`、`1.0.0.1`，域名目标通过 WARP 查询。
 
-申请流程仍是“创建并提交隧道 → 按机器同意条款并申请身份 → 发布”。注册适配器先创建临时设备，再登记 MASQUE 公钥；登记失败会注销临时设备。密钥和设备令牌加密保存，草稿预览不调用 Cloudflare。WARP 不再接受 WireGuard 的 MTU、Keepalive、Allowed IPs、TUN、Workers 和 reserved 参数；旧 WG 身份不能复用，需重新申请。此变更不兼容旧 WARP 模型和绑定数据，升级已有安装前须完成旧绑定清理与重新注册；历史修订保持不可变；读取未绑定、未被规则或订阅前置引用的旧默认隧道时，仅在内存中兼容其旧参数，不改写模型或订阅快照。携带旧 WG 身份或引用旧隧道的历史修订不能用新版重新编译。先发布支持 MASQUE 的 Brocade Xray，再发布使用它的配置。
+申请流程仍是“创建并提交隧道 → 按机器同意条款并申请身份 → 发布”。注册适配器先创建临时设备，再登记 MASQUE 公钥；登记失败会注销临时设备。密钥和设备令牌加密保存，草稿预览不调用 Cloudflare。WARP 不再接受 WireGuard 的 MTU、Keepalive、Allowed IPs、TUN、Workers 和 reserved 参数；旧 WG 身份不能复用，需重新申请。此变更不兼容旧 WARP 模型和绑定数据，升级已有安装前须完成旧绑定清理与重新注册；运行时仅接受 MASQUE 格式，不转换旧快照。已有安装应先备份、停止 Console 写入，再使用 `scripts/migrate-warp-checkpoints.py` 审计并以 `--apply` 迁移未绑定、未引用的旧默认配置；脚本原子更新存储格式和订阅摘要，保留修订编号及运行引用。携带旧 WG 身份或引用旧隧道的数据会拒绝迁移，必须先显式重新注册并发布。先发布支持 MASQUE 的 Brocade Xray，再发布使用它的配置。
 
 外部隧道的资源 ID 是不承载业务语义的随机标识：手工隧道使用 `custom-xxxx-xxxx`，WARP 使用 `warp-xxxx-xxxx`，VPN Gate 地区池或固定节点使用 `vpngate-xxxx-xxxx`，其中 `x` 是小写十六进制。地区、节点、租户和展示名称只保存在各自字段中，旧前缀或语义化 ID 不再接受。
 
