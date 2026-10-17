@@ -53,3 +53,8 @@ description = "MASQUE client: Support WARP (#6878)"
 commit = "5121c28b855c9d7f12deaeb1352116eb490754bb"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6882"
 description = "QUIC sniffer: Handle zero-filled datagram tails (#6882)"
+
+[[backports]]
+commit = "6ce8dc53e79842af71f0b4a360cb65d9eaa1e8f7"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6723"
+description = "common/buf/writer.go: Fix buffered writes failing when payload exceeds remaining capacity (#6723)"

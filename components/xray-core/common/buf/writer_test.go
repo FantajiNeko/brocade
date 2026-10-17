@@ -31,6 +31,24 @@ func TestWriter(t *testing.T) {
 	}
 }
 
+func TestBufferedWriterCrossCapacity(t *testing.T) {
+	for _, size := range []int{32, 2*int(Size) + 32} {
+		var output bytes.Buffer
+		writer := NewBufferedWriter(NewWriter(&output))
+		first := bytes.Repeat([]byte{'a'}, int(Size)-8)
+		second := bytes.Repeat([]byte{'b'}, size)
+		for _, payload := range [][]byte{first, second} {
+			if n, err := writer.Write(payload); n != len(payload) || err != nil {
+				t.Fatalf("write %d bytes: got %d, %v", len(payload), n, err)
+			}
+		}
+		common.Must(writer.Close())
+		if !bytes.Equal(output.Bytes(), append(first, second...)) {
+			t.Fatal("cross-capacity write lost or reordered bytes")
+		}
+	}
+}
+
 func TestBytesWriterReadFrom(t *testing.T) {
 	const size = 50000
 	pReader, pWriter := pipe.New(pipe.WithSizeLimit(size))
