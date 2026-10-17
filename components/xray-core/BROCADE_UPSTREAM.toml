@@ -63,3 +63,18 @@ description = "common/buf/writer.go: Fix buffered writes failing when payload ex
 commit = "a2cec2e580e8ea1900701b11b425e0351de2ec71"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6207"
 description = "DNS: Avoid panic on domain too long (#6207)"
+
+[[backports]]
+commit = "2eedef51a241cf6f49bb35fb179eb1a1ceeaf09e"
+pull_request = "https://github.com/XTLS/Xray-core/pull/7091"
+description = "DNS: Fix pubsub cleanup sizing every topic's slice by the topic count (#7091)"
+
+[[backports]]
+commit = "ac04c445bd09541cc9c35a120ee01d8a177a4d83"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6363"
+description = "DNS: Fix unexpected TTL clamp (#6363)"
+
+[[backports]]
+commit = "cb206ddc74766509f57321c48d08ec807b9dfbad"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6163"
+description = "DNS: Avoid passing domain to WriteTo func (#6163)"
