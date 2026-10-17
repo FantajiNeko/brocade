@@ -1529,7 +1529,7 @@ fn a_change_the_running_xray_can_absorb_is_not_disruptive() {
 }
 
 #[test]
-fn adding_a_managed_warp_outbound_requires_an_xray_restart() {
+fn adding_a_managed_masque_outbound_can_hot_swap() {
     let mut before = snapshot(
         vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
         vec![direct_app("direct", "hk", "i-hk", 8443, true, any_egress())],
@@ -1538,8 +1538,8 @@ fn adding_a_managed_warp_outbound_requires_an_xray_restart() {
         id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "WARP".to_owned(),
-        address: "engage.example".to_owned(),
-        port: 2408,
+        address: "masque.example".to_owned(),
+        port: 443,
         protocol: ExternalOutboundProtocol::Warp {
             http_version: Default::default(),
             remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
@@ -1589,8 +1589,19 @@ fn adding_a_managed_warp_outbound_requires_an_xray_restart() {
     let plan = plan_deployment(&after, &applied).unwrap();
     let hk = target(&plan, "hk");
     assert_eq!(hk.actions, vec![PlannedAction::ApplyXray]);
-    assert!(
-        hk.disruptive,
-        "新增 WARP/WireGuard 出站不能通过 HandlerService 热切"
+    assert!(!hk.disruptive, "MASQUE 出站可通过 HandlerService 动态添加");
+    let DesiredArtifact::Present {
+        content: desired, ..
+    } = &hk.desired.xray
+    else {
+        panic!("MASQUE 路由应生成 xray 配置");
+    };
+    let swap = brocade_deployment::hotswap::hot_swap(content, desired).unwrap();
+    assert_eq!(swap.add_outbounds.len(), 1);
+    assert_eq!(swap.add_outbounds[0]["protocol"], "masque");
+    let reverse = brocade_deployment::hotswap::hot_swap(desired, content).unwrap();
+    assert_eq!(
+        reverse.remove_outbounds,
+        vec!["out:external/warp-8f3a-2d71"]
     );
 }
