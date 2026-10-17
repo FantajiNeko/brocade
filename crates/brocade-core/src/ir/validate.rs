@@ -13,10 +13,9 @@ use crate::{
         ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial,
         HopPool, HopWire, Hysteria2, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
         HysteriaQuic, ModelSnapshot, RealityFallbackLimits, RealityFallbackRateLimit, Transport,
-        Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, EXTERNAL_WIREGUARD_MAX_WORKERS,
-        VPNGATE_CONNECT_THRESHOLD_MAX_MS, VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS,
-        VPNGATE_MANAGED_ADDRESS, VPNGATE_MANAGED_PORT, VPNGATE_MAX_CANDIDATES,
-        VPNGATE_RUNTIME_MAX_POOLS_PER_NODE,
+        Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, VPNGATE_CONNECT_THRESHOLD_MAX_MS,
+        VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS, VPNGATE_MANAGED_ADDRESS, VPNGATE_MANAGED_PORT,
+        VPNGATE_MAX_CANDIDATES, VPNGATE_RUNTIME_MAX_POOLS_PER_NODE,
     },
     physical::user::project_user,
     text::{
@@ -845,51 +844,19 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                     ));
                 }
             }
-            ExternalOutboundProtocol::Warp {
-                mtu,
-                allowed_ips,
-                domain_strategy,
-                workers,
-                ..
-            } => {
-                if !(576..=9000).contains(mtu) {
-                    diagnostics.push(Diagnostic::error(
-                        "external-outbound.warp-mtu",
-                        &at,
-                        "WARP MTU 必须在 576–9000 之间；Cloudflare 默认使用 1280",
-                    ));
-                }
-                if allowed_ips.is_empty()
-                    || allowed_ips
+            ExternalOutboundProtocol::Warp { remote_dns, .. } => {
+                if remote_dns.is_empty()
+                    || remote_dns.len() > 8
+                    || remote_dns
                         .iter()
-                        .any(|network| network.parse::<IpNet>().is_err())
+                        .any(|ip| ip.is_unspecified() || ip.is_multicast())
                 {
                     diagnostics.push(Diagnostic::error(
-                        "external-outbound.warp-allowed-ips",
+                        "external-outbound.warp-dns",
                         &at,
-                        "WARP Allowed IPs 至少填写一个合法 CIDR",
+                        "MASQUE 需要 1–8 个有效的隧道内 DNS IP 地址",
                     ));
                 }
-                if !matches!(
-                    domain_strategy.as_str(),
-                    "ForceIP" | "ForceIPv4" | "ForceIPv6" | "ForceIPv4v6" | "ForceIPv6v4"
-                ) {
-                    diagnostics.push(Diagnostic::error(
-                        "external-outbound.warp-domain-strategy",
-                        &at,
-                        "WARP 域名策略不是 Xray 支持的 ForceIP 系列取值",
-                    ));
-                }
-                if *workers > EXTERNAL_WIREGUARD_MAX_WORKERS {
-                    diagnostics.push(Diagnostic::error(
-                        "external-outbound.warp-workers",
-                        &at,
-                        format!(
-                            "WARP Workers 必须在 0–{EXTERNAL_WIREGUARD_MAX_WORKERS} 之间；0 表示自动"
-                        ),
-                    ));
-                }
-
                 let mut nodes = BTreeSet::new();
                 for binding in &outbound.bindings {
                     let binding_at = format!("{at}/{}", binding.node);
@@ -900,13 +867,13 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                             "同一条 WARP 隧道在一台机器上只能有一个设备身份",
                         ));
                     }
-                    if !wireguard_key_is_valid(&binding.private_key)
-                        || !wireguard_key_is_valid(&binding.peer_public_key)
+                    if !warp_p256_der_is_valid(&binding.private_key, false)
+                        || !warp_p256_der_is_valid(&binding.peer_public_key, true)
                     {
                         diagnostics.push(Diagnostic::error(
                             "external-outbound.warp-key",
                             &binding_at,
-                            "WARP 注册返回的 WireGuard 密钥不是 Base64 编码的 32 字节密钥",
+                            "MASQUE 需要重新注册的 P-256 设备身份，不能复用 WireGuard 密钥",
                         ));
                     }
                     if binding.local_addresses.is_empty()
@@ -921,77 +888,20 @@ fn validate_external_outbounds(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
                             "WARP 设备至少需要一个合法的隧道 CIDR",
                         ));
                     }
-                    if !binding.reserved.is_empty() && binding.reserved.len() != 3 {
-                        diagnostics.push(Diagnostic::error(
-                            "external-outbound.warp-reserved",
-                            &binding_at,
-                            "WARP client_id 必须为空或恰好解码为 3 个 reserved 字节",
-                        ));
-                    }
                     if binding.endpoint_address.as_deref().is_some_and(|address| {
                         address.trim().is_empty() || address.chars().any(char::is_whitespace)
                     }) {
                         diagnostics.push(Diagnostic::error(
                             "external-outbound.warp-endpoint-address",
                             &binding_at,
-                            "WARP 机器 Endpoint 地址不能为空或含空白；不覆盖时应省略该字段",
+                            "WARP 机器 Endpoint 地址不能为空或含空白",
                         ));
                     }
                     if binding.endpoint_port == Some(0) {
                         diagnostics.push(Diagnostic::error(
                             "external-outbound.warp-endpoint-port",
                             &binding_at,
-                            "WARP 机器 Endpoint 端口必须在 1–65535 之间",
-                        ));
-                    }
-                    if binding.mtu.is_some_and(|mtu| !(576..=9000).contains(&mtu)) {
-                        diagnostics.push(Diagnostic::error(
-                            "external-outbound.warp-binding-mtu",
-                            &binding_at,
-                            "WARP 机器 MTU 必须在 576–9000 之间",
-                        ));
-                    }
-                    if binding.allowed_ips.is_some() != binding.domain_strategy.is_some() {
-                        diagnostics.push(Diagnostic::error(
-                            "external-outbound.warp-binding-address-policy",
-                            &binding_at,
-                            "WARP 机器地址策略必须同时覆盖 Allowed IPs 与域名策略",
-                        ));
-                    }
-                    if binding.allowed_ips.as_ref().is_some_and(|networks| {
-                        networks.is_empty()
-                            || networks
-                                .iter()
-                                .any(|network| network.parse::<IpNet>().is_err())
-                    }) {
-                        diagnostics.push(Diagnostic::error(
-                            "external-outbound.warp-binding-allowed-ips",
-                            &binding_at,
-                            "WARP 机器 Allowed IPs 至少需要一个合法 CIDR",
-                        ));
-                    }
-                    if binding.domain_strategy.as_deref().is_some_and(|strategy| {
-                        !matches!(
-                            strategy,
-                            "ForceIP" | "ForceIPv4" | "ForceIPv6" | "ForceIPv4v6" | "ForceIPv6v4"
-                        )
-                    }) {
-                        diagnostics.push(Diagnostic::error(
-                            "external-outbound.warp-binding-domain-strategy",
-                            &binding_at,
-                            "WARP 机器域名策略不是 Xray 支持的 ForceIP 系列取值",
-                        ));
-                    }
-                    if binding
-                        .workers
-                        .is_some_and(|workers| workers > EXTERNAL_WIREGUARD_MAX_WORKERS)
-                    {
-                        diagnostics.push(Diagnostic::error(
-                            "external-outbound.warp-binding-workers",
-                            &binding_at,
-                            format!(
-                                "WARP 机器 Workers 必须在 0–{EXTERNAL_WIREGUARD_MAX_WORKERS} 之间；0 表示自动"
-                            ),
+                            "WARP Endpoint 端口必须在 1–65535 之间",
                         ));
                     }
                 }
@@ -1569,6 +1479,23 @@ fn ss2022_credential_is_valid(credential: &str, key_len: usize) -> bool {
                     .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(part))
                     .is_ok_and(|key| key.len() == key_len)
         })
+}
+
+// The compiler checks the stored DER envelope and curve identity. Xray's x509 parser performs
+// full key validation before activation; the console generates the private key locally.
+fn warp_p256_der_is_valid(key: &str, public: bool) -> bool {
+    let Ok(der) = base64::engine::general_purpose::STANDARD.decode(key) else {
+        return false;
+    };
+    const CURVE: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    der.first() == Some(&0x30)
+        && if public {
+            der.len() == 91
+                && der.get(13..23) == Some(CURVE)
+                && der.get(23..27) == Some(&[0x03, 0x42, 0x00, 0x04])
+        } else {
+            (100..=256).contains(&der.len()) && der.windows(CURVE.len()).any(|v| v == CURVE)
+        }
 }
 
 fn wireguard_key_is_valid(key: &str) -> bool {

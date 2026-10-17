@@ -802,7 +802,7 @@ async fn initial_html_uses_current_branding_without_default_title_flash() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn http_warp_binding_route_updates_every_machine_runtime_override() {
+async fn http_warp_binding_route_updates_endpoint_and_rejects_removed_options() {
     std::env::set_var(
         brocade_store::secrets::SECRET_KEY_ENV,
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -823,12 +823,8 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
                     address: "engage.cloudflareclient.com".to_owned(),
                     port: 2408,
                     protocol: ExternalOutboundProtocol::Warp {
-                        mtu: 1280,
-                        keep_alive: 25,
-                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-                        no_kernel_tun: true,
-                        domain_strategy: "ForceIP".to_owned(),
-                        workers: 0,
+                        http_version: Default::default(),
+                        remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
                     },
                     security: ExternalOutboundSecurity::None,
                     note: None,
@@ -847,16 +843,24 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
                 device_id: "device-n1".to_owned(),
                 account_id: "account-n1".to_owned(),
                 access_token: "provider-token".to_owned(),
-                private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
-                peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+                private_key: include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../brocade-core/tests/fixtures/warp/private.b64"
+                ))
+                .trim()
+                .to_owned(),
+                peer_public_key: include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../brocade-core/tests/fixtures/warp/public.b64"
+                ))
+                .trim()
+                .to_owned(),
                 local_addresses: vec!["172.16.0.2/32".to_owned()],
-                reserved: vec![1, 2, 3],
                 note: None,
             },
         )
         .await
         .unwrap();
-
     let (app, token) = admin_app(&db).await;
     let uri = "/tenants/platform.acme/tunnels/warp-8f3a-2d71/warp-bindings/n1";
     let unauthorized = app
@@ -870,14 +874,12 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
         .await
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
     let unauthorized_delete = app
         .clone()
         .oneshot(Request::delete(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(unauthorized_delete.status(), StatusCode::UNAUTHORIZED);
-
     let updated = app
         .clone()
         .oneshot(
@@ -888,12 +890,6 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
                     json!({
                         "endpoint_address": "162.159.193.10",
                         "endpoint_port": 500,
-                        "mtu": 1420,
-                        "keep_alive": 40,
-                        "allowed_ips": ["::/0"],
-                        "no_kernel_tun": false,
-                        "domain_strategy": "ForceIPv6",
-                        "workers": 4
                     })
                     .to_string(),
                 ))
@@ -905,31 +901,18 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
     let updated = response_json(updated).await;
     assert_eq!(updated["binding"]["endpoint_address"], "162.159.193.10");
     assert_eq!(updated["binding"]["endpoint_port"], 500);
-    assert_eq!(updated["binding"]["mtu"], 1420);
-    assert_eq!(updated["binding"]["keep_alive"], 40);
-    assert_eq!(updated["binding"]["allowed_ips"], json!(["::/0"]));
-    assert_eq!(updated["binding"]["no_kernel_tun"], false);
-    assert_eq!(updated["binding"]["domain_strategy"], "ForceIPv6");
-    assert_eq!(updated["binding"]["workers"], 4);
-
-    let incomplete_policy = app
+    let removed_option = app
         .clone()
         .oneshot(
             Request::put(uri)
                 .header("authorization", format!("Bearer {token}"))
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "allowed_ips": ["0.0.0.0/0"]
-                    })
-                    .to_string(),
-                ))
+                .body(Body::from(json!({"mtu": 1280}).to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(incomplete_policy.status(), StatusCode::BAD_REQUEST);
-
+    assert_eq!(removed_option.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let blank_address = app
         .clone()
         .oneshot(
@@ -940,7 +923,6 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
                     json!({
                         "endpoint_address": "   ",
                         "endpoint_port": 500,
-                        "mtu": 1420
                     })
                     .to_string(),
                 ))
@@ -949,7 +931,6 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
         .await
         .unwrap();
     assert_eq!(blank_address.status(), StatusCode::BAD_REQUEST);
-
     let cleared = app
         .oneshot(
             Request::put(uri)
@@ -959,12 +940,6 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
                     json!({
                         "endpoint_address": null,
                         "endpoint_port": null,
-                        "mtu": null,
-                        "keep_alive": null,
-                        "allowed_ips": null,
-                        "no_kernel_tun": null,
-                        "domain_strategy": null,
-                        "workers": null
                     })
                     .to_string(),
                 ))
@@ -976,14 +951,13 @@ async fn http_warp_binding_route_updates_every_machine_runtime_override() {
     let cleared = response_json(cleared).await;
     assert!(cleared["binding"]["endpoint_address"].is_null());
     assert!(cleared["binding"]["endpoint_port"].is_null());
-    assert!(cleared["binding"]["mtu"].is_null());
-    assert!(cleared["binding"]["keep_alive"].is_null());
-    assert!(cleared["binding"]["allowed_ips"].is_null());
-    assert!(cleared["binding"]["no_kernel_tun"].is_null());
-    assert!(cleared["binding"]["domain_strategy"].is_null());
-    assert!(cleared["binding"]["workers"].is_null());
+    assert!(cleared["binding"].get("mtu").is_none());
+    assert!(cleared["binding"].get("keep_alive").is_none());
+    assert!(cleared["binding"].get("allowed_ips").is_none());
+    assert!(cleared["binding"].get("no_kernel_tun").is_none());
+    assert!(cleared["binding"].get("domain_strategy").is_none());
+    assert!(cleared["binding"].get("workers").is_none());
 }
-
 /// Asking for the split still gets two separate route tables, and the agent face still learns its
 /// own origin. The console's paths must not be reachable from it: that separation is the only
 /// reason to run two listeners, so it is worth a test rather than an assumption.

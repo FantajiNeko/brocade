@@ -58,68 +58,6 @@ type Drill =
   | { p: 'warp'; id: string }
   | { p: 'custom'; id: string };
 
-export type WarpIpStack = 'dual' | 'prefer_ipv4' | 'prefer_ipv6' | 'ipv4' | 'ipv6';
-
-type WarpProtocol = Extract<ExternalOutbound['protocol'], { t: 'warp' }>;
-
-/**
- * WARP keeps Xray's low-level routing fields in the model, but the operator-facing choice is
- * represented as one address policy. Routes remain authoritative for single-stack configurations;
- * domainStrategy then distinguishes automatic dual stack from either preferred family.
- */
-export const warpIpStackOf = (protocol: WarpProtocol): WarpIpStack => {
-  const hasIpv4 = protocol.v.allowed_ips.some(network => network.includes('.'));
-  const hasIpv6 = protocol.v.allowed_ips.some(network => network.includes(':'));
-  if (hasIpv4 && !hasIpv6) return 'ipv4';
-  if (hasIpv6 && !hasIpv4) return 'ipv6';
-  if (protocol.v.domain_strategy === 'ForceIPv4') return 'ipv4';
-  if (protocol.v.domain_strategy === 'ForceIPv6') return 'ipv6';
-  if (protocol.v.domain_strategy === 'ForceIPv4v6') return 'prefer_ipv4';
-  if (protocol.v.domain_strategy === 'ForceIPv6v4') return 'prefer_ipv6';
-  return 'dual';
-};
-
-export const warpIpRouting = (stack: WarpIpStack): Pick<WarpProtocol['v'], 'allowed_ips' | 'domain_strategy'> => {
-  switch (stack) {
-    case 'prefer_ipv4':
-      return { allowed_ips: ['0.0.0.0/0', '::/0'], domain_strategy: 'ForceIPv4v6' };
-    case 'prefer_ipv6':
-      return { allowed_ips: ['0.0.0.0/0', '::/0'], domain_strategy: 'ForceIPv6v4' };
-    case 'ipv4':
-      return { allowed_ips: ['0.0.0.0/0'], domain_strategy: 'ForceIPv4' };
-    case 'ipv6':
-      return { allowed_ips: ['::/0'], domain_strategy: 'ForceIPv6' };
-    default:
-      return { allowed_ips: ['0.0.0.0/0', '::/0'], domain_strategy: 'ForceIP' };
-  }
-};
-
-const warpIpStackLabel = (stack: WarpIpStack) =>
-  ({
-    dual: '自动双栈',
-    prefer_ipv4: 'IPv4 优先',
-    prefer_ipv6: 'IPv6 优先',
-    ipv4: '仅 IPv4',
-    ipv6: '仅 IPv6',
-  })[stack];
-
-function WarpIpStackControl({ value, onChange }: { value: WarpIpStack; onChange: (value: WarpIpStack) => void }) {
-  return (
-    <select
-      className="f warp-stack-control"
-      aria-label="WARP 出口协议栈"
-      value={value}
-      onChange={event => onChange(event.target.value as WarpIpStack)}
-    >
-      <option value="dual">自动双栈</option>
-      <option value="prefer_ipv4">IPv4 优先</option>
-      <option value="prefer_ipv6">IPv6 优先</option>
-      <option value="ipv4">仅 IPv4</option>
-      <option value="ipv6">仅 IPv6</option>
-    </select>
-  );
-}
-
 const protocolName = (tunnel: ExternalOutbound) => {
   if (tunnel.protocol.t === 'vless' && tunnel.protocol.v.encryption !== 'none') return 'VLESS Encryption';
   return {
@@ -472,53 +410,54 @@ export function WarpCreate({
   onClose: () => void;
   onCreated: (tunnel: ExternalOutbound) => void;
 }) {
-  const qc = useQueryClient();
-  const [name, setName] = useState('Cloudflare WARP');
   const [id] = useState(() => randomWarpTunnelId(existingIds));
-  const [address, setAddress] = useState('engage.cloudflareclient.com');
-  const [port, setPort] = useState('2408');
-  const [advanced, setAdvanced] = useState(false);
-  const [mtu, setMtu] = useState('1280');
-  const [keepAlive, setKeepAlive] = useState('25');
-  const [ipStack, setIpStack] = useState<WarpIpStack>('dual');
-  const [noKernelTun, setNoKernelTun] = useState(false);
-  const [workers, setWorkers] = useState('0');
+  return <WarpMasqueEditor tenantId={tenantId} id={id} onClose={onClose} onSaved={onCreated} />;
+}
+
+function WarpMasqueEditor({
+  tenantId,
+  id,
+  tunnel,
+  onClose,
+  onSaved,
+}: {
+  tenantId: string;
+  id: string;
+  tunnel?: ExternalOutbound;
+  onClose: () => void;
+  onSaved: (tunnel: ExternalOutbound) => void;
+}) {
+  const qc = useQueryClient();
+  const initial = tunnel?.protocol.t === 'warp' ? tunnel.protocol.v : null;
+  const [name, setName] = useState(tunnel?.name ?? 'Cloudflare WARP');
+  const [address, setAddress] = useState(tunnel?.address ?? '162.159.198.2');
+  const [port, setPort] = useState(String(tunnel?.port ?? 443));
+  const [httpVersion, setHttpVersion] = useState<'h3' | 'h2'>(initial?.http_version ?? 'h3');
+  const [dns, setDns] = useState((initial?.remote_dns ?? ['1.1.1.1', '1.0.0.1']).join(', '));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  const guardScope = `warp-create:${id}`;
+  const guardScope = `warp-masque:${tenantId}:${id}`;
   const dirty =
-    name !== 'Cloudflare WARP' ||
-    address !== 'engage.cloudflareclient.com' ||
-    port !== '2408' ||
-    mtu !== '1280' ||
-    keepAlive !== '25' ||
-    ipStack !== 'dual' ||
-    noKernelTun ||
-    workers !== '0';
-  const clearUnsavedChanges = useUnsavedChanges(dirty, '新建 WARP 隧道', guardScope);
+    name !== (tunnel?.name ?? 'Cloudflare WARP') ||
+    address !== (tunnel?.address ?? '162.159.198.2') ||
+    port !== String(tunnel?.port ?? 443) ||
+    httpVersion !== (initial?.http_version ?? 'h3') ||
+    dns !== (initial?.remote_dns ?? ['1.1.1.1', '1.0.0.1']).join(', ');
+  const clearUnsavedChanges = useUnsavedChanges(dirty, 'WARP MASQUE 参数', guardScope);
   const valid =
     !!tenantId &&
     !!name.trim() &&
-    /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id) &&
     !!address.trim() &&
+    !/\s/.test(address) &&
     Number.isInteger(Number(port)) &&
     Number(port) > 0 &&
     Number(port) <= 65535 &&
-    Number.isInteger(Number(mtu)) &&
-    Number(mtu) >= 576 &&
-    Number(mtu) <= 9000 &&
-    Number.isInteger(Number(keepAlive)) &&
-    Number(keepAlive) >= 0 &&
-    Number(keepAlive) <= 65535 &&
-    Number.isInteger(Number(workers)) &&
-    Number(workers) >= 0 &&
-    Number(workers) <= 256;
-
+    !!dns.trim();
   const save = async () => {
     if (!valid) return;
     setSaving(true);
     setError(null);
-    const tunnel: ExternalOutbound = {
+    const value: ExternalOutbound = {
       id,
       tenant: tenantId,
       name: name.trim(),
@@ -527,61 +466,50 @@ export function WarpCreate({
       protocol: {
         t: 'warp',
         v: {
-          mtu: Number(mtu),
-          keep_alive: Number(keepAlive),
-          ...warpIpRouting(ipStack),
-          no_kernel_tun: noKernelTun,
-          workers: Number(workers),
+          http_version: httpVersion,
+          remote_dns: dns.split(/[,\s]+/).filter(Boolean),
         },
       },
       security: { t: 'none' },
-      bindings: [],
+      bindings: tunnel?.bindings ?? [],
     };
     try {
       await upsertExternalOutbound({
         id,
         tenant_id: tenantId,
-        name: tunnel.name,
-        address: tunnel.address,
-        port: tunnel.port,
-        protocol: tunnel.protocol,
-        security: tunnel.security,
+        name: value.name,
+        address: value.address,
+        port: value.port,
+        protocol: value.protocol,
+        security: value.security,
       });
       await Promise.all([
         qc.invalidateQueries({ queryKey: ['snapshot'] }),
         qc.invalidateQueries({ queryKey: ['compile'] }),
       ]);
       clearUnsavedChanges();
-      onCreated(tunnel);
+      onSaved(value);
     } catch (next) {
       setError(next);
     } finally {
       setSaving(false);
     }
   };
-
   return (
     <DialogLayer
-      label="创建 Cloudflare WARP"
+      label={tunnel ? '编辑 WARP 默认参数' : '创建 Cloudflare WARP'}
       mode="drawer"
       onClose={onClose}
       canClose={() => confirmDiscardChanges(guardScope)}
     >
       <section className="dialog-surface dialog-drawer external-outbound-drawer warp-create-drawer">
         <header>
-          <b>创建 Cloudflare WARP</b>
-          <small>免费 WARP · WireGuard 兼容</small>
+          <b>{tunnel ? '编辑 WARP 默认参数' : '创建 Cloudflare WARP'}</b>
+          <small>MASQUE</small>
           <span className="sp" />
           <DialogClose className="btn">关闭</DialogClose>
         </header>
         <div className="external-outbound-body">
-          <section className="warp-identity-card">
-            <span>CF</span>
-            <div>
-              <b>逻辑隧道与机器身份分离</b>
-              <p>这里先创建可引用的隧道；提交草稿后，再为实际使用它的机器逐台申请身份。不会在预览时联系 Cloudflare。</p>
-            </div>
-          </section>
           <div className="fgrid one warp-create-fields">
             <label className="row">
               <span className="k">名称</span>
@@ -601,108 +529,52 @@ export function WarpCreate({
                 <input
                   className="f mono"
                   type="number"
+                  min={1}
+                  max={65535}
                   aria-label="Endpoint 端口"
                   value={port}
                   onChange={event => setPort(event.target.value)}
                 />
               </span>
             </div>
-            <div className="row">
-              <span className="k">出口协议栈</span>
+            <label className="row">
+              <span className="k">HTTP 版本</span>
               <span className="v">
-                <WarpIpStackControl value={ipStack} onChange={setIpStack} />
-                <span className="sub">优先模式会先解析首选地址族，无结果时再回退；外层 Endpoint 可独立使用 IPv4。</span>
+                <select
+                  className="f"
+                  value={httpVersion}
+                  onChange={event => setHttpVersion(event.target.value as 'h3' | 'h2')}
+                >
+                  <option value="h3">HTTP/3 · QUIC / UDP</option>
+                  <option value="h2">HTTP/2 · TLS / TCP</option>
+                </select>
+                <span className="sub">UDP 受限时可选 HTTP/2；不会自动切换。两种方式都承载 TCP 和 UDP 业务。</span>
               </span>
-            </div>
+            </label>
+            <label className="row">
+              <span className="k">隧道内 DNS</span>
+              <span className="v">
+                <input className="f mono" value={dns} onChange={event => setDns(event.target.value)} />
+                <span className="sub">填写 1–8 个 IP，以逗号分隔；通过 WARP 隧道查询。</span>
+              </span>
+            </label>
           </div>
-          <button className="warp-advanced-toggle" onClick={() => setAdvanced(value => !value)}>
-            <span>{advanced ? '−' : '+'}</span>高级 WireGuard 参数
-          </button>
-          {advanced && (
-            <div className="fgrid one warp-create-fields compact-fields">
-              <label className="row">
-                <span className="k">MTU</span>
-                <span className="v">
-                  <input className="f mono" type="number" value={mtu} onChange={event => setMtu(event.target.value)} />
-                  <span className="sub">Cloudflare 客户端默认 1280。</span>
-                </span>
-              </label>
-              <label className="row">
-                <span className="k">Keepalive</span>
-                <span className="v">
-                  <input
-                    className="f mono"
-                    type="number"
-                    min={0}
-                    max={65535}
-                    aria-label="Keepalive"
-                    value={keepAlive}
-                    onChange={event => setKeepAlive(event.target.value)}
-                  />
-                </span>
-              </label>
-              <label className="row">
-                <span className="k">TUN 实现</span>
-                <span className="v">
-                  <select
-                    className="f"
-                    aria-label="TUN 实现"
-                    value={noKernelTun ? 'userspace' : 'auto'}
-                    onChange={event => setNoKernelTun(event.target.value === 'userspace')}
-                  >
-                    <option value="auto">系统优先（默认）</option>
-                    <option value="userspace">仅用户态</option>
-                  </select>
-                  <span className="sub">仅用户态会设置 Xray noKernelTun，适合内核 WireGuard 不可用的环境。</span>
-                </span>
-              </label>
-              <label className="row">
-                <span className="k">Workers</span>
-                <span className="v">
-                  <input
-                    className="f mono"
-                    type="number"
-                    min={0}
-                    max={256}
-                    aria-label="Workers"
-                    value={workers}
-                    onChange={event => setWorkers(event.target.value)}
-                  />
-                  <span className="sub">wireguard-go 并行 Worker 数；0 表示自动。</span>
-                </span>
-              </label>
-            </div>
-          )}
-          <div className="warp-safety-list">
-            <span>1</span>
-            <p>
-              <b>提交草稿</b>
-              <small>资源进入正式修订后才允许申请。</small>
-            </p>
-            <span>2</span>
-            <p>
-              <b>在线路中选择</b>
-              <small>由规则确定实际需要 WARP 身份的机器。</small>
-            </p>
-            <span>3</span>
-            <p>
-              <b>就地申请身份</b>
-              <small>规则旁直接申请当前机器的一对密钥与 Cloudflare 设备。</small>
-            </p>
-            <span>4</span>
-            <p>
-              <b>发布并收敛</b>
-              <small>发布页校验后下发 Xray，以 Agent 收敛结果为准。</small>
-            </p>
-          </div>
+          <p className="tunnel-provider-note">
+            {tunnel
+              ? '修改保存到草稿，发布后生效。每台机器可独立覆盖 Endpoint。'
+              : '提交草稿后，为使用隧道的机器申请 P-256 设备身份，再发布配置。旧版 WARP 身份需要重新注册。'}
+          </p>
           {error !== null && <ErrorBox error={error} />}
         </div>
         <footer>
-          <span className="note">本步不调用 Cloudflare，也不会产生孤儿设备。</span>
           <span className="sp" />
           <DialogClose className="btn">取消</DialogClose>
-          <button className="btn primary" disabled={!valid || saving} onClick={() => void save()}>
-            {saving ? '创建中…' : '创建到草稿'}
+          <button
+            className="btn primary"
+            disabled={saving || !valid || (!!tunnel && !dirty)}
+            onClick={() => void save()}
+          >
+            {saving ? '保存中…' : tunnel ? '保存到草稿' : '创建隧道'}
           </button>
         </footer>
       </section>
@@ -710,25 +582,12 @@ export function WarpCreate({
   );
 }
 
-type TunnelReference = {
-  app: string;
-  project: string;
-  node: string;
-  chain: string;
-  chainId: string;
-};
+type TunnelReference = { app: string; project: string; node: string; chain: string; chainId: string };
 
 type WarpPhase = 'draft' | 'missing' | 'unused' | 'configured' | 'ready' | 'rolling' | 'live';
 
 const hasWarpBindingOverrides = (binding: ExternalWarpBinding) =>
-  binding.endpoint_address != null ||
-  binding.endpoint_port != null ||
-  binding.mtu != null ||
-  binding.keep_alive != null ||
-  binding.allowed_ips != null ||
-  binding.domain_strategy != null ||
-  binding.no_kernel_tun != null ||
-  binding.workers != null;
+  binding.endpoint_address != null || binding.endpoint_port != null;
 
 function WarpTunnelDetail({
   tunnel,
@@ -1059,7 +918,7 @@ function WarpTunnelDetail({
                           referenceLabels={referencesByNode(binding.node).map(reference => reference.chain)}
                           defaultAddress={tunnel.address}
                           defaultPort={tunnel.port}
-                          defaults={warpProtocol}
+
                           editable={editable}
                           removalBlockedReason="这台机器仍被规则引用。请先解除引用并完成发布，再注销身份。"
                         />
@@ -1084,7 +943,7 @@ function WarpTunnelDetail({
                           countryCode={nodeById.get(binding.node)?.public_ipv4_country}
                           defaultAddress={tunnel.address}
                           defaultPort={tunnel.port}
-                          defaults={warpProtocol}
+
                           editable={editable}
                           removalBlockedReason={!draft.isEmpty() ? '先提交或丢弃当前草稿，再注销身份。' : undefined}
                         />
@@ -1181,19 +1040,10 @@ function WarpTunnelDetail({
                   {tunnel.address}
                   <span className="port">:{tunnel.port}</span>
                 </dd>
-                <dt>地址策略</dt>
-                <dd className="t">{warpIpStackLabel(warpIpStackOf(warpProtocol))}</dd>
-                <dt>MTU</dt>
-                <dd>{warpProtocol.v.mtu}</dd>
-                <dt>Keepalive</dt>
-                <dd>
-                  {warpProtocol.v.keep_alive}
-                  <span className="u"> s</span>
-                </dd>
-                <dt>TUN</dt>
-                <dd className="t">{warpProtocol.v.no_kernel_tun ? '仅用户态' : '系统优先'}</dd>
-                <dt>Workers</dt>
-                <dd className="t">{warpProtocol.v.workers || '自动'}</dd>
+                <dt>传输</dt>
+                <dd>MASQUE / {warpProtocol.v.http_version === 'h3' ? 'HTTP/3' : 'HTTP/2'}</dd>
+                <dt>隧道内 DNS</dt>
+                <dd>{warpProtocol.v.remote_dns.join(', ')}</dd>
               </dl>
             </section>
           </aside>
@@ -1593,7 +1443,6 @@ export function WarpBindingCard({
   referenceLabels = [],
   defaultAddress,
   defaultPort,
-  defaults,
   editable,
   removalBlockedReason,
 }: {
@@ -1605,58 +1454,20 @@ export function WarpBindingCard({
   referenceLabels?: string[];
   defaultAddress: string;
   defaultPort: number;
-  defaults: WarpProtocol;
   editable: boolean;
   removalBlockedReason?: string;
 }) {
   const qc = useQueryClient();
   const effectiveAddress = binding.endpoint_address ?? defaultAddress;
   const effectivePort = binding.endpoint_port ?? defaultPort;
-  const effectiveMtu = binding.mtu ?? defaults.v.mtu;
-  const effectiveKeepAlive = binding.keep_alive ?? defaults.v.keep_alive;
-  const effectiveIpStack = warpIpStackOf({
-    t: 'warp',
-    v: {
-      ...defaults.v,
-      allowed_ips: binding.allowed_ips ?? defaults.v.allowed_ips,
-      domain_strategy: binding.domain_strategy ?? defaults.v.domain_strategy,
-    },
-  });
-  const defaultIpStack = warpIpStackOf(defaults);
-  const effectiveNoKernelTun = binding.no_kernel_tun ?? defaults.v.no_kernel_tun;
-  const effectiveWorkers = binding.workers ?? defaults.v.workers;
   const customized = hasWarpBindingOverrides(binding);
-  const overrideTags: { key?: string; value: string }[] = [];
-  if (binding.endpoint_address != null || binding.endpoint_port != null) {
-    overrideTags.push({ key: 'Endpoint', value: hostPort(effectiveAddress, effectivePort) });
-  }
-  if (binding.allowed_ips != null || binding.domain_strategy != null) {
-    overrideTags.push({ value: warpIpStackLabel(effectiveIpStack) });
-  }
-  if (binding.mtu != null) overrideTags.push({ key: 'MTU', value: String(effectiveMtu) });
-  if (binding.keep_alive != null) overrideTags.push({ key: 'Keepalive', value: `${effectiveKeepAlive}s` });
-  if (binding.no_kernel_tun != null) {
-    overrideTags.push({ key: 'TUN', value: effectiveNoKernelTun ? '仅用户态' : '系统优先' });
-  }
-  if (binding.workers != null) overrideTags.push({ key: 'Workers', value: String(effectiveWorkers || '自动') });
+  const overrideTags = customized ? [{ key: 'Endpoint', value: hostPort(effectiveAddress, effectivePort) }] : [];
   const [editing, setEditing] = useState(false);
   const [address, setAddress] = useState(effectiveAddress);
   const [port, setPort] = useState(String(effectivePort));
-  const [mtu, setMtu] = useState(String(effectiveMtu));
-  const [keepAlive, setKeepAlive] = useState(String(effectiveKeepAlive));
-  const [ipStack, setIpStack] = useState<WarpIpStack>(effectiveIpStack);
-  const [noKernelTun, setNoKernelTun] = useState(effectiveNoKernelTun);
-  const [workers, setWorkers] = useState(String(effectiveWorkers));
   const [formError, setFormError] = useState<unknown>(null);
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
-  const dirty =
-    address.trim() !== effectiveAddress ||
-    Number(port) !== effectivePort ||
-    Number(mtu) !== effectiveMtu ||
-    Number(keepAlive) !== effectiveKeepAlive ||
-    ipStack !== effectiveIpStack ||
-    noKernelTun !== effectiveNoKernelTun ||
-    Number(workers) !== effectiveWorkers;
+  const dirty = address.trim() !== effectiveAddress || Number(port) !== effectivePort;
   const guardScope = `warp-binding:${tenantId}:${outboundId}:${binding.node}`;
   useUnsavedChanges(editing && dirty, `${nodeName} 的 WARP 参数`, guardScope);
 
@@ -1689,11 +1500,6 @@ export function WarpBindingCard({
   const begin = () => {
     setAddress(effectiveAddress);
     setPort(String(effectivePort));
-    setMtu(String(effectiveMtu));
-    setKeepAlive(String(effectiveKeepAlive));
-    setIpStack(effectiveIpStack);
-    setNoKernelTun(effectiveNoKernelTun);
-    setWorkers(String(effectiveWorkers));
     setFormError(null);
     update.reset();
     remove.reset();
@@ -1704,9 +1510,6 @@ export function WarpBindingCard({
     if (!dirty) return;
     const nextAddress = address.trim();
     const nextPort = Number(port);
-    const nextMtu = Number(mtu);
-    const nextKeepAlive = Number(keepAlive);
-    const nextWorkers = Number(workers);
     if (!nextAddress) {
       setFormError(new Error('Endpoint 地址不能为空。'));
       return;
@@ -1719,30 +1522,10 @@ export function WarpBindingCard({
       setFormError(new Error('Endpoint 端口必须是 1–65535 的整数。'));
       return;
     }
-    if (!Number.isInteger(nextMtu) || nextMtu < 576 || nextMtu > 9000) {
-      setFormError(new Error('MTU 必须是 576–9000 的整数。'));
-      return;
-    }
-    if (!Number.isInteger(nextKeepAlive) || nextKeepAlive < 0 || nextKeepAlive > 65535) {
-      setFormError(new Error('Keepalive 必须是 0–65535 的整数。'));
-      return;
-    }
-    if (!Number.isInteger(nextWorkers) || nextWorkers < 0 || nextWorkers > 256) {
-      setFormError(new Error('Workers 必须是 0–256 的整数；0 表示自动。'));
-      return;
-    }
-    const routing = warpIpRouting(ipStack);
-    const inheritsRouting = ipStack === defaultIpStack;
     setFormError(null);
     update.mutate({
       endpoint_address: nextAddress === defaultAddress ? null : nextAddress,
       endpoint_port: nextPort === defaultPort ? null : nextPort,
-      mtu: nextMtu === defaults.v.mtu ? null : nextMtu,
-      keep_alive: nextKeepAlive === defaults.v.keep_alive ? null : nextKeepAlive,
-      allowed_ips: inheritsRouting ? null : routing.allowed_ips,
-      domain_strategy: inheritsRouting ? null : routing.domain_strategy,
-      no_kernel_tun: noKernelTun === defaults.v.no_kernel_tun ? null : noKernelTun,
-      workers: nextWorkers === defaults.v.workers ? null : nextWorkers,
     });
   };
   const clear = () => {
@@ -1750,12 +1533,6 @@ export function WarpBindingCard({
     update.mutate({
       endpoint_address: null,
       endpoint_port: null,
-      mtu: null,
-      keep_alive: null,
-      allowed_ips: null,
-      no_kernel_tun: null,
-      domain_strategy: null,
-      workers: null,
     });
   };
   const beginRemoval = () => {
@@ -1836,55 +1613,6 @@ export function WarpBindingCard({
                 />
               </span>
             </label>
-            <label>
-              <span className="k">地址策略</span>
-              <WarpIpStackControl value={ipStack} onChange={setIpStack} />
-            </label>
-            <label>
-              <span className="k">MTU</span>
-              <input
-                className="f mono"
-                type="number"
-                min={576}
-                max={9000}
-                value={mtu}
-                onChange={event => setMtu(event.target.value)}
-              />
-            </label>
-            <label>
-              <span className="k">Keepalive（秒）</span>
-              <input
-                className="f mono"
-                type="number"
-                min={0}
-                max={65535}
-                value={keepAlive}
-                onChange={event => setKeepAlive(event.target.value)}
-              />
-            </label>
-            <label>
-              <span className="k">TUN</span>
-              <select
-                className="f"
-                aria-label="TUN 实现"
-                value={noKernelTun ? 'userspace' : 'auto'}
-                onChange={event => setNoKernelTun(event.target.value === 'userspace')}
-              >
-                <option value="auto">系统优先（默认）</option>
-                <option value="userspace">仅用户态</option>
-              </select>
-            </label>
-            <label>
-              <span className="k">Workers</span>
-              <input
-                className="f mono"
-                type="number"
-                min={0}
-                max={256}
-                value={workers}
-                onChange={event => setWorkers(event.target.value)}
-              />
-            </label>
           </div>
           <p className="wp-id">
             设备 {binding.device_id} · {binding.local_addresses.join(' · ')}
@@ -1956,201 +1684,7 @@ export function WarpBindingCard({
 }
 
 export function WarpEdit({ tunnel, onClose }: { tunnel: ExternalOutbound; onClose: () => void }) {
-  const qc = useQueryClient();
-  const protocol = tunnel.protocol.t === 'warp' ? tunnel.protocol : null;
-  const [name, setName] = useState(tunnel.name);
-  const [address, setAddress] = useState(tunnel.address);
-  const [port, setPort] = useState(String(tunnel.port));
-  const [mtu, setMtu] = useState(String(protocol?.v.mtu ?? 1280));
-  const [keepAlive, setKeepAlive] = useState(String(protocol?.v.keep_alive ?? 25));
-  const [ipStack, setIpStack] = useState<WarpIpStack>(() => (protocol ? warpIpStackOf(protocol) : 'dual'));
-  const [noKernelTun, setNoKernelTun] = useState(protocol?.v.no_kernel_tun ?? false);
-  const [workers, setWorkers] = useState(String(protocol?.v.workers ?? 0));
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<unknown>(null);
-  const guardScope = `warp-edit:${tunnel.tenant}:${tunnel.id}`;
-  const valid =
-    !!name.trim() &&
-    !!address.trim() &&
-    Number.isInteger(Number(port)) &&
-    Number(port) >= 1 &&
-    Number(port) <= 65535 &&
-    Number.isInteger(Number(mtu)) &&
-    Number(mtu) >= 576 &&
-    Number(mtu) <= 9000 &&
-    Number.isInteger(Number(keepAlive)) &&
-    Number(keepAlive) >= 0 &&
-    Number(keepAlive) <= 65535 &&
-    Number.isInteger(Number(workers)) &&
-    Number(workers) >= 0 &&
-    Number(workers) <= 256;
-  const dirty =
-    protocol !== null &&
-    (name.trim() !== tunnel.name ||
-      address.trim() !== tunnel.address ||
-      Number(port) !== tunnel.port ||
-      Number(mtu) !== protocol.v.mtu ||
-      Number(keepAlive) !== protocol.v.keep_alive ||
-      ipStack !== warpIpStackOf(protocol) ||
-      noKernelTun !== protocol.v.no_kernel_tun ||
-      Number(workers) !== protocol.v.workers);
-  useUnsavedChanges(dirty, `${tunnel.name} 的 WARP 默认参数`, guardScope);
-  if (!protocol) return null;
-  const save = async () => {
-    if (!valid || !dirty) return;
-    setSaving(true);
-    setError(null);
-    try {
-      await upsertExternalOutbound({
-        id: tunnel.id,
-        tenant_id: tunnel.tenant,
-        name: name.trim(),
-        address: address.trim(),
-        port: Number(port),
-        protocol: {
-          ...protocol,
-          v: {
-            ...protocol.v,
-            mtu: Number(mtu),
-            keep_alive: Number(keepAlive),
-            ...warpIpRouting(ipStack),
-            no_kernel_tun: noKernelTun,
-            workers: Number(workers),
-          },
-        },
-        security: { t: 'none' },
-      });
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: ['snapshot'] }),
-        qc.invalidateQueries({ queryKey: ['compile'] }),
-      ]);
-      onClose();
-    } catch (next) {
-      setError(next);
-    } finally {
-      setSaving(false);
-    }
-  };
   return (
-    <DialogLayer label="编辑 WARP 默认参数" onClose={onClose} canClose={() => confirmDiscardChanges(guardScope)}>
-      <section className="dialog-surface tunnel-dialog narrow">
-        <header>
-          <b>编辑 WARP 默认参数</b>
-          <span className="sp" />
-          <DialogClose className="btn">关闭</DialogClose>
-        </header>
-        <div className="tunnel-dialog-body">
-          <div className="fgrid one warp-create-fields">
-            <label className="row">
-              <span className="k">名称</span>
-              <span className="v">
-                <input className="f" value={name} onChange={event => setName(event.target.value)} />
-              </span>
-            </label>
-            <div className="row">
-              <span className="k">默认 Endpoint</span>
-              <span className="v tunnel-endpoint-fields">
-                <input
-                  className="f mono"
-                  aria-label="默认 Endpoint 地址"
-                  value={address}
-                  onChange={event => setAddress(event.target.value)}
-                />
-                <input
-                  className="f mono"
-                  type="number"
-                  min={1}
-                  max={65535}
-                  aria-label="默认 Endpoint 端口"
-                  value={port}
-                  onChange={event => setPort(event.target.value)}
-                />
-              </span>
-            </div>
-            <div className="row">
-              <span className="k">出口协议栈</span>
-              <span className="v">
-                <WarpIpStackControl value={ipStack} onChange={setIpStack} />
-              </span>
-            </div>
-            <label className="row">
-              <span className="k">默认 MTU</span>
-              <span className="v">
-                <input
-                  className="f mono"
-                  type="number"
-                  min={576}
-                  max={9000}
-                  value={mtu}
-                  onChange={event => setMtu(event.target.value)}
-                />
-              </span>
-            </label>
-            <label className="row">
-              <span className="k">Keepalive</span>
-              <span className="v">
-                <input
-                  className="f mono"
-                  type="number"
-                  min={0}
-                  max={65535}
-                  aria-label="Keepalive"
-                  value={keepAlive}
-                  onChange={event => setKeepAlive(event.target.value)}
-                />
-                <span className="sub">单位为秒；0 表示关闭心跳，NAT 环境建议保留 25。</span>
-              </span>
-            </label>
-            <label className="row">
-              <span className="k">TUN 实现</span>
-              <span className="v">
-                <select
-                  className="f"
-                  aria-label="TUN 实现"
-                  value={noKernelTun ? 'userspace' : 'auto'}
-                  onChange={event => setNoKernelTun(event.target.value === 'userspace')}
-                >
-                  <option value="auto">系统优先（默认）</option>
-                  <option value="userspace">仅用户态</option>
-                </select>
-                <span className="sub">仅用户态会设置 noKernelTun，适合内核 WireGuard 不可用的机器。</span>
-              </span>
-            </label>
-            <label className="row">
-              <span className="k">Workers</span>
-              <span className="v">
-                <input
-                  className="f mono"
-                  type="number"
-                  min={0}
-                  max={256}
-                  aria-label="Workers"
-                  value={workers}
-                  onChange={event => setWorkers(event.target.value)}
-                />
-                <span className="sub">wireguard-go 并行 Worker 数；0 表示自动。</span>
-              </span>
-            </label>
-          </div>
-          <p className="tunnel-provider-note">
-            这些参数不会重新注册机器身份；保存到草稿并发布后生效。每台机器可以分别覆盖 Endpoint、端口、
-            MTU、Keepalive、出口地址策略、TUN 实现和 Workers。
-          </p>
-          {error !== null && <ErrorBox error={error} />}
-        </div>
-        <footer>
-          <span className="sp" />
-          <DialogClose className="btn">取消</DialogClose>
-          <button
-            className="btn primary"
-            disabled={saving || !valid || !dirty}
-            title={dirty ? undefined : '没有修改'}
-            onClick={() => void save()}
-          >
-            {saving ? '保存中…' : '保存到草稿'}
-          </button>
-        </footer>
-      </section>
-    </DialogLayer>
+    <WarpMasqueEditor tenantId={tunnel.tenant} id={tunnel.id} tunnel={tunnel} onClose={onClose} onSaved={onClose} />
   );
 }

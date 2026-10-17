@@ -481,12 +481,8 @@ fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
         address: "engage.cloudflareclient.com".to_owned(),
         port: 2408,
         protocol: ExternalOutboundProtocol::Warp {
-            mtu: 1280,
-            keep_alive: 25,
-            allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-            no_kernel_tun: true,
-            domain_strategy: "ForceIP".to_owned(),
-            workers: 4,
+            http_version: Default::default(),
+            remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
         },
         security: ExternalOutboundSecurity::None,
         bindings: vec![ExternalWarpBinding {
@@ -496,19 +492,22 @@ fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
             registered_at: "2026-08-27T00:00:00.000Z".to_owned(),
             endpoint_address: None,
             endpoint_port: None,
-            mtu: None,
-            keep_alive: None,
-            allowed_ips: None,
-            no_kernel_tun: None,
-            domain_strategy: None,
-            workers: None,
-            private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
-            peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+            private_key: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../brocade-core/tests/fixtures/warp/private.b64"
+            ))
+            .trim()
+            .to_owned(),
+            peer_public_key: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../brocade-core/tests/fixtures/warp/public.b64"
+            ))
+            .trim()
+            .to_owned(),
             local_addresses: vec![
                 "172.16.0.2/32".to_owned(),
                 "2606:4700:110:8::2/128".to_owned(),
             ],
-            reserved: vec![1, 2, 3],
         }],
     }];
     app.steps[0].rules = vec![Rule {
@@ -539,8 +538,8 @@ fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
         .iter()
         .find(|outbound| outbound["tag"] == "out:external/warp-8f3a-2d71")
         .expect("managed WARP outbound");
-    assert_eq!(warp["protocol"], "wireguard");
-    assert_eq!(warp["settings"]["reserved"], json!([1, 2, 3]));
+    assert_eq!(warp["protocol"], "masque");
+    assert_eq!(warp["streamSettings"]["tlsSettings"]["alpn"], json!(["h3"]));
 
     let path = std::env::temp_dir().join("brocade-xray-managed-warp.json");
     fs::write(&path, &config).unwrap();

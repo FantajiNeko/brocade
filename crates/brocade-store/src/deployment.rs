@@ -4621,11 +4621,9 @@ async fn restore_warp_bindings_tx(
         sqlx::query(
             "INSERT INTO external_outbound_bindings
                 (outbound_id, node_id, device_id, account_id, access_token_sealed,
-                 private_key_sealed, peer_public_key, local_addresses, reserved,
-                 endpoint_address, endpoint_port, mtu, keep_alive, allowed_ips,
-                 no_kernel_tun, domain_strategy, workers, registered_at, created_revision)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                     $13, $14, $15, $16, $17, $18::timestamptz, $19)",
+                 private_key_sealed, peer_public_key, local_addresses,
+                 endpoint_address, endpoint_port, registered_at, created_revision)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz, $12)",
         )
         .bind(&outbound.id)
         .bind(&binding.node)
@@ -4635,21 +4633,8 @@ async fn restore_warp_bindings_tx(
         .bind(private_key_sealed)
         .bind(&binding.peer_public_key)
         .bind(serde_json::to_value(&binding.local_addresses)?)
-        .bind(serde_json::to_value(&binding.reserved)?)
         .bind(&binding.endpoint_address)
         .bind(binding.endpoint_port.map(i32::from))
-        .bind(binding.mtu.map(i32::from))
-        .bind(binding.keep_alive.map(i32::from))
-        .bind(
-            binding
-                .allowed_ips
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()?,
-        )
-        .bind(binding.no_kernel_tun)
-        .bind(&binding.domain_strategy)
-        .bind(binding.workers.map(i32::from))
         .bind(&binding.registered_at)
         .bind(revision_id)
         .execute(&mut **tx)

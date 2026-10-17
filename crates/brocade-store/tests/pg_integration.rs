@@ -1262,19 +1262,15 @@ async fn tenant_creation_adds_exactly_one_default_warp_in_the_same_revision() {
     );
     assert_eq!(warp.tenant, "platform.acme");
     assert_eq!(warp.name, "Cloudflare WARP");
-    assert_eq!(warp.address, "engage.cloudflareclient.com");
-    assert_eq!(warp.port, 2408);
-    assert!(matches!(
-        &warp.protocol,
+    assert_eq!(warp.address, "162.159.198.2");
+    assert_eq!(warp.port, 443);
+    assert_eq!(
+        warp.protocol,
         ExternalOutboundProtocol::Warp {
-            mtu: 1280,
-            keep_alive: 25,
-            allowed_ips,
-            no_kernel_tun: false,
-            domain_strategy,
-            workers: 0,
-        } if allowed_ips == &["0.0.0.0/0", "::/0"] && domain_strategy == "ForceIP"
-    ));
+            http_version: brocade_core::model::WarpHttpVersion::H3,
+            remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
+        }
+    );
     let credential: String =
         sqlx::query_scalar("SELECT credential_sealed FROM external_outbounds WHERE id = $1")
             .bind(&warp.id)
@@ -1319,12 +1315,8 @@ async fn tenant_creation_adds_exactly_one_default_warp_in_the_same_revision() {
                     address: "engage.cloudflareclient.com".to_owned(),
                     port: 2408,
                     protocol: ExternalOutboundProtocol::Warp {
-                        mtu: 1280,
-                        keep_alive: 25,
-                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-                        no_kernel_tun: false,
-                        domain_strategy: "ForceIP".to_owned(),
-                        workers: 0,
+                        http_version: Default::default(),
+                        remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
                     },
                     security: ExternalOutboundSecurity::None,
                     note: None,
@@ -1555,12 +1547,8 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
                     address: "engage.cloudflareclient.com".to_owned(),
                     port: 2408,
                     protocol: ExternalOutboundProtocol::Warp {
-                        mtu: 1280,
-                        keep_alive: 25,
-                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-                        no_kernel_tun: true,
-                        domain_strategy: "ForceIP".to_owned(),
-                        workers: 0,
+                        http_version: Default::default(),
+                        remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
                     },
                     security: ExternalOutboundSecurity::None,
                     note: None,
@@ -1571,7 +1559,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
         .await
         .unwrap();
 
-    let private_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    let private_key = include_str!("../../brocade-core/tests/fixtures/warp/private.b64").trim();
     let access_token = "provider-control-token";
     let committed = db
         .store
@@ -1583,13 +1571,22 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
                 device_id: "device-1".to_owned(),
                 account_id: "account-1".to_owned(),
                 access_token: access_token.to_owned(),
-                private_key: private_key.to_owned(),
-                peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+                private_key: include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../brocade-core/tests/fixtures/warp/private.b64"
+                ))
+                .trim()
+                .to_owned(),
+                peer_public_key: include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../brocade-core/tests/fixtures/warp/public.b64"
+                ))
+                .trim()
+                .to_owned(),
                 local_addresses: vec![
                     "172.16.0.2/32".to_owned(),
                     "2606:4700:110:8::2/128".to_owned(),
                 ],
-                reserved: vec![1, 2, 3],
                 note: None,
             },
         )
@@ -1621,12 +1618,6 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
                 node_id: "n1".to_owned(),
                 endpoint_address: Some("162.159.193.10".to_owned()),
                 endpoint_port: Some(500),
-                mtu: Some(1420),
-                keep_alive: Some(40),
-                allowed_ips: Some(vec!["::/0".to_owned()]),
-                no_kernel_tun: Some(false),
-                domain_strategy: Some("ForceIPv6".to_owned()),
-                workers: Some(4),
                 note: None,
             },
         )
@@ -1645,18 +1636,6 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
         Some("162.159.193.10")
     );
     assert_eq!(customized_binding.endpoint_port, Some(500));
-    assert_eq!(customized_binding.mtu, Some(1420));
-    assert_eq!(customized_binding.keep_alive, Some(40));
-    assert_eq!(
-        customized_binding.allowed_ips,
-        Some(vec!["::/0".to_owned()])
-    );
-    assert_eq!(customized_binding.no_kernel_tun, Some(false));
-    assert_eq!(
-        customized_binding.domain_strategy.as_deref(),
-        Some("ForceIPv6")
-    );
-    assert_eq!(customized_binding.workers, Some(4));
 
     let customized_deployment = db
         .store
@@ -1678,12 +1657,6 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
                 node_id: "n1".to_owned(),
                 endpoint_address: Some("162.159.193.10".to_owned()),
                 endpoint_port: Some(500),
-                mtu: Some(1420),
-                keep_alive: Some(40),
-                allowed_ips: Some(vec!["::/0".to_owned()]),
-                no_kernel_tun: Some(false),
-                domain_strategy: Some("ForceIPv6".to_owned()),
-                workers: Some(4),
                 note: None,
             },
         )
@@ -1701,12 +1674,6 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
                 node_id: "n1".to_owned(),
                 endpoint_address: None,
                 endpoint_port: None,
-                mtu: None,
-                keep_alive: None,
-                allowed_ips: None,
-                no_kernel_tun: None,
-                domain_strategy: None,
-                workers: None,
                 note: None,
             },
         )
@@ -1717,12 +1684,6 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
     let current_binding = &current_snapshot.external_outbounds[0].bindings[0];
     assert_eq!(current_binding.endpoint_address, None);
     assert_eq!(current_binding.endpoint_port, None);
-    assert_eq!(current_binding.mtu, None);
-    assert_eq!(current_binding.keep_alive, None);
-    assert_eq!(current_binding.allowed_ips, None);
-    assert_eq!(current_binding.no_kernel_tun, None);
-    assert_eq!(current_binding.domain_strategy, None);
-    assert_eq!(current_binding.workers, None);
 
     db.store
         .create_rollback_deployment(
@@ -1741,18 +1702,6 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
         Some("162.159.193.10")
     );
     assert_eq!(rolled_back_binding.endpoint_port, Some(500));
-    assert_eq!(rolled_back_binding.mtu, Some(1420));
-    assert_eq!(rolled_back_binding.keep_alive, Some(40));
-    assert_eq!(
-        rolled_back_binding.allowed_ips,
-        Some(vec!["::/0".to_owned()])
-    );
-    assert_eq!(rolled_back_binding.no_kernel_tun, Some(false));
-    assert_eq!(
-        rolled_back_binding.domain_strategy.as_deref(),
-        Some("ForceIPv6")
-    );
-    assert_eq!(rolled_back_binding.workers, Some(4));
 
     for revision in [
         None,
@@ -1768,7 +1717,6 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
         assert_eq!(tunnel.bindings.len(), 1);
         assert_eq!(tunnel.bindings[0].node, "n1");
         assert_eq!(tunnel.bindings[0].private_key, private_key);
-        assert_eq!(tunnel.bindings[0].reserved, vec![1, 2, 3]);
     }
 
     let redacted = db
@@ -1805,12 +1753,8 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
                     address: "engage.cloudflareclient.com".to_owned(),
                     port: 2408,
                     protocol: ExternalOutboundProtocol::Warp {
-                        mtu: 1280,
-                        keep_alive: 25,
-                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-                        no_kernel_tun: false,
-                        domain_strategy: "ForceIP".to_owned(),
-                        workers: 0,
+                        http_version: Default::default(),
+                        remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
                     },
                     security: ExternalOutboundSecurity::None,
                     note: None,
@@ -1829,13 +1773,22 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
                 device_id: "device-remove".to_owned(),
                 account_id: "account-remove".to_owned(),
                 access_token: "provider-delete-token".to_owned(),
-                private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
-                peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+                private_key: include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../brocade-core/tests/fixtures/warp/private.b64"
+                ))
+                .trim()
+                .to_owned(),
+                peer_public_key: include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../brocade-core/tests/fixtures/warp/public.b64"
+                ))
+                .trim()
+                .to_owned(),
                 local_addresses: vec![
                     "172.16.0.2/32".to_owned(),
                     "2606:4700:110:8::2/128".to_owned(),
                 ],
-                reserved: vec![1, 2, 3],
                 note: None,
             },
         )

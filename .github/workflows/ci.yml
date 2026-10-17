@@ -113,6 +113,11 @@ jobs:
           go test -race ./app/stats/... ./app/dispatcher ./features/stats -count=3 -timeout=3m
           go vet ./app/stats/... ./app/dispatcher ./features/stats
 
+      - name: WARP MASQUE transport and node stack
+        run: |
+          go test -race ./proxy/masque/... ./transport/internet/masque/... ./transport/internet/tls -count=1 -timeout=3m
+          go vet ./proxy/masque/... ./transport/internet/masque/...
+
       - name: Mux and reverse deterministic tests
         run: go test ./common/buf ./common/mux ./app/reverse ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless/... -count=1 -timeout=10m
 

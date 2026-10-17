@@ -58,12 +58,8 @@ fn probe_artifact_has_one_forced_outbound_and_no_direct_fallback() {
 fn managed_warp_is_refused_without_a_console_identity() {
     let mut value = outbound();
     value.protocol = ExternalOutboundProtocol::Warp {
-        mtu: 1280,
-        keep_alive: 25,
-        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-        no_kernel_tun: false,
-        domain_strategy: "ForceIP".to_owned(),
-        workers: 0,
+        http_version: Default::default(),
+        remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
     };
     assert_eq!(
         tunnel_probe::build(&value, 19080).unwrap_err(),

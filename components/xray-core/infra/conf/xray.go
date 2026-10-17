@@ -49,6 +49,7 @@ var (
 		"vless":       func() interface{} { return new(VLessOutboundConfig) },
 		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
 		"trojan":      func() interface{} { return new(TrojanClientConfig) },
+		"masque":      func() interface{} { return new(MasqueClientConfig) },
 		"hysteria":    func() interface{} { return new(HysteriaClientConfig) },
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
 		"wireguard":   func() interface{} { return &WireGuardConfig{IsClient: true} },
@@ -317,6 +318,16 @@ func (c *OutboundDetourConfig) checkChainProxyConfig() error {
 
 // Build implements Buildable.
 func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
+	if c.Protocol == "masque" {
+		if c.StreamSetting == nil || c.StreamSetting.Network == nil || string(*c.StreamSetting.Network) != "masque" || c.StreamSetting.Security != "tls" {
+			return nil, errors.New("MASQUE outbound requires MASQUE transport with TLS")
+		}
+		if c.MuxSettings != nil && c.MuxSettings.Enabled {
+			return nil, errors.New("MASQUE outbound does not support mux")
+		}
+	} else if c.StreamSetting != nil && c.StreamSetting.Network != nil && string(*c.StreamSetting.Network) == "masque" {
+		return nil, errors.New("MASQUE transport requires MASQUE outbound")
+	}
 	senderSettings := &proxyman.SenderConfig{}
 	switch strings.ToLower(c.TargetStrategy) {
 	case "asis", "":

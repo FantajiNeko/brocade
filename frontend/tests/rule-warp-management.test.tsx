@@ -32,14 +32,7 @@ const warp: ExternalOutbound = {
   port: 2408,
   protocol: {
     t: 'warp',
-    v: {
-      mtu: 1280,
-      keep_alive: 25,
-      allowed_ips: ['0.0.0.0/0', '::/0'],
-      no_kernel_tun: false,
-      domain_strategy: 'ForceIP',
-      workers: 0,
-    },
+    v: { http_version: 'h3', remote_dns: ['1.1.1.1', '1.0.0.1'] },
   },
   security: { t: 'none' },
   bindings: [],

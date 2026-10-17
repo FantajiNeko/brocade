@@ -1095,19 +1095,8 @@ fn external_outbound_from_row(
             domain_strategy: external_option_string(&options, "domain_strategy", &tenant, &id)?,
         },
         "warp" => ExternalOutboundProtocol::Warp {
-            mtu: external_option_u16(&options, "mtu", &tenant, &id)?,
-            keep_alive: external_option_u16(&options, "keep_alive", &tenant, &id)?,
-            allowed_ips: external_option_string_vec(&options, "allowed_ips", &tenant, &id)?,
-            no_kernel_tun: options
-                .get("no_kernel_tun")
-                .and_then(Value::as_bool)
-                .ok_or_else(|| {
-                    invalid_error(format!(
-                        "external_outbounds.protocol_options 缺少 no_kernel_tun（{tenant}/{id}）"
-                    ))
-                })?,
-            domain_strategy: external_option_string(&options, "domain_strategy", &tenant, &id)?,
-            workers: external_option_u16(&options, "workers", &tenant, &id)?,
+            http_version: serde_json::from_value(options.get("http_version").cloned().ok_or_else(|| invalid_error("WARP requires MASQUE options; register a new identity"))?)?,
+            remote_dns: serde_json::from_value(options.get("remote_dns").cloned().ok_or_else(|| invalid_error("WARP requires tunnel-local DNS"))?)?,
         },
         "vpngate" => ExternalOutboundProtocol::Vpngate {
             country_code: external_option_string(&options, "country_code", &tenant, &id)?,
@@ -1224,9 +1213,8 @@ async fn load_external_outbound_bindings(
     let rows = sqlx::query(
         "SELECT external_outbound_bindings.outbound_id, external_outbounds.tenant_id,
                 node_id, device_id, account_id, private_key_sealed,
-                peer_public_key, local_addresses, reserved,
-                endpoint_address, endpoint_port, mtu, keep_alive, allowed_ips,
-                no_kernel_tun, domain_strategy, workers,
+                peer_public_key, local_addresses,
+                endpoint_address, endpoint_port,
                 to_char(registered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS registered_at
          FROM external_outbound_bindings
          JOIN external_outbounds ON external_outbounds.id = external_outbound_bindings.outbound_id
@@ -1245,9 +1233,8 @@ async fn load_external_outbound_bindings_tx(
     let rows = sqlx::query(
         "SELECT external_outbound_bindings.outbound_id, external_outbounds.tenant_id,
                 node_id, device_id, account_id, private_key_sealed,
-                peer_public_key, local_addresses, reserved,
-                endpoint_address, endpoint_port, mtu, keep_alive, allowed_ips,
-                no_kernel_tun, domain_strategy, workers,
+                peer_public_key, local_addresses,
+                endpoint_address, endpoint_port,
                 to_char(registered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS registered_at
          FROM external_outbound_bindings
          JOIN external_outbounds ON external_outbounds.id = external_outbound_bindings.outbound_id
@@ -1282,28 +1269,9 @@ fn external_outbound_binding_from_row(
                 .try_get::<Option<i32>, _>("endpoint_port")?
                 .map(|value| u16_column("external_outbound_bindings.endpoint_port", value))
                 .transpose()?,
-            mtu: row
-                .try_get::<Option<i32>, _>("mtu")?
-                .map(|value| u16_column("external_outbound_bindings.mtu", value))
-                .transpose()?,
-            keep_alive: row
-                .try_get::<Option<i32>, _>("keep_alive")?
-                .map(|value| u16_column("external_outbound_bindings.keep_alive", value))
-                .transpose()?,
-            allowed_ips: row
-                .try_get::<Option<Value>, _>("allowed_ips")?
-                .map(serde_json::from_value)
-                .transpose()?,
-            no_kernel_tun: row.try_get("no_kernel_tun")?,
-            domain_strategy: row.try_get("domain_strategy")?,
-            workers: row
-                .try_get::<Option<i32>, _>("workers")?
-                .map(|value| u16_column("external_outbound_bindings.workers", value))
-                .transpose()?,
             private_key,
             peer_public_key: text(row, "peer_public_key")?,
             local_addresses: serde_json::from_value(row.try_get::<Value, _>("local_addresses")?)?,
-            reserved: serde_json::from_value(row.try_get::<Value, _>("reserved")?)?,
         },
     ))
 }

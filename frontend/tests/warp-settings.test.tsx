@@ -3,28 +3,13 @@ import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ExternalOutbound } from '../src/api';
 import { draft } from '../src/draft';
-import {
-  WarpBindingCard,
-  WarpCreate,
-  WarpEdit,
-  warpIpRouting,
-  warpIpStackOf,
-  warpReferenceStatus,
-} from '../src/panes/tunnels';
+import { WarpBindingCard, WarpCreate, WarpEdit, warpReferenceStatus } from '../src/panes/tunnels';
 
 type WarpProtocol = Extract<ExternalOutbound['protocol'], { t: 'warp' }>;
 
-const protocol = (overrides: Partial<WarpProtocol['v']> = {}): WarpProtocol => ({
+const protocol = (): WarpProtocol => ({
   t: 'warp',
-  v: {
-    mtu: 1280,
-    keep_alive: 25,
-    allowed_ips: ['0.0.0.0/0', '::/0'],
-    no_kernel_tun: false,
-    domain_strategy: 'ForceIP',
-    workers: 0,
-    ...overrides,
-  },
+  v: { http_version: 'h3', remote_dns: ['1.1.1.1', '1.0.0.1'] },
 });
 
 afterEach(() => {
@@ -40,38 +25,6 @@ describe('WARP exit stack settings', () => {
     expect(warpReferenceStatus(2, 0)).toBe('已引用');
   });
 
-  it('maps every operator choice to matching Xray routing knobs', () => {
-    expect(warpIpRouting('ipv4')).toEqual({
-      allowed_ips: ['0.0.0.0/0'],
-      domain_strategy: 'ForceIPv4',
-    });
-    expect(warpIpRouting('dual')).toEqual({
-      allowed_ips: ['0.0.0.0/0', '::/0'],
-      domain_strategy: 'ForceIP',
-    });
-    expect(warpIpRouting('prefer_ipv4')).toEqual({
-      allowed_ips: ['0.0.0.0/0', '::/0'],
-      domain_strategy: 'ForceIPv4v6',
-    });
-    expect(warpIpRouting('prefer_ipv6')).toEqual({
-      allowed_ips: ['0.0.0.0/0', '::/0'],
-      domain_strategy: 'ForceIPv6v4',
-    });
-    expect(warpIpRouting('ipv6')).toEqual({
-      allowed_ips: ['::/0'],
-      domain_strategy: 'ForceIPv6',
-    });
-  });
-
-  it('does not widen custom IPv4-only tunnels when they are edited', () => {
-    expect(warpIpStackOf(protocol())).toBe('dual');
-    expect(warpIpStackOf(protocol({ domain_strategy: 'ForceIPv4' }))).toBe('ipv4');
-    expect(warpIpStackOf(protocol({ domain_strategy: 'ForceIPv4v6' }))).toBe('prefer_ipv4');
-    expect(warpIpStackOf(protocol({ domain_strategy: 'ForceIPv6v4' }))).toBe('prefer_ipv6');
-    expect(warpIpStackOf(protocol({ allowed_ips: ['0.0.0.0/0'] }))).toBe('ipv4');
-    expect(warpIpStackOf(protocol({ allowed_ips: ['::/0'] }))).toBe('ipv6');
-  });
-
   it('keeps its random generated id hidden', async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const view = render(
@@ -82,7 +35,7 @@ describe('WARP exit stack settings', () => {
 
     expect(view.queryByText('资源 ID')).toBeNull();
     expect(view.queryByDisplayValue(/^warp-[0-9a-f]{4}-[0-9a-f]{4}$/)).toBeNull();
-    const create = view.getByRole('button', { name: '创建到草稿' }) as HTMLButtonElement;
+    const create = view.getByRole('button', { name: '创建隧道' }) as HTMLButtonElement;
     expect(create.disabled).toBe(false);
     expect(view.getByRole('textbox', { name: 'Endpoint 地址' })).toBeTruthy();
     expect(view.getByRole('spinbutton', { name: 'Endpoint 端口' })).toBeTruthy();
@@ -94,61 +47,39 @@ describe('WARP exit stack settings', () => {
     expect(operation.outbound.id).toMatch(/^warp-[0-9a-f]{4}-[0-9a-f]{4}$/);
   });
 
-  it('makes the stack and Keepalive editable after the tunnel is created', async () => {
-    draft.clear();
+  it('edits MASQUE HTTP version and tunnel DNS without exposing WG controls', async () => {
     const tunnel: ExternalOutbound = {
       id: 'warp-8f3a-2d71',
       tenant: 'platform',
-      name: 'Cloudflare WARP',
-      address: 'engage.cloudflareclient.com',
-      port: 2408,
+      name: 'WARP',
+      address: '162.159.198.2',
+      port: 443,
       protocol: protocol(),
       security: { t: 'none' },
       bindings: [],
     };
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const onClose = vi.fn();
+    const client = new QueryClient();
     const view = render(
       <QueryClientProvider client={client}>
-        <WarpEdit tunnel={tunnel} onClose={onClose} />
+        <WarpEdit tunnel={tunnel} onClose={() => undefined} />
       </QueryClientProvider>,
     );
-
     const save = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
-    expect(save.title).toBe('没有修改');
-    expect(draft.ops()).toHaveLength(0);
-    expect(view.getByRole('textbox', { name: '默认 Endpoint 地址' })).toBeTruthy();
-    expect(view.getByRole('spinbutton', { name: '默认 Endpoint 端口' })).toBeTruthy();
-
-    const keepAlive = view.getByRole('spinbutton', { name: 'Keepalive' });
-    expect((keepAlive as HTMLInputElement).value).toBe('25');
-    fireEvent.change(keepAlive, { target: { value: '40' } });
-    expect((keepAlive as HTMLInputElement).value).toBe('40');
-    expect(save.disabled).toBe(false);
-
-    const stack = view.getByRole('combobox', { name: 'WARP 出口协议栈' });
-    fireEvent.change(stack, { target: { value: 'ipv4' } });
-    expect((stack as HTMLSelectElement).value).toBe('ipv4');
-
-    const tun = view.getByRole('combobox', { name: 'TUN 实现' });
-    fireEvent.change(tun, { target: { value: 'userspace' } });
-    const workers = view.getByRole('spinbutton', { name: 'Workers' });
-    fireEvent.change(workers, { target: { value: '4' } });
-
+    expect(view.queryByText('Keepalive')).toBeNull();
+    expect(view.queryByText('Workers')).toBeNull();
+    fireEvent.change(view.getByRole('combobox'), { target: { value: 'h2' } });
+    fireEvent.change(view.getByRole('textbox', { name: /隧道内 DNS/ }), {
+      target: { value: '9.9.9.9, 2606:4700:4700::1111' },
+    });
     fireEvent.click(save);
-    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
     const operation = draft.ops()[0];
-    expect(operation?.op).toBe('upsert_external_outbound');
-    if (operation?.op !== 'upsert_external_outbound' || operation.outbound.protocol.t !== 'warp') {
-      throw new Error('expected a WARP draft operation');
-    }
-    expect(operation.outbound.protocol.v.keep_alive).toBe(40);
-    expect(operation.outbound.protocol.v.allowed_ips).toEqual(['0.0.0.0/0']);
-    expect(operation.outbound.protocol.v.domain_strategy).toBe('ForceIPv4');
-    expect(operation.outbound.protocol.v.no_kernel_tun).toBe(true);
-    expect(operation.outbound.protocol.v.workers).toBe(4);
-    draft.clear();
+    if (operation.op !== 'upsert_external_outbound') throw new Error('expected tunnel draft');
+    expect(operation.outbound.protocol).toEqual({
+      t: 'warp',
+      v: { http_version: 'h2', remote_dns: ['9.9.9.9', '2606:4700:4700::1111'] },
+    });
   });
 
   it('sends every machine-level setting as an independent override', async () => {
@@ -171,12 +102,11 @@ describe('WARP exit stack settings', () => {
             registered_at: '2026-08-28T00:00:00.000Z',
             peer_public_key: 'peer-key',
             local_addresses: ['172.16.0.2/32', '2606:4700::2/128'],
-            reserved: [1, 2, 3],
           }}
           nodeName="香港"
           defaultAddress="engage.cloudflareclient.com"
           defaultPort={2408}
-          defaults={protocol()}
+
           editable
         />
       </QueryClientProvider>,
@@ -188,27 +118,14 @@ describe('WARP exit stack settings', () => {
     expect(save.disabled).toBe(true);
     expect(save.title).toBe('没有修改');
     expect(fetchMock).not.toHaveBeenCalled();
-    fireEvent.change(card.getByLabelText('Keepalive（秒）'), { target: { value: '35' } });
-    fireEvent.change(card.getByRole('combobox', { name: 'WARP 出口协议栈' }), {
-      target: { value: 'prefer_ipv6' },
-    });
-    fireEvent.change(card.getByLabelText('TUN 实现'), { target: { value: 'userspace' } });
-    fireEvent.change(card.getByLabelText('Workers'), { target: { value: '8' } });
+    expect(card.queryByText('Keepalive（秒）')).toBeNull();
+    fireEvent.change(card.getByRole('textbox', { name: 'Endpoint 地址' }), { target: { value: '162.159.198.2' } });
     expect(save.disabled).toBe(false);
     fireEvent.click(save);
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(String(init.body))).toEqual({
-      endpoint_address: null,
-      endpoint_port: null,
-      mtu: null,
-      keep_alive: 35,
-      allowed_ips: ['0.0.0.0/0', '::/0'],
-      domain_strategy: 'ForceIPv6v4',
-      no_kernel_tun: true,
-      workers: 8,
-    });
+    expect(JSON.parse(String(init.body))).toEqual({ endpoint_address: '162.159.198.2', endpoint_port: null });
     vi.unstubAllGlobals();
   });
 
@@ -232,12 +149,11 @@ describe('WARP exit stack settings', () => {
             registered_at: '2026-08-28T00:00:00.000Z',
             peer_public_key: 'peer-key',
             local_addresses: ['172.16.0.2/32', '2606:4700::2/128'],
-            reserved: [1, 2, 3],
           }}
           nodeName="香港"
           defaultAddress="engage.cloudflareclient.com"
           defaultPort={2408}
-          defaults={protocol()}
+
           editable
         />
       </QueryClientProvider>,
@@ -273,12 +189,11 @@ describe('WARP exit stack settings', () => {
             registered_at: '2026-08-28T00:00:00.000Z',
             peer_public_key: 'peer-key',
             local_addresses: ['172.16.0.2/32'],
-            reserved: [1, 2, 3],
           }}
           nodeName="香港"
           defaultAddress="engage.cloudflareclient.com"
           defaultPort={2408}
-          defaults={protocol()}
+
           editable
           removalBlockedReason="这台机器仍被规则引用。请先解除引用并完成发布，再注销身份。"
         />

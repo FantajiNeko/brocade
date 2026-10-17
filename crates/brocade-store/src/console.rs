@@ -29,13 +29,12 @@ use brocade_core::{
         IngressIdentity, IngressWires, IngressWiresWire, ModelSnapshot, NodeConnection, Projection,
         ProjectionDownloadEndpoint, ProjectionEndpoint, Reality, RealityFallbackLimits,
         RealityFallbackMode, RealityFallbackRateLimit, RealitySettings, RealityXhttp, Tls,
-        TlsXhttp, Transport, User, WgTransport, Xhttp, XhttpTuning, EXTERNAL_WIREGUARD_MAX_WORKERS,
+        TlsXhttp, Transport, User, WgTransport, Xhttp, XhttpTuning,
     },
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_server_name, normalize_host_port,
     },
 };
-use ipnet::IpNet;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -169,8 +168,8 @@ pub(crate) async fn create_tenant_tx(
     Ok(tenant_changed || warp_changed)
 }
 
-const DEFAULT_WARP_ADDRESS: &str = "engage.cloudflareclient.com";
-const DEFAULT_WARP_PORT: u16 = 2408;
+const DEFAULT_WARP_ADDRESS: &str = "162.159.198.2";
+const DEFAULT_WARP_PORT: u16 = 443;
 
 /// Add the one managed WARP target every tenant receives.
 ///
@@ -209,12 +208,8 @@ async fn ensure_default_warp_for_tenant_tx(
             address: DEFAULT_WARP_ADDRESS.to_owned(),
             port: DEFAULT_WARP_PORT,
             protocol: ExternalOutboundProtocol::Warp {
-                mtu: 1280,
-                keep_alive: 25,
-                allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-                no_kernel_tun: false,
-                domain_strategy: "ForceIP".to_owned(),
-                workers: 0,
+                http_version: Default::default(),
+                remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
             },
             security: ExternalOutboundSecurity::None,
             note: None,
@@ -1067,20 +1062,9 @@ pub(crate) async fn upsert_external_outbound_tx(
             "domain_strategy": domain_strategy,
         }),
         ExternalOutboundProtocol::Warp {
-            mtu,
-            keep_alive,
-            allowed_ips,
-            no_kernel_tun,
-            domain_strategy,
-            workers,
-        } => json!({
-            "mtu": mtu,
-            "keep_alive": keep_alive,
-            "allowed_ips": allowed_ips,
-            "no_kernel_tun": no_kernel_tun,
-            "domain_strategy": domain_strategy,
-            "workers": workers,
-        }),
+            http_version,
+            remote_dns,
+        } => json!({"http_version": http_version, "remote_dns": remote_dns}),
         ExternalOutboundProtocol::Vpngate {
             country_code,
             server_id,
@@ -1216,11 +1200,6 @@ pub async fn register_warp_binding(
             "WARP registration returned no tunnel addresses".to_owned(),
         ));
     }
-    if !request.reserved.is_empty() && request.reserved.len() != 3 {
-        return Err(StoreError::InvalidData(
-            "WARP client_id must decode to exactly three reserved bytes".to_owned(),
-        ));
-    }
 
     let note = note_or(request.note.as_deref(), || {
         format!("bind WARP tunnel {outbound_id} to {node_id}")
@@ -1294,8 +1273,8 @@ pub async fn register_warp_binding(
     let row = sqlx::query(
         "INSERT INTO external_outbound_bindings
             (outbound_id, node_id, device_id, account_id, access_token_sealed,
-             private_key_sealed, peer_public_key, local_addresses, reserved, created_revision)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             private_key_sealed, peer_public_key, local_addresses, created_revision)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING to_char(registered_at AT TIME ZONE 'UTC',
                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS registered_at",
     )
@@ -1307,7 +1286,6 @@ pub async fn register_warp_binding(
     .bind(private_key_sealed)
     .bind(&peer_public_key)
     .bind(serde_json::to_value(&request.local_addresses)?)
-    .bind(serde_json::to_value(&request.reserved)?)
     .bind(u64_to_i64(revision_id, "revision_id")?)
     .fetch_one(&mut *tx)
     .await?;
@@ -1321,16 +1299,9 @@ pub async fn register_warp_binding(
         registered_at: row.try_get("registered_at")?,
         endpoint_address: None,
         endpoint_port: None,
-        mtu: None,
-        keep_alive: None,
-        allowed_ips: None,
-        no_kernel_tun: None,
-        domain_strategy: None,
-        workers: None,
         private_key,
         peer_public_key,
         local_addresses: request.local_addresses,
-        reserved: request.reserved,
     };
     Ok(RegisterWarpBindingResult {
         revision_id,
@@ -1368,50 +1339,6 @@ pub async fn update_warp_binding(
     if let Some(port) = request.endpoint_port {
         ensure_nonzero_port(port, "WARP endpoint port")?;
     }
-    if request.mtu.is_some_and(|mtu| !(576..=9000).contains(&mtu)) {
-        return Err(StoreError::InvalidData(
-            "WARP MTU must be between 576 and 9000".to_owned(),
-        ));
-    }
-    if request.allowed_ips.is_some() != request.domain_strategy.is_some() {
-        return Err(StoreError::InvalidData(
-            "WARP address policy must override allowed IPs and domain strategy together".to_owned(),
-        ));
-    }
-    if request.allowed_ips.as_ref().is_some_and(|networks| {
-        networks.is_empty()
-            || networks
-                .iter()
-                .any(|network| network.parse::<IpNet>().is_err())
-    }) {
-        return Err(StoreError::InvalidData(
-            "WARP allowed IPs must contain valid CIDR networks".to_owned(),
-        ));
-    }
-    if request.domain_strategy.as_deref().is_some_and(|strategy| {
-        !matches!(
-            strategy,
-            "ForceIP" | "ForceIPv4" | "ForceIPv6" | "ForceIPv4v6" | "ForceIPv6v4"
-        )
-    }) {
-        return Err(StoreError::InvalidData(
-            "WARP domain strategy is not supported by Xray".to_owned(),
-        ));
-    }
-    if request
-        .workers
-        .is_some_and(|workers| workers > EXTERNAL_WIREGUARD_MAX_WORKERS)
-    {
-        return Err(StoreError::InvalidData(format!(
-            "WARP workers must be between 0 and {EXTERNAL_WIREGUARD_MAX_WORKERS}"
-        )));
-    }
-    let allowed_ips_json = request
-        .allowed_ips
-        .as_ref()
-        .map(serde_json::to_value)
-        .transpose()?;
-
     let note = note_or(request.note.as_deref(), || {
         format!("update WARP route {outbound_id} on {node_id}")
     });
@@ -1423,7 +1350,6 @@ pub async fn update_warp_binding(
                 external_outbound_bindings.account_id,
                 external_outbound_bindings.peer_public_key,
                 external_outbound_bindings.local_addresses,
-                external_outbound_bindings.reserved,
                 to_char(external_outbound_bindings.registered_at AT TIME ZONE 'UTC',
                         'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS registered_at
          FROM external_outbound_bindings
@@ -1453,40 +1379,22 @@ pub async fn update_warp_binding(
             "tunnel {outbound_id} is not a managed WARP tunnel"
         )));
     }
-
     let revision_id = insert_revision(&mut tx, actor.operator_id(), &note).await?;
     let changed = sqlx::query(
-        "UPDATE external_outbound_bindings
-         SET endpoint_address = $3, endpoint_port = $4, mtu = $5,
-             keep_alive = $6, allowed_ips = $7, no_kernel_tun = $8,
-             domain_strategy = $9, workers = $10
+        "UPDATE external_outbound_bindings SET endpoint_address = $3, endpoint_port = $4
          WHERE outbound_id = $1 AND node_id = $2
-           AND (endpoint_address IS DISTINCT FROM $3
-             OR endpoint_port IS DISTINCT FROM $4
-             OR mtu IS DISTINCT FROM $5
-             OR keep_alive IS DISTINCT FROM $6
-             OR allowed_ips IS DISTINCT FROM $7
-             OR no_kernel_tun IS DISTINCT FROM $8
-             OR domain_strategy IS DISTINCT FROM $9
-             OR workers IS DISTINCT FROM $10)",
+           AND (endpoint_address IS DISTINCT FROM $3 OR endpoint_port IS DISTINCT FROM $4)",
     )
     .bind(&outbound_id)
     .bind(&node_id)
     .bind(&endpoint_address)
     .bind(request.endpoint_port.map(i32::from))
-    .bind(request.mtu.map(i32::from))
-    .bind(request.keep_alive.map(i32::from))
-    .bind(&allowed_ips_json)
-    .bind(request.no_kernel_tun)
-    .bind(&request.domain_strategy)
-    .bind(request.workers.map(i32::from))
     .execute(&mut *tx)
     .await?
     .rows_affected()
         > 0;
     let revision_id = commit_revision(&mut tx, revision_id, previous, changed).await?;
     tx.commit().await?;
-
     Ok(UpdateWarpBindingResult {
         revision_id,
         binding: json!({
@@ -1496,19 +1404,11 @@ pub async fn update_warp_binding(
             "registered_at": row.try_get::<String, _>("registered_at")?,
             "endpoint_address": endpoint_address,
             "endpoint_port": request.endpoint_port,
-            "mtu": request.mtu,
-            "keep_alive": request.keep_alive,
-            "allowed_ips": request.allowed_ips,
-            "no_kernel_tun": request.no_kernel_tun,
-            "domain_strategy": request.domain_strategy,
-            "workers": request.workers,
             "peer_public_key": row.try_get::<String, _>("peer_public_key")?,
             "local_addresses": row.try_get::<Value, _>("local_addresses")?,
-            "reserved": row.try_get::<Value, _>("reserved")?,
         }),
     })
 }
-
 /// Reads the provider credential only after proving that retiring it cannot cut a live route.
 ///
 /// A WARP identity has two consumers to consider. The current model may still refer to it, and a

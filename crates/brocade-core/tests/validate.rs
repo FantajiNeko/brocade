@@ -386,12 +386,8 @@ fn managed_warp_runtime_overrides_are_validated() {
         address: "engage.cloudflareclient.com".to_owned(),
         port: 2408,
         protocol: ExternalOutboundProtocol::Warp {
-            mtu: 1280,
-            keep_alive: 25,
-            allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-            no_kernel_tun: false,
-            domain_strategy: "ForceIP".to_owned(),
-            workers: 257,
+            http_version: Default::default(),
+            remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
         },
         security: ExternalOutboundSecurity::None,
         bindings: vec![ExternalWarpBinding {
@@ -401,29 +397,34 @@ fn managed_warp_runtime_overrides_are_validated() {
             registered_at: "2026-08-28T00:00:00.000Z".to_owned(),
             endpoint_address: None,
             endpoint_port: None,
-            mtu: None,
-            keep_alive: None,
-            allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
-            no_kernel_tun: None,
-            domain_strategy: None,
-            workers: Some(257),
-            private_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned(),
-            peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+            private_key: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../brocade-core/tests/fixtures/warp/private.b64"
+            ))
+            .trim()
+            .to_owned(),
+            peer_public_key: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../brocade-core/tests/fixtures/warp/public.b64"
+            ))
+            .trim()
+            .to_owned(),
             local_addresses: vec!["172.16.0.2/32".to_owned()],
-            reserved: vec![0, 0, 0],
         }],
     }];
+    doc.external_outbounds[0].bindings[0].private_key =
+        "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".to_owned();
+    if let ExternalOutboundProtocol::Warp { remote_dns, .. } =
+        &mut doc.external_outbounds[0].protocol
+    {
+        remote_dns.clear();
+    }
     let mut invalid_warp = Vec::new();
     let sys = compile_system(&doc, &mut invalid_warp);
     let app_ir = compile_app(&doc, &app, &mut invalid_warp);
     validate_app(&sys, &app_ir, &mut invalid_warp);
-    for code in [
-        "external-outbound.warp-workers",
-        "external-outbound.warp-binding-address-policy",
-        "external-outbound.warp-binding-workers",
-    ] {
-        assert_has(&invalid_warp, Level::Error, code);
-    }
+    assert_has(&invalid_warp, Level::Error, "external-outbound.warp-key");
+    assert_has(&invalid_warp, Level::Error, "external-outbound.warp-dns");
 }
 
 #[test]
@@ -5376,4 +5377,20 @@ fn native_vless_encryption_claims_its_tcp_port_and_validates_keys() {
     validate_app(&sys, &app, &mut diagnostics);
     assert_has(&diagnostics, Level::Error, "node.port-clash");
     assert_has(&diagnostics, Level::Error, "ingress.vless-encryption-key");
+}
+
+#[test]
+fn warp_rejects_removed_wireguard_options() {
+    assert!(
+        serde_json::from_value::<ExternalOutboundProtocol>(serde_json::json!({
+            "t": "warp", "v": { "mtu": 1280, "workers": 4 }
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ExternalOutboundProtocol>(serde_json::json!({
+            "t": "warp", "v": { "http_version": "h1", "remote_dns": ["1.1.1.1"] }
+        }))
+        .is_err()
+    );
 }

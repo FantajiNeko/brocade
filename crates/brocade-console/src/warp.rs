@@ -1,26 +1,23 @@
-//! Cloudflare WARP's WireGuard-compatible registration boundary.
+//! Cloudflare WARP device registration and MASQUE key enrollment.
 //!
 //! This is deliberately a small adapter rather than a Cloudflare account model. The endpoint is
 //! undocumented and wgcf is unaffiliated with Cloudflare, so every assumption is kept in this
 //! file and failures are returned with enough provider detail to diagnose a changed response.
-//! The rest of Brocade sees only an ordinary per-machine WireGuard identity.
+//! A bootstrap device is enrolled with a fresh P-256 identity before it reaches the store.
 
 use std::time::Duration;
 
-use base64::{
-    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
-    Engine as _,
-};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use rcgen::PublicKeyData as _;
 use reqwest::{header, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const API_ORIGIN: &str = "https://api.cloudflareclient.com";
-// Current wgcf v2 identifies itself as the Android 6.3 client against this API shape. Keeping
-// both tokens together is important: Cloudflare has rejected mismatched fingerprints with 1020.
-const API_VERSION: &str = "v0a1922";
-const CLIENT_VERSION: &str = "a-6.3-1922";
+// The bootstrap and MASQUE enrollment requests use the same Android API version.
+const API_VERSION: &str = "v0a4616";
+const CLIENT_VERSION: &str = "a-6.81-4616";
 const RESPONSE_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +27,6 @@ pub struct Registration {
     pub access_token: String,
     pub peer_public_key: String,
     pub local_addresses: Vec<String>,
-    pub reserved: Vec<u8>,
     pub suggested_endpoint: Option<String>,
 }
 
@@ -39,6 +35,8 @@ struct RegisterRequest<'a> {
     fcm_token: &'a str,
     install_id: &'a str,
     key: &'a str,
+    key_type: &'a str,
+    tunnel_type: &'a str,
     locale: &'a str,
     model: &'a str,
     tos: &'a str,
@@ -61,8 +59,6 @@ struct Account {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    #[serde(default)]
-    client_id: String,
     interface: Interface,
     peers: Vec<Peer>,
 }
@@ -95,7 +91,137 @@ struct Endpoint {
 }
 
 pub async fn register(public_key: &str, node_name: &str) -> Result<Registration, String> {
-    register_at(API_ORIGIN, public_key, node_name).await
+    register_masque_at(API_ORIGIN, public_key, node_name).await
+}
+
+pub struct MasqueKeys {
+    pub private_key: String,
+    pub public_key: String,
+}
+
+pub fn generate_masque_keys() -> Result<MasqueKeys, String> {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|_| "无法生成 WARP P-256 设备密钥".to_owned())?;
+    Ok(MasqueKeys {
+        private_key: BASE64_STANDARD.encode(key.serialize_der()),
+        public_key: BASE64_STANDARD.encode(key.subject_public_key_info()),
+    })
+}
+
+async fn register_masque_at(
+    origin: &str,
+    public_key: &str,
+    node_name: &str,
+) -> Result<Registration, String> {
+    // The provider bootstraps devices through its legacy registration endpoint, then enrolls
+    // the actual MASQUE key. This throwaway key is never used by the data plane or persisted.
+    use ring::rand::SecureRandom as _;
+    let mut bootstrap = [0_u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bootstrap)
+        .map_err(|_| "无法生成 WARP 注册随机值".to_owned())?;
+    let registered = register_at(origin, &BASE64_STANDARD.encode(bootstrap), node_name).await?;
+    match enroll_masque(origin, &registered, public_key).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Err(cleanup) =
+                unregister_at(origin, &registered.device_id, &registered.access_token).await
+            {
+                return Err(format!(
+                    "{error}；临时 WARP 设备 {} 清理失败：{cleanup}",
+                    registered.device_id
+                ));
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn enroll_masque(
+    origin: &str,
+    registered: &Registration,
+    public_key: &str,
+) -> Result<Registration, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(25))
+        .http1_only()
+        .build()
+        .map_err(|_| "无法建立 MASQUE 注册客户端".to_owned())?;
+    let mut url = reqwest::Url::parse(origin).map_err(|_| "WARP API 地址无效".to_owned())?;
+    url.path_segments_mut()
+        .map_err(|_| "WARP API 地址无效".to_owned())?
+        .push(API_VERSION)
+        .push("reg")
+        .push(&registered.device_id);
+    let response = client.patch(url).header(header::USER_AGENT, "WARP for Android")
+        .header("CF-Client-Version", CLIENT_VERSION).bearer_auth(&registered.access_token)
+        .json(&serde_json::json!({"key": public_key, "key_type": "secp256r1", "tunnel_type": "masque", "warp_enabled": true}))
+        .send().await.map_err(|_| "Cloudflare MASQUE 密钥注册请求失败".to_owned())?;
+    let status = response.status();
+    let bytes = response_bytes(response).await?;
+    if status != StatusCode::OK {
+        return Err(format!(
+            "Cloudflare MASQUE 注册失败（HTTP {}）",
+            status.as_u16()
+        ));
+    }
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Cloudflare MASQUE 响应不是有效 JSON".to_owned())?;
+    if value.get("warp_enabled").and_then(Value::as_bool) == Some(false) {
+        return Err("Cloudflare 未启用 WARP".to_owned());
+    }
+    // PATCH responses may omit the creation-only bearer token.
+    value["token"] = Value::String(registered.access_token.clone());
+    let mut result = parse_registration(
+        &serde_json::to_vec(&value).map_err(|_| "无法解析 MASQUE 身份".to_owned())?,
+    )?;
+    if result.device_id != registered.device_id || result.account_id != registered.account_id {
+        return Err("Cloudflare MASQUE 返回了不匹配的设备身份".to_owned());
+    }
+    result.peer_public_key = normalize_masque_public_key(&result.peer_public_key)?;
+    Ok(result)
+}
+
+fn normalize_masque_public_key(key: &str) -> Result<String, String> {
+    // Cloudflare returns a PEM public key; persist the same canonical Base64 DER that the
+    // compiler validates and the Xray renderer consumes.
+    let key = key.trim();
+    let der = if key.starts_with("-----BEGIN ") {
+        let (remaining, pem) = x509_parser::pem::parse_x509_pem(key.as_bytes())
+            .map_err(|_| "MASQUE 服务端公钥不是有效 PEM".to_owned())?;
+        if pem.label != "PUBLIC KEY" || !remaining.iter().all(u8::is_ascii_whitespace) {
+            return Err("MASQUE 服务端公钥不是单个 PUBLIC KEY".to_owned());
+        }
+        pem.contents
+    } else {
+        BASE64_STANDARD
+            .decode(key)
+            .map_err(|_| "MASQUE 服务端公钥不是 PEM 或 Base64 DER".to_owned())?
+    };
+    const PREFIX: &[u8] = &[
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
+    ];
+    if der.len() != 91 || !der.starts_with(PREFIX) {
+        return Err("MASQUE 服务端未返回 P-256 公钥".to_owned());
+    }
+    Ok(BASE64_STANDARD.encode(der))
+}
+
+async fn response_bytes(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "无法读取 WARP 响应".to_owned())?
+    {
+        if bytes.len() + chunk.len() > RESPONSE_LIMIT {
+            return Err("WARP 响应超过 64 KiB".to_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Retires one source registration with the device-scoped token returned at creation time.
@@ -130,17 +256,14 @@ async fn unregister_at(
         .push(device_id);
     let response = client
         .delete(url)
-        .header(header::USER_AGENT, "okhttp/3.12.1")
+        .header(header::USER_AGENT, "WARP for Android")
         .header("CF-Client-Version", CLIENT_VERSION)
         .bearer_auth(access_token)
         .send()
         .await
         .map_err(|error| format!("Cloudflare WARP 注销请求失败：{error}"))?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("无法读取 Cloudflare WARP 注销响应：{error}"))?;
+    let bytes = response_bytes(response).await?;
     if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_FOUND) {
         return Err(format!(
             "Cloudflare WARP 注销失败（HTTP {}）：{}",
@@ -174,12 +297,14 @@ async fn register_at(
             "{}/{API_VERSION}/reg",
             api_origin.trim_end_matches('/')
         ))
-        .header(header::USER_AGENT, "okhttp/3.12.1")
+        .header(header::USER_AGENT, "WARP for Android")
         .header("CF-Client-Version", CLIENT_VERSION)
         .json(&RegisterRequest {
             fcm_token: "",
             install_id: "",
             key: public_key,
+            key_type: "curve25519",
+            tunnel_type: "wireguard",
             locale: "en_US",
             model: &model,
             tos: &tos,
@@ -189,10 +314,7 @@ async fn register_at(
         .await
         .map_err(|error| format!("Cloudflare WARP 注册请求失败：{error}"))?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("无法读取 Cloudflare WARP 响应：{error}"))?;
+    let bytes = response_bytes(response).await?;
     if bytes.len() > RESPONSE_LIMIT {
         return Err(format!(
             "Cloudflare WARP 返回异常大的响应（{} bytes）",
@@ -202,7 +324,7 @@ async fn register_at(
     if status != StatusCode::OK {
         let detail = provider_error(&bytes);
         return Err(format!(
-            "Cloudflare WARP 注册失败（HTTP {}）：{detail}。该接口为非官方兼容接口，可稍后重试或导入普通 WireGuard 配置",
+            "Cloudflare WARP 注册失败（HTTP {}）：{detail}。该接口为非官方兼容接口，可稍后重试",
             status.as_u16()
         ));
     }
@@ -220,7 +342,7 @@ fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
         .peers
         .into_iter()
         .next()
-        .ok_or_else(|| "Cloudflare WARP 响应没有 WireGuard peer".to_owned())?;
+        .ok_or_else(|| "Cloudflare WARP 响应没有 peer".to_owned())?;
     let local_addresses = [
         response.config.interface.addresses.v4,
         response.config.interface.addresses.v6,
@@ -229,10 +351,20 @@ fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
     .filter(|address| !address.trim().is_empty())
     .map(normalize_interface_address)
     .collect::<Vec<_>>();
+    if local_addresses.iter().any(|address| {
+        let Some((ip, prefix)) = address.split_once('/') else {
+            return true;
+        };
+        match (ip.parse::<std::net::IpAddr>(), prefix.parse::<u8>()) {
+            (Ok(ip), Ok(prefix)) => prefix > if ip.is_ipv4() { 32 } else { 128 },
+            _ => true,
+        }
+    }) {
+        return Err("Cloudflare WARP 返回了无效隧道地址".to_owned());
+    }
     if local_addresses.is_empty() {
         return Err("Cloudflare WARP 响应没有隧道地址".to_owned());
     }
-    let reserved = decode_client_id(&response.config.client_id)?;
     let suggested_endpoint = preferred_endpoint(peer.endpoint);
 
     Ok(Registration {
@@ -241,7 +373,6 @@ fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
         access_token: response.token,
         peer_public_key: peer.public_key,
         local_addresses,
-        reserved,
         suggested_endpoint,
     })
 }
@@ -281,23 +412,6 @@ fn normalize_interface_address(address: String) -> String {
     } else {
         format!("{address}/32")
     }
-}
-
-fn decode_client_id(client_id: &str) -> Result<Vec<u8>, String> {
-    if client_id.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let bytes = BASE64_STANDARD
-        .decode(client_id)
-        .or_else(|_| URL_SAFE_NO_PAD.decode(client_id))
-        .map_err(|_| "Cloudflare WARP client_id 不是有效 Base64".to_owned())?;
-    if bytes.len() != 3 {
-        return Err(format!(
-            "Cloudflare WARP client_id 解码后应为 3 bytes，实际为 {}",
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
 }
 
 fn provider_error(bytes: &[u8]) -> String {
@@ -342,7 +456,7 @@ mod tests {
         format::json as json_format,
         model::{
             Dns, DomainStrategy, ExternalOutboundProtocol, ExternalOutboundSecurity,
-            GeodataSettings, RealityClientPolicy,
+            GeodataSettings, RealityClientPolicy, WarpHttpVersion,
         },
         physical::node::{
             GrantSyncPlan, NodePlan, ResolvedConnection, XrayExternalOutboundPlan, XrayPlan,
@@ -405,7 +519,7 @@ mod tests {
                     }
                 },
                 "peers": [{
-                    "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                    "public_key": include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../brocade-core/tests/fixtures/warp/public.b64")).trim().to_owned(),
                     "endpoint": {
                         "host": "engage.cloudflareclient.com:2408",
                         "v4": "162.159.193.1:0",
@@ -417,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_request_matches_the_wgcf_contract() {
+    async fn bootstrap_registration_uses_the_provider_contract() {
         let (origin, seen, server) =
             registration_server(StatusCode::OK, registration_response()).await;
         let registration = register_at(&origin, "test-public-key", "hk-01")
@@ -430,7 +544,6 @@ mod tests {
         assert_eq!(registration.access_token, "token-1");
         assert_eq!(registration.local_addresses[0], "172.16.0.2/32");
         assert_eq!(registration.local_addresses[1], "2606:4700::1/128");
-        assert_eq!(registration.reserved, vec![168, 26, 21]);
         assert_eq!(
             registration.suggested_endpoint.as_deref(),
             Some("162.159.193.1:2408")
@@ -438,7 +551,7 @@ mod tests {
 
         let guard = seen.lock().unwrap();
         let (headers, body) = guard.as_ref().expect("注册请求到达本地供应商替身");
-        assert_eq!(headers[header::USER_AGENT], "okhttp/3.12.1");
+        assert_eq!(headers[header::USER_AGENT], "WARP for Android");
         assert_eq!(headers["CF-Client-Version"], CLIENT_VERSION);
         assert_eq!(body["fcm_token"], "");
         assert_eq!(body["install_id"], "");
@@ -502,7 +615,7 @@ mod tests {
         let guard = seen.lock().unwrap();
         let headers = guard.as_ref().expect("注销请求到达本地供应商替身");
         assert_eq!(headers[header::AUTHORIZATION], "Bearer token-1");
-        assert_eq!(headers[header::USER_AGENT], "okhttp/3.12.1");
+        assert_eq!(headers[header::USER_AGENT], "WARP for Android");
         assert_eq!(headers["CF-Client-Version"], CLIENT_VERSION);
     }
 
@@ -528,9 +641,15 @@ mod tests {
             &serde_json::to_vec(&registration_response()).expect("mock registration JSON"),
         )
         .unwrap();
-        let private_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        let private_key = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../brocade-core/tests/fixtures/warp/private.b64"
+        ))
+        .trim()
+        .to_owned();
         let socks_port = free_tcp_port().unwrap();
-        let config = live_xray_config(private_key, &registration, socks_port).unwrap();
+        let config =
+            live_xray_config(&private_key, &registration, socks_port, WarpHttpVersion::H3).unwrap();
 
         let inbound = config["inbounds"]
             .as_array()
@@ -546,22 +665,14 @@ mod tests {
             .iter()
             .find(|outbound| outbound["tag"] == "out:external/warp-live-e2e")
             .expect("compiled WARP outbound");
-        assert_eq!(outbound["protocol"], "wireguard");
-        assert_eq!(outbound["settings"]["secretKey"], private_key);
-        assert_eq!(outbound["settings"]["address"][0], "172.16.0.2/32");
-        assert_eq!(outbound["settings"]["address"][1], "2606:4700::1/128");
+        assert_eq!(outbound["protocol"], "masque");
         assert_eq!(
-            outbound["settings"]["peers"][0]["allowedIPs"],
-            serde_json::json!(["0.0.0.0/0", "::/0"])
-        );
-        assert_eq!(outbound["settings"]["peers"][0]["keepAlive"], 25);
-        assert_eq!(
-            outbound["settings"]["reserved"],
-            serde_json::json!([168, 26, 21])
+            outbound["streamSettings"]["masqueSettings"]["warp"]["privateKey"],
+            private_key
         );
         assert_eq!(
-            outbound["settings"]["peers"][0]["endpoint"],
-            "162.159.193.1:2408"
+            outbound["streamSettings"]["tlsSettings"]["alpn"],
+            serde_json::json!(["h3"])
         );
         assert_eq!(
             config["routing"]["rules"][0]["outboundTag"],
@@ -629,12 +740,39 @@ mod tests {
             Command::new("curl").arg("--version").output().is_ok(),
             "真实 WARP E2E 需要 curl"
         );
+        let targets = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::lookup_host(("www.cloudflare.com", 443)),
+        )
+        .await
+        .expect("trace 目标 DNS 查询超时")
+        .expect("trace 目标 DNS 查询成功")
+        .map(|address| address.ip())
+        .collect::<Vec<_>>();
+        let targets = [
+            *targets.iter().find(|ip| ip.is_ipv4()).expect("trace IPv4"),
+            *targets.iter().find(|ip| ip.is_ipv6()).expect("trace IPv6"),
+        ];
 
-        let keys = brocade_store::generate_wireguard_keypair().unwrap();
+        let keys = generate_masque_keys().unwrap();
         let registration = register(&keys.public_key, "brocade-live-e2e")
             .await
             .unwrap_or_else(|error| panic!("Cloudflare WARP 真实注册失败：{error}"));
-        let outcome = run_live_data_plane(&binary, &keys.private_key, &registration);
+        eprintln!("Cloudflare 真实申请与 MASQUE 密钥登记通过");
+        let failures = [WarpHttpVersion::H3, WarpHttpVersion::H2]
+            .into_iter()
+            .filter_map(|version| {
+                eprintln!("开始 {} 数据面测试", version.alpn());
+                run_live_data_plane(&binary, &keys.private_key, &registration, version, targets)
+                    .err()
+                    .map(|error| format!("{}: {error}", version.alpn()))
+            })
+            .collect::<Vec<_>>();
+        let outcome: Result<(), String> = if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("；"))
+        };
         let cleanup = unregister(&registration.device_id, &registration.access_token).await;
 
         if let Err(error) = cleanup {
@@ -648,6 +786,7 @@ mod tests {
                     .unwrap_or_default()
             );
         }
+        eprintln!("Cloudflare 测试设备已注销");
         if let Err(error) = outcome {
             panic!("Cloudflare 设备已清理，但 WARP 数据面没有通过：{error}");
         }
@@ -657,9 +796,11 @@ mod tests {
         binary: &Path,
         private_key: &str,
         registration: &Registration,
+        version: WarpHttpVersion,
+        targets: [IpAddr; 2],
     ) -> Result<(), String> {
         let socks_port = free_tcp_port()?;
-        let config = live_xray_config(private_key, registration, socks_port)?;
+        let config = live_xray_config(private_key, registration, socks_port, version)?;
 
         let dir = PrivateTempDir::create(
             std::env::temp_dir().join(format!("brocade-warp-live-e2e-{socks_port}")),
@@ -695,26 +836,33 @@ mod tests {
                 false
             }
         });
-        // `socks5` (without the `h`) makes curl resolve the target locally. Combined with
-        // --ipv4/--ipv6 this sends an address literal through SOCKS, so both inner address
-        // families are genuinely exercised instead of asking Xray to choose one for a domain.
-        let proxy = format!("socks5://127.0.0.1:{socks_port}");
+        // Pin the target with --resolve, leaving the localhost SOCKS connection IPv4. curl's
+        // --ipv6 also constrains the proxy connection and cannot reach a 127.0.0.1 listener.
+        // socks5h separately exercises DNS resolution inside the MASQUE tunnel.
+        let probes = [
+            ("IPv4", Some(targets[0]), "socks5", Some(true)),
+            ("IPv6", Some(targets[1]), "socks5", Some(false)),
+            ("隧道 DNS", None, "socks5h", None),
+        ];
         let curls = ready.then(|| {
-            [("IPv4", "--ipv4", true), ("IPv6", "--ipv6", false)].map(|(_, family_arg, _)| {
-                Command::new("curl")
-                    .args([
-                        "--silent",
-                        "--show-error",
-                        "--max-time",
-                        "20",
-                        family_arg,
-                        "--noproxy",
-                        "",
-                        "--proxy",
-                        &proxy,
-                        "https://www.cloudflare.com/cdn-cgi/trace",
-                    ])
-                    .output()
+            probes.map(|(_, address, scheme, _)| {
+                let proxy = format!("{scheme}://127.0.0.1:{socks_port}");
+                let mut curl = Command::new("curl");
+                if let Some(address) = address {
+                    curl.args(["--resolve", &format!("www.cloudflare.com:443:[{address}]")]);
+                }
+                curl.args([
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "20",
+                    "--noproxy",
+                    "",
+                    "--proxy",
+                    &proxy,
+                    "https://www.cloudflare.com/cdn-cgi/trace",
+                ])
+                .output()
             })
         });
         let _ = child.kill();
@@ -730,10 +878,7 @@ mod tests {
             ));
         }
         let curls = curls.expect("ready 时一定运行 curl");
-        for ((label, _, expect_ipv4), curl) in [("IPv4", "--ipv4", true), ("IPv6", "--ipv6", false)]
-            .into_iter()
-            .zip(curls)
-        {
+        for ((label, _, _, expect_ipv4), curl) in probes.into_iter().zip(curls) {
             let curl = curl.map_err(|error| format!("无法运行 {label} curl：{error}"))?;
             if !curl.status.success() {
                 return Err(format!(
@@ -756,10 +901,13 @@ mod tests {
             let exit_ip = exit_ip.parse::<IpAddr>().map_err(|error| {
                 format!("{label} Cloudflare trace 出口 IP 无效（{exit_ip}）：{error}")
             })?;
-            if exit_ip.is_ipv4() != expect_ipv4 {
+            if expect_ipv4.is_some_and(|v4| exit_ip.is_ipv4() != v4) {
                 return Err(format!("{label} WARP 返回了错误地址族的出口 IP：{exit_ip}"));
             }
-            eprintln!("{label} WARP 数据面通过：warp={warp}，出口 IP={exit_ip}");
+            eprintln!(
+                "{} / {label} WARP 数据面通过：warp={warp}，出口 IP={exit_ip}",
+                version.alpn()
+            );
         }
         Ok(())
     }
@@ -768,13 +916,10 @@ mod tests {
         private_key: &str,
         registration: &Registration,
         socks_port: u16,
+        version: WarpHttpVersion,
     ) -> Result<Value, String> {
-        let (address, port) = split_endpoint(
-            registration
-                .suggested_endpoint
-                .as_deref()
-                .unwrap_or("engage.cloudflareclient.com:2408"),
-        )?;
+        // Exercise the default endpoint offered by Console, not the provider's suggestion.
+        let (address, port) = ("162.159.198.2".to_owned(), 443);
         let plan = NodePlan {
             node_id: "warp-live-e2e".to_owned(),
             wireguard: None,
@@ -806,19 +951,20 @@ mod tests {
                     tag: "out:external/warp-live-e2e".to_owned(),
                     address,
                     port,
-                    protocol: ExternalOutboundProtocol::Wireguard {
-                        credential: private_key.to_owned(),
-                        peer_public_key: registration.peer_public_key.clone(),
-                        local_addresses: registration.local_addresses.clone(),
-                        mtu: 1280,
-                        reserved: registration.reserved.clone(),
-                        keep_alive: 25,
-                        allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-                        no_kernel_tun: true,
-                        domain_strategy: "ForceIP".to_owned(),
+                    protocol: ExternalOutboundProtocol::Warp {
+                        http_version: version,
+                        remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
                     },
                     security: ExternalOutboundSecurity::None,
-                    wireguard_workers: 0,
+                    warp_masque: Some(brocade_core::physical::node::XrayWarpMasquePlan {
+                        options: brocade_core::model::WarpMasqueOptions {
+                            http_version: version,
+                            ..Default::default()
+                        },
+                        private_key: private_key.to_owned(),
+                        peer_public_key: registration.peer_public_key.clone(),
+                        local_addresses: registration.local_addresses.clone(),
+                    }),
                 }],
                 block_outbound: false,
                 routing_rules: Vec::new(),
@@ -881,30 +1027,6 @@ mod tests {
         }
     }
 
-    fn split_endpoint(endpoint: &str) -> Result<(String, u16), String> {
-        let endpoint = endpoint.trim();
-        let (address, port) = if let Some(rest) = endpoint.strip_prefix('[') {
-            let (address, port) = rest
-                .split_once("]:")
-                .ok_or_else(|| format!("WARP 返回的 IPv6 Endpoint 无效：{endpoint}"))?;
-            (address, port)
-        } else {
-            endpoint
-                .rsplit_once(':')
-                .ok_or_else(|| format!("WARP 返回的 Endpoint 缺少端口：{endpoint}"))?
-        };
-        if address.trim().is_empty() {
-            return Err("WARP 返回的 Endpoint 地址为空".to_owned());
-        }
-        let port = port
-            .parse::<u16>()
-            .map_err(|error| format!("WARP 返回的 Endpoint 端口无效（{port}）：{error}"))?;
-        if port == 0 {
-            return Err("WARP 返回的 Endpoint 端口不能为 0".to_owned());
-        }
-        Ok((address.to_owned(), port))
-    }
-
     fn xray_binary() -> Option<PathBuf> {
         let path = match std::env::var_os("BROCADE_XRAY_BIN") {
             Some(value) => PathBuf::from(value),
@@ -945,20 +1067,121 @@ mod tests {
     }
 
     #[test]
+    fn masque_public_key_normalizes_pem_and_rejects_invalid_envelopes() {
+        let expected = registration_response()["config"]["peers"][0]["public_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{expected}\n-----END PUBLIC KEY-----");
+        assert_eq!(normalize_masque_public_key(&expected).unwrap(), expected);
+        assert_eq!(normalize_masque_public_key(&pem).unwrap(), expected);
+        for invalid in [
+            pem.replace("PUBLIC KEY", "CERTIFICATE"),
+            format!("{pem}\n{pem}"),
+            "-----BEGIN PUBLIC KEY-----\ninvalid\n-----END PUBLIC KEY-----".to_owned(),
+            BASE64_STANDARD.encode([0_u8; 32]),
+        ] {
+            assert!(normalize_masque_public_key(&invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn masque_registration_enrolls_p256_and_cleans_up_failed_enrollment() {
+        for reject in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let enrollment = Arc::new(Mutex::new(None));
+            let cleanup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = Arc::clone(&enrollment);
+            let deleted = Arc::clone(&cleanup);
+            let app = Router::new()
+                .route(
+                    &format!("/{API_VERSION}/reg"),
+                    post(|| async { Json(registration_response()) }),
+                )
+                .route(
+                    &format!("/{API_VERSION}/reg/device-1"),
+                    axum::routing::patch(move |headers: HeaderMap, Json(body): Json<Value>| {
+                        let seen = Arc::clone(&seen);
+                        async move {
+                            *seen.lock().unwrap() = Some((headers, body));
+                            let mut response = registration_response();
+                            response.as_object_mut().unwrap().remove("token");
+                            response["warp_enabled"] = Value::Bool(true);
+                            let public_key = response["config"]["peers"][0]["public_key"]
+                                .as_str()
+                                .unwrap();
+                            response["config"]["peers"][0]["public_key"] = Value::String(
+                                format!("-----BEGIN PUBLIC KEY-----\n{public_key}\n-----END PUBLIC KEY-----\n"),
+                            );
+                            response["config"]["peers"][0]["endpoint"] =
+                                serde_json::json!({"v4":"162.159.198.2:443"});
+                            (
+                                if reject {
+                                    StatusCode::FORBIDDEN
+                                } else {
+                                    StatusCode::OK
+                                },
+                                Json(response),
+                            )
+                        }
+                    })
+                    .delete(move || {
+                        let deleted = Arc::clone(&deleted);
+                        async move {
+                            deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    }),
+                );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let keys = generate_masque_keys().unwrap();
+            let result = register_masque_at(&origin, &keys.public_key, "fixture-node").await;
+            server.abort();
+            let guard = enrollment.lock().unwrap();
+            let (headers, body) = guard.as_ref().expect("MASQUE enrollment request");
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer token-1");
+            assert_eq!(body["key"], keys.public_key);
+            assert_eq!(body["key_type"], "secp256r1");
+            assert_eq!(body["tunnel_type"], "masque");
+            assert_eq!(body["warp_enabled"], true);
+            assert_eq!(cleanup.load(std::sync::atomic::Ordering::SeqCst), reject);
+            if reject {
+                assert!(result.is_err());
+            } else {
+                let registration = result.unwrap();
+                assert_eq!(registration.access_token, "token-1");
+                assert_eq!(
+                    registration.peer_public_key,
+                    registration_response()["config"]["peers"][0]["public_key"]
+                        .as_str()
+                        .unwrap()
+                );
+                assert_eq!(
+                    registration.suggested_endpoint.as_deref(),
+                    Some("162.159.198.2:443")
+                );
+                let private = BASE64_STANDARD.decode(keys.private_key).unwrap();
+                let parsed = rcgen::KeyPair::try_from(private).unwrap();
+                assert_eq!(
+                    BASE64_STANDARD.encode(parsed.subject_public_key_info()),
+                    keys.public_key
+                );
+            }
+        }
+    }
+
+    #[test]
     fn registration_shape_parses() {
         let registration =
             parse_registration(&serde_json::to_vec(&registration_response()).unwrap()).unwrap();
         assert_eq!(registration.local_addresses[0], "172.16.0.2/32");
         assert_eq!(registration.local_addresses[1], "2606:4700::1/128");
-        assert_eq!(registration.reserved, vec![168, 26, 21]);
         assert_eq!(
             registration.suggested_endpoint.as_deref(),
             Some("162.159.193.1:2408")
         );
-    }
-
-    #[test]
-    fn malformed_client_id_is_not_silently_discarded() {
-        assert!(decode_client_id("AQI=").unwrap_err().contains("3 bytes"));
     }
 }

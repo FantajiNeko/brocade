@@ -740,13 +740,23 @@ fn managed_vpngate_pools_lower_to_deterministic_local_socks_endpoints() {
 }
 
 #[test]
-fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
+fn managed_warp_renders_masque_with_a_distinct_identity_on_each_machine() {
     let mut doc = doc(vec![
         node("hk", [10, 66, 0, 1], true, Dns::System),
         node("sg", [10, 66, 0, 2], true, Dns::System),
     ]);
-    let private_hk = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
-    let private_sg = "QG4l1cVXHNVPQxL0FKBTaFAsuGSKLFB39JYFhTOEXFo=";
+    let private_hk = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../brocade-core/tests/fixtures/warp/private.b64"
+    ))
+    .trim()
+    .to_owned();
+    let private_sg = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../brocade-core/tests/fixtures/warp/private-2.b64"
+    ))
+    .trim()
+    .to_owned();
     let binding = |node: &str, private_key: &str, address: &str| ExternalWarpBinding {
         node: node.to_owned(),
         device_id: format!("device-{node}"),
@@ -754,14 +764,13 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
         registered_at: "2026-08-27T12:00:00.000Z".to_owned(),
         endpoint_address: (node == "hk").then(|| "162.159.193.10".to_owned()),
         endpoint_port: (node == "hk").then_some(500),
-        mtu: (node == "hk").then_some(1420),
-        keep_alive: (node == "hk").then_some(40),
-        allowed_ips: (node == "hk").then(|| vec!["::/0".to_owned()]),
-        no_kernel_tun: (node == "hk").then_some(false),
-        domain_strategy: (node == "hk").then(|| "ForceIPv6".to_owned()),
-        workers: (node == "hk").then_some(4),
         private_key: private_key.to_owned(),
-        peer_public_key: "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=".to_owned(),
+        peer_public_key: include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../brocade-core/tests/fixtures/warp/public.b64"
+        ))
+        .trim()
+        .to_owned(),
         local_addresses: vec![
             address.to_owned(),
             if node == "hk" {
@@ -770,26 +779,21 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
                 "2606:4700:110:8::3/128".to_owned()
             },
         ],
-        reserved: vec![1, 2, 3],
     };
     doc.external_outbounds = vec![ExternalOutbound {
         id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "Cloudflare WARP".to_owned(),
-        address: "engage.cloudflareclient.com".to_owned(),
-        port: 2408,
+        address: "162.159.198.2".to_owned(),
+        port: 443,
         protocol: ExternalOutboundProtocol::Warp {
-            mtu: 1280,
-            keep_alive: 25,
-            allowed_ips: vec!["0.0.0.0/0".to_owned(), "::/0".to_owned()],
-            no_kernel_tun: true,
-            domain_strategy: "ForceIP".to_owned(),
-            workers: 0,
+            http_version: Default::default(),
+            remote_dns: brocade_core::model::WarpMasqueOptions::default().remote_dns,
         },
         security: ExternalOutboundSecurity::None,
         bindings: vec![
-            binding("hk", private_hk, "172.16.0.2/32"),
-            binding("sg", private_sg, "172.16.0.3/32"),
+            binding("hk", &private_hk, "172.16.0.2/32"),
+            binding("sg", &private_sg, "172.16.0.3/32"),
         ],
     }];
     let proxy_rule = || Rule {
@@ -861,38 +865,36 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
     )));
     let hk_warp = outbound(&hk, "out:external/warp-8f3a-2d71");
     let sg_warp = outbound(&sg, "out:external/warp-8f3a-2d71");
-    assert_eq!(hk_warp["protocol"], "wireguard");
-    assert_eq!(sg_warp["protocol"], "wireguard");
-    assert_eq!(hk_warp["settings"]["secretKey"], private_hk);
-    assert_eq!(sg_warp["settings"]["secretKey"], private_sg);
+    assert_eq!(hk_warp["protocol"], "masque");
+    assert_eq!(sg_warp["protocol"], "masque");
     assert_eq!(
-        hk_warp["settings"]["address"],
-        serde_json::json!(["2606:4700:110:8::2/128"]),
-        "逐机地址策略应同时限制本地接口地址族"
+        hk_warp["streamSettings"]["masqueSettings"]["warp"]["privateKey"],
+        private_hk
     );
-    assert_eq!(sg_warp["settings"]["address"][0], "172.16.0.3/32");
     assert_eq!(
-        hk_warp["settings"]["peers"][0]["allowedIPs"],
-        serde_json::json!(["::/0"])
+        sg_warp["streamSettings"]["masqueSettings"]["warp"]["privateKey"],
+        private_sg
     );
-    assert_eq!(hk_warp["settings"]["peers"][0]["keepAlive"], 40);
-    assert_eq!(hk_warp["settings"]["domainStrategy"], "ForceIPv6");
-    assert_eq!(hk_warp["settings"]["noKernelTun"], false);
-    assert_eq!(hk_warp["settings"]["workers"], 4);
     assert_eq!(
-        hk_warp["settings"]["peers"][0]["endpoint"], "162.159.193.10:500",
-        "机器级 Endpoint 应覆盖逻辑隧道默认值"
+        hk_warp["streamSettings"]["masqueSettings"]["warp"]["address"],
+        serde_json::json!(["172.16.0.2/32", "2606:4700:110:8::2/128"])
     );
-    assert_eq!(hk_warp["settings"]["mtu"], 1420);
+    assert_eq!(hk_warp["settings"]["address"], "162.159.193.10");
+    assert_eq!(hk_warp["settings"]["port"], 500);
+    assert_eq!(sg_warp["settings"]["address"], "162.159.198.2");
+    assert_eq!(sg_warp["settings"]["port"], 443);
     assert_eq!(
-        sg_warp["settings"]["peers"][0]["endpoint"], "engage.cloudflareclient.com:2408",
-        "没有覆盖的机器应继续继承逻辑隧道默认值"
+        hk_warp["settings"]["remoteDNS"],
+        serde_json::json!(["1.1.1.1", "1.0.0.1"])
     );
-    assert_eq!(sg_warp["settings"]["mtu"], 1280);
-    assert_eq!(sg_warp["settings"]["peers"][0]["keepAlive"], 25);
-    assert_eq!(sg_warp["settings"]["domainStrategy"], "ForceIP");
-    assert_eq!(sg_warp["settings"]["noKernelTun"], true);
-    assert!(sg_warp["settings"].get("workers").is_none());
+    assert_eq!(
+        hk_warp["streamSettings"]["tlsSettings"]["alpn"],
+        serde_json::json!(["h3"])
+    );
+    assert!(hk_warp["streamSettings"]["tlsSettings"]
+        .get("allowInsecure")
+        .is_none());
+    assert!(hk_warp["settings"].get("secretKey").is_none());
     assert_eq!(
         hk["outbounds"]
             .as_array()
@@ -903,48 +905,31 @@ fn managed_warp_lowers_to_a_distinct_wireguard_identity_on_each_machine() {
         1,
         "同一租户隧道被多个项目引用时，一台机器只能生成一个 Xray outbound"
     );
-    assert_ne!(
-        hk_warp["settings"]["secretKey"], sg_warp["settings"]["secretKey"],
-        "共享一个 WARP 逻辑资源不能让两台机器复用同一个 WireGuard peer"
-    );
-
-    let ExternalOutboundProtocol::Warp {
-        allowed_ips,
-        domain_strategy,
-        ..
+    if let ExternalOutboundProtocol::Warp {
+        http_version,
+        remote_dns,
     } = &mut doc.external_outbounds[0].protocol
-    else {
-        unreachable!()
-    };
-    *allowed_ips = vec!["0.0.0.0/0".to_owned()];
-    *domain_strategy = "ForceIPv4".to_owned();
-    doc.external_outbounds[0].bindings[0].allowed_ips = None;
-    doc.external_outbounds[0].bindings[0].domain_strategy = None;
-    let mut ipv4_diagnostics = Vec::new();
-    let ipv4_sys = compile_system(&doc, &mut ipv4_diagnostics);
-    let ipv4_app = compile_hops(
-        compile_app(&doc, &app, &mut ipv4_diagnostics),
-        &ipv4_sys,
-        &mut ipv4_diagnostics,
+    {
+        *http_version = brocade_core::model::WarpHttpVersion::H2;
+        *remote_dns = vec!["2606:4700:4700::1111".parse().unwrap()];
+    }
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
     );
-    assert!(
-        ipv4_diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.level != Level::Error),
-        "{ipv4_diagnostics:#?}"
-    );
-    let ipv4 = parse_xray(&xray::build(&project_node(&ipv4_sys, &[ipv4_app], "hk")));
-    let ipv4_warp = outbound(&ipv4, "out:external/warp-8f3a-2d71");
+    let h2 = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let warp = outbound(&h2, "out:external/warp-8f3a-2d71");
     assert_eq!(
-        ipv4_warp["settings"]["address"],
-        serde_json::json!(["172.16.0.2/32"]),
-        "IPv4-only WARP must not leave the registered IPv6 address on Xray's interface"
+        warp["streamSettings"]["tlsSettings"]["alpn"],
+        serde_json::json!(["h2"])
     );
     assert_eq!(
-        ipv4_warp["settings"]["peers"][0]["allowedIPs"],
-        serde_json::json!(["0.0.0.0/0"])
+        warp["settings"]["remoteDNS"],
+        serde_json::json!(["2606:4700:4700::1111"])
     );
-    assert_eq!(ipv4_warp["settings"]["domainStrategy"], "ForceIPv4");
 }
 
 #[test]

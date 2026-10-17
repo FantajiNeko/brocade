@@ -3962,7 +3962,7 @@ function externalOutboundFacts(outbound: ExternalOutbound): {
   }
   if (protocol.t === 'warp') {
     return {
-      transport: `WireGuard · MTU ${protocol.v.mtu}`,
+      transport: `MASQUE · ${protocol.v.http_version === 'h3' ? 'HTTP/3' : 'HTTP/2'}`,
       transportSecurity: null,
       credential: `${outbound.bindings.length} 台机器已绑定`,
     };

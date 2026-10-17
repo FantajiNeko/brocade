@@ -100,6 +100,10 @@ VPN Gate 候选不使用 Brocade 合成的“综合质量分”。Agent 先完�
 
 已验证出口的任一 IP 情报来源将 ISP 识别为 OPTAGE 或 Chubu Telecommunications Company, Inc. 时，该节点不进入 VPN Gate 的候选、候补或实际下发池（包括手动选择）；目录和拨测证据仍保留。ISP 尚无情报时不凭主机名推断。
 
+WARP 使用 Xray MASQUE 出站，默认 HTTP/3（UDP/443），也可在隧道参数中选择 HTTP/2（TCP/443）；两者都承载 TCP/UDP 业务，不自动互相回退。Endpoint 默认 `162.159.198.2:443`，TLS SNI 固定为 `consumer-masque.cloudflareclient.com`；设备使用 P-256 密钥认证并校验注册返回的服务端公钥。隧道内 DNS 默认 `1.1.1.1`、`1.0.0.1`，域名目标通过 WARP 查询。
+
+申请流程仍是“创建并提交隧道 → 按机器同意条款并申请身份 → 发布”。注册适配器先创建临时设备，再登记 MASQUE 公钥；登记失败会注销临时设备。密钥和设备令牌加密保存，草稿预览不调用 Cloudflare。WARP 不再接受 WireGuard 的 MTU、Keepalive、Allowed IPs、TUN、Workers 和 reserved 参数；旧 WG 身份不能复用，需重新申请。此变更不兼容旧 WARP 模型和绑定数据，升级已有安装前须完成旧绑定清理与重新注册；历史修订保持不可变，不能用新版重新编译旧 WG 修订。先发布支持 MASQUE 的 Brocade Xray，再发布使用它的配置。
+
 外部隧道的资源 ID 是不承载业务语义的随机标识：手工隧道使用 `custom-xxxx-xxxx`，WARP 使用 `warp-xxxx-xxxx`，VPN Gate 地区池或固定节点使用 `vpngate-xxxx-xxxx`，其中 `x` 是小写十六进制。地区、节点、租户和展示名称只保存在各自字段中，旧前缀或语义化 ID 不再接受。
 
 VPN Gate 出口直接在规则的目标菜单选择：`VPN Gate → 地区` 使用自动维护的地区池；展开该地区节点列表可勾选 1–16 个节点组成手动池。手动池只在所选节点间切换，节点退役或不满足准入门槛时不会补入其它节点。隧道页只负责目录观测与采集，不再要求先创建独立出站。选择和规则一起保存到变更集，提交并发布后生效；底层继续复用可审计的出站引用，兼容历史 `server_id` 固定节点。一批模型操作全部落地后，控制面会在同一事务中删除已经没有规则或前置组引用的 VPN Gate 派生出口；自定义隧道仍可作为未引用资源保留，历史观测也不依赖派生出口继续存在。手动池使用 `server_ids` 模型字段，需部署对应新版 Console；Agent 收到的是最多 16 个的有界候选列表。

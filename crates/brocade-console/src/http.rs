@@ -5868,24 +5868,11 @@ struct RegisterWarpBindingHttpResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateWarpBindingHttpRequest {
-    /// NULL/absent means inherit the logical tunnel default for that field. `allowed_ips` and
-    /// `domain_strategy` are the two wire fields of one operator-facing address policy.
+    /// NULL/absent means inherit the logical tunnel endpoint default for that field.
     #[serde(default)]
     endpoint_address: Option<String>,
     #[serde(default)]
     endpoint_port: Option<u16>,
-    #[serde(default)]
-    mtu: Option<u16>,
-    #[serde(default)]
-    keep_alive: Option<u16>,
-    #[serde(default)]
-    allowed_ips: Option<Vec<String>>,
-    #[serde(default)]
-    no_kernel_tun: Option<bool>,
-    #[serde(default)]
-    domain_strategy: Option<String>,
-    #[serde(default)]
-    workers: Option<u16>,
 }
 
 async fn register_warp_binding(
@@ -5969,10 +5956,12 @@ async fn register_warp_binding(
         .and_then(Value::as_str)
         .unwrap_or(&request.node_id);
 
-    let keys = brocade_store::generate_wireguard_keypair()?;
+    let keys = crate::warp::generate_masque_keys().map_err(ApiError::Provider)?;
     let registration = crate::warp::register(&keys.public_key, node_name)
         .await
         .map_err(ApiError::Provider)?;
+    let cleanup_device = registration.device_id.clone();
+    let cleanup_token = registration.access_token.clone();
     let result = state
         .store
         .register_warp_binding(
@@ -5986,11 +5975,21 @@ async fn register_warp_binding(
                 private_key: keys.private_key,
                 peer_public_key: registration.peer_public_key,
                 local_addresses: registration.local_addresses,
-                reserved: registration.reserved,
                 note: None,
             },
         )
-        .await?;
+        .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Err(cleanup) = crate::warp::unregister(&cleanup_device, &cleanup_token).await {
+                return Err(ApiError::Provider(format!(
+                    "WARP 身份保存失败；设备 {cleanup_device} 清理失败：{cleanup}"
+                )));
+            }
+            return Err(ApiError::Store(error));
+        }
+    };
     Ok(Json(RegisterWarpBindingHttpResponse {
         revision_id: result.revision_id,
         binding: result.binding,
@@ -6016,12 +6015,6 @@ async fn update_warp_binding(
                 node_id,
                 endpoint_address: request.endpoint_address,
                 endpoint_port: request.endpoint_port,
-                mtu: request.mtu,
-                keep_alive: request.keep_alive,
-                allowed_ips: request.allowed_ips,
-                no_kernel_tun: request.no_kernel_tun,
-                domain_strategy: request.domain_strategy,
-                workers: request.workers,
                 note: None,
             },
         )

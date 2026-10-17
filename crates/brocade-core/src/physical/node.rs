@@ -414,9 +414,15 @@ pub struct XrayExternalOutboundPlan {
     pub port: u16,
     pub protocol: ExternalOutboundProtocol,
     pub security: ExternalOutboundSecurity,
-    /// Only meaningful for a WireGuard protocol after a managed WARP target is lowered. Zero
-    /// leaves wireguard-go's automatic worker selection in control.
-    pub wireguard_workers: u16,
+    pub warp_masque: Option<XrayWarpMasquePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrayWarpMasquePlan {
+    pub options: crate::model::WarpMasqueOptions,
+    pub private_key: String,
+    pub peer_public_key: String,
+    pub local_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1661,59 +1667,38 @@ fn xray_external_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayExternalOut
                     continue;
                 };
                 let tag = external_outbound_tag(outbound);
-                let (protocol, address, port, wireguard_workers) = match &target.protocol {
+                let mut warp_masque = None;
+                let (protocol, address, port) = match &target.protocol {
                     ExternalOutboundProtocol::Warp {
-                        mtu,
-                        keep_alive,
-                        allowed_ips,
-                        no_kernel_tun,
-                        domain_strategy,
-                        workers,
+                        http_version,
+                        remote_dns,
                     } => {
                         let Some(binding) = target
                             .bindings
                             .iter()
                             .find(|binding| binding.node == node_id)
                         else {
-                            // Validation reports the missing per-machine identity. Do not emit a
-                            // half-configured WireGuard outbound which Xray would accept but could
-                            // never authenticate as this machine.
                             continue;
                         };
-                        let effective_domain_strategy =
-                            binding.domain_strategy.as_ref().unwrap_or(domain_strategy);
-                        (
-                            ExternalOutboundProtocol::Wireguard {
-                                credential: binding.private_key.clone(),
-                                peer_public_key: binding.peer_public_key.clone(),
-                                // A WARP registration normally returns one address from each
-                                // family. Keep the full identity in the model, but only put the
-                                // selected family on Xray's virtual interface for a single-stack
-                                // exit. `allowedIPs` and `domainStrategy` then enforce the same
-                                // decision for literal and domain targets respectively.
-                                local_addresses: warp_local_addresses(
-                                    &binding.local_addresses,
-                                    effective_domain_strategy,
-                                ),
-                                mtu: binding.mtu.unwrap_or(*mtu),
-                                reserved: binding.reserved.clone(),
-                                keep_alive: binding.keep_alive.unwrap_or(*keep_alive),
-                                allowed_ips: binding
-                                    .allowed_ips
-                                    .clone()
-                                    .unwrap_or_else(|| allowed_ips.clone()),
-                                no_kernel_tun: binding.no_kernel_tun.unwrap_or(*no_kernel_tun),
-                                domain_strategy: effective_domain_strategy.clone(),
+                        warp_masque = Some(XrayWarpMasquePlan {
+                            options: crate::model::WarpMasqueOptions {
+                                http_version: *http_version,
+                                remote_dns: remote_dns.clone(),
                             },
+                            private_key: binding.private_key.clone(),
+                            peer_public_key: binding.peer_public_key.clone(),
+                            local_addresses: binding.local_addresses.clone(),
+                        });
+                        (
+                            target.protocol.clone(),
                             binding
                                 .endpoint_address
                                 .clone()
                                 .unwrap_or_else(|| target.address.clone()),
                             binding.endpoint_port.unwrap_or(target.port),
-                            binding.workers.unwrap_or(*workers),
                         )
                     }
-                    protocol => (protocol.clone(), target.address.clone(), target.port, 0),
+                    protocol => (protocol.clone(), target.address.clone(), target.port),
                 };
                 outbounds
                     .entry(tag.clone())
@@ -1723,7 +1708,7 @@ fn xray_external_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayExternalOut
                         port,
                         protocol,
                         security: target.security.clone(),
-                        wireguard_workers,
+                        warp_masque,
                     });
             }
         }
@@ -1742,28 +1727,6 @@ fn xray_external_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayExternalOut
         vpngate_slot += 1;
     }
     plans
-}
-
-fn warp_local_addresses(addresses: &[String], domain_strategy: &str) -> Vec<String> {
-    let family = match domain_strategy {
-        "ForceIPv4" => Some(true),
-        "ForceIPv6" => Some(false),
-        _ => None,
-    };
-    let Some(ipv4) = family else {
-        return addresses.to_vec();
-    };
-    addresses
-        .iter()
-        .filter(|address| {
-            address
-                .split_once('/')
-                .map_or(address.as_str(), |(ip, _)| ip)
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_ipv4() == ipv4)
-        })
-        .cloned()
-        .collect()
 }
 
 fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<XrayRoutingRulePlan> {
@@ -2197,27 +2160,4 @@ fn reverse_dial_tag(app: &AppIr, chain: &str, from: &str) -> String {
 // outbound list derive the tag from one definition.
 fn egress_tag(send_through: Option<IpAddr>) -> String {
     routing_egress_tag(send_through.as_ref())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::warp_local_addresses;
-
-    #[test]
-    fn warp_address_family_follows_the_exit_strategy() {
-        let addresses = vec![
-            "172.16.0.2/32".to_owned(),
-            "2606:4700:110:8::2/128".to_owned(),
-        ];
-
-        assert_eq!(
-            warp_local_addresses(&addresses, "ForceIPv4"),
-            ["172.16.0.2/32"]
-        );
-        assert_eq!(
-            warp_local_addresses(&addresses, "ForceIPv6"),
-            ["2606:4700:110:8::2/128"]
-        );
-        assert_eq!(warp_local_addresses(&addresses, "ForceIP"), addresses);
-    }
 }

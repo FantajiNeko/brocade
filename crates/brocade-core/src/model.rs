@@ -830,7 +830,7 @@ pub struct ExternalOutbound {
     pub security: ExternalOutboundSecurity,
     /// Machine-specific identities owned by a managed provider. Ordinary imported tunnels leave
     /// this empty; WARP deliberately gets one private key and one Cloudflare device per machine
-    /// instead of copying a single WireGuard identity across the fleet.
+    /// instead of copying a single provider identity across the fleet.
     #[serde(default)]
     pub bindings: Vec<ExternalWarpBinding>,
 }
@@ -856,32 +856,53 @@ pub struct ExternalWarpBinding {
     pub endpoint_address: Option<String>,
     #[serde(default)]
     pub endpoint_port: Option<u16>,
-    #[serde(default)]
-    pub mtu: Option<u16>,
-    #[serde(default)]
-    pub keep_alive: Option<u16>,
-    /// Kept together with `domain_strategy` by the console: one operator-facing address policy
-    /// controls both the peer routes and DNS selection.
-    #[serde(default)]
-    pub allowed_ips: Option<Vec<String>>,
-    #[serde(default)]
-    pub no_kernel_tun: Option<bool>,
-    #[serde(default)]
-    pub domain_strategy: Option<String>,
-    /// Zero asks xray/wireguard-go to choose its worker count automatically.
-    #[serde(default)]
-    pub workers: Option<u16>,
     pub private_key: String,
     pub peer_public_key: String,
     pub local_addresses: Vec<String>,
-    #[serde(default)]
-    pub reserved: Vec<u8>,
 }
 
-/// A defensive control-plane ceiling rather than an xray wire-format limit. A machine has no
-/// practical reason to create more WireGuard workers than this, while an unbounded value could
-/// turn a configuration typo into substantial scheduler and memory pressure.
-pub const EXTERNAL_WIREGUARD_MAX_WORKERS: u16 = 256;
+/// Transport and tunnel-local DNS for Cloudflare's MASQUE client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarpMasqueOptions {
+    #[serde(default)]
+    pub http_version: WarpHttpVersion,
+    #[serde(default = "warp_remote_dns")]
+    pub remote_dns: Vec<IpAddr>,
+}
+
+impl Default for WarpMasqueOptions {
+    fn default() -> Self {
+        Self {
+            http_version: WarpHttpVersion::H3,
+            remote_dns: warp_remote_dns(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WarpHttpVersion {
+    #[default]
+    H3,
+    H2,
+}
+
+impl WarpHttpVersion {
+    pub const fn alpn(self) -> &'static str {
+        match self {
+            Self::H3 => "h3",
+            Self::H2 => "h2",
+        }
+    }
+}
+
+fn warp_remote_dns() -> Vec<IpAddr> {
+    vec![
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+    ]
+}
 
 /// The endpoint written into a node's main Xray configuration for one managed VPN Gate pool.
 ///
@@ -917,7 +938,12 @@ pub fn vpngate_runtime_peer(slot: usize) -> Option<Ipv4Addr> {
 // spread allocation and constructor churn through the model solely to shrink this cold enum.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "t", content = "v", rename_all = "snake_case")]
+#[serde(
+    tag = "t",
+    content = "v",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ExternalOutboundProtocol {
     Anytls {
         credential: String,
@@ -974,27 +1000,12 @@ pub enum ExternalOutboundProtocol {
         #[serde(default = "external_wireguard_domain_strategy")]
         domain_strategy: String,
     },
-    /// Cloudflare WARP registered through its WireGuard-compatible client interface.
-    ///
-    /// Endpoint and port have fleet defaults on [`ExternalOutbound`]; MTU, Keepalive, address
-    /// policy, TUN implementation and worker count live on this variant. A machine can override
-    /// all of them through [`ExternalWarpBinding`] without rotating its Cloudflare device. During
-    /// node compilation this variant is lowered to the ordinary `Wireguard` variant above with
-    /// those effective values.
+    /// Cloudflare WARP over MASQUE, with a separately registered P-256 identity per node.
     Warp {
-        #[serde(default = "external_warp_mtu")]
-        mtu: u16,
-        #[serde(default = "external_warp_keep_alive")]
-        keep_alive: u16,
-        #[serde(default = "external_wireguard_allowed_ips")]
-        allowed_ips: Vec<String>,
         #[serde(default)]
-        no_kernel_tun: bool,
-        #[serde(default = "external_wireguard_domain_strategy")]
-        domain_strategy: String,
-        /// wireguard-go worker count; zero leaves its automatic fallback in control.
-        #[serde(default)]
-        workers: u16,
+        http_version: WarpHttpVersion,
+        #[serde(default = "warp_remote_dns")]
+        remote_dns: Vec<IpAddr>,
     },
     /// A country-scoped, continuously measured pool sourced from VPN Gate.
     ///
@@ -1169,14 +1180,6 @@ fn external_wireguard_allowed_ips() -> Vec<String> {
 
 fn external_wireguard_domain_strategy() -> String {
     "ForceIP".to_owned()
-}
-
-fn external_warp_mtu() -> u16 {
-    1280
-}
-
-fn external_warp_keep_alive() -> u16 {
-    25
 }
 
 impl ExternalOutboundProtocol {

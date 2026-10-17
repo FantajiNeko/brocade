@@ -1027,8 +1027,21 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             port,
             protocol,
             security,
-            wireguard_workers,
+            warp_masque,
         } => {
+            if let Some(warp) = warp_masque {
+                return json!({
+                    "tag": tag, "protocol": "masque",
+                    "settings": { "address": address, "port": port, "remoteDNS": warp.options.remote_dns },
+                    "streamSettings": {
+                        "network": "masque", "security": "tls",
+                        "tlsSettings": { "serverName": "consumer-masque.cloudflareclient.com", "alpn": [warp.options.http_version.alpn()] },
+                        "masqueSettings": { "warp": {
+                            "privateKey": warp.private_key, "publicKey": warp.peer_public_key, "address": warp.local_addresses
+                        } }
+                    }
+                });
+            }
             let supports_stream_settings = !matches!(
                 protocol,
                 ExternalOutboundProtocol::Wireguard { .. } | ExternalOutboundProtocol::Warp { .. }
@@ -1116,16 +1129,10 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                             .unwrap()
                             .insert("reserved".to_owned(), json!(reserved));
                     }
-                    if *wireguard_workers != 0 {
-                        settings
-                            .as_object_mut()
-                            .unwrap()
-                            .insert("workers".to_owned(), json!(wireguard_workers));
-                    }
                     ("wireguard", settings)
                 }
                 ExternalOutboundProtocol::Warp { .. } => {
-                    unreachable!("managed WARP must be lowered to WireGuard for its target node")
+                    unreachable!("managed WARP requires its resolved per-node MASQUE identity")
                 }
                 ExternalOutboundProtocol::Vpngate { .. } => {
                     ("socks", json!({ "address": address, "port": port }))

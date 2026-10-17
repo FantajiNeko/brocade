@@ -54,7 +54,7 @@ pub fn build(
             security: outbound.security.clone(),
             // Ordinary WireGuard tunnels do not have the per-machine worker override used by
             // managed WARP bindings. Zero delegates to Xray's bounded automatic choice.
-            wireguard_workers: 0,
+            warp_masque: None,
         },
     })
 }

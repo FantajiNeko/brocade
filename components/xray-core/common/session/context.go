@@ -192,3 +192,13 @@ func MitmServerNameFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+// Stream settings are scoped to handler construction, so transports can validate their pairing.
+type streamSettingsKey struct{}
+
+func ContextWithStreamSettings(ctx context.Context, settings any) context.Context {
+	return context.WithValue(ctx, streamSettingsKey{}, settings)
+}
+func StreamSettingsFromContext(ctx context.Context) any {
+	return ctx.Value(streamSettingsKey{})
+}

@@ -1015,6 +1015,8 @@ func (p TransportProtocol) Build() (string, error) {
 		return "", errors.PrintRemovedFeatureError("HTTP transport (without header padding, etc.)", "XHTTP stream-one H2 & H3")
 	case "quic":
 		return "", errors.PrintRemovedFeatureError("QUIC transport (without web service, etc.)", "XHTTP stream-one H3")
+	case "masque":
+		return "masque", nil
 	case "hysteria":
 		return "hysteria", nil
 	default:
@@ -1937,6 +1939,7 @@ type FinalMask struct {
 }
 
 type StreamConfig struct {
+	MasqueSettings      *MasqueConfig      `json:"masqueSettings"`
 	Address             *Address           `json:"address"`
 	Port                uint16             `json:"port"`
 	Network             *TransportProtocol `json:"network"`
@@ -2072,6 +2075,13 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 			ProtocolName: "httpupgrade",
 			Settings:     serial.ToTypedMessage(hs),
 		})
+	}
+	if c.MasqueSettings != nil {
+		ms, err := c.MasqueSettings.Build()
+		if err != nil {
+			return nil, errors.New("failed to build MASQUE config").Base(err)
+		}
+		config.TransportSettings = append(config.TransportSettings, &internet.TransportConfig{ProtocolName: "masque", Settings: serial.ToTypedMessage(ms)})
 	}
 	if c.HysteriaSettings != nil {
 		hs, err := c.HysteriaSettings.Build()

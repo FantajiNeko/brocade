@@ -2109,15 +2109,7 @@ export type ExternalOutboundProtocol =
     }
   | {
       t: 'warp';
-      v: {
-        mtu: number;
-        keep_alive: number;
-        allowed_ips: string[];
-        no_kernel_tun: boolean;
-        domain_strategy: 'ForceIP' | 'ForceIPv4' | 'ForceIPv6' | 'ForceIPv4v6' | 'ForceIPv6v4';
-        /** 0 表示交给 Xray/wireguard-go 自动决定。 */
-        workers: number;
-      };
+      v: { http_version: 'h3' | 'h2'; remote_dns: string[] };
     }
   | {
       /** A node-managed country pool. Provider profiles never cross the client boundary. */
@@ -2139,20 +2131,13 @@ export interface ExternalWarpBinding {
   device_id: string;
   account_id: string;
   registered_at: string;
-  /** null 表示跟随逻辑隧道默认值；地址策略的两个底层字段始终成对覆盖。 */
+  /** null 表示跟随逻辑隧道默认值。 */
   endpoint_address?: string | null;
   endpoint_port?: number | null;
-  mtu?: number | null;
-  keep_alive?: number | null;
-  allowed_ips?: string[] | null;
-  no_kernel_tun?: boolean | null;
-  domain_strategy?: 'ForceIP' | 'ForceIPv4' | 'ForceIPv6' | 'ForceIPv4v6' | 'ForceIPv6v4' | null;
-  workers?: number | null;
   /* 服务端会完全移除私钥；仅历史/未打码数据形状允许它存在。 */
   private_key?: string;
   peer_public_key: string;
   local_addresses: string[];
-  reserved: number[];
 }
 
 export type ExternalVlessTransport =
@@ -2618,12 +2603,6 @@ export interface RemoveWarpBindingResult {
 export interface WarpBindingOverrides {
   endpoint_address: string | null;
   endpoint_port: number | null;
-  mtu: number | null;
-  keep_alive: number | null;
-  allowed_ips: string[] | null;
-  no_kernel_tun: boolean | null;
-  domain_strategy: 'ForceIP' | 'ForceIPv4' | 'ForceIPv6' | 'ForceIPv4v6' | 'ForceIPv6v4' | null;
-  workers: number | null;
 }
 
 export const registerWarpBinding = (tenantId: string, outboundId: string, nodeId: string): Promise<WarpBindingResult> =>

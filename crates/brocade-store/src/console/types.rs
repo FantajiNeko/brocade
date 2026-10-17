@@ -560,7 +560,6 @@ pub struct RegisterWarpBindingRequest {
     pub private_key: String,
     pub peer_public_key: String,
     pub local_addresses: Vec<String>,
-    pub reserved: Vec<u8>,
     pub note: Option<String>,
 }
 
@@ -572,8 +571,7 @@ pub struct RegisterWarpBindingResult {
 }
 
 /// Replaces the optional route overrides for one already-registered WARP machine identity.
-/// `None` means inherit that field from the logical tunnel. Fields inherit independently except
-/// `allowed_ips` and `domain_strategy`, which form one address-policy override and move together.
+/// `None` means inherit that endpoint field from the logical tunnel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateWarpBindingRequest {
@@ -585,25 +583,13 @@ pub struct UpdateWarpBindingRequest {
     #[serde(default)]
     pub endpoint_port: Option<u16>,
     #[serde(default)]
-    pub mtu: Option<u16>,
-    #[serde(default)]
-    pub keep_alive: Option<u16>,
-    #[serde(default)]
-    pub allowed_ips: Option<Vec<String>>,
-    #[serde(default)]
-    pub no_kernel_tun: Option<bool>,
-    #[serde(default)]
-    pub domain_strategy: Option<String>,
-    #[serde(default)]
-    pub workers: Option<u16>,
-    #[serde(default)]
     pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateWarpBindingResult {
     pub revision_id: u64,
-    /// Safe machine binding fields only; provider token and WireGuard private key are absent.
+    /// Safe machine binding fields only; provider token and P-256 private key are absent.
     pub binding: Value,
 }
 

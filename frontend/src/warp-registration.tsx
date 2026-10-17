@@ -121,7 +121,7 @@ export function WarpRegistrationAction({
               disabled={register.isPending}
               onChange={event => setAcceptTerms(event.target.checked)}
             />
-            <span>我同意 Cloudflare Application Terms，并知悉 WireGuard 注册接口为非官方兼容能力。</span>
+            <span>我同意 Cloudflare Application Terms，并知悉 WARP 设备注册接口为非官方兼容能力。</span>
           </label>
           <div className="warp-registration-submit-row">
             <button

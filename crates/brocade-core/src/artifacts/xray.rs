@@ -525,7 +525,8 @@ pub enum XrayOutbound {
         port: u16,
         protocol: ExternalOutboundProtocol,
         security: ExternalOutboundSecurity,
-        wireguard_workers: u16,
+
+        warp_masque: Option<crate::physical::node::XrayWarpMasquePlan>,
     },
     Freedom {
         tag: String,
@@ -1446,7 +1447,8 @@ fn external_outbound(outbound: &XrayExternalOutboundPlan) -> XrayOutbound {
         port: outbound.port,
         protocol: outbound.protocol.clone(),
         security: outbound.security.clone(),
-        wireguard_workers: outbound.wireguard_workers,
+
+        warp_masque: outbound.warp_masque.clone(),
     }
 }
 

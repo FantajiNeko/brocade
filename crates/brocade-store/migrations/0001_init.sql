@@ -2229,17 +2229,10 @@ CREATE TABLE external_outbound_bindings (
     private_key_sealed TEXT NOT NULL,
     peer_public_key TEXT NOT NULL,
     local_addresses JSONB NOT NULL,
-    reserved JSONB DEFAULT '[]'::jsonb NOT NULL,
     -- NULL means inherit the logical tunnel default. These are operational route choices, not
     -- part of the Cloudflare identity, so changing one must not rotate the device or private key.
     endpoint_address TEXT,
     endpoint_port INTEGER,
-    mtu INTEGER,
-    keep_alive INTEGER,
-    allowed_ips JSONB,
-    no_kernel_tun BOOLEAN,
-    domain_strategy TEXT,
-    workers INTEGER,
     registered_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     created_revision BIGINT,
     CONSTRAINT external_outbound_bindings_pkey PRIMARY KEY (outbound_id, node_id),
@@ -2248,20 +2241,6 @@ CREATE TABLE external_outbound_bindings (
         CHECK ((endpoint_address IS NULL) OR (length(btrim(endpoint_address)) > 0)),
     CONSTRAINT external_outbound_bindings_endpoint_port_check
         CHECK ((endpoint_port IS NULL) OR ((endpoint_port >= 1) AND (endpoint_port <= 65535))),
-    CONSTRAINT external_outbound_bindings_mtu_check
-        CHECK ((mtu IS NULL) OR ((mtu >= 576) AND (mtu <= 9000))),
-    CONSTRAINT external_outbound_bindings_keep_alive_check
-        CHECK ((keep_alive IS NULL) OR ((keep_alive >= 0) AND (keep_alive <= 65535))),
-    CONSTRAINT external_outbound_bindings_allowed_ips_check
-        CHECK ((allowed_ips IS NULL) OR
-               ((jsonb_typeof(allowed_ips) = 'array') AND (jsonb_array_length(allowed_ips) > 0))),
-    CONSTRAINT external_outbound_bindings_domain_strategy_check
-        CHECK ((domain_strategy IS NULL) OR
-               (domain_strategy IN ('ForceIP', 'ForceIPv4', 'ForceIPv6', 'ForceIPv4v6', 'ForceIPv6v4'))),
-    CONSTRAINT external_outbound_bindings_address_policy_pair_check
-        CHECK ((allowed_ips IS NULL) = (domain_strategy IS NULL)),
-    CONSTRAINT external_outbound_bindings_workers_check
-        CHECK ((workers IS NULL) OR ((workers >= 0) AND (workers <= 256))),
     CONSTRAINT external_outbound_bindings_outbound_fkey FOREIGN KEY (outbound_id)
         REFERENCES external_outbounds(id) ON DELETE CASCADE,
     CONSTRAINT external_outbound_bindings_node_fkey FOREIGN KEY (node_id)
