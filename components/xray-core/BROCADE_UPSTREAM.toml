@@ -123,3 +123,13 @@ description = "XHTTP client: Fix a data race in WaitReadCloser (#6694)"
 commit = "dffc7ada5eef8a8b3df7da8928536ce57135a119"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6632"
 description = "XHTTP client: Define Request.GetBody() for packet-up so h2 can replay after GOAWAY (#6632)"
+
+[[backports]]
+commit = "ca4b156b57b11d77545039b4000ed3bbc2fdabdd"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6106"
+description = "Burst observatory: Fix time compare, cancel pending ping on instance close or new schedule started (#6106)"
+
+[[backports]]
+commit = "c4dfcd4c1a998cc7eb5be61ef7c2e5dbb65dfcff"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6221"
+description = "Burst observatory: Fix init check (#6221)"
