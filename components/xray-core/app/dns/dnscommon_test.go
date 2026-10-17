@@ -1,7 +1,9 @@
 package dns
 
 import (
+	"context"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,31 @@ import (
 	dns_feature "github.com/xtls/xray-core/features/dns"
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+func TestLongDomainReportsBothQueryErrors(t *testing.T) {
+	cache := &CacheController{name: "invalid-domain-test"}
+	for name, send := range map[string]func(context.Context, chan<- error, string, dns_feature.IPOption){
+		"udp":  (&ClassicNameServer{cacheController: cache}).sendQuery,
+		"tcp":  (&TCPNameServer{cacheController: cache}).sendQuery,
+		"doh":  (&DoHNameServer{cacheController: cache}).sendQuery,
+		"quic": (&QUICNameServer{cacheController: cache}).sendQuery,
+	} {
+		t.Run(name, func(t *testing.T) {
+			results := make(chan error, 2)
+			send(context.Background(), results, strings.Repeat("a", 256), dns_feature.IPOption{IPv4Enable: true, IPv6Enable: true})
+			for range 2 {
+				select {
+				case err := <-results:
+					if err == nil {
+						t.Fatal("accepted an oversized DNS name")
+					}
+				default:
+					t.Fatal("did not notify both A and AAAA waiters")
+				}
+			}
+		})
+	}
+}
 
 func Test_parseResponse(t *testing.T) {
 	var p [][]byte
@@ -131,10 +158,19 @@ func Test_buildReqMsgs(t *testing.T) {
 			IPv6Enable: false,
 			FakeEnable: false,
 		}, nil}, 0},
+		{"name too long", args{strings.Repeat("a", 256), dns_feature.IPOption{
+			IPv4Enable: true,
+			IPv6Enable: true,
+			FakeEnable: false,
+		}, nil}, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := buildReqMsgs(tt.args.domain, tt.args.option, stubID, tt.args.reqOpts); !(len(got) == tt.want) {
+			got, err := buildReqMsgs(tt.args.domain, tt.args.option, stubID, tt.args.reqOpts)
+			if (err != nil) != (tt.name == "name too long") {
+				t.Fatalf("buildReqMsgs() error = %v", err)
+			}
+			if len(got) != tt.want {
 				t.Errorf("buildReqMsgs() = %v, want %v", got, tt.want)
 			}
 		})
