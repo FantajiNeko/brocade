@@ -48,3 +48,8 @@ description = "MASQUE client: Support HTTP/2 (Extended CONNECT, RFC 8441) (#6810
 commit = "9e55a6ed180570124cf6f9332dc86e68e2f3873b"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6878"
 description = "MASQUE client: Support WARP (#6878)"
+
+[[backports]]
+commit = "5121c28b855c9d7f12deaeb1352116eb490754bb"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6882"
+description = "QUIC sniffer: Handle zero-filled datagram tails (#6882)"
