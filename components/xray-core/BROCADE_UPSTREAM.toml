@@ -78,3 +78,8 @@ description = "DNS: Fix unexpected TTL clamp (#6363)"
 commit = "cb206ddc74766509f57321c48d08ec807b9dfbad"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6163"
 description = "DNS: Avoid passing domain to WriteTo func (#6163)"
+
+[[backports]]
+commit = "540b9070f5bc0e67a04341f11bde598153957b91"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6688"
+description = "Transport: Bind the UDP outbound socket in the destination family (#6688)"
