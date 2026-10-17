@@ -88,3 +88,38 @@ description = "Transport: Bind the UDP outbound socket in the destination family
 commit = "2776ea6d7426e1d024924df02d749d7021b2747f"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6698"
 description = "SS2022 outbound: Close connection to server on early returns (#6698)"
+
+[[backports]]
+commit = "9d9eaf399fbcba14e883c34a53dffcdfe5143669"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6095"
+description = "XHTTP client: Fix potential memory leak in stream-up/one (#6095)"
+
+[[backports]]
+commit = "4c3842711dd6abc8401f83678f30bb56e3f8819b"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6140"
+description = "XHTTP client: Fix packet-up `OpenUsage` counting and H3 `keepAlivePeriod` parameter (#6140)"
+
+[[backports]]
+commit = "986c512e0f7bc40069e84de903ae2d5a32e324b4"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6316"
+description = "XHTTP client: Avoid panic when `host` is invalid (#6316)"
+
+[[backports]]
+commit = "1e036ce1c5076f695d149a672ca578ebf907f882"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6332"
+description = "XHTTP/3 client: Actively close underlying QUIC & UDP (#6332)"
+
+[[backports]]
+commit = "77f98eba0978cbcb425e2f8ec3cec86bd5aa8444"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6665"
+description = "XHTTP client: Fix a race condition and a data race (#6665)"
+
+[[backports]]
+commit = "eef6e63bc16d6e97fd98178556d49aad7978809a"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6694"
+description = "XHTTP client: Fix a data race in WaitReadCloser (#6694)"
+
+[[backports]]
+commit = "dffc7ada5eef8a8b3df7da8928536ce57135a119"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6632"
+description = "XHTTP client: Define Request.GetBody() for packet-up so h2 can replay after GOAWAY (#6632)"

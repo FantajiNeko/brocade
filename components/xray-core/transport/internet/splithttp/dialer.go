@@ -181,6 +181,8 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 		if quicParams.KeepAlivePeriod == 0 {
 			if keepAlivePeriod == 0 {
 				quicConfig.KeepAlivePeriod = net.QuicgoH3KeepAlivePeriod
+			} else if keepAlivePeriod > 0 {
+				quicConfig.KeepAlivePeriod = keepAlivePeriod
 			}
 		}
 		if quicParams.MaxIncomingStreams == 0 {
@@ -198,7 +200,6 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 					conn, err := internet.DialSystem(ctx, net.UDPDestination(net.IPAddress(addr.IP), net.Port(addr.Port)), streamSettings.SocketSettings)
 					if err != nil {
 						errors.LogDebug(context.Background(), "skip hop: failed to dial to dest")
-						conn.Close()
 						return nil, errors.New()
 					}
 
@@ -283,8 +284,10 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 				quicConn, err := quic.DialEarly(ctx, udpConn, udpAddr, tlsCfg, cfg)
 				if err != nil {
+					udpConn.Close()
 					return nil, err
 				}
+				context.AfterFunc(quicConn.Context(), func() { udpConn.Close() })
 
 				switch quicParams.Congestion {
 				case "force-brutal":
@@ -441,10 +444,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	if xmuxClient != nil {
-		xmuxClient.OpenUsage.Add(1)
+		xmuxClient.AddRunning()
 	}
 	if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
-		xmuxClient2.OpenUsage.Add(1)
+		xmuxClient2.AddRunning()
 	}
 	var closed atomic.Int32
 
@@ -456,10 +459,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				return
 			}
 			if xmuxClient != nil {
-				xmuxClient.OpenUsage.Add(-1)
+				xmuxClient.DoneRunning()
 			}
 			if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
-				xmuxClient2.OpenUsage.Add(-1)
+				xmuxClient2.DoneRunning()
 			}
 		},
 	}
@@ -518,6 +521,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		var seq int64
 		var lastWrite time.Time
 
+		dynamicHTTPClient := httpClient
+		dynamicXmuxClient := xmuxClient
 		for {
 			// by offloading the uploads into a buffered pipe, multiple conn.Write
 			// calls get automatically batched together into larger POST requests.
@@ -552,13 +557,13 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 				lastWrite = time.Now()
 
-				if xmuxClient != nil && (xmuxClient.LeftRequests.Add(-1) <= 0 ||
-					(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
-					httpClient, xmuxClient = getHTTPClient(ctx, dest, streamSettings)
+				if dynamicXmuxClient != nil && (dynamicXmuxClient.LeftRequests.Add(-1) <= 0 ||
+					(dynamicXmuxClient.UnreusableAt != time.Time{} && lastWrite.After(dynamicXmuxClient.UnreusableAt))) {
+					dynamicHTTPClient, dynamicXmuxClient = getHTTPClient(ctx, dest, streamSettings)
 				}
 
-				go func() {
-					err := httpClient.PostPacket(
+				go func(hClient DialerClient) {
+					err := hClient.PostPacket(
 						ctx,
 						requestURL.String(),
 						sessionId,
@@ -571,9 +576,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 						uploadPipeReader.Interrupt()
 						doSplit.Store(false)
 					}
-				}()
+				}(dynamicHTTPClient)
 
-				if _, ok := httpClient.(*DefaultDialerClient); ok {
+				if _, ok := dynamicHTTPClient.(*DefaultDialerClient); ok {
 					<-wroteRequest.Wait()
 				}
 			}
@@ -608,11 +613,12 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 
 	var writed int
 	for _, buff := range buffer.MultiBuffer {
+		n := int(buff.Len())
 		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
 		if err != nil {
 			return writed, err
 		}
-		writed += int(buff.Len())
+		writed += n
 	}
 	return writed, nil
 }
