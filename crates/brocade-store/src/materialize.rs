@@ -337,6 +337,7 @@ pub(crate) async fn load_immutable_snapshot_tx(
 }
 
 fn decode_stored_snapshot(mut snapshot: Value, revision: u64) -> Result<ModelSnapshot> {
+    normalize_unused_legacy_warp(&mut snapshot)?;
     open_snapshot_external_credentials(&mut snapshot)?;
     let snapshot = serde_json::from_value::<ModelSnapshot>(snapshot)?;
     if snapshot.revision != revision {
@@ -346,6 +347,106 @@ fn decode_stored_snapshot(mut snapshot: Value, revision: u64) -> Result<ModelSna
         )));
     }
     Ok(snapshot)
+}
+
+/// Default, unused WARP tunnels were included in historical model and client checkpoints.
+/// Decode their old options without rewriting the immutable document. An identity or reference
+/// must never be silently reinterpreted as MASQUE: those revisions require an explicit migration.
+pub(crate) fn normalize_unused_legacy_warp(snapshot: &mut Value) -> Result<()> {
+    let mut referenced = std::collections::BTreeSet::new();
+    for app in snapshot
+        .get("apps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for step in app
+            .get("steps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for rule in step
+                .get("rules")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if rule.pointer("/a/t").and_then(Value::as_str) == Some("proxy") {
+                    if let Some(id) = rule.pointer("/a/outbound").and_then(Value::as_str) {
+                        referenced.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        for front in app
+            .get("fronts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for id in front
+                .get("external_via")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                referenced.insert(id.to_owned());
+            }
+        }
+    }
+    if let Some(fronts) = snapshot.get("fronts").and_then(Value::as_object) {
+        for front in fronts.values() {
+            for id in front
+                .get("external_via")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                referenced.insert(id.to_owned());
+            }
+        }
+    }
+    let Some(outbounds) = snapshot_external_outbounds_mut(snapshot)? else {
+        return Ok(());
+    };
+    const LEGACY_FIELDS: &[&str] = &[
+        "mtu",
+        "keep_alive",
+        "allowed_ips",
+        "no_kernel_tun",
+        "domain_strategy",
+        "workers",
+    ];
+    for outbound in outbounds {
+        if outbound.pointer("/protocol/t").and_then(Value::as_str) != Some("warp") {
+            continue;
+        }
+        let Some(options) = outbound.pointer("/protocol/v").and_then(Value::as_object) else {
+            continue;
+        };
+        if options.is_empty()
+            || !options
+                .keys()
+                .all(|key| LEGACY_FIELDS.contains(&key.as_str()))
+        {
+            continue;
+        }
+        let (tenant, id) = external_snapshot_identity(outbound)?;
+        let unbound = match outbound.get("bindings") {
+            None => true,
+            Some(Value::Array(bindings)) => bindings.is_empty(),
+            Some(_) => false,
+        };
+        if !unbound || referenced.contains(&id) {
+            return Err(invalid_error(format!("historical WARP WireGuard tunnel {tenant}/{id} is bound or referenced; register a new MASQUE identity instead of reusing this revision")));
+        }
+        outbound["protocol"]["v"] =
+            serde_json::to_value(brocade_core::model::WarpMasqueOptions::default())?;
+    }
+    Ok(())
 }
 
 /// Historical snapshots remain fully compilable, but proxy secrets must not turn the JSONB
@@ -2385,6 +2486,76 @@ mod tests {
     use super::*;
     use brocade_core::model::{Action, DestMatch, HopDial, HopPool, Network};
     use serde_json::json;
+
+    fn legacy_warp_checkpoint() -> Value {
+        json!({"external_outbounds": [{
+            "id": "warp-1234-abcd", "tenant": "platform.acme", "name": "WARP",
+            "address": "engage.cloudflareclient.com", "port": 2408,
+            "protocol": {"t": "warp", "v": {"mtu": 1280, "keep_alive": 25,
+                "allowed_ips": ["0.0.0.0/0", "::/0"], "no_kernel_tun": false,
+                "domain_strategy": "ForceIP", "workers": 0}},
+            "security": {"t": "none"}, "bindings": []
+        }]})
+    }
+
+    #[test]
+    fn unused_legacy_warp_checkpoint_decodes_without_rewriting_its_source() {
+        let stored = legacy_warp_checkpoint();
+        let original = serde_json::to_vec(&stored).unwrap();
+        let mut decoded = stored.clone();
+        normalize_unused_legacy_warp(&mut decoded).unwrap();
+        let outbound: ExternalOutbound =
+            serde_json::from_value(decoded["external_outbounds"][0].clone()).unwrap();
+        assert!(matches!(
+            outbound.protocol,
+            ExternalOutboundProtocol::Warp { .. }
+        ));
+        assert!(outbound.bindings.is_empty());
+        assert_eq!(serde_json::to_vec(&stored).unwrap(), original);
+        let once = decoded.clone();
+        normalize_unused_legacy_warp(&mut decoded).unwrap();
+        assert_eq!(decoded, once);
+    }
+
+    #[test]
+    fn legacy_warp_identity_or_route_is_never_reinterpreted_as_masque() {
+        for usage in ["binding", "rule", "model_front", "client_front"] {
+            let mut stored = legacy_warp_checkpoint();
+            match usage {
+                "binding" => stored["external_outbounds"][0]["bindings"] = json!([{"node": "hk"}]),
+                "rule" => {
+                    stored["apps"] = json!([{"steps": [{"rules": [{"a": {"t": "proxy", "outbound": "warp-1234-abcd"}}]}]}])
+                }
+                "model_front" => {
+                    stored["apps"] = json!([{"fronts": [{"external_via": ["warp-1234-abcd"]}]}])
+                }
+                "client_front" => {
+                    stored["fronts"] = json!({"f": {"external_via": ["warp-1234-abcd"]}})
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                normalize_unused_legacy_warp(&mut stored).is_err(),
+                "{usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_warp_compatibility_does_not_hide_unknown_or_mixed_options() {
+        for options in [
+            json!({"mtu": 1280, "typo": true}),
+            json!({"mtu": 1280, "http_version": "h3"}),
+        ] {
+            let mut stored = legacy_warp_checkpoint();
+            stored["external_outbounds"][0]["protocol"]["v"] = options;
+            normalize_unused_legacy_warp(&mut stored).unwrap();
+            assert!(serde_json::from_value::<ExternalOutbound>(
+                stored["external_outbounds"][0].clone()
+            )
+            .is_err());
+        }
+    }
 
     #[test]
     fn parse_rules_accepts_the_current_wire_shape() {

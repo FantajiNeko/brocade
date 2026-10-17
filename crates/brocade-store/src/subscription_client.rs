@@ -583,6 +583,7 @@ fn decode_snapshot_row(row: &sqlx::postgres::PgRow) -> Result<LoadedClientSnapsh
         )));
     }
     let mut document = stored_document.clone();
+    crate::materialize::normalize_unused_legacy_warp(&mut document)?;
     crate::materialize::open_snapshot_external_credentials(&mut document)?;
     let config = serde_json::from_value::<SubscriptionClientConfig>(document)?;
     if config.schema != SUBSCRIPTION_CLIENT_CONFIG_SCHEMA {
