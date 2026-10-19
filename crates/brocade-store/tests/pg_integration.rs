@@ -301,6 +301,20 @@ fn tenant_admin(scope: &str) -> AdminContext {
     )
 }
 
+fn ordinary_user(scope: &str) -> AdminContext {
+    AdminContext::new("alice", AdminRole::User, Some(scope.to_owned()))
+}
+
+fn traffic_readers(scope: &str) -> [AdminContext; 3] {
+    [AdminRole::Readonly, AdminRole::Editor, AdminRole::Publisher].map(|role| {
+        AdminContext::new(
+            format!("traffic-reader:{role:?}"),
+            role,
+            Some(scope.to_owned()),
+        )
+    })
+}
+
 fn publisher(scope: &str) -> AdminContext {
     AdminContext::new(
         format!("publisher:{scope}"),
@@ -3494,10 +3508,20 @@ async fn user_traffic_history_groups_windows_and_honours_scope() {
     assert_eq!(scoped.series.len(), 1);
     assert_eq!(scoped.series[0].user_id, "alice");
 
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .list_user_traffic_history(&actor, UserTrafficHistoryScope::Node("n1"), 3_600)
+            .await
+            .unwrap();
+        assert_eq!(visible.series.len(), 1);
+        assert_eq!(visible.series[0].user_id, "alice");
+    }
+
     let refused = db
         .store
         .list_user_traffic_history(
-            &publisher("platform.acme"),
+            &ordinary_user("platform.acme"),
             UserTrafficHistoryScope::Node("n1"),
             3_600,
         )
@@ -14026,7 +14050,7 @@ fn current_usage(
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn sniffing_failed_usage_is_bounded_idempotent_and_admin_only() {
+async fn sniffing_failed_usage_is_bounded_idempotent_and_operator_scoped() {
     use brocade_deployment::sniffing_failed::{
         SniffingFailedCounter, SniffingFailedPolicy, SniffingFailedReport,
     };
@@ -14136,10 +14160,21 @@ async fn sniffing_failed_usage_is_bounded_idempotent_and_admin_only() {
         .await
         .unwrap();
     assert_eq!(bills, 0);
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .user_sniffing_failed_targets(&actor, "platform.acme", "alice", SiteUsagePeriod::Month)
+            .await
+            .unwrap();
+        assert!(
+            !visible.rows.is_empty(),
+            "{:?} can read scoped traffic",
+            actor.role()
+        );
+    }
     for actor in [
         AdminContext::new("public", AdminRole::Readonly, None),
         AdminContext::new("alice", AdminRole::User, Some("platform.acme".into())),
-        publisher("platform.acme"),
         tenant_admin("platform.other"),
     ] {
         assert!(matches!(
@@ -14284,7 +14319,7 @@ async fn sniffing_failed_compatibility_script_preserves_default_off_and_ownershi
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn other_domain_usage_is_bounded_idempotent_and_admin_only() {
+async fn other_domain_usage_is_bounded_idempotent_and_operator_scoped() {
     use brocade_deployment::other_domain::{
         OtherDomainCounter, OtherDomainPolicy, OtherDomainReport,
     };
@@ -14407,10 +14442,21 @@ async fn other_domain_usage_is_bounded_idempotent_and_admin_only() {
         .await
         .unwrap();
     assert_eq!(bills, 0);
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .user_other_domains(&actor, "platform.acme", "alice", SiteUsagePeriod::Month)
+            .await
+            .unwrap();
+        assert!(
+            !visible.rows.is_empty(),
+            "{:?} can read scoped traffic",
+            actor.role()
+        );
+    }
     for actor in [
         AdminContext::new("public", AdminRole::Readonly, None),
         AdminContext::new("alice", AdminRole::User, Some("platform.acme".into())),
-        publisher("platform.acme"),
         tenant_admin("platform.other"),
     ] {
         assert!(matches!(
@@ -14519,7 +14565,7 @@ async fn other_domain_usage_is_bounded_idempotent_and_admin_only() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn user_site_usage_is_idempotent_non_billable_and_admin_scoped() {
+async fn user_site_usage_is_idempotent_non_billable_and_operator_scoped() {
     use brocade_deployment::site_usage::{SiteUsageCounter, SiteUsageReport};
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -14706,10 +14752,22 @@ async fn user_site_usage_is_idempotent_non_billable_and_admin_scoped() {
     }
     let billable: (i64,i64) = sqlx::query_as("SELECT sum(uplink_bytes)::bigint,sum(downlink_bytes)::bigint FROM usage_samples WHERE user_id='alice'").fetch_one(db.pool()).await.unwrap();
     assert_eq!(billable, (10, 20), "site counters must not be billed again");
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .user_site_usage(&actor, "platform.acme", "alice", SiteUsagePeriod::Month)
+            .await
+            .unwrap();
+        assert!(
+            !visible.rows.is_empty(),
+            "{:?} can read scoped traffic",
+            actor.role()
+        );
+    }
     for actor in [
         AdminContext::new("public", AdminRole::Readonly, None),
         tenant_admin("platform.other"),
-        publisher("platform.acme"),
+        ordinary_user("platform.acme"),
     ] {
         assert!(matches!(
             db.store
@@ -25612,10 +25670,19 @@ async fn forwarding_traffic_integrates_users_machines_and_survives_lifecycle() {
     ));
     assert!(matches!(
         db.store
-            .user_realtime_targets(&publisher("platform.acme"), "platform.acme", "alice")
+            .user_realtime_targets(&ordinary_user("platform.acme"), "platform.acme", "alice")
             .await,
         Err(StoreError::Forbidden(_))
     ));
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .user_realtime_targets(&actor, "platform.acme", "alice")
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].forwarding[0].rule_id, rule_id);
+    }
     write.node_id = "n2".to_owned();
     db.store
         .update_forwarding_rule(&admin, "platform.acme", "alice", rule_id, write)
@@ -28596,7 +28663,7 @@ async fn regrant_waits_for_an_unsettled_revoke_order() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn user_machine_usage_preserves_accounting_history_and_admin_scope() {
+async fn user_machine_usage_preserves_accounting_history_and_operator_scope() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -28736,10 +28803,22 @@ async fn user_machine_usage_preserves_accounting_history_and_admin_scope() {
         retained.rows[0].uplink_bytes, 130,
         "month survives raw retention"
     );
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .user_machine_usage(&actor, "platform.acme", "alice", SiteUsagePeriod::Month)
+            .await
+            .unwrap();
+        assert!(
+            !visible.rows.is_empty(),
+            "{:?} can read scoped traffic",
+            actor.role()
+        );
+    }
     for actor in [
         AdminContext::new("public", AdminRole::Readonly, None),
         tenant_admin("platform.other"),
-        publisher("platform.acme"),
+        ordinary_user("platform.acme"),
     ] {
         assert!(matches!(
             db.store
@@ -29040,7 +29119,7 @@ async fn node_inflow_usage_attributes_chains_forwarding_history_and_scope() {
         .await
         .unwrap();
 
-    // Tenant administrators read their own subtree only; other roles are refused.
+    // Signed-in operators read their own subtree; visitors and ordinary users are refused.
     let outside = db
         .store
         .node_inflow_usage(&tenant_admin("platform.other"), "n1", SiteUsagePeriod::Day)
@@ -29053,9 +29132,21 @@ async fn node_inflow_usage_attributes_chains_forwarding_history_and_scope() {
         .await
         .unwrap();
     assert!(!inside.rows.is_empty());
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .node_inflow_usage(&actor, "n1", SiteUsagePeriod::Day)
+            .await
+            .unwrap();
+        assert!(
+            !visible.rows.is_empty(),
+            "{:?} can read scoped traffic",
+            actor.role()
+        );
+    }
     for actor in [
         AdminContext::new("public", AdminRole::Readonly, None),
-        publisher("platform.acme"),
+        ordinary_user("platform.acme"),
     ] {
         assert!(matches!(
             db.store
@@ -29323,9 +29414,21 @@ async fn node_site_usage_reads_one_machine_across_users_in_scope() {
             .collect::<Vec<_>>(),
         vec![("video.example", 4, 6)]
     );
+    for actor in traffic_readers("platform.acme") {
+        let visible = db
+            .store
+            .node_site_usage(&actor, "n1", SiteUsagePeriod::Day)
+            .await
+            .unwrap();
+        assert!(
+            !visible.usage.rows.is_empty(),
+            "{:?} can read scoped traffic",
+            actor.role()
+        );
+    }
     for actor in [
         AdminContext::new("public", AdminRole::Readonly, None),
-        publisher("platform.acme"),
+        ordinary_user("platform.acme"),
     ] {
         assert!(matches!(
             db.store

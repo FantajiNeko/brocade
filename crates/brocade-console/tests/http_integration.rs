@@ -97,7 +97,7 @@ async fn data_retention_api_lists_only_bounded_tables_and_updates_without_a_revi
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn sniffing_failed_api_is_admin_scoped_default_off_and_never_cached() {
+async fn sniffing_failed_api_is_operator_scoped_default_off_and_never_cached() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -158,14 +158,7 @@ async fn sniffing_failed_api_is_admin_scoped_default_off_and_never_cached() {
             "/users/platform.acme/alice/sniffing-failed-targets?period=week",
         )
         .await;
-        assert_eq!(
-            own.0,
-            if role == "tenant-admin" {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            }
-        );
+        assert_eq!(own.0, StatusCode::OK);
         assert_eq!(
             get_json(
                 &app,
@@ -187,7 +180,7 @@ async fn sniffing_failed_api_is_admin_scoped_default_off_and_never_cached() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn node_traffic_statistics_are_admin_only_visible_and_never_cached() {
+async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cached() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -253,6 +246,31 @@ async fn node_traffic_statistics_are_admin_only_visible_and_never_cached() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
+    assert_eq!(
+        put_json(&app, &token, "/visitor-access", json!({ "enabled": true }))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let public_cookie = login_cookie(&app, "public", "").await;
+    for private_path in [
+        "/nodes/n1/inflow-usage",
+        "/nodes/n1/site-usage",
+        "/nodes/n1/other-domains",
+        "/nodes/n1/sniffing-failed-targets",
+        "/users/platform.acme/alice/realtime/history",
+        "/users/platform.acme/alice/site-usage",
+        "/users/platform.acme/alice/other-domains",
+        "/users/platform.acme/alice/sniffing-failed-targets",
+    ] {
+        assert_eq!(
+            get_json_with_cookie(&app, private_path, &public_cookie)
+                .await
+                .0,
+            StatusCode::FORBIDDEN,
+            "visitor cannot read {private_path}"
+        );
+    }
     for role in ["readonly", "editor", "publisher", "tenant-admin"] {
         let id = format!("node-traffic-{role}");
         let created = post_json(
@@ -275,11 +293,7 @@ async fn node_traffic_statistics_are_admin_only_visible_and_never_cached() {
         for path in ["/nodes/n1/inflow-usage", "/nodes/n1/site-usage"] {
             assert_eq!(
                 get_json(&app, scoped, path).await.0,
-                if role == "tenant-admin" {
-                    StatusCode::OK
-                } else {
-                    StatusCode::FORBIDDEN
-                },
+                StatusCode::OK,
                 "{role} {path}"
             );
         }
@@ -288,7 +302,7 @@ async fn node_traffic_statistics_are_admin_only_visible_and_never_cached() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn other_domain_api_is_admin_scoped_default_off_and_never_cached() {
+async fn other_domain_api_is_operator_scoped_default_off_and_never_cached() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -401,14 +415,7 @@ async fn other_domain_api_is_admin_scoped_default_off_and_never_cached() {
             "/users/platform.acme/alice/other-domains?period=week",
         )
         .await;
-        assert_eq!(
-            own.0,
-            if role == "tenant-admin" {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            }
-        );
+        assert_eq!(own.0, StatusCode::OK);
         assert_eq!(
             get_json(
                 &app,
@@ -427,11 +434,7 @@ async fn other_domain_api_is_admin_scoped_default_off_and_never_cached() {
             )
             .await
             .0,
-            if role == "tenant-admin" {
-                StatusCode::OK
-            } else {
-                StatusCode::FORBIDDEN
-            }
+            StatusCode::OK
         );
         assert_eq!(
             get_json(&app, scoped, "/users/platform.other/alice/machine-usage")
@@ -1810,7 +1813,7 @@ async fn realtime_settings_and_sse_create_one_bounded_node_lease() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn realtime_user_traffic_is_admin_only_and_filters_shared_machine_samples() {
+async fn realtime_user_traffic_allows_signed_in_operators_and_filters_shared_machine_samples() {
     use brocade_deployment::protocol::{
         AgentRealtimeCommand, AgentRealtimeSample, RealtimeUserTrafficSelector,
     };
@@ -1877,11 +1880,25 @@ async fn realtime_user_traffic_is_admin_only_and_filters_shared_machine_samples(
 
     for role in [
         brocade_store::AdminRole::Readonly,
-        brocade_store::AdminRole::User,
         brocade_store::AdminRole::Editor,
         brocade_store::AdminRole::Publisher,
     ] {
         let actor = AdminContext::new("operator", role, Some("platform.acme".to_owned()));
+        let targets = db
+            .store
+            .user_realtime_targets(&actor, "platform.acme", "alice")
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+    }
+    for actor in [
+        AdminContext::new("public", brocade_store::AdminRole::Readonly, None),
+        AdminContext::new(
+            "alice",
+            brocade_store::AdminRole::User,
+            Some("platform.acme".to_owned()),
+        ),
+    ] {
         assert!(matches!(
             db.store
                 .user_realtime_targets(&actor, "platform.acme", "alice")
@@ -1910,17 +1927,20 @@ async fn realtime_user_traffic_is_admin_only_and_filters_shared_machine_samples(
     )
     .await;
     let readonly_token = issued.1["token"].as_str().unwrap();
-    assert_eq!(
-        get_json_with_token(&app, path, readonly_token).await.0,
-        StatusCode::FORBIDDEN
-    );
+    let readonly = get_json_with_token(&app, path, readonly_token).await;
+    assert_eq!(readonly.0, StatusCode::OK);
+    let users = readonly.1["nodes"][0]["samples"][0]["sample"]["user_traffic"]["users"]
+        .as_array()
+        .unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["user_id"], "alice");
     let machine = get_json_with_token(&app, "/realtime/nodes/n1/snapshot", readonly_token).await;
     assert_eq!(machine.0, StatusCode::OK);
     assert!(machine.1["nodes"][0]["samples"][0]["sample"]
         .get("user_traffic")
-        .is_none());
+        .is_some());
 
-    // The card's one-hour accounting history follows the same administrator-only boundary.
+    // The card's one-hour accounting history follows the signed-in operator boundary.
     for history in [
         "/users/platform.acme/alice/realtime/history",
         "/realtime/nodes/n1/user-history",
@@ -1936,7 +1956,7 @@ async fn realtime_user_traffic_is_admin_only_and_filters_shared_machine_samples(
         assert_eq!(allowed.1["nodes"][0]["node_id"], "n1", "{history}");
         assert_eq!(
             get_json_with_token(&app, history, readonly_token).await.0,
-            StatusCode::FORBIDDEN,
+            StatusCode::OK,
             "{history}"
         );
     }
@@ -1944,7 +1964,7 @@ async fn realtime_user_traffic_is_admin_only_and_filters_shared_machine_samples(
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn fleet_realtime_keeps_machine_rates_public_and_user_intersections_admin_only() {
+async fn fleet_realtime_allows_public_rates_and_scopes_signed_in_operators() {
     use brocade_deployment::protocol::{
         AgentRealtimeCommand, AgentRealtimeSample, RealtimeUserTrafficSelector,
     };
@@ -1992,7 +2012,7 @@ async fn fleet_realtime_keeps_machine_rates_public_and_user_intersections_admin_
     let path = "/realtime/fleet-traffic/snapshot";
     let public = get_json_with_cookie(&app, path, &cookie).await;
     assert_eq!(public.0, StatusCode::OK);
-    assert_eq!(public.1["expected"], json!([]));
+    assert_eq!(public.1["expected"].as_array().unwrap().len(), 1);
 
     let mut ordinary_tokens = Vec::new();
     for role in ["readonly", "editor", "publisher"] {
@@ -2022,7 +2042,11 @@ async fn fleet_realtime_keeps_machine_rates_public_and_user_intersections_admin_
         let credential = issued.1["token"].as_str().unwrap().to_owned();
         let machine_only = get_json_with_token(&app, path, &credential).await;
         assert_eq!(machine_only.0, StatusCode::OK, "{role}");
-        assert_eq!(machine_only.1["expected"], json!([]), "{role}");
+        assert_eq!(
+            machine_only.1["expected"].as_array().unwrap().len(),
+            1,
+            "{role}"
+        );
         ordinary_tokens.push((role, credential));
     }
     let created = post_json(
@@ -2075,10 +2099,10 @@ async fn fleet_realtime_keeps_machine_rates_public_and_user_intersections_admin_
         brocade_store::AdminRole::Publisher,
     ] {
         let actor = AdminContext::new("operator", role, Some("platform.acme".to_owned()));
-        assert!(matches!(
-            db.store.fleet_realtime_targets(&actor).await,
-            Err(brocade_store::StoreError::Forbidden(_))
-        ));
+        assert_eq!(
+            db.store.fleet_realtime_targets(&actor).await.unwrap().len(),
+            1
+        );
     }
     let tenant = AdminContext::new(
         "tenant-admin",
@@ -2126,21 +2150,66 @@ async fn fleet_realtime_keeps_machine_rates_public_and_user_intersections_admin_
 
     let public = get_json_with_cookie(&app, path, &cookie).await;
     assert_eq!(public.0, StatusCode::OK);
-    assert_eq!(public.1["expected"], json!([]));
+    assert_eq!(public.1["expected"].as_array().unwrap().len(), 1);
     assert_eq!(
         public.1["nodes"][0]["samples"][0]["sample"]["rx_bytes_per_sec"],
         9000
     );
     assert!(public.1["nodes"][0]["samples"][0]["sample"]
         .get("user_traffic")
-        .is_none());
+        .is_some());
+    fn assert_no_private_fields(value: &Value) {
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    assert!(
+                        ![
+                            "site_id",
+                            "domain",
+                            "target_host",
+                            "target_port",
+                            "source_ip",
+                            "uuid",
+                            "token",
+                            "password",
+                            "mux",
+                            "reverse_health",
+                            "vpngate"
+                        ]
+                        .contains(&key.as_str()),
+                        "private field: {key}"
+                    );
+                    assert_no_private_fields(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_no_private_fields(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_no_private_fields(&public.1);
     for (role, credential) in &ordinary_tokens {
         let machine_only = get_json_with_token(&app, path, credential).await;
         assert_eq!(machine_only.0, StatusCode::OK, "{role}");
-        assert_eq!(machine_only.1["expected"], json!([]), "{role}");
+        assert_eq!(
+            machine_only.1["expected"].as_array().unwrap().len(),
+            1,
+            "{role}"
+        );
         assert!(machine_only.1["nodes"][0]["samples"][0]["sample"]
             .get("user_traffic")
-            .is_none());
+            .is_some());
+        let users = machine_only.1["nodes"][0]["samples"][0]["sample"]["user_traffic"]["users"]
+            .as_array()
+            .unwrap();
+        assert_eq!(users.len(), 2, "{role}");
+        assert!(
+            users.iter().all(|user| user["user_id"] == "alice"),
+            "{role}"
+        );
     }
 
     let response = app
@@ -2224,7 +2293,8 @@ async fn fleet_realtime_keeps_machine_rates_public_and_user_intersections_admin_
     let streamed: Value = serde_json::from_str(data).unwrap();
     assert!(streamed["nodes"][0]["samples"][0]["sample"]
         .get("user_traffic")
-        .is_none());
+        .is_some());
+    assert_no_private_fields(&streamed);
     drop(body);
     assert_eq!(
         get_json_with_cookie(&app, "/realtime/settings", &cookie)

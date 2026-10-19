@@ -46,7 +46,7 @@ pub struct FleetRealtimeTarget {
 /// to the single-user resolver is what lets the UI distinguish an entitled user with zero traffic
 /// from a user who is not routed through that machine at all. The matrix is a read-only public
 /// surface; signed-in tenant-scoped viewers remain restricted to their tenant subtree by the
-/// query below. Machine detail and per-user history keep their separate administrator gate.
+/// query below. Machine detail and per-user history require a signed-in operator, with the same tenant scope.
 pub async fn fleet_realtime_targets(
     pool: &PgPool,
     actor: &AdminContext,
