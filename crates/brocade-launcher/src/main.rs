@@ -1,6 +1,7 @@
 mod cloudflare;
 mod database;
 mod download;
+mod entry;
 mod paths;
 mod platform;
 
@@ -18,6 +19,7 @@ use serde::Deserialize;
 use std::{
     env, fs,
     future::pending,
+    io::IsTerminal,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -40,6 +42,8 @@ struct Cli {
 enum LauncherCommand {
     /// 启动 Console；没有 DATABASE_URL 时使用受管 PostgreSQL
     Up(UpArgs),
+    /// 显示当前控制台入口；交互终端会自动携带一次性初始化凭据
+    Url(entry::UrlArgs),
 }
 
 #[derive(Debug, Args)]
@@ -99,7 +103,7 @@ struct BootstrapToken {
 struct InitializationAccess<'a> {
     url: &'a str,
     local_addr: SocketAddr,
-    bootstrap_file: Option<&'a Path>,
+    bootstrap_token: &'a str,
 }
 
 #[tokio::main]
@@ -113,6 +117,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         LauncherCommand::Up(args) => up(args).await,
+        LauncherCommand::Url(args) => entry::print_current(args).await,
     }
 }
 
@@ -155,17 +160,7 @@ async fn up(args: UpArgs) -> Result<()> {
         }
     };
 
-    let admin_bind = match args.bind {
-        Some(bind) => bind,
-        None => optional_env("BROCADE_ADMIN_BIND")?
-            .map(|value| {
-                value
-                    .parse()
-                    .context("BROCADE_ADMIN_BIND 不是合法的 IP:PORT")
-            })
-            .transpose()?
-            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))),
-    };
+    let admin_bind = admin_bind(args.bind)?;
     if args.tunnel
         && env::var("BROCADE_AGENT_BIND")
             .ok()
@@ -267,6 +262,7 @@ async fn up(args: UpArgs) -> Result<()> {
     let initialization_url = tunnel
         .as_ref()
         .map(|tunnel| tunnel.url.clone())
+        .or(optional_env("BROCADE_AGENT_PUBLIC_URL")?)
         .unwrap_or_else(|| local_url.clone());
 
     match wait_until_initialized(
@@ -275,7 +271,7 @@ async fn up(args: UpArgs) -> Result<()> {
         InitializationAccess {
             url: &initialization_url,
             local_addr,
-            bootstrap_file: bootstrap_token.private_file.as_deref(),
+            bootstrap_token: &bootstrap_token.secret,
         },
         &mut console,
         &mut tunnel,
@@ -418,9 +414,10 @@ async fn wait_until_initialized(
         initialization_instructions(
             access.url,
             access.local_addr,
-            access.bootstrap_file,
+            access.bootstrap_token,
             tunnel.is_some(),
-        )
+            std::io::stdout().is_terminal(),
+        )?
     );
     loop {
         tokio::select! {
@@ -444,12 +441,15 @@ async fn wait_until_initialized(
 fn initialization_instructions(
     initialization_url: &str,
     local_addr: SocketAddr,
-    bootstrap_file: Option<&Path>,
+    bootstrap_token: &str,
     tunneled: bool,
-) -> String {
-    let credential = match bootstrap_file {
-        Some(path) => format!("一次性初始化凭据文件：{}", path.display()),
-        None => "一次性初始化凭据：BROCADE_BOOTSTRAP_TOKEN".to_owned(),
+    terminal: bool,
+) -> Result<String> {
+    let initialization_url = entry::entry_url(initialization_url, Some(bootstrap_token), terminal)?;
+    let credential = if terminal {
+        "打开完整初始化链接后，设置管理员用户名和密码即可。"
+    } else {
+        "请在交互终端运行 sudo brocade url 获取一次性初始化链接。"
     };
     let mut instructions =
         format!("首次启动尚未创建管理员。\n初始化地址：{initialization_url}\n{credential}");
@@ -465,7 +465,21 @@ fn initialization_instructions(
             port = local_addr.port(),
         ));
     }
-    instructions
+    Ok(instructions)
+}
+
+fn admin_bind(explicit: Option<SocketAddr>) -> Result<SocketAddr> {
+    Ok(match explicit {
+        Some(bind) => bind,
+        None => optional_env("BROCADE_ADMIN_BIND")?
+            .map(|value| {
+                value
+                    .parse()
+                    .context("BROCADE_ADMIN_BIND 不是合法的 IP:PORT")
+            })
+            .transpose()?
+            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))),
+    })
 }
 
 async fn auth_state(client: &reqwest::Client, local_url: &str) -> Result<AuthState> {
@@ -705,12 +719,15 @@ mod tests {
         let message = initialization_instructions(
             "https://bootstrap.example.trycloudflare.com",
             "127.0.0.1:8080".parse().unwrap(),
-            Some(Path::new("/var/lib/brocade/bootstrap-token")),
+            "bootstrap-test-token-with-at-least-32-bytes",
             true,
-        );
+            true,
+        )
+        .unwrap();
 
         assert!(message.contains("初始化地址：https://bootstrap.example.trycloudflare.com"));
-        assert!(message.contains("/var/lib/brocade/bootstrap-token"));
+        assert!(message.contains("#/initialize/bootstrap-test-token-with-at-least-32-bytes"));
+        assert!(!message.contains("bootstrap-token"));
         assert!(!message.contains("ssh -N -L"));
     }
 
@@ -719,14 +736,17 @@ mod tests {
         let message = initialization_instructions(
             "http://127.0.0.1:8080",
             "127.0.0.1:8080".parse().unwrap(),
-            None,
+            "bootstrap-test-token-with-at-least-32-bytes",
             false,
-        );
+            false,
+        )
+        .unwrap();
 
         assert!(message.contains("初始化地址：http://127.0.0.1:8080"));
         assert!(message.contains("ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>"));
         assert!(message.contains("然后打开 http://127.0.0.1:8080"));
-        assert!(message.contains("BROCADE_BOOTSTRAP_TOKEN"));
+        assert!(message.contains("sudo brocade url"));
+        assert!(!message.contains("bootstrap-test-token-with-at-least-32-bytes"));
     }
 
     #[test]
@@ -741,10 +761,17 @@ mod tests {
         assert!(INSTALLER.contains("--managed-db"));
         assert!(INSTALLER.contains("--external-db"));
         assert!(INSTALLER.contains("set -- \"$@\" --tunnel"));
-        assert!(INSTALLER.contains("启动后显示的“初始化地址”HTTPS 链接"));
-        assert!(INSTALLER.contains("ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>"));
-        assert!(INSTALLER.contains("sudo cat /var/lib/brocade/bootstrap-token"));
+        assert!(INSTALLER.contains("systemctl restart brocade.service"));
+        assert!(INSTALLER.contains("\"$command_path\" url"));
+        assert!(INSTALLER.contains("--no-start"));
+        assert!(!INSTALLER.contains("sudo cat /var/lib/brocade/bootstrap-token"));
         assert!(!INSTALLER.contains("默认初始化地址：http://127.0.0.1:8080"));
+        let verify = INSTALLER.find("sha256sum -c SHA256SUMS").unwrap();
+        let service = INSTALLER.find("systemctl restart brocade.service").unwrap();
+        assert!(
+            verify < service,
+            "integrity checks must precede service changes"
+        );
     }
 
     #[cfg(unix)]

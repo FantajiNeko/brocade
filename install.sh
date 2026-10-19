@@ -30,6 +30,7 @@ usage() {
     cat <<'EOF'
 Usage: [sudo] sh install.sh [--tunnel | --site-url https://console.example.net]
                               [--managed-db | --database-url postgresql://...]
+                              [--no-start]
 
 Installs the two binaries from this release bundle, the minimal OS prerequisites, and a dedicated
 non-login `brocade` account. Without an option, an interactive terminal first asks whether this
@@ -37,6 +38,8 @@ installation uses a Cloudflare Quick Tunnel or an existing HTTPS site. Existing-
 must configure DNS, TLS, and the reverse proxy themselves.
 
 PostgreSQL is not installed by apt/apk and no project is compiled.
+Starts the managed systemd service and prints the ready URL. Without systemd, the launcher
+continues in the foreground. --no-start installs files without starting the runtime.
 EOF
 }
 
@@ -44,11 +47,16 @@ installation_type=
 site_url=
 database_type=
 database_url=
+start_runtime=true
 while [ "$#" -gt 0 ]; do
     case $1 in
         -h|--help)
             usage
             exit 0
+            ;;
+        --no-start)
+            start_runtime=false
+            shift
             ;;
         --tunnel)
             [ -z "$installation_type" ] || die "--tunnel 不能与其他安装类型同时使用"
@@ -371,10 +379,12 @@ installation_type_stage=$config_root/.installation-type.$$
 public_url_stage=$config_root/.agent-public-url.$$
 database_type_stage=$config_root/.database-type.$$
 database_url_stage=$config_root/.database-url.$$
+service_stage=$config_root/.brocade.service.$$
+ready_error=$config_root/.install-ready.$$
 cleanup_staging() {
     rm -f "$launcher_stage" "$console_stage" "$command_stage" \
         "$installation_type_stage" "$public_url_stage" \
-        "$database_type_stage" "$database_url_stage"
+        "$database_type_stage" "$database_url_stage" "$service_stage" "$ready_error"
 }
 trap cleanup_staging 0 HUP INT TERM
 
@@ -480,7 +490,7 @@ case $database_type in
         ;;
 esac
 
-if [ "${1-}" = up ] && [ "$installation_type" = tunnel ]; then
+if { [ "${1-}" = up ] || [ "${1-}" = url ]; } && [ "$installation_type" = tunnel ]; then
     tunnel_requested=false
     for argument in "$@"; do
         [ "$argument" = --tunnel ] && tunnel_requested=true
@@ -568,18 +578,72 @@ trap - 0 HUP INT TERM
 say "Brocade 已安装完成。"
 if [ "$installation_type" = tunnel ]; then
     say "安装类型：Cloudflare Quick Tunnel（临时地址可能在每次启动时变化）"
-    say "启动：sudo brocade up（会按安装配置自动启用 Tunnel）"
-    say "请打开启动后显示的“初始化地址”HTTPS 链接"
 else
     say "安装类型：已有 HTTPS 站点"
     say "已登记地址：$site_url"
-    say "启动：sudo brocade up"
-    say "启动前请自行完成该站点的 DNS、TLS 与反向代理，并把请求转发到 http://127.0.0.1:8080。"
+    say "请确认该站点的 DNS、TLS 与反向代理已就绪，并把请求转发到 http://127.0.0.1:8080。"
 fi
 if [ "$database_type" = managed ]; then
     say "数据库：Brocade 托管 PostgreSQL（首次启动自动下载并初始化）"
 else
     say "数据库：已有 PostgreSQL（连接地址已保存到仅 root 与 brocade 账号可读的配置）"
 fi
-say "SSH 转发初始化：在浏览器所在电脑运行 ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>，再打开 http://127.0.0.1:8080"
-say "一次性初始化凭据：启动后运行 sudo cat /var/lib/brocade/bootstrap-token（初始化成功后自动删除）"
+if [ "$start_runtime" = false ]; then
+    say "已按 --no-start 跳过启动；运行 sudo brocade up 后打开输出的完整初始化链接。"
+    exit 0
+fi
+
+if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+    say "当前系统没有 systemd，正在前台启动 Brocade；请保持此终端运行。"
+    exec "$command_path" up
+fi
+
+service_unit=/etc/systemd/system/brocade.service
+if [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
+    [ -f "$service_unit" ] && [ ! -L "$service_unit" ] &&
+        grep -Fq '# Managed by Brocade installer' "$service_unit" ||
+        die "brocade.service 已存在且不由安装器管理；请核对服务配置后使用 --no-start 安装"
+fi
+cat >"$service_stage" <<EOF
+# Managed by Brocade installer
+[Unit]
+Description=Brocade Console and managed runtime
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=$service_user
+Group=$service_group
+ExecStart=$command_path up
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 "$service_stage"
+mv -f "$service_stage" "$service_unit"
+systemctl daemon-reload
+systemctl enable brocade.service
+systemctl restart brocade.service
+
+say "正在等待数据库、控制台与公网入口就绪…"
+trap 'rm -f "$ready_error"' 0
+ready_attempt=0
+until "$command_path" url >/dev/null 2>"$ready_error"; do
+    ready_attempt=$((ready_attempt + 1))
+    if [ "$ready_attempt" -ge 600 ] || systemctl is-failed --quiet brocade.service; then
+        cat "$ready_error" >&2
+        die "Brocade 未能就绪；请运行 systemctl status brocade.service 和 journalctl -u brocade.service 检查"
+    fi
+    sleep 1
+done
+rm -f "$ready_error"
+trap - 0
+say "Brocade 已启动并设置开机启动。请打开下面的完整链接；首次使用时创建管理员："
+"$command_path" url

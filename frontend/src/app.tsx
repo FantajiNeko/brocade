@@ -11,7 +11,7 @@ import {
   type AuthState,
   type BrandingSettings,
 } from './api';
-import { DirectLogin, Login, parseDirectLoginHash } from './ui/login';
+import { DirectLogin, Login, parseDirectLoginHash, parseInitializationHash } from './ui/login';
 import {
   announceSessionChange,
   autoPublicSuppressed,
@@ -103,6 +103,11 @@ export function App() {
   const [restoreExistingSession] = useState(directCredentials === null);
   /* 浏览器会话依赖 HttpOnly cookie；内存中保存身份及首帧骨架所需的轻量统计。 */
   const [session, setSession] = useState<Session | null>(null);
+  useEffect(() => {
+    if (session && parseInitializationHash(window.location.hash)) {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    }
+  }, [session]);
   // 刷新后先用 cookie 恢复会话：恢复完成前只保留中性台面，避免短暂闪出登录表单。
   // 401 和网络错误同样进入登录页。
   const [restoring, setRestoring] = useState(restoreExistingSession);

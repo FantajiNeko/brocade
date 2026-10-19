@@ -228,7 +228,7 @@ sudo sh install.sh --site-url https://console.example.net \
   --database-url postgresql://brocade:password@database.example.net/brocade
 ```
 
-包含密码的连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器随后校验发行包与 CPU/libc 是否匹配，再通过 apt、apk、dnf、yum 或 zypper 补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建无登录权限的 `brocade` 服务账号，并原子安装两个二进制和选择结果。musl 发行物由 CI 强制检查为无动态库依赖。纯 `sh` 只负责安装、宿主环境适配和保存启动默认值；启动期的锁、进程回收、数据库状态和 Tunnel 就绪判断仍由 Rust launcher 处理。它不会通过系统包管理器安装或编译 PostgreSQL，也不会预装 cloudflared。安装后无需 Docker：
+包含密码的连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器随后校验发行包与 CPU/libc 是否匹配，再通过 apt、apk、dnf、yum 或 zypper 补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建无登录权限的 `brocade` 服务账号，并原子安装两个二进制和选择结果。musl 发行物由 CI 强制检查为无动态库依赖。有 systemd 时安装器自动启用并启动 `brocade.service`，等待数据库、控制台与公网入口就绪后输出完整初始化链接；打开链接只需设置管理员用户名和密码，无需读取服务器文件。无 systemd 时在当前终端前台运行 launcher，需保持终端打开。无需 Docker，也不会通过系统包管理器安装或编译 PostgreSQL；PostgreSQL 与 cloudflared 由 launcher 下载并校验。自动化只安装文件时可加 `--no-start`，稍后手动启动：
 
 ```sh
 sudo brocade up
@@ -242,7 +242,9 @@ sudo brocade up
 sudo brocade up --tunnel
 ```
 
-首次启动时，launcher 会生成 32 字节随机初始化凭据，写入终端提示的 `0600` 私有文件；在页面中粘贴该凭据后文件会被删除，凭据也因系统已经初始化而失去权限。凭据值不会写入日志。初始化只创建系统管理员和根租户，不预置网络用户；登录后由可恢复的入门向导依次纳管首台机器、创建链和首个用户、发布配置，并以真实用户授权完成一次节点拨测。使用 `--tunnel` 时，一次性凭据会先保护初始化接口，launcher 再建立 Tunnel 并把随机的 `https://*.trycloudflare.com` 地址明确打印为“初始化地址”，所以通过 SSH 安装的操作者不需要访问服务器的回环地址。若不希望初始化凭据经过 Cloudflare，可在浏览器所在电脑建立 `ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>` 转发，再打开 `http://127.0.0.1:8080`；系统安装版凭据可用 `sudo cat /var/lib/brocade/bootstrap-token` 读取。随后 launcher 查询 Cloudflare 官方 latest stable release，校验官方 SHA-256 后缓存 `cloudflared`。查询失败时只会回退到最近一个已验证缓存；不会执行 cloudflared 自更新，也不会把它打进 Brocade 发行包。需要可复现环境时使用 `--cloudflared-version VERSION`，已有受管安装时使用 `--cloudflared-bin PATH`。
+首次启动时，launcher 生成 32 字节随机初始化凭据，以 `0600` 私有文件保存供重启恢复。完整初始化链接把一次性凭据放在 `#/initialize/...` fragment 中，浏览器不会把 fragment 放进 HTTP 请求或 Referer；网页接收后立即从地址栏清除，只在内存保留直到提交。完整链接仅向交互终端输出，重定向和 systemd 日志只输出普通地址；再次获取入口可在终端运行 `sudo brocade url`。初始化成功后凭据立即失效，私有文件被删除。手动部署指定 `BROCADE_BOOTSTRAP_TOKEN` 的旧入口仍可填写凭据，以兼容已有部署。初始化只创建系统管理员和根租户，不预置网络用户；登录后由可恢复的入门向导依次纳管首台机器、创建链和首个用户、发布配置，并以真实用户授权完成一次节点拨测。
+
+使用 `--tunnel` 时，一次性凭据先保护初始化接口，launcher 再建立 Tunnel，安装终端输出带有随机 `https://*.trycloudflare.com` 地址的完整链接。若不希望初始化提交经过 Cloudflare，可在浏览器所在电脑建立 `ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>` 转发，把完整链接的站点部分改成 `http://127.0.0.1:8080` 并保留 fragment。launcher 查询 Cloudflare 官方 latest stable release，校验官方 SHA-256 后缓存 `cloudflared`。查询失败时只会回退到最近一个已验证缓存；不会执行 cloudflared 自更新，也不会把它打进 Brocade 发行包。需要可复现环境时使用 `--cloudflared-version VERSION`，已有受管安装时使用 `--cloudflared-bin PATH`。
 
 Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地址每次可能变化，并受 Cloudflare 的并发限制；正式部署仍应使用自己的域名、TLS 与受管 Tunnel/反向代理。Quick Tunnel 不支持 SSE，控制台会在实时流失败后自动切换到同权限、无缓存的短轮询接口。
 

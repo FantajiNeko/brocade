@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -8,6 +9,7 @@ import {
   Login,
   directLoginUrl,
   parseDirectLoginHash,
+  parseInitializationHash,
 } from '../src/ui/login';
 
 const wrapper = () => {
@@ -22,10 +24,77 @@ const jsonResponse = (body: unknown, status = 200) =>
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  window.history.replaceState(null, '', '/');
 });
 
 describe('系统初始化默认身份', () => {
+  it('严格解析安装器链接并保留编码后的凭据内容', () => {
+    const token = 'bootstrap-test-token-with-at-least-32-bytes/+#%';
+    expect(parseInitializationHash(`#/initialize/${encodeURIComponent(token)}`)).toBe(token);
+    for (const hash of ['#/initialize/short', '#/initialize/%E0%A4%A', '#/initialize/a/b', '#/login/a/b']) {
+      expect(parseInitializationHash(hash)).toBeNull();
+    }
+    expect(parseInitializationHash(`#/initialize/${'a'.repeat(513)}`)).toBeNull();
+  });
+
+  it('完整初始化链接自动携带凭据，在 StrictMode 下清除地址后仍可创建管理员', async () => {
+    const token = 'bootstrap-test-token-with-at-least-32-bytes/+#%';
+    window.history.replaceState(null, '', `/?from=install#/initialize/${encodeURIComponent(token)}`);
+    const onLogin = vi.fn();
+    const localWrite = vi.spyOn(Storage.prototype, 'setItem');
+    let authorization: string | null = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      expect(path).not.toContain(token);
+      if (path === '/auth/state') return jsonResponse({ initialized: false, public_open: false });
+      if (path === '/auth/init') {
+        expect(window.location.hash).toBe('');
+        authorization = new Headers(init?.headers).get('authorization');
+        return jsonResponse({ admin: { operator_id: 'root', role: 'system-admin' } }, 201);
+      }
+      if (path === '/bootstrap') {
+        return jsonResponse({ who: { operator_id: 'root', role: 'system-admin' }, initial: {} });
+      }
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = render(
+      <StrictMode>
+        <Login branding={{ site_name: '我的站点', icon_data_url: null }} onLogin={onLogin} />
+      </StrictMode>,
+      { wrapper: wrapper() },
+    );
+    await view.findByRole('button', { name: '创建管理员' });
+    expect(window.location.hash).toBe('');
+    expect(window.location.search).toBe('?from=install');
+    expect(view.queryByLabelText('初始化凭据')).toBeNull();
+    expect(view.container.innerHTML).not.toContain(token);
+    fireEvent.change(view.getByLabelText('密码'), { target: { value: 'root-password' } });
+    const submit = view.getByRole('button', { name: '创建管理员' }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    fireEvent.click(submit);
+    await vi.waitFor(() => expect(onLogin).toHaveBeenCalledOnce());
+    expect(authorization).toBe(`Bearer ${token}`);
+    expect(localWrite).not.toHaveBeenCalled();
+    localWrite.mockRestore();
+  });
+
+  it('已初始化站点打开旧链接时也清除地址中的一次性凭据', async () => {
+    window.history.replaceState(null, '', '/#/initialize/bootstrap-test-token-with-at-least-32-bytes');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ initialized: true, public_open: false })),
+    );
+    const view = render(<Login branding={{ site_name: '我的站点', icon_data_url: null }} onLogin={vi.fn()} />, {
+      wrapper: wrapper(),
+    });
+    await view.findByRole('button', { name: '登录' });
+    expect(window.location.hash).toBe('');
+    expect(view.queryByLabelText('初始化凭据')).toBeNull();
+  });
+
   it('读取状态前显示加载中，初始化站点不会先显示登录标题', async () => {
     let complete!: (response: Response) => void;
     const auth = new Promise<Response>(resolve => {

@@ -20,6 +20,18 @@ export interface DirectLoginCredentials {
   token: string;
 }
 
+/** The installer passes its single-use credential in a fragment, never an HTTP URL component. */
+export function parseInitializationHash(hash: string): string | null {
+  const match = /^#\/initialize\/([^/]+)$/.exec(hash);
+  if (!match) return null;
+  try {
+    const token = decodeURIComponent(match[1]);
+    return token.length >= 32 && token.length <= 512 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Direct credentials stay in the URL fragment, which browsers never send in HTTP requests. */
 export function parseDirectLoginHash(hash: string): DirectLoginCredentials | null {
   const parts = hash.replace(/^#\/?/, '').split('/');
@@ -90,6 +102,12 @@ export function DirectLogin({
 }
 
 export function Login({ branding, onLogin }: { branding: BrandingSettings; onLogin: (session: Session) => void }) {
+  const [initialBootstrapToken] = useState(() => parseInitializationHash(window.location.hash));
+  useEffect(() => {
+    if (initialBootstrapToken) {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    }
+  }, [initialBootstrapToken]);
   const auth = useQuery({ queryKey: ['auth-state'], queryFn: fetchAuthState });
   const initialized = auth.data?.initialized;
 
@@ -110,7 +128,7 @@ export function Login({ branding, onLogin }: { branding: BrandingSettings; onLog
            而访客点击退出通常只是想关闭账号栏返回查看机器。 */
         <PasswordLogin onLogin={onLogin} publicOpen={auth.data?.public_open ?? false} />
       ) : (
-        <InitializeAdmin onInitialized={onLogin} />
+        <InitializeAdmin onInitialized={onLogin} initialBootstrapToken={initialBootstrapToken} />
       )}
     </LoginLayout>
   );
@@ -263,8 +281,14 @@ export function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Sess
   );
 }
 
-export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Session) => void }) {
-  const [bootstrapToken, setBootstrapToken] = useState('');
+export function InitializeAdmin({
+  onInitialized,
+  initialBootstrapToken = null,
+}: {
+  onInitialized: (session: Session) => void;
+  initialBootstrapToken?: string | null;
+}) {
+  const [bootstrapToken, setBootstrapToken] = useState(initialBootstrapToken ?? '');
   const [operatorId, setOperatorId] = useState('root');
   const [password, setPassword] = useState('');
   const [reveal, setReveal] = useState(false);
@@ -294,16 +318,20 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
       }}
     >
       <p className="login-lead">先创建系统管理员；登录后由入门向导纳管首台机器并创建第一个用户。</p>
-      <label className="login-field">
-        <span>初始化凭据</span>
-        <ConfigSecretInput
-          className="f"
-          autoFocus
-          value={bootstrapToken}
-          onChange={e => setBootstrapToken(e.target.value)}
-        />
-      </label>
-      <p className="login-note">使用启动器提示的私有文件内容，或 BROCADE_BOOTSTRAP_TOKEN；成功后即失效。</p>
+      {!initialBootstrapToken && (
+        <>
+          <label className="login-field">
+            <span>初始化凭据</span>
+            <ConfigSecretInput
+              className="f"
+              autoFocus
+              value={bootstrapToken}
+              onChange={e => setBootstrapToken(e.target.value)}
+            />
+          </label>
+          <p className="login-note">请打开安装器输出的完整初始化链接；手动部署也可填写 BROCADE_BOOTSTRAP_TOKEN。</p>
+        </>
+      )}
       <label className="login-field">
         <span>用户名</span>
         <input className="f" autoComplete="username" value={operatorId} onChange={e => setOperatorId(e.target.value)} />
@@ -315,6 +343,7 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
             className="f"
             type={reveal ? 'text' : 'password'}
             autoComplete="new-password"
+            autoFocus={initialBootstrapToken !== null}
             value={password}
             onChange={e => setPassword(e.target.value)}
           />
