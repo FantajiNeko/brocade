@@ -17,6 +17,8 @@ import { useSession } from '../session';
 import { useAgentLiveness } from '../ui/agent-alive';
 import { ErrorBox, Loading } from '../ui/bits';
 import { DialogClose, DialogLayer } from '../ui/dialog';
+import { wm } from '../wm/store';
+import type { Drill } from './nodes';
 import { isValidSlug } from './ports';
 import { SubscriptionViewer } from './subscription';
 
@@ -124,6 +126,8 @@ export function OnboardingGuide() {
   const qc = useQueryClient();
   const { initial, who } = useSession();
   const { nav } = useForge();
+  const windows = useSyncExternalStore(wm.subscribe, wm.snapshot);
+  const nodeDrill = windows.wins.find(win => win.key === 'tab:nodes')?.data.drill as Drill | undefined;
   const entries = useSyncExternalStore(draft.subscribe, draft.snapshot);
   const reopen = useSyncExternalStore(subscribeReopen, reopenSnapshot, reopenSnapshot);
   const seenReopen = useRef(reopen);
@@ -133,11 +137,13 @@ export function OnboardingGuide() {
   const [receipt, setReceipt] = useState<ModelReceipt | null>(() => readReceipt(who.operator_id));
   const [viewer, setViewer] = useState(false);
   const [blocking, setBlocking] = useState(false);
+  const [explicitlyOpened, setExplicitlyOpened] = useState(false);
 
   useEffect(() => {
     if (seenReopen.current === reopen) return;
     seenReopen.current = reopen;
     setDismissed(null);
+    setExplicitlyOpened(true);
   }, [reopen]);
 
   const onboarding = useQuery({
@@ -261,8 +267,15 @@ export function OnboardingGuide() {
                 : 'activate';
 
   if (dismissed === phase) return null;
+  // Registration already advances to the installation surface with its single-use receipt.
+  // Checkpoint polling must keep running without interrupting that surface with a second prompt.
+  const machineSurfaceActive = nav === 'nodes' && (nodeDrill?.p === 'provision' || nodeDrill?.p === 'install');
+  if (!explicitlyOpened && machineSurfaceActive && (phase === 'machine' || phase === 'agent')) return null;
 
-  const close = () => setDismissed(phase);
+  const close = () => {
+    setDismissed(phase);
+    setExplicitlyOpened(false);
+  };
   const canClose = () =>
     !blocking && !complete.isPending && !checkpointNode.isPending && !checkpointDeployment.isPending;
   let title: string;
@@ -317,6 +330,11 @@ export function OnboardingGuide() {
       </>
     );
   } else if (phase === 'agent') {
+    const installation =
+      nodeDrill?.p === 'install' && nodeDrill.node === state.node_id
+        ? nodeDrill
+        : { p: 'install' as const, node: state.node_id!, step: 2 };
+    const alreadyInstalling = nav === 'nodes' && installation === nodeDrill;
     title = '安装 Agent，等待机器上线';
     body = (
       <>
@@ -332,9 +350,11 @@ export function OnboardingGuide() {
         <DialogClose className="btn">稍后</DialogClose>
         <DialogClose
           className="btn primary"
-          onClick={() => navigate('nodes', { p: 'install', node: state.node_id!, step: 2 })}
+          onClick={() => {
+            if (!alreadyInstalling) navigate('nodes', installation);
+          }}
         >
-          查看安装步骤
+          {alreadyInstalling ? '继续当前安装' : '查看安装步骤'}
         </DialogClose>
       </>
     );
