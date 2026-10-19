@@ -254,4 +254,3 @@ if __name__ == "__main__":
         smoke()
     else:
         raise SystemExit("usage: probe.py snapshot|serve|client ADDRESS|smoke")
-

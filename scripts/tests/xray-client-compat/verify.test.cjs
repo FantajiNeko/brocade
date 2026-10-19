@@ -829,4 +829,3 @@ for (const [name, mutate] of [
   ['nonzero child exit', s => { s.r.processes[0].wait.exit_code = 2; }],
   ['unmeasured half hour', s => { s.manifest.duration_ms = s.r.duration_ms = 1800000; }],
 ]) test('real fixture rejects ' + name, () => { const s = structuredClone(recordedSmoke); mutate(s); assert.throws(() => check(s)); });
-

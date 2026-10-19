@@ -103,4 +103,3 @@ case "$lab_cmd" in
     ;;
   *) usage ;;
 esac
-

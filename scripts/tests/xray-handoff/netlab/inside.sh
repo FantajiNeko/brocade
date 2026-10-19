@@ -70,4 +70,3 @@ if [[ "$lab_action" == init ]]; then
   touch /run/h7-netlab-ready
   exec sleep infinity
 fi
-
