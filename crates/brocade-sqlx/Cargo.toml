@@ -1,0 +1,17 @@
+[package]
+name = "brocade-sqlx"
+version.workspace = true
+description = "Brocade 的 PostgreSQL-only SQLx facade，不解析未使用的数据库驱动和宏依赖"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "sqlx"
+
+[dependencies]
+# sqlx-core is explicitly semver-exempt. Keep these exact versions in lockstep until the store is
+# migrated to SQLx 0.9's audited dynamic-SQL API.
+sqlx-core = { version = "=0.8.6", default-features = false, features = ["_rt-tokio", "_tls-rustls-ring-webpki", "json", "migrate"] }
+sqlx-postgres = { version = "=0.8.6", default-features = false, features = ["json", "migrate"] }

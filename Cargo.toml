@@ -7,6 +7,7 @@ members = [
     "crates/brocade-agent",
     "crates/brocade-probe",
     "crates/brocade-preview",
+    "crates/brocade-sqlx",
     "crates/brocade-store",
 ]
 resolver = "2"

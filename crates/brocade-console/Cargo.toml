@@ -51,7 +51,7 @@ tempfile = "3"
 futures-util = "0.3"
 ipnet = "2.11.0"
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
+sqlx = { package = "brocade-sqlx", path = "../brocade-sqlx" }
 testcontainers = "0.27.3"
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tower = { version = "0.5.3", features = ["util"] }
