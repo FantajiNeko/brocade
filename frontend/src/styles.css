@@ -17632,7 +17632,9 @@ body.fg-dragging * {
   align-items: center;
   gap: 5px;
 }
-@container (max-width: 520px) {
+/* 协议卡落在半幅面板里时内容宽约 508px：端口与参数仍排得下，标题行保持一行；
+   再窄才把端口和参数移到说明下方。 */
+@container (max-width: 480px) {
   .pv-chain-fields .wzp-card {
     grid-template-columns: 16px minmax(0, 1fr) auto;
   }

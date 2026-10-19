@@ -56,7 +56,7 @@ test('新建链接入协议保持逐行选择，中等宽度的端口与参数�
   assert.match(rule('.pv-chain-fields .wzp-more'), /grid-column:\s*4;\s*grid-row:\s*1;/);
   assert.match(
     styles,
-    /@container \(max-width:\s*520px\)\s*\{\s*\.pv-chain-fields \.wzp-card\s*\{\s*grid-template-columns:\s*16px minmax\(0, 1fr\) auto;/,
+    /@container \(max-width:\s*480px\)\s*\{\s*\.pv-chain-fields \.wzp-card\s*\{\s*grid-template-columns:\s*16px minmax\(0, 1fr\) auto;/,
   );
   // 问题行和参数区都按文档顺序自动排位：写死行号会让问题行落到展开的参数下面。
   assert.match(rule('.pv-chain-fields .wzp-card > .wzp-issue'), /grid-column:\s*2 \/ -1;/);
