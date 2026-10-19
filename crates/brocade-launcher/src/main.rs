@@ -1,17 +1,17 @@
-mod cloudflare;
+mod access;
 mod database;
 mod download;
 mod entry;
 mod paths;
 mod platform;
 
+use access::AccessArgs;
 use anyhow::{bail, Context, Result};
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
 use clap::{Args, Parser, Subcommand};
-use cloudflare::{CloudflaredBinary, QuickTunnel};
 use database::{DatabaseChoice, ManagedPostgres};
 use paths::{atomic_write_private, LauncherPaths};
 use platform::Platform;
@@ -44,6 +44,8 @@ enum LauncherCommand {
     Up(UpArgs),
     /// 显示当前控制台入口；交互终端会自动携带一次性初始化凭据
     Url(entry::UrlArgs),
+    /// 显示 HTTP IP 入口，供安装器确认地址；不启动服务
+    Address(AccessArgs),
 }
 
 #[derive(Debug, Args)]
@@ -56,9 +58,8 @@ struct UpArgs {
     #[arg(long, conflicts_with = "managed_db")]
     external_db: bool,
 
-    /// 建立无需域名的 Cloudflare Quick Tunnel
-    #[arg(long)]
-    tunnel: bool,
+    #[command(flatten)]
+    access: AccessArgs,
 
     /// Brocade 持久数据根目录
     #[arg(long, value_name = "DIR")]
@@ -71,23 +72,6 @@ struct UpArgs {
     /// brocade-console 可执行文件
     #[arg(long, value_name = "PATH")]
     console_bin: Option<PathBuf>,
-
-    /// Console 监听地址；默认 127.0.0.1:8080
-    #[arg(long, value_name = "ADDR")]
-    bind: Option<SocketAddr>,
-
-    /// 使用指定 cloudflared，不下载受管版本
-    #[arg(
-        long,
-        value_name = "PATH",
-        requires = "tunnel",
-        conflicts_with = "cloudflared_version"
-    )]
-    cloudflared_bin: Option<PathBuf>,
-
-    /// 指定 cloudflared 版本；默认查询官方 latest
-    #[arg(long, value_name = "VERSION", requires = "tunnel")]
-    cloudflared_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +86,6 @@ struct BootstrapToken {
 
 struct InitializationAccess<'a> {
     url: &'a str,
-    local_addr: SocketAddr,
     bootstrap_token: &'a str,
 }
 
@@ -118,10 +101,15 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         LauncherCommand::Up(args) => up(args).await,
         LauncherCommand::Url(args) => entry::print_current(args).await,
+        LauncherCommand::Address(args) => {
+            println!("{}", args.resolve()?.public_url);
+            Ok(())
+        }
     }
 }
 
 async fn up(args: UpArgs) -> Result<()> {
+    let access = args.access.resolve()?;
     let platform = Platform::current()?;
     let paths = LauncherPaths::resolve(args.data_dir.clone(), args.cache_dir.clone())?;
     let _instance = paths::InstanceLock::acquire(&paths.runtime)?;
@@ -160,20 +148,8 @@ async fn up(args: UpArgs) -> Result<()> {
         }
     };
 
-    let admin_bind = admin_bind(args.bind)?;
-    if args.tunnel
-        && env::var("BROCADE_AGENT_BIND")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-    {
-        bail!("--tunnel 要求 Console 与 Agent 共用一个监听端口；请移除 BROCADE_AGENT_BIND");
-    }
-    let local_addr = reachable_loopback(admin_bind);
+    let local_addr = reachable_loopback(access.bind);
     let local_url = format!("http://{local_addr}");
-    let public_url_file = paths.runtime.join("public-url");
-    if args.tunnel {
-        remove_stale_runtime_file(&public_url_file)?;
-    }
 
     let secret = if managed.is_some() {
         Some(managed_secret(&paths.data)?)
@@ -185,7 +161,8 @@ async fn up(args: UpArgs) -> Result<()> {
     let mut console_command = Command::new(&console_bin);
     console_command
         .env("DATABASE_URL", &database_url)
-        .env("BROCADE_ADMIN_BIND", admin_bind.to_string())
+        .env("BROCADE_ADMIN_BIND", access.bind.to_string())
+        .env("BROCADE_AGENT_PUBLIC_URL", &access.public_url)
         .env("BROCADE_BOOTSTRAP_TOKEN", &bootstrap_token.secret)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -200,9 +177,6 @@ async fn up(args: UpArgs) -> Result<()> {
     if let Some(secret) = &secret {
         console_command.env("BROCADE_SECRET_KEY", secret);
     }
-    if args.tunnel {
-        console_command.env("BROCADE_RUNTIME_PUBLIC_URL_FILE", &public_url_file);
-    }
     let mut console = console_command
         .spawn()
         .with_context(|| format!("无法启动 {}", console_bin.display()))?;
@@ -214,84 +188,37 @@ async fn up(args: UpArgs) -> Result<()> {
     match console_ready {
         Some(Ok(())) => {}
         Some(Err(error)) => {
-            let mut no_tunnel = None;
-            cleanup(&mut no_tunnel, &mut console, managed).await;
+            cleanup(&mut console, managed).await;
             return Err(error);
         }
         None => {
-            let mut no_tunnel = None;
-            cleanup(&mut no_tunnel, &mut console, managed).await;
+            cleanup(&mut console, managed).await;
             return Ok(());
         }
     }
     println!("Local: {local_url}");
 
-    // A bootstrap credential now protects /auth/init, so a requested Tunnel can safely become the
-    // operator's first reachable URL. Starting it only after initialization strands an SSH install:
-    // 127.0.0.1 names the operator's own computer in their browser, not this server.
-    let mut tunnel = if args.tunnel {
-        let started = tokio::select! {
-            _ = shutdown.as_mut() => None,
-            result = start_tunnel(
-                &args,
-                &paths,
-                platform,
-                &client,
-                &local_url,
-                &public_url_file,
-            ) => Some(result),
-        };
-        match started {
-            Some(Ok(tunnel)) => Some(tunnel),
-            Some(Err(error)) => {
-                let _ = remove_stale_runtime_file(&public_url_file);
-                let mut no_tunnel = None;
-                cleanup(&mut no_tunnel, &mut console, managed).await;
-                return Err(error);
-            }
-            None => {
-                let _ = remove_stale_runtime_file(&public_url_file);
-                let mut no_tunnel = None;
-                cleanup(&mut no_tunnel, &mut console, managed).await;
-                return Ok(());
-            }
-        }
-    } else {
-        None
-    };
-    let initialization_url = tunnel
-        .as_ref()
-        .map(|tunnel| tunnel.url.clone())
-        .or(optional_env("BROCADE_AGENT_PUBLIC_URL")?)
-        .unwrap_or_else(|| local_url.clone());
+    println!("控制台地址：{}", access.public_url);
 
     match wait_until_initialized(
         &client,
         &local_url,
         InitializationAccess {
-            url: &initialization_url,
-            local_addr,
+            url: &access.public_url,
             bootstrap_token: &bootstrap_token.secret,
         },
         &mut console,
-        &mut tunnel,
         &mut shutdown,
     )
     .await
     {
         Ok(true) => {}
         Ok(false) => {
-            if args.tunnel {
-                let _ = remove_stale_runtime_file(&public_url_file);
-            }
-            cleanup(&mut tunnel, &mut console, managed).await;
+            cleanup(&mut console, managed).await;
             return Ok(());
         }
         Err(error) => {
-            if args.tunnel {
-                let _ = remove_stale_runtime_file(&public_url_file);
-            }
-            cleanup(&mut tunnel, &mut console, managed).await;
+            cleanup(&mut console, managed).await;
             return Err(error);
         }
     }
@@ -304,71 +231,21 @@ async fn up(args: UpArgs) -> Result<()> {
     let event = tokio::select! {
         _ = &mut shutdown => RuntimeExit::Signal,
         status = console.wait() => RuntimeExit::Console(status?),
-        status = wait_for_tunnel(&mut tunnel) => RuntimeExit::Tunnel(status?),
         result = wait_for_postgres(managed.as_ref()) => RuntimeExit::Postgres(result),
     };
 
-    if args.tunnel {
-        if let Err(error) = remove_stale_runtime_file(&public_url_file) {
-            eprintln!("清理临时公网地址失败：{error:#}");
-        }
-    }
-    cleanup(&mut tunnel, &mut console, managed).await;
+    cleanup(&mut console, managed).await;
     match event {
         RuntimeExit::Signal => Ok(()),
         RuntimeExit::Console(status) if status.success() => Ok(()),
         RuntimeExit::Console(status) => bail!("brocade-console 意外退出：{status}"),
-        RuntimeExit::Tunnel(status) => bail!("cloudflared 意外退出：{status}"),
         RuntimeExit::Postgres(result) => result,
     }
-}
-
-async fn start_tunnel(
-    args: &UpArgs,
-    paths: &LauncherPaths,
-    platform: Platform,
-    client: &reqwest::Client,
-    local_url: &str,
-    public_url_file: &Path,
-) -> Result<QuickTunnel> {
-    let environment_version = optional_env("BROCADE_CLOUDFLARED_VERSION")?;
-    let requested_version = args
-        .cloudflared_version
-        .as_deref()
-        .or(environment_version.as_deref());
-    let explicit_binary = args.cloudflared_bin.clone().or_else(|| {
-        env::var_os("BROCADE_CLOUDFLARED_BIN")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    });
-    if explicit_binary.is_some() && requested_version.is_some() {
-        bail!("指定 cloudflared 路径时不能同时指定 BROCADE_CLOUDFLARED_VERSION");
-    }
-    let cloudflared = CloudflaredBinary::prepare(
-        explicit_binary,
-        requested_version,
-        &paths.cache,
-        platform,
-        client,
-    )
-    .await?;
-    if let Some(version) = &cloudflared.version {
-        eprintln!("Tunnel: cloudflared {version}");
-    }
-    let tunnel = QuickTunnel::start(&cloudflared, local_url, &paths.runtime, client).await?;
-    atomic_write_private(
-        public_url_file,
-        format!("{}\n", tunnel.url).as_bytes(),
-        0o600,
-    )?;
-    println!("Public: {}", tunnel.url);
-    Ok(tunnel)
 }
 
 enum RuntimeExit {
     Signal,
     Console(ExitStatus),
-    Tunnel(ExitStatus),
     Postgres(Result<()>),
 }
 
@@ -403,7 +280,6 @@ async fn wait_until_initialized(
     local_url: &str,
     access: InitializationAccess<'_>,
     console: &mut Child,
-    tunnel: &mut Option<QuickTunnel>,
     shutdown: &mut std::pin::Pin<Box<impl std::future::Future<Output = ()>>>,
 ) -> Result<bool> {
     if auth_state(client, local_url).await?.initialized {
@@ -413,9 +289,7 @@ async fn wait_until_initialized(
         "{}",
         initialization_instructions(
             access.url,
-            access.local_addr,
             access.bootstrap_token,
-            tunnel.is_some(),
             std::io::stdout().is_terminal(),
         )?
     );
@@ -427,11 +301,6 @@ async fn wait_until_initialized(
         if let Some(status) = console.try_wait()? {
             bail!("brocade-console 在等待管理员初始化时退出：{status}");
         }
-        if let Some(tunnel) = tunnel.as_mut() {
-            if let Some(status) = tunnel.child.try_wait()? {
-                bail!("cloudflared 在等待管理员初始化时退出：{status}");
-            }
-        }
         if auth_state(client, local_url).await?.initialized {
             return Ok(true);
         }
@@ -440,9 +309,7 @@ async fn wait_until_initialized(
 
 fn initialization_instructions(
     initialization_url: &str,
-    local_addr: SocketAddr,
     bootstrap_token: &str,
-    tunneled: bool,
     terminal: bool,
 ) -> Result<String> {
     let initialization_url = entry::entry_url(initialization_url, Some(bootstrap_token), terminal)?;
@@ -451,35 +318,9 @@ fn initialization_instructions(
     } else {
         "请在交互终端运行 sudo brocade url 获取一次性初始化链接。"
     };
-    let mut instructions =
-        format!("首次启动尚未创建管理员。\n初始化地址：{initialization_url}\n{credential}");
-    if !tunneled && local_addr.ip().is_loopback() {
-        let target = match local_addr.ip() {
-            IpAddr::V4(ip) => ip.to_string(),
-            IpAddr::V6(ip) => format!("[{ip}]"),
-        };
-        instructions.push_str(&format!(
-            "\n浏览器不在这台服务器上时，请在浏览器所在电脑另开终端运行：\n\
-             ssh -N -L {port}:{target}:{port} <用户>@<服务器>\n\
-             然后打开 http://127.0.0.1:{port}",
-            port = local_addr.port(),
-        ));
-    }
-    Ok(instructions)
-}
-
-fn admin_bind(explicit: Option<SocketAddr>) -> Result<SocketAddr> {
-    Ok(match explicit {
-        Some(bind) => bind,
-        None => optional_env("BROCADE_ADMIN_BIND")?
-            .map(|value| {
-                value
-                    .parse()
-                    .context("BROCADE_ADMIN_BIND 不是合法的 IP:PORT")
-            })
-            .transpose()?
-            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))),
-    })
+    Ok(format!(
+        "首次启动尚未创建管理员。\n初始化地址：{initialization_url}\n{credential}"
+    ))
 }
 
 async fn auth_state(client: &reqwest::Client, local_url: &str) -> Result<AuthState> {
@@ -494,13 +335,6 @@ async fn auth_state(client: &reqwest::Client, local_url: &str) -> Result<AuthSta
         .context("无法读取管理员初始化状态")
 }
 
-async fn wait_for_tunnel(tunnel: &mut Option<QuickTunnel>) -> Result<ExitStatus> {
-    match tunnel {
-        Some(tunnel) => Ok(tunnel.child.wait().await?),
-        None => pending().await,
-    }
-}
-
 async fn wait_for_postgres(postgres: Option<&ManagedPostgres>) -> Result<()> {
     match postgres {
         Some(postgres) => postgres.wait_for_exit().await,
@@ -508,14 +342,7 @@ async fn wait_for_postgres(postgres: Option<&ManagedPostgres>) -> Result<()> {
     }
 }
 
-async fn cleanup(
-    tunnel: &mut Option<QuickTunnel>,
-    console: &mut Child,
-    postgres: Option<ManagedPostgres>,
-) {
-    if let Some(tunnel) = tunnel {
-        stop_child("cloudflared", &mut tunnel.child, Duration::from_secs(20)).await;
-    }
+async fn cleanup(console: &mut Child, postgres: Option<ManagedPostgres>) {
     stop_child("brocade-console", console, Duration::from_secs(90)).await;
     if let Some(postgres) = postgres {
         if let Err(error) = postgres.stop().await {
@@ -715,63 +542,70 @@ mod tests {
     }
 
     #[test]
-    fn tunneled_bootstrap_names_the_reachable_https_url() {
-        let message = initialization_instructions(
-            "https://bootstrap.example.trycloudflare.com",
-            "127.0.0.1:8080".parse().unwrap(),
-            "bootstrap-test-token-with-at-least-32-bytes",
-            true,
-            true,
-        )
-        .unwrap();
-
-        assert!(message.contains("初始化地址：https://bootstrap.example.trycloudflare.com"));
-        assert!(message.contains("#/initialize/bootstrap-test-token-with-at-least-32-bytes"));
-        assert!(!message.contains("bootstrap-token"));
-        assert!(!message.contains("ssh -N -L"));
+    fn direct_ip_bootstrap_prints_a_complete_initialization_link() {
+        let token = "bootstrap-test-token-with-at-least-32-bytes";
+        let message = initialization_instructions("http://192.0.2.10:8008", token, true).unwrap();
+        assert!(message.contains(&format!(
+            "初始化地址：http://192.0.2.10:8008/#/initialize/{token}"
+        )));
+        let logged = initialization_instructions("http://192.0.2.10:8008", token, false).unwrap();
+        assert!(!logged.contains(token));
+        assert!(logged.contains("sudo brocade url"));
     }
 
     #[test]
-    fn loopback_bootstrap_explains_the_complete_ssh_forward() {
-        let message = initialization_instructions(
-            "http://127.0.0.1:8080",
-            "127.0.0.1:8080".parse().unwrap(),
-            "bootstrap-test-token-with-at-least-32-bytes",
-            false,
-            false,
-        )
-        .unwrap();
-
-        assert!(message.contains("初始化地址：http://127.0.0.1:8080"));
-        assert!(message.contains("ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>"));
-        assert!(message.contains("然后打开 http://127.0.0.1:8080"));
-        assert!(message.contains("sudo brocade url"));
-        assert!(!message.contains("bootstrap-test-token-with-at-least-32-bytes"));
-    }
-
-    #[test]
-    fn release_installer_records_access_and_database_choices() {
+    fn release_installer_records_direct_access_and_database_choices() {
         const INSTALLER: &str = include_str!("../../../install.sh");
-
-        assert!(INSTALLER.contains("Cloudflare Quick Tunnel"));
-        assert!(INSTALLER.contains("已有 HTTPS 站点"));
-        assert!(INSTALLER.contains("DNS、TLS 与反向代理需要自行配置"));
+        assert!(INSTALLER.contains("--public-ip"));
+        assert!(INSTALLER.contains("--port"));
         assert!(INSTALLER.contains("BROCADE_AGENT_PUBLIC_URL"));
         assert!(INSTALLER.contains("Brocade 托管 PostgreSQL"));
         assert!(INSTALLER.contains("--managed-db"));
         assert!(INSTALLER.contains("--external-db"));
-        assert!(INSTALLER.contains("set -- \"$@\" --tunnel"));
-        assert!(INSTALLER.contains("systemctl restart brocade.service"));
-        assert!(INSTALLER.contains("\"$command_path\" url"));
         assert!(INSTALLER.contains("--no-start"));
-        assert!(!INSTALLER.contains("sudo cat /var/lib/brocade/bootstrap-token"));
-        assert!(!INSTALLER.contains("默认初始化地址：http://127.0.0.1:8080"));
+        assert!(INSTALLER.contains("\"$command_path\" url"));
+        assert!(!INSTALLER.contains("cloudflared"));
+        assert!(!INSTALLER.contains("--tunnel"));
         let verify = INSTALLER.find("sha256sum -c SHA256SUMS").unwrap();
         let service = INSTALLER.find("systemctl restart brocade.service").unwrap();
         assert!(
             verify < service,
             "integrity checks must precede service changes"
         );
+    }
+
+    #[test]
+    fn cli_accepts_ip_port_and_rejects_removed_tunnel_options() {
+        let cli = Cli::try_parse_from(["brocade", "address", "--public-ip", "192.0.2.10"]).unwrap();
+        let LauncherCommand::Address(args) = cli.command else {
+            panic!("address command")
+        };
+        let access = args.resolve().unwrap();
+        assert_eq!(access.bind, "0.0.0.0:8008".parse().unwrap());
+        assert_eq!(access.public_url, "http://192.0.2.10:8008");
+        let cli = Cli::try_parse_from([
+            "brocade",
+            "address",
+            "--public-ip",
+            "2001:db8::10",
+            "--port",
+            "9000",
+        ])
+        .unwrap();
+        let LauncherCommand::Address(args) = cli.command else {
+            panic!("address command")
+        };
+        let access = args.resolve().unwrap();
+        assert_eq!(access.bind, "[::]:9000".parse().unwrap());
+        assert_eq!(access.public_url, "http://[2001:db8::10]:9000");
+        for command in ["up", "url", "address"] {
+            for flag in ["--tunnel", "--cloudflared-bin", "--cloudflared-version"] {
+                assert!(Cli::try_parse_from(["brocade", command, flag]).is_err());
+            }
+            for port in ["0", "65536", "invalid"] {
+                assert!(Cli::try_parse_from(["brocade", command, "--port", port]).is_err());
+            }
+        }
     }
 
     #[cfg(unix)]

@@ -44,14 +44,6 @@ impl Platform {
             _ => unreachable!("Platform::current validates the supported matrix"),
         }
     }
-
-    pub(crate) fn cloudflared_asset(self) -> &'static str {
-        match self.arch {
-            "x86_64" => "cloudflared-linux-amd64",
-            "aarch64" => "cloudflared-linux-arm64",
-            _ => unreachable!("Platform::current validates the supported matrix"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -60,35 +52,30 @@ mod tests {
 
     #[test]
     fn supported_matrix_maps_to_upstream_asset_names() {
-        for (arch, libc, postgres, cloudflared) in [
+        for (arch, libc, postgres) in [
             (
                 "x86_64",
                 Libc::Gnu,
                 "embedded-postgres-binaries-linux-amd64",
-                "cloudflared-linux-amd64",
             ),
             (
                 "x86_64",
                 Libc::Musl,
                 "embedded-postgres-binaries-linux-amd64-alpine",
-                "cloudflared-linux-amd64",
             ),
             (
                 "aarch64",
                 Libc::Gnu,
                 "embedded-postgres-binaries-linux-arm64v8",
-                "cloudflared-linux-arm64",
             ),
             (
                 "aarch64",
                 Libc::Musl,
                 "embedded-postgres-binaries-linux-arm64v8-alpine",
-                "cloudflared-linux-arm64",
             ),
         ] {
             let platform = Platform { arch, libc };
             assert_eq!(platform.postgres_artifact(), postgres);
-            assert_eq!(platform.cloudflared_asset(), cloudflared);
         }
     }
 }

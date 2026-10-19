@@ -487,7 +487,6 @@ dependencies = [
  "liblzma",
  "postgresql_embedded",
  "reqwest 0.12.28",
- "semver",
  "serde",
  "sha2 0.10.9",
  "sqlx",

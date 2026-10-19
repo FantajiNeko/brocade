@@ -41,19 +41,3 @@ pub(crate) async fn verified_bytes(
     }
     Ok(bytes)
 }
-
-pub(crate) fn sha256_file(path: &std::path::Path) -> Result<String> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}

@@ -53,7 +53,7 @@ ModelSnapshot -> IR -> 节点产物 -> 期望状态 -> Agent 收敛
 | `crates/brocade-deployment` | 发布计划、热切换和 Console/Agent 共享协议；协议入口为 `src/protocol.rs`。 |
 | `crates/brocade-agent` | 节点侧收敛、系统配置、观测、探测、自更新与离线缓冲。 |
 | `crates/brocade-probe` | Console 与 Agent 共用的临时 Xray 客户端和端到端拨测。 |
-| `crates/brocade-launcher` | Console、可选受管 PostgreSQL 和 Cloudflare Tunnel 的本机编排。 |
+| `crates/brocade-launcher` | Console 和可选受管 PostgreSQL 的本机编排；默认 HTTP IP 入口端口 8008。 |
 | `crates/brocade-preview` | 基于 Docker 的本地集群预览环境。 |
 | `frontend/src/api.ts` | 前端 API 类型与请求入口；后端响应变化时从这里检查调用方。 |
 | `frontend/src/panes/` | 页面级功能；`ui/` 是复用界面组件，`forge/` 是草稿/产物工作区，`topo/` 是拓扑，`wm/` 是窗口与导航状态。 |

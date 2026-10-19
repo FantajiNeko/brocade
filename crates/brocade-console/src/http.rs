@@ -1,9 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    env, fmt, fs,
+    env, fmt,
     net::IpAddr,
-    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -289,10 +288,6 @@ pub struct AppState {
     // Optional dedicated subscription origin. When absent, subscriptions follow the effective
     // Agent public URL, including a value changed live from the settings page.
     subscription_public_url_override: Option<String>,
-    // `brocade up --tunnel` publishes the ephemeral Quick Tunnel hostname atomically here after
-    // cloudflared is ready. Reading it per request lets one Console process follow a new random
-    // hostname without persisting that disposable value in PostgreSQL.
-    runtime_public_url_file: Option<PathBuf>,
     subscription_rate: Arc<Mutex<HashMap<String, SubscriptionRateWindow>>>,
     // A quota change wakes the enforcement loop immediately rather than waiting for its next
     // tick. Lowering a quota has to revoke immediately and raising one has to restore
@@ -393,7 +388,7 @@ impl ConsoleServices {
 /// printed into the command an operator runs on a new machine, and a fallback naming a port with
 /// no listener produces an enrolment that fails at the first fetch. A deployment that splits the
 /// faces passes its own value, and `main.rs` derives it from the address the agent face bound.
-pub const DEFAULT_AGENT_ORIGIN: &str = "http://127.0.0.1:8080";
+pub const DEFAULT_AGENT_ORIGIN: &str = "http://127.0.0.1:8008";
 
 impl AppState {
     pub fn new(store: PgStore) -> Self {
@@ -404,9 +399,8 @@ impl AppState {
         Self::with_agent_origin(store, quota_wake, DEFAULT_AGENT_ORIGIN.to_owned())
     }
 
-    /// The distribution as it stands right now: a process-local launcher URL, over what the
-    /// console has stored, over the environment this process started with, over the built-in
-    /// default.
+    /// The distribution as it stands right now: what the console has stored, over the
+    /// environment this process started with, over the built-in default.
     ///
     /// Resolved per call rather than held on the state. The public Agent origin is editable from
     /// the settings page, and a copy taken at startup would delay an edit until restart. The Xray
@@ -418,33 +412,15 @@ impl AppState {
     async fn distribution(&self) -> Result<AgentDistribution, StoreError> {
         let stored = self.store.distribution().await?;
         let mut dist = self.dist.clone();
-        dist.agent_public_url = resolve_agent_public_url(
-            dist.agent_public_url,
-            stored.agent_public_url,
-            self.runtime_public_url(),
-        );
+        dist.agent_public_url =
+            resolve_agent_public_url(dist.agent_public_url, stored.agent_public_url);
         Ok(dist)
-    }
-
-    fn runtime_public_url(&self) -> Option<String> {
-        let path = self.runtime_public_url_file.as_ref()?;
-        fs::read_to_string(path).ok().and_then(normalize_url)
     }
 
     /// The subscription face normally shares the site's public origin with the Agent face. A
     /// dedicated origin remains available for split deployments, but is an override rather than
     /// a second mandatory setting.
     async fn subscription_origin(&self) -> ApiResult<String> {
-        // A launcher URL must also outrank a deployment's dedicated origin: while Quick Tunnel is
-        // active, every URL shown by this process needs to be reachable through that same random
-        // hostname. The stored and environment settings take effect again as soon as the launcher
-        // file disappears.
-        if let Some(origin) = self
-            .runtime_public_url()
-            .and_then(normalize_subscription_origin)
-        {
-            return Ok(origin);
-        }
         let agent_public_url = self.distribution().await?.agent_public_url;
         resolve_subscription_origin(
             self.subscription_public_url_override.clone(),
@@ -504,20 +480,16 @@ impl AppState {
                 let origin = normalize_subscription_origin(url);
                 if origin.is_none() {
                     eprintln!(
-                        "忽略 BROCADE_SUBSCRIPTION_PUBLIC_URL：生产订阅入口必须使用 HTTPS（本地 debug 仅允许 localhost）"
+                        "忽略 BROCADE_SUBSCRIPTION_PUBLIC_URL：订阅入口必须使用有效的 HTTP 或 HTTPS 地址"
                     );
                 }
                 origin
             });
-        let runtime_public_url_file = env::var_os("BROCADE_RUNTIME_PUBLIC_URL_FILE")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
         Self {
             store,
             bootstrap_credential: None,
             geoip: crate::geoip::GeoIpLookup::default(),
             subscription_public_url_override,
-            runtime_public_url_file,
             subscription_rate: Arc::new(Mutex::new(HashMap::new())),
             quota_wake,
             grants_wake: Arc::new(Notify::new()),
@@ -2789,7 +2761,7 @@ async fn realtime_node_events(
     ))
 }
 
-/// A bounded fallback for proxies such as Cloudflare Quick Tunnel that do not carry SSE.
+/// A bounded fallback when a realtime stream cannot be established.
 ///
 /// Each request briefly acquires the same demand lease as the stream. The realtime service's
 /// stop grace bridges normal two-second polling gaps, so the Agent keeps sampling while the page
@@ -8808,32 +8780,17 @@ fn admin_session_cookie(headers: &HeaderMap) -> Option<&str> {
     None
 }
 
-/// `Secure` is present only in release builds.
-///
-/// A browser stores a cookie carrying `Secure` only in a secure context. `localhost` and
-/// `127.0.0.1` are secure contexts and are accepted over plain HTTP; a LAN address is not. When
-/// debugging with the control plane bound to `0.0.0.0` and opened from another machine at
-/// `http://192.168.x.x:8080`, the login returns 200, the browser discards the cookie, and every
-/// later request answers 401.
-///
-/// Both functions have to use the same value. Setting the cookie without `Secure` and clearing it
-/// with `Secure` gives the browser two different cookies, so signing out does not clear the one
-/// that exists.
-const COOKIE_SECURE: &str = if cfg!(debug_assertions) {
-    ""
-} else {
-    " Secure;"
-};
-
+// The default public entry is plain HTTP on a server IP in every build profile. A Secure
+// cookie would be discarded by browsers there, making a successful login immediately look lost.
 fn session_cookie(token: &str) -> String {
     format!(
-        "{ADMIN_SESSION_COOKIE}={token}; Path=/; HttpOnly;{COOKIE_SECURE} SameSite=Lax; Max-Age={}",
+        "{ADMIN_SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
         brocade_store::ADMIN_SESSION_TTL_SECONDS
     )
 }
 
 fn expired_session_cookie() -> String {
-    format!("{ADMIN_SESSION_COOKIE}=; Path=/; HttpOnly;{COOKIE_SECURE} SameSite=Lax; Max-Age=0")
+    format!("{ADMIN_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
 fn normalize_token(token: String) -> Option<String> {
@@ -8854,27 +8811,18 @@ fn normalize_url(url: String) -> Option<String> {
     }
 }
 
-fn resolve_agent_public_url(
-    configured: String,
-    stored: Option<String>,
-    runtime: Option<String>,
-) -> String {
-    runtime
-        .and_then(normalize_url)
-        .or_else(|| stored.and_then(normalize_url))
-        .unwrap_or(configured)
+fn resolve_agent_public_url(configured: String, stored: Option<String>) -> String {
+    stored.and_then(normalize_url).unwrap_or(configured)
 }
 
 fn normalize_subscription_origin(url: String) -> Option<String> {
     let url = normalize_url(url)?;
-    if url.starts_with("https://")
-        || (cfg!(debug_assertions)
-            && (url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost")))
-    {
-        Some(url)
-    } else {
-        None
-    }
+    let parsed = reqwest::Url::parse(&url).ok()?;
+    (matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none())
+    .then_some(url)
 }
 
 fn resolve_subscription_origin(
@@ -9856,30 +9804,33 @@ mod tests {
     }
 
     #[test]
-    fn subscription_origin_rejects_non_local_plain_http() {
-        assert_eq!(
-            resolve_subscription_origin(None, "http://console.example".to_owned()),
-            None
-        );
+    fn subscription_origin_accepts_direct_http_ip_in_every_profile() {
+        for origin in ["http://192.0.2.10:8008", "http://[2001:db8::10]:8008"] {
+            assert_eq!(
+                resolve_subscription_origin(None, origin.to_owned()).as_deref(),
+                Some(origin)
+            );
+        }
+        for origin in [
+            "file:///tmp/subscription",
+            "https://user:password@example.com",
+        ] {
+            assert!(resolve_subscription_origin(None, origin.to_owned()).is_none());
+        }
     }
 
     #[test]
-    fn launcher_public_url_is_ephemeral_and_highest_precedence() {
+    fn stored_agent_origin_overrides_the_startup_origin() {
         assert_eq!(
             resolve_agent_public_url(
-                "https://environment.example".to_owned(),
-                Some("https://stored.example/".to_owned()),
-                Some("https://random.trycloudflare.com/\n".to_owned()),
+                "http://192.0.2.10:8008".to_owned(),
+                Some("http://192.0.2.11:9000/".to_owned())
             ),
-            "https://random.trycloudflare.com"
+            "http://192.0.2.11:9000"
         );
         assert_eq!(
-            resolve_agent_public_url(
-                "https://environment.example".to_owned(),
-                Some("https://stored.example/".to_owned()),
-                None,
-            ),
-            "https://stored.example"
+            resolve_agent_public_url("http://192.0.2.10:8008".to_owned(), None),
+            "http://192.0.2.10:8008"
         );
     }
 
@@ -10006,12 +9957,9 @@ mod tests {
         assert!(parse("/artifacts/content/user/t:u/clash?protocol=hy2").is_err());
     }
 
-    /// Setting and clearing have to carry the same attributes, or signing out does not clear the
-    /// existing cookie. Whether `Secure` is present is determined by the build profile, and both
-    /// sites change together. The assertion compares against `cfg!`, so it runs in both release
-    /// and debug.
+    /// HTTP IP installs must retain login sessions in both debug and release builds.
     #[test]
-    fn session_cookies_carry_the_same_attributes_in_both_profiles() {
+    fn session_cookies_support_plain_http_in_both_profiles() {
         let set = session_cookie("token-abc");
         let cleared = expired_session_cookie();
         for cookie in [&set, &cleared] {
@@ -10024,10 +9972,9 @@ mod tests {
             cleared.contains("Secure"),
             "置入与清除的 Secure 不一致：\n{set}\n{cleared}"
         );
-        assert_eq!(
-            set.contains("Secure"),
-            !cfg!(debug_assertions),
-            "release 构建必须带 Secure，debug 构建必须不带：{set}"
+        assert!(
+            !set.contains("Secure"),
+            "HTTP IP 入口的 Cookie 不能带 Secure：{set}"
         );
         assert!(set.contains("token-abc"));
         assert!(cleared.contains("Max-Age=0"));
@@ -10739,6 +10686,23 @@ mod tests {
             command.contains("--agent-bin-url 'https://cdn.example.net/agent-arm64'"),
             "{command}"
         );
+    }
+
+    #[test]
+    fn install_command_keeps_the_direct_http_ip_and_port() {
+        let origin = "http://192.0.2.10:8008";
+        let dist = AgentDistribution {
+            agent_public_url: origin.to_owned(),
+            ..AgentDistribution::default()
+        };
+        let command = install_command(
+            &dist,
+            &format!("{origin}/enroll/install.sh"),
+            "abc",
+            InstallCredential::Enrollment("broc_enroll_test"),
+        );
+        assert!(command.contains("curl -fsSL 'http://192.0.2.10:8008/enroll/install.sh'"));
+        assert!(command.contains("--server 'http://192.0.2.10:8008'"));
     }
 
     #[test]

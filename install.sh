@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install a prebuilt Brocade bundle. This script intentionally installs only the small operating
-# system prerequisites; PostgreSQL and cloudflared remain launcher-managed downloads.
+# system prerequisites; PostgreSQL remains a launcher-managed download.
 set -eu
 umask 077
 
@@ -12,7 +12,7 @@ service_user=brocade
 data_root=/var/lib/brocade
 cache_root=/var/cache/brocade
 config_root=/etc/brocade
-installation_type_path=$config_root/installation-type
+listen_address_path=$config_root/listen-address
 public_url_path=$config_root/agent-public-url
 database_type_path=$config_root/database-type
 database_url_path=$config_root/database-url
@@ -28,14 +28,14 @@ die() {
 
 usage() {
     cat <<'EOF'
-Usage: [sudo] sh install.sh [--tunnel | --site-url https://console.example.net]
+Usage: [sudo] sh install.sh [--public-ip IP] [--port PORT]
                               [--managed-db | --database-url postgresql://...]
                               [--no-start]
 
 Installs the two binaries from this release bundle, the minimal OS prerequisites, and a dedicated
-non-login `brocade` account. Without an option, an interactive terminal first asks whether this
-installation uses a Cloudflare Quick Tunnel or an existing HTTPS site. Existing-site operators
-must configure DNS, TLS, and the reverse proxy themselves.
+non-login `brocade` account. Serves HTTP directly on the server IP, port 8008 by default.
+An interactive terminal lets you confirm the detected IP, port, and database choice.
+--public-ip overrides automatic local-address detection, including behind NAT.
 
 PostgreSQL is not installed by apt/apk and no project is compiled.
 Starts the managed systemd service and prints the ready URL. Without systemd, the launcher
@@ -43,8 +43,9 @@ continues in the foreground. --no-start installs files without starting the runt
 EOF
 }
 
-installation_type=
-site_url=
+public_ip=
+port=8008
+port_specified=false
 database_type=
 database_url=
 start_runtime=true
@@ -58,22 +59,24 @@ while [ "$#" -gt 0 ]; do
             start_runtime=false
             shift
             ;;
-        --tunnel)
-            [ -z "$installation_type" ] || die "--tunnel 不能与其他安装类型同时使用"
-            installation_type=tunnel
-            shift
-            ;;
-        --site-url)
-            [ -z "$installation_type" ] || die "--site-url 不能与其他安装类型同时使用"
-            [ "$#" -ge 2 ] || die "--site-url 后需要填写 HTTPS 站点地址"
-            installation_type=site
-            site_url=$2
+        --public-ip)
+            [ "$#" -ge 2 ] || die "--public-ip 后需要填写 IP 地址"
+            public_ip=$2
             shift 2
             ;;
-        --site-url=*)
-            [ -z "$installation_type" ] || die "--site-url 不能与其他安装类型同时使用"
-            installation_type=site
-            site_url=${1#--site-url=}
+        --public-ip=*)
+            public_ip=${1#--public-ip=}
+            shift
+            ;;
+        --port)
+            [ "$#" -ge 2 ] || die "--port 后需要填写端口"
+            port=$2
+            port_specified=true
+            shift 2
+            ;;
+        --port=*)
+            port=${1#--port=}
+            port_specified=true
             shift
             ;;
         --managed-db)
@@ -103,28 +106,13 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限；请用 root 执行（有 sudo 时可执行 sudo sh install.sh）"
 
-normalize_site_url() {
-    site_url=$1
-    while [ "${site_url%/}" != "$site_url" ]; do
-        site_url=${site_url%/}
-    done
+valid_port() {
+    case $port in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#port}" -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
-
-valid_site_url() {
-    [ "${#site_url}" -le 255 ] || return 1
-    case $site_url in
-        https://?*) ;;
-        *) return 1 ;;
-    esac
-    case $site_url in
-        *[[:space:]]*|*\'*|*\"*|*\`*|*\$*|*\\*) return 1 ;;
-    esac
-    site_authority=${site_url#https://}
-    case $site_authority in
-        ''|/*|\?*|\#*|*@*|*\?*|*\#*) return 1 ;;
-    esac
-    return 0
-}
+valid_port || die "端口必须是 1 至 65535 之间的整数"
 
 valid_database_url() {
     [ "${#database_url}" -le 2048 ] || return 1
@@ -136,28 +124,6 @@ valid_database_url() {
         *[[:space:]]*|*[[:cntrl:]]*) return 1 ;;
     esac
     return 0
-}
-
-prompt_installation_type() {
-    [ -t 0 ] || die "非交互安装必须指定 --tunnel 或 --site-url https://你的站点"
-    while :; do
-        say "请选择控制台公网接入方式："
-        say "  1) Cloudflare Quick Tunnel（临时公网地址，由 Brocade 管理 cloudflared）"
-        say "  2) 已有 HTTPS 站点（DNS、TLS 与反向代理需要自行配置）"
-        printf '请输入 1 或 2：'
-        IFS= read -r choice || die "未读取到安装类型"
-        case $choice in
-            1)
-                installation_type=tunnel
-                return
-                ;;
-            2)
-                installation_type=site
-                return
-                ;;
-            *) say "选择无效，请重新输入。" ;;
-        esac
-    done
 }
 
 prompt_database_type() {
@@ -181,24 +147,6 @@ prompt_database_type() {
         esac
     done
 }
-
-[ -n "$installation_type" ] || prompt_installation_type
-if [ "$installation_type" = site ]; then
-    while :; do
-        if [ -z "$site_url" ]; then
-            [ -t 0 ] || die "--site-url 后需要填写 HTTPS 站点地址"
-            printf '请输入已有站点地址（https://...）：'
-            IFS= read -r site_url || die "未读取到站点地址"
-        fi
-        normalize_site_url "$site_url"
-        if valid_site_url; then
-            break
-        fi
-        [ -t 0 ] || die "站点地址无效；必须是最长 255 字符且不含空白、引号的 https:// 地址"
-        say "站点地址无效；必须填写 https:// 开头的完整地址，且不能包含空白或引号。"
-        site_url=
-    done
-fi
 
 [ -n "$database_type" ] || prompt_database_type
 if [ "$database_type" = external ]; then
@@ -229,11 +177,7 @@ if [ "$database_type" = external ]; then
 fi
 
 say "安装配置："
-if [ "$installation_type" = tunnel ]; then
-    say "  公网接入：Cloudflare Quick Tunnel"
-else
-    say "  公网接入：已有 HTTPS 站点（$site_url）"
-fi
+say "  公网接入：服务器 IP 直连 HTTP（默认端口 8008）"
 if [ "$database_type" = managed ]; then
     say "  数据库：Brocade 托管 PostgreSQL"
 else
@@ -364,7 +308,7 @@ install -d -o root -g root -m 0755 "$install_root"
 install -d -o "$service_user" -g "$service_group" -m 0700 "$data_root" "$cache_root"
 install -d -o root -g root -m 0755 "$config_root"
 for config_path in \
-    "$installation_type_path" "$public_url_path" \
+    "$listen_address_path" "$public_url_path" \
     "$database_type_path" "$database_url_path"; do
     if [ -e "$config_path" ] || [ -L "$config_path" ]; then
         [ -f "$config_path" ] && [ ! -L "$config_path" ] ||
@@ -375,7 +319,7 @@ done
 launcher_stage=$install_root/.brocade-launcher.$$
 console_stage=$install_root/.brocade-console.$$
 command_stage=/usr/local/bin/.brocade.$$
-installation_type_stage=$config_root/.installation-type.$$
+listen_address_stage=$config_root/.listen-address.$$
 public_url_stage=$config_root/.agent-public-url.$$
 database_type_stage=$config_root/.database-type.$$
 database_url_stage=$config_root/.database-url.$$
@@ -383,7 +327,7 @@ service_stage=$config_root/.brocade.service.$$
 ready_error=$config_root/.install-ready.$$
 cleanup_staging() {
     rm -f "$launcher_stage" "$console_stage" "$command_stage" \
-        "$installation_type_stage" "$public_url_stage" \
+        "$listen_address_stage" "$public_url_stage" \
         "$database_type_stage" "$database_url_stage" "$service_stage" "$ready_error"
 }
 trap cleanup_staging 0 HUP INT TERM
@@ -391,16 +335,46 @@ trap cleanup_staging 0 HUP INT TERM
 install -o root -g root -m 0755 "$script_dir/brocade-launcher" "$launcher_stage"
 install -o root -g root -m 0755 "$script_dir/brocade-console" "$console_stage"
 
-# Compatibility-check untrusted executable bytes only after dropping to the dedicated account.
-if command -v su-exec >/dev/null 2>&1; then
-    su-exec "$service_user" "$launcher_stage" --version >/dev/null 2>&1 ||
-        die "launcher 无法在当前系统执行"
-else
-    service_uid=$(id -u "$service_user")
-    service_gid=$(id -g "$service_user")
-    setpriv --reuid="$service_uid" --regid="$service_gid" --init-groups \
-        "$launcher_stage" --version >/dev/null 2>&1 || die "launcher 无法在当前系统执行"
+# Run verified bundle bytes as the dedicated account, including address detection.
+run_launcher() {
+    if command -v su-exec >/dev/null 2>&1; then
+        su-exec "$service_user" "$launcher_stage" "$@"
+    else
+        setpriv --reuid="$(id -u "$service_user")" --regid="$(id -g "$service_user")" \
+            --init-groups "$launcher_stage" "$@"
+    fi
+}
+run_launcher --version >/dev/null 2>&1 || die "launcher 无法在当前系统执行"
+resolve_origin() {
+    set -- address --port "$port"
+    [ -z "$public_ip" ] || set -- "$@" --public-ip "$public_ip"
+    run_launcher "$@"
+}
+
+if [ -z "$public_ip" ] && [ -t 0 ]; then
+    detected_origin=$(resolve_origin) || die "无法识别 IP；请加 --public-ip IP 重试"
+    detected_ip=${detected_origin#http://}
+    detected_ip=${detected_ip%:*}
+    detected_ip=${detected_ip#\[}
+    detected_ip=${detected_ip%\]}
+    printf '服务器访问 IP [%s]：' "$detected_ip"
+    IFS= read -r public_ip || die "未读取到服务器 IP"
+    public_ip=${public_ip:-$detected_ip}
 fi
+if [ "$port_specified" = false ] && [ -t 0 ]; then
+    while :; do
+        printf 'HTTP 端口 [8008]：'
+        IFS= read -r selected_port || die "未读取到 HTTP 端口"
+        port=${selected_port:-8008}
+        valid_port && break
+        say "端口必须是 1 至 65535 之间的整数。"
+    done
+fi
+public_url=$(resolve_origin) || die "IP 地址无效；请通过 --public-ip IP 指定服务器地址"
+case $public_url in
+    http://\[*) listen_address="[::]:$port" ;;
+    *) listen_address="0.0.0.0:$port" ;;
+esac
 
 # The public command supplies system paths and, when invoked through sudo/root, drops privileges
 # before the Rust launcher starts. This keeps `sudo brocade up` convenient without ever running
@@ -410,7 +384,7 @@ cat >"$command_stage" <<'EOF'
 set -eu
 service_user=brocade
 runtime=/opt/brocade/brocade-launcher
-installation_type_path=/etc/brocade/installation-type
+listen_address_path=/etc/brocade/listen-address
 public_url_path=/etc/brocade/agent-public-url
 database_type_path=/etc/brocade/database-type
 database_url_path=/etc/brocade/database-url
@@ -418,41 +392,20 @@ database_url_path=/etc/brocade/database-url
 : "${BROCADE_CACHE_DIR:=/var/cache/brocade}"
 export BROCADE_DATA_DIR BROCADE_CACHE_DIR
 
-installation_type=
-if [ -r "$installation_type_path" ]; then
-    IFS= read -r installation_type < "$installation_type_path" || {
-        printf 'brocade: 无法读取安装类型配置\n' >&2
+if [ -z "${BROCADE_AGENT_PUBLIC_URL:-}" ] && [ -r "$public_url_path" ]; then
+    IFS= read -r BROCADE_AGENT_PUBLIC_URL < "$public_url_path" || {
+        printf 'brocade: 无法读取访问地址配置\n' >&2
         exit 1
     }
+    export BROCADE_AGENT_PUBLIC_URL
 fi
-case $installation_type in
-    tunnel) ;;
-    site)
-        if [ -z "${BROCADE_AGENT_PUBLIC_URL:-}" ]; then
-            [ -r "$public_url_path" ] || {
-                printf 'brocade: 已有站点模式缺少公网地址配置\n' >&2
-                exit 1
-            }
-            IFS= read -r BROCADE_AGENT_PUBLIC_URL < "$public_url_path" || {
-                printf 'brocade: 无法读取公网地址配置\n' >&2
-                exit 1
-            }
-            case $BROCADE_AGENT_PUBLIC_URL in
-                https://?*) ;;
-                *)
-                    printf 'brocade: 公网地址配置必须使用 https://\n' >&2
-                    exit 1
-                    ;;
-            esac
-            export BROCADE_AGENT_PUBLIC_URL
-        fi
-        ;;
-    '') ;;
-    *)
-        printf 'brocade: 未识别的安装类型配置：%s\n' "$installation_type" >&2
+if [ -z "${BROCADE_ADMIN_BIND:-}" ] && [ -r "$listen_address_path" ]; then
+    IFS= read -r BROCADE_ADMIN_BIND < "$listen_address_path" || {
+        printf 'brocade: 无法读取监听地址配置\n' >&2
         exit 1
-        ;;
-esac
+    }
+    export BROCADE_ADMIN_BIND
+fi
 
 database_type=
 if [ -r "$database_type_path" ]; then
@@ -490,13 +443,6 @@ case $database_type in
         ;;
 esac
 
-if { [ "${1-}" = up ] || [ "${1-}" = url ]; } && [ "$installation_type" = tunnel ]; then
-    tunnel_requested=false
-    for argument in "$@"; do
-        [ "$argument" = --tunnel ] && tunnel_requested=true
-    done
-    [ "$tunnel_requested" = true ] || set -- "$@" --tunnel
-fi
 if [ "${1-}" = up ] && { [ "$database_type" = managed ] || [ "$database_type" = external ]; }; then
     database_requested=false
     for argument in "$@"; do
@@ -538,12 +484,10 @@ exec "$runtime" "$@"
 EOF
 chmod 0755 "$command_stage"
 
-printf '%s\n' "$installation_type" >"$installation_type_stage"
-chmod 0644 "$installation_type_stage"
-if [ "$installation_type" = site ]; then
-    printf '%s\n' "$site_url" >"$public_url_stage"
-    chmod 0644 "$public_url_stage"
-fi
+printf '%s\n' "$listen_address" >"$listen_address_stage"
+chmod 0644 "$listen_address_stage"
+printf '%s\n' "$public_url" >"$public_url_stage"
+chmod 0644 "$public_url_stage"
 printf '%s\n' "$database_type" >"$database_type_stage"
 chmod 0644 "$database_type_stage"
 if [ "$database_type" = external ]; then
@@ -558,13 +502,10 @@ mv -f "$console_stage" "$console_path"
 mv -f "$launcher_stage" "$launcher_path"
 install -o root -g root -m 0644 "$script_dir/BROCADE_PLATFORM" "$install_root/BROCADE_PLATFORM"
 install -o root -g root -m 0644 "$script_dir/SHA256SUMS" "$install_root/SHA256SUMS"
-if [ "$installation_type" = site ]; then
-    mv -f "$public_url_stage" "$public_url_path"
-    mv -f "$installation_type_stage" "$installation_type_path"
-else
-    mv -f "$installation_type_stage" "$installation_type_path"
-    rm -f "$public_url_path"
-fi
+mv -f "$public_url_stage" "$public_url_path"
+mv -f "$listen_address_stage" "$listen_address_path"
+# One-time migration: the new wrapper no longer reads the retired access-mode selector.
+rm -f "$config_root/installation-type"
 if [ "$database_type" = external ]; then
     mv -f "$database_url_stage" "$database_url_path"
     mv -f "$database_type_stage" "$database_type_path"
@@ -576,13 +517,9 @@ mv -f "$command_stage" "$command_path"
 trap - 0 HUP INT TERM
 
 say "Brocade 已安装完成。"
-if [ "$installation_type" = tunnel ]; then
-    say "安装类型：Cloudflare Quick Tunnel（临时地址可能在每次启动时变化）"
-else
-    say "安装类型：已有 HTTPS 站点"
-    say "已登记地址：$site_url"
-    say "请确认该站点的 DNS、TLS 与反向代理已就绪，并把请求转发到 http://127.0.0.1:8080。"
-fi
+say "访问方式：服务器 IP 直连 HTTP"
+say "控制台地址：$public_url"
+say "监听地址：$listen_address"
 if [ "$database_type" = managed ]; then
     say "数据库：Brocade 托管 PostgreSQL（首次启动自动下载并初始化）"
 else

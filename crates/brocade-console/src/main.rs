@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url =
         env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set for brocade-console")?;
     let admin_bind: SocketAddr = env::var("BROCADE_ADMIN_BIND")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
+        .unwrap_or_else(|_| "0.0.0.0:8008".to_owned())
         .parse()?;
     // Absent means one listener carrying both faces. Splitting them costs a second open port, a
     // second reverse-proxy entry and a second certificate, and it buys nothing on its own — the

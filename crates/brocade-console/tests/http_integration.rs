@@ -3230,11 +3230,8 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         .to_owned();
     assert!(init_cookie.starts_with("brocade_session=broc_session_"));
     assert!(init_cookie.contains("HttpOnly"));
-    // `Secure` only appears in release builds — in debug the console is often bound to 0.0.0.0, and
-    // plaintext HTTP over a LAN IP is not a secure context, so a `Secure` cookie would be dropped by
-    // the browser. The mapping between this value and the build type is pinned separately by
-    // `session_cookies_carry_the_same_attributes_in_both_profiles` in http.rs.
-    assert_eq!(init_cookie.contains("Secure"), !cfg!(debug_assertions));
+    // Plain HTTP on a public IP must retain the session in release builds too.
+    assert!(!init_cookie.contains("Secure"));
     assert!(init_cookie.contains("SameSite=Lax"));
     let init_cookie_pair = init_cookie.split(';').next().unwrap().to_owned();
     let body = response_json(response).await;

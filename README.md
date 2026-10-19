@@ -220,33 +220,23 @@ CI 同时生成同名 `.tar.gz.sha256`，用于在解压前校验整个归档。
 sudo sh install.sh
 ```
 
-安装器首先选择公网接入方式与数据库方式。公网接入可选由 launcher 管理的 Cloudflare Quick Tunnel，或登记一个已经准备好的 HTTPS 站点；后者的 DNS、TLS 与反向代理仍由操作者自行配置，默认应转发到 `127.0.0.1:8080`。数据库可选 Brocade 托管 PostgreSQL，或填写已有 PostgreSQL 的连接地址；外部连接地址以仅 root 与 `brocade` 账号可读的权限保存，连接失败不会回退并建立空库。非交互安装必须显式给出两项选择，例如：
+安装器默认直接提供服务器 IP 的 HTTP 入口，监听 `0.0.0.0:8008`。交互安装先选择托管或外部 PostgreSQL，再确认自动识别的服务器 IP 和端口；重启或升级不会重新分配入口地址。NAT 环境请填写外部机器能访问的 IP，并做好端口映射。非交互安装可指定：
 
 ```sh
-sudo sh install.sh --tunnel --managed-db
-sudo sh install.sh --site-url https://console.example.net \
+sudo sh install.sh --public-ip 192.0.2.10 --managed-db
+sudo sh install.sh --public-ip 192.0.2.10 --port 9000 \
   --database-url postgresql://brocade:password@database.example.net/brocade
 ```
 
-包含密码的连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器随后校验发行包与 CPU/libc 是否匹配，再通过 apt、apk、dnf、yum 或 zypper 补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建无登录权限的 `brocade` 服务账号，并原子安装两个二进制和选择结果。musl 发行物由 CI 强制检查为无动态库依赖。有 systemd 时安装器自动启用并启动 `brocade.service`，等待数据库、控制台与公网入口就绪后输出完整初始化链接；打开链接只需设置管理员用户名和密码，无需读取服务器文件。无 systemd 时在当前终端前台运行 launcher，需保持终端打开。无需 Docker，也不会通过系统包管理器安装或编译 PostgreSQL；PostgreSQL 与 cloudflared 由 launcher 下载并校验。自动化只安装文件时可加 `--no-start`，稍后手动启动：
+省略 `--public-ip` 时，安装器使用默认路由的本机地址；省略 `--port` 时使用 8008。包含密码的数据库连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器校验发行包与 CPU/libc 后补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建 `brocade` 服务账号并原子安装二进制和配置。有 systemd 时自动启用并启动 `brocade.service`，等待就绪后输出 `http://服务器IP:8008/#/initialize/...` 完整初始化链接；打开后设置管理员用户名和密码即可。无 systemd 时在当前终端前台运行。自动化仅安装文件可加 `--no-start`，随后手动启动：
 
 ```sh
 sudo brocade up
 ```
 
-未设置 `DATABASE_URL` 时，launcher 会按当前 CPU 与 libc（x86_64/aarch64、GNU/musl）下载并校验固定的 PostgreSQL 17.11.0 运行时，在用户数据目录维护数据库；设置了 `DATABASE_URL` 则只连接外部数据库，绝不会因连接失败回退并新建空库。需要把选择写得更明确时，可使用 `--managed-db` 或 `--external-db`。PostgreSQL 不会由本项目编译或塞进 launcher；所选预编译归档自带匹配的共享库，并通过相对 RUNPATH 从自己的 `lib/` 加载。这些 PG 私有库不能安全替换成发行版包：OpenSSL、ICU 与 libxml2 在不同 Debian、Ubuntu、Alpine 版本上的 SONAME 并不稳定，而数据目录必须继续由同一套 PG 版本读取。
+未设置 `DATABASE_URL` 时，launcher 按 CPU 与 libc 下载并校验固定的 PostgreSQL 17.11.0，在持久目录维护数据库；设置了 `DATABASE_URL` 则只连接外部数据库，失败不会回退并新建空库。可用 `--managed-db` 或 `--external-db` 明确选择。系统安装器将访问地址保存到 `/etc/brocade/agent-public-url`，监听地址保存到 `/etc/brocade/listen-address`，以后启动继续使用。直接从发行包执行时可传 `brocade-launcher up --public-ip 192.0.2.10 --port 8008`；仅查看识别结果可执行 `brocade-launcher address`。
 
-选择 Quick Tunnel 后，系统安装版的同一条启动命令会按保存的安装类型自动启用它；也可以在未使用系统安装配置时显式传入选项：
-
-```sh
-sudo brocade up --tunnel
-```
-
-首次启动时，launcher 生成 32 字节随机初始化凭据，以 `0600` 私有文件保存供重启恢复。完整初始化链接把一次性凭据放在 `#/initialize/...` fragment 中，浏览器不会把 fragment 放进 HTTP 请求或 Referer；网页接收后立即从地址栏清除，只在内存保留直到提交。完整链接仅向交互终端输出，重定向和 systemd 日志只输出普通地址；再次获取入口可在终端运行 `sudo brocade url`。初始化成功后凭据立即失效，私有文件被删除。手动部署指定 `BROCADE_BOOTSTRAP_TOKEN` 的旧入口仍可填写凭据，以兼容已有部署。初始化只创建系统管理员和根租户，不预置网络用户；登录后由可恢复的入门向导依次纳管首台机器、创建链和首个用户、发布配置，并以真实用户授权完成一次节点拨测。
-
-使用 `--tunnel` 时，一次性凭据先保护初始化接口，launcher 再建立 Tunnel，安装终端输出带有随机 `https://*.trycloudflare.com` 地址的完整链接。若不希望初始化提交经过 Cloudflare，可在浏览器所在电脑建立 `ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>` 转发，把完整链接的站点部分改成 `http://127.0.0.1:8080` 并保留 fragment。launcher 查询 Cloudflare 官方 latest stable release，校验官方 SHA-256 后缓存 `cloudflared`。查询失败时只会回退到最近一个已验证缓存；不会执行 cloudflared 自更新，也不会把它打进 Brocade 发行包。需要可复现环境时使用 `--cloudflared-version VERSION`，已有受管安装时使用 `--cloudflared-bin PATH`。
-
-Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地址每次可能变化，并受 Cloudflare 的并发限制；正式部署仍应使用自己的域名、TLS 与受管 Tunnel/反向代理。Quick Tunnel 不支持 SSE，控制台会在实时流失败后自动切换到同权限、无缓存的短轮询接口。
+首次启动生成一次性初始化凭据。完整链接把凭据放在 `#/initialize/...` fragment 中，网页接收后清除地址栏 fragment，只在内存保留直到提交。完整链接仅向交互终端输出，重定向和 systemd 日志只输出普通地址；再次获取入口运行 `sudo brocade url`。初始化成功后凭据失效，私有文件被删除。初始化只创建系统管理员和根租户；登录后由入门向导纳管首台机器、创建链和首个用户、发布配置并完成真实节点拨测。登录、订阅链接和 Agent 安装命令均支持 HTTP IP 入口。
 
 系统安装器把数据和下载缓存分别放在 `/var/lib/brocade` 与 `/var/cache/brocade`；`sudo brocade` 会先降权到专用账号，PostgreSQL 和 Console 都不会以 root 运行。直接从解压目录执行时，默认仍为 `$XDG_DATA_HOME/brocade`（或 `~/.local/share/brocade`）与 `$XDG_CACHE_HOME/brocade`（或 `~/.cache/brocade`）。完整参数见 `brocade up --help`。
 
@@ -257,7 +247,7 @@ Cloudflare Quick Tunnel 适合临时查看和联调，不提供 SLA，公网地�
 | `brocade-core`       | 纯函数编译器：模型快照 → IR → 节点产物                     |
 | `brocade-store`      | PostgreSQL 持久化：修订、草稿、发布、凭据、配额与用量      |
 | `brocade-console`    | 控制台 API、节点 API，以及内嵌的 Web 控制台与 agent 发行物 |
-| `brocade-launcher`   | 一键编排 Console、可选受管 PostgreSQL 与 Cloudflare Tunnel |
+| `brocade-launcher`   | 一键编排 Console 与可选受管 PostgreSQL |
 | `brocade-deployment` | 发布计划和控制面—节点协议类型                              |
 | `brocade-agent`      | 节点侧收敛、观测、探测与用量采集                           |
 | `brocade-probe`      | Agent 与控制面共用的临时 Xray 客户端和端到端拨测执行器     |
@@ -397,7 +387,7 @@ ssh deploy@console.example.net \
 ```dotenv
 DATABASE_URL=postgres://brocade:CHANGE_ME@127.0.0.1:5432/brocade
 BROCADE_BOOTSTRAP_TOKEN=CHANGE_ME
-BROCADE_ADMIN_BIND=127.0.0.1:8080
+BROCADE_ADMIN_BIND=127.0.0.1:8008
 BROCADE_AGENT_PUBLIC_URL=https://console.example.net
 BROCADE_CACHE_DIR=/var/cache/brocade
 BROCADE_PROBE_RUNTIME_DIR=/run/brocade/probes
@@ -436,7 +426,7 @@ sudo chmod 0600 /opt/brocade/console.env
 Description=Brocade Console listener
 
 [Socket]
-ListenStream=127.0.0.1:8080
+ListenStream=127.0.0.1:8008
 Accept=no
 Backlog=4096
 NoDelay=true
@@ -535,7 +525,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/console.example.net/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:8008;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -634,7 +624,7 @@ SQL 归因范围是请求任务内的查询，不包含后台任务、另行 spa
 或 SSH 转发的本地端口，运行顺序、只读的 HTTP 基线：
 
 ```sh
-BROCADE_BASE_URL=http://127.0.0.1:8080 \
+BROCADE_BASE_URL=http://127.0.0.1:8008 \
   BROCADE_BASELINE_REPEATS=10 node scripts/performance-baseline.mjs > baseline.json
 node --test scripts/performance-baseline.test.mjs
 ```
