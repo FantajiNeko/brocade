@@ -21,9 +21,11 @@ type Listener struct {
 	listener      net.Listener
 	tlsConfig     *gotls.Config
 	realityConfig *goreality.Config
+	realityGuard  *reality.FallbackProtection
 	authConfig    internet.ConnectionAuthenticator
 	config        *Config
 	addConn       internet.ConnHandler
+	handoff       handoffGate
 }
 
 // ListenTCP creates a new Listener based on configurations.
@@ -54,10 +56,14 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 		}
 		errors.LogInfo(ctx, "listening Unix Domain Socket on ", address)
 	} else {
-		listener, err = internet.ListenSystem(ctx, &net.TCPAddr{
+		addr := &net.TCPAddr{
 			IP:   address.IP(),
 			Port: int(port),
-		}, streamSettings.SocketSettings)
+		}
+		unsupported := streamSettings.TcpmaskManager != nil || tcpSettings.HeaderSettings != nil || (streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol)
+		listener, l.handoff, err = openHandoffListener(addr.String(), unsupported, streamSettings.SocketSettings, func() (net.Listener, error) {
+			return internet.ListenSystem(ctx, addr, streamSettings.SocketSettings)
+		})
 		if err != nil {
 			return nil, errors.New("failed to listen TCP on ", address, ":", port).Base(err)
 		}
@@ -79,6 +85,7 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 	if config := reality.ConfigFromStreamSettings(streamSettings); config != nil {
 		l.realityConfig = config.GetREALITYConfig()
+		l.realityGuard = reality.DefaultFallbackProtection()
 		go goreality.DetectPostHandshakeRecordsLens(l.realityConfig)
 	}
 
@@ -100,7 +107,16 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 
 func (v *Listener) keepAccepting() {
 	for {
+		if v.handoff != nil && !v.handoff.beforeAccept() {
+			return
+		}
 		conn, err := v.listener.Accept()
+		if v.handoff != nil {
+			v.handoff.afterAccept(err == nil)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+		}
 		if err != nil {
 			errStr := err.Error()
 			if strings.Contains(errStr, "closed") {
@@ -112,18 +128,32 @@ func (v *Listener) keepAccepting() {
 			}
 			continue
 		}
+		if v.handoff != nil {
+			if err := v.handoff.prepareConnection(conn); err != nil {
+				v.handoff.finishConnection()
+				conn.Close()
+				errors.LogWarningInner(context.Background(), err, "failed to restore inherited TCP connection options")
+				continue
+			}
+		}
 
 		go func() {
 			if v.tlsConfig != nil {
 				conn = tls.Server(conn, v.tlsConfig)
 			} else if v.realityConfig != nil {
-				if conn, err = reality.Server(conn, v.realityConfig); err != nil {
+				if conn, err = reality.Server(conn, v.realityConfig, v.realityGuard); err != nil {
+					if v.handoff != nil {
+						v.handoff.finishConnection()
+					}
 					errors.LogInfo(context.Background(), err.Error())
 					return
 				}
 			}
 			if v.authConfig != nil {
 				conn = v.authConfig.Server(conn)
+			}
+			if v.handoff != nil {
+				v.handoff.trackConnection(conn)
 			}
 			v.addConn(stat.Connection(conn))
 		}()
@@ -137,6 +167,9 @@ func (v *Listener) Addr() net.Addr {
 
 // Close implements internet.Listener.Close.
 func (v *Listener) Close() error {
+	if v.handoff != nil {
+		v.handoff.close()
+	}
 	return v.listener.Close()
 }
 

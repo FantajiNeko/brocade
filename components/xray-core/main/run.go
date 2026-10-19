@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/main/commands/base"
+	"github.com/xtls/xray-core/transport/internet/tcp"
 )
 
 var cmdRun = &base.Command{
@@ -87,11 +88,23 @@ func executeRun(cmd *base.Command, args []string) {
 		os.Exit(0)
 	}
 
+	if err := tcp.InitHandoff(); err != nil {
+		fmt.Println("Failed to initialize generation handoff:", err)
+		os.Exit(23)
+	}
 	if err := server.Start(); err != nil {
+		_ = tcp.CloseHandoff()
 		fmt.Println("Failed to start:", err)
 		os.Exit(-1)
 	}
+	if err := tcp.MarkHandoffReady(); err != nil {
+		_ = tcp.CloseHandoff()
+		_ = server.Close()
+		fmt.Println("Failed to prepare generation handoff:", err)
+		os.Exit(23)
+	}
 	defer server.Close()
+	defer tcp.CloseHandoff()
 
 	// Explicitly triggering GC to remove garbage from config loading.
 	runtime.GC()

@@ -47,6 +47,23 @@ type ProtocolOnlineMap interface {
 	ForEachWithProtocols(func(ip string, lastSeen int64, protocols []string) bool)
 }
 
+// SessionTrafficOnlineMap augments an online source with the lifetime and byte totals of its
+// current continuous online epoch. The counters are scoped to one online map (one authenticated
+// user label) and one source address; they are discarded when the source's reference count reaches
+// zero. Call TrafficCounters only after adding the source reference.
+type SessionTrafficOnlineMap interface {
+	ProtocolOnlineMap
+	TrafficCounters(ip string) (uplink Counter, downlink Counter, ok bool)
+	ForEachWithSessionTraffic(func(
+		ip string,
+		lastSeen int64,
+		onlineSince int64,
+		uplinkBytes int64,
+		downlinkBytes int64,
+		protocols []string,
+	) bool)
+}
+
 // Channel is the interface for stats channel.
 //
 // xray:api:stable

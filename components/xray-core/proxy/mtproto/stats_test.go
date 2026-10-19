@@ -16,6 +16,10 @@ import (
 
 type unavailableAccounting struct{ featurestats.NoopManager }
 
+type siteAccounting struct{ *appstats.Manager }
+
+func (siteAccounting) SiteStatsEnabled() bool { return true }
+
 func (unavailableAccounting) RegisterCounter(string) (featurestats.Counter, error) {
 	return nil, errors.New("fixture accounting storage unavailable")
 }
@@ -33,10 +37,11 @@ func TestAccountConnectionRejectsUnavailableRequiredAccounting(t *testing.T) {
 }
 
 func TestAccountConnectionPublishesUserTrafficAndOnlineProtocol(t *testing.T) {
-	manager, err := appstats.NewManager(context.Background(), nil)
+	base, err := appstats.NewManager(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager := siteAccounting{base}
 	server, client := net.Pipe()
 	defer client.Close()
 
@@ -108,6 +113,27 @@ func TestAccountConnectionPublishesUserTrafficAndOnlineProtocol(t *testing.T) {
 	}
 	if got := manager.GetCounter("user>>>" + email + ">>>traffic>>>downlink").Value(); got != int64(len(downlink)) {
 		t.Fatalf("downlink counter = %d", got)
+	}
+	if got := manager.GetCounter("site>>>" + email + ">>>telegram>>>traffic>>>uplink").Value(); got != int64(len(uplink)) {
+		t.Fatalf("Telegram uplink = %d", got)
+	}
+	if got := manager.GetCounter("site>>>" + email + ">>>telegram>>>traffic>>>downlink").Value(); got != int64(len(downlink)) {
+		t.Fatalf("Telegram downlink = %d", got)
+	}
+	session, ok := online.(featurestats.SessionTrafficOnlineMap)
+	if !ok {
+		t.Fatal("online map does not expose source-session traffic")
+	}
+	var sourceUp, sourceDown int64
+	session.ForEachWithSessionTraffic(func(ip string, _, onlineSince, up, down int64, _ []string) bool {
+		if ip != sourceIP || onlineSince <= 0 {
+			t.Fatalf("source session = %q since %d", ip, onlineSince)
+		}
+		sourceUp, sourceDown = up, down
+		return true
+	})
+	if sourceUp != int64(len(uplink)) || sourceDown != int64(len(downlink)) {
+		t.Fatalf("source session traffic = %d/%d", sourceUp, sourceDown)
 	}
 
 	stopAccounting()

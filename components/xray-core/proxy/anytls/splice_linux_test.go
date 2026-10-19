@@ -427,8 +427,12 @@ func TestKernelTLSFastPathPreservesDispatchMetadata(t *testing.T) {
 		if capture.inbound.CanSpliceCopy.Load() != sessionctx.SpliceCopyDirect {
 			t.Fatalf("per-stream splice state = %v, want direct", capture.inbound.CanSpliceCopy.Load())
 		}
-		if capture.content != content || !capture.content.SniffingRequest.Enabled || !capture.content.SniffingRequest.RouteOnly {
-			t.Fatal("fast path changed the sniffing request context")
+		if capture.content == nil || capture.content == content || !capture.content.SniffingRequest.Enabled || !capture.content.SniffingRequest.RouteOnly {
+			t.Fatal("fast path did not preserve sniffing policy in independent stream metadata")
+		}
+		capture.content.SetAttribute("xray.sniffing", "failed")
+		if content.Attributes != nil {
+			t.Fatal("fast path shared sniffed attributes with connection metadata")
 		}
 		if capture.destination != destination {
 			t.Fatalf("dispatch destination = %v, want %v", capture.destination, destination)

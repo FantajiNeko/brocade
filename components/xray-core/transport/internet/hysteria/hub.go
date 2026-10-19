@@ -152,15 +152,21 @@ type httpHandler struct {
 	validator   *account.Validator
 	masqHandler http.Handler
 
-	auth  bool
-	mutex sync.Mutex
-	user  *protocol.MemoryUser
+	auth        bool
+	mutex       sync.Mutex
+	user        *protocol.MemoryUser
+	workers     sync.WaitGroup
+	closed      bool
+	releaseUser func()
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && r.Host == URLHost && r.URL.Path == URLPath {
 		h.mutex.Lock()
 		defer h.mutex.Unlock()
+		if h.closed {
+			return
+		}
 
 		if h.auth {
 			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(hyCtx.RequireDatagramFromContext(h.ctx)))
@@ -175,13 +181,23 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var user *protocol.MemoryUser
 		var ok bool
-		if h.validator != nil && h.validator.GetCount() > 0 {
+		if h.validator != nil && (h.validator.IsManaged() || h.config.Auth == "") {
 			user = h.validator.Get(auth)
 		} else if h.config.Auth != "" {
 			ok = auth == h.config.Auth
 		}
 
 		if user != nil || ok {
+			if user != nil {
+				release, admitted := h.validator.RegisterConnection(user, func() {
+					_ = h.conn.CloseWithError(closeErrCodeOK, "authorization revoked")
+				})
+				if !admitted {
+					h.masqHandler.ServeHTTP(w, r)
+					return
+				}
+				h.releaseUser = release
+			}
 			h.auth = true
 			h.user = user
 
@@ -216,8 +232,15 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 					user: h.user,
 				}
-				go udpSM.clean()
-				go udpSM.run()
+				h.workers.Add(2)
+				go func() {
+					defer h.workers.Done()
+					udpSM.clean()
+				}()
+				go func() {
+					defer h.workers.Done()
+					udpSM.run()
+				}()
 			}
 
 			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(hyCtx.RequireDatagramFromContext(h.ctx)))
@@ -232,7 +255,11 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if err != nil || !h.auth {
+	h.mutex.Lock()
+	authenticated := h.auth && !h.closed
+	user := h.user
+	h.mutex.Unlock()
+	if err != nil || !authenticated {
 		return false, nil
 	}
 
@@ -247,7 +274,7 @@ func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, 
 			local:  h.conn.LocalAddr(),
 			remote: h.conn.RemoteAddr(),
 
-			user: h.user,
+			user: user,
 		})
 		return true, nil
 	default:
@@ -255,10 +282,22 @@ func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, 
 	}
 }
 
+func (h *httpHandler) releaseAuthentication() {
+	h.mutex.Lock()
+	h.closed = true
+	release := h.releaseUser
+	h.releaseUser = nil
+	h.mutex.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
 type Listener struct {
 	ctx      context.Context
 	pktConn  net.PacketConn
 	listener *quic.Listener
+	handoff  internet.PacketHandoffGate
 	addConn  internet.ConnHandler
 
 	config      *Config
@@ -268,6 +307,9 @@ type Listener struct {
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
+	if l.handoff != nil {
+		defer l.handoff.FinishConnection()
+	}
 	handler := &httpHandler{
 		ctx:     l.ctx,
 		conn:    conn,
@@ -284,12 +326,28 @@ func (l *Listener) handleClient(conn *quic.Conn) {
 	}
 	err := h3.ServeQUICConn(conn)
 	_ = conn.CloseWithError(closeErrCodeOK, "")
+	handler.releaseAuthentication()
+	handler.workers.Wait()
 	errors.LogDebug(context.Background(), conn.RemoteAddr(), " disconnected with err ", err)
 }
 
 func (l *Listener) keepAccepting() {
 	for {
-		conn, err := l.listener.Accept(context.Background())
+		acceptCtx := context.Background()
+		if l.handoff != nil {
+			var proceed bool
+			acceptCtx, proceed = l.handoff.BeforeAccept(acceptCtx)
+			if !proceed {
+				return
+			}
+		}
+		conn, err := l.listener.Accept(acceptCtx)
+		if l.handoff != nil {
+			l.handoff.AfterAccept(err == nil)
+			if errors.Cause(err) == context.Canceled {
+				continue
+			}
+		}
 		if err != nil {
 			errors.LogInfoInner(context.Background(), err, "failed to accept QUIC connection")
 			break
@@ -303,6 +361,9 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
+	if l.handoff != nil {
+		l.handoff.Close()
+	}
 	err := l.listener.Close()
 	_ = l.pktConn.Close()
 	return err
@@ -372,7 +433,14 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		return nil, errors.New("unknown masq type")
 	}
 
-	raw, err := internet.ListenSystemPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings.SocketSettings)
+	logicalAddress := (&net.UDPAddr{IP: address.IP(), Port: int(port)}).String()
+	raw, handoff, err := internet.OpenPacketHandoffListener(logicalAddress, streamSettings.SocketSettings, func(bindAddress string) (net.PacketConn, error) {
+		udpAddress, err := net.ResolveUDPAddr("udp", bindAddress)
+		if err != nil {
+			return nil, err
+		}
+		return internet.ListenSystemPacket(context.Background(), udpAddress, streamSettings.SocketSettings)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -437,6 +505,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		ctx:      ctx,
 		pktConn:  pktConn,
 		listener: qListener,
+		handoff:  handoff,
 		addConn:  handler,
 
 		config:      config,

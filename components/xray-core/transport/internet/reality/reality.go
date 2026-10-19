@@ -38,6 +38,17 @@ type Conn struct {
 	suppressCloseNotify atomic.Bool
 }
 
+// NetConn keeps the pre-authentication fallback guard out of the authenticated data path.
+// The external REALITY connection retains the wrapper it handshook over, but callers which
+// deliberately unwrap REALITY for splice need the original TCP connection.
+func (c *Conn) NetConn() net.Conn {
+	conn := c.Conn.NetConn()
+	if guarded, ok := conn.(*fallbackIdleConn); ok {
+		return guarded.Conn
+	}
+	return conn
+}
+
 func (c *Conn) SuppressCloseNotify() {
 	c.suppressCloseNotify.Store(true)
 }
@@ -70,9 +81,8 @@ func (c *Conn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
 	return input, rawInput
 }
 
-func Server(c net.Conn, config *reality.Config) (net.Conn, error) {
-	realityConn, err := reality.Server(context.Background(), c, config)
-	return &Conn{Conn: realityConn}, err
+func Server(c net.Conn, config *reality.Config, protection *FallbackProtection) (net.Conn, error) {
+	return serverWithFallbackProtection(c, config, protection)
 }
 
 type UConn struct {

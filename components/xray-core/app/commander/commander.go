@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/outbound"
+	"github.com/xtls/xray-core/transport/internet/tcp"
 	"google.golang.org/grpc"
 )
 
@@ -74,7 +75,7 @@ func (c *Commander) Start() error {
 	}
 
 	if len(c.listen) > 0 {
-		if l, err := net.Listen("tcp", c.listen); err != nil {
+		if l, err := tcp.ListenHandoffControl(context.Background(), c.listen); err != nil {
 			errors.LogErrorInner(context.Background(), err, "API server failed to listen on ", c.listen)
 			return err
 		} else {

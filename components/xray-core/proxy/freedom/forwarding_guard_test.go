@@ -39,6 +39,30 @@ func (*forwardingSystemDialer) Dial(ctx context.Context, dest xnet.Destination) 
 func (*forwardingSystemDialer) DestIpAddress() xnet.IP                                { return nil }
 func (*forwardingSystemDialer) SetOutboundGateway(context.Context, *session.Outbound) {}
 
+func TestFreedomOnlyBlocksExplicitIPRules(t *testing.T) {
+	for _, blocked := range []*IPRules{nil, {}} {
+		handler := new(Handler)
+		if err := handler.Init(&Config{IpsBlocked: blocked}, policy.DefaultManager{}); err != nil {
+			t.Fatal(err)
+		}
+		if handler.blockedIPMatcher != nil {
+			t.Fatal("missing or empty ipsBlocked unexpectedly enabled an IP blocker")
+		}
+	}
+
+	rules, err := geodata.ParseIPRules([]string{"127.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := new(Handler)
+	if err := handler.Init(&Config{IpsBlocked: &IPRules{Rules: rules}}, policy.DefaultManager{}); err != nil {
+		t.Fatal(err)
+	}
+	if handler.blockedIPMatcher == nil || !handler.blockedIPMatcher.Match(xnet.LocalHostIP.IP()) {
+		t.Fatal("explicit ipsBlocked rule did not enable the IP blocker")
+	}
+}
+
 func TestForwardingGuardBlocksBeforeTCPConnectIncludingDNSFallback(t *testing.T) {
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {

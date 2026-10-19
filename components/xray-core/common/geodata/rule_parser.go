@@ -13,6 +13,36 @@ const (
 	DefaultGeoSiteDat = "geosite.dat"
 )
 
+type geoIPFamily uint8
+
+const (
+	geoIPFamilyAny geoIPFamily = iota
+	geoIPFamilyIPv4
+	geoIPFamilyIPv6
+)
+
+// splitGeoIPFamily keeps the address-family selector in the rule code so cache keys stay
+// distinct, while loading the actual country entry by its base code. The @ syntax follows
+// geosite attributes but deliberately accepts exactly one selector: address families are
+// mutually exclusive rather than a list of independent attributes.
+func splitGeoIPFamily(code string) (string, geoIPFamily, error) {
+	base, selector, found := strings.Cut(code, "@")
+	if !found {
+		return code, geoIPFamilyAny, nil
+	}
+	if base == "" || selector == "" || strings.Contains(selector, "@") {
+		return "", geoIPFamilyAny, errors.New("invalid geoip address family selector")
+	}
+	switch strings.ToUpper(selector) {
+	case "IPV4":
+		return base, geoIPFamilyIPv4, nil
+	case "IPV6":
+		return base, geoIPFamilyIPv6, nil
+	default:
+		return "", geoIPFamilyAny, errors.New("unknown geoip address family selector: ", selector)
+	}
+}
+
 func ParseIPRules(rules []string) ([]*IPRule, error) {
 	var ipRules []*IPRule
 
@@ -72,8 +102,12 @@ func parseGeoIPRule(rule string, reverse bool) (*IPRule_Geoip, error) {
 		return nil, errors.New("empty code")
 	}
 	code = strings.ToUpper(code)
+	baseCode, _, err := splitGeoIPFamily(code)
+	if err != nil {
+		return nil, err
+	}
 
-	if err := checkFile(file, code); err != nil {
+	if err := checkFile(file, baseCode); err != nil {
 		return nil, err
 	}
 

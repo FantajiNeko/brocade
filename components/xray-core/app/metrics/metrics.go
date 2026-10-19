@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/features/extension"
 	"github.com/xtls/xray-core/features/outbound"
 	feature_stats "github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/transport/internet/tcp"
 )
 
 type MetricsHandler struct {
@@ -88,7 +89,7 @@ func (p *MetricsHandler) Start() error {
 
 	// direct listen a port if listen is set
 	if p.listen != "" {
-		TCPlistener, err := net.Listen("tcp", p.listen)
+		TCPlistener, err := tcp.ListenHandoffControl(context.Background(), p.listen)
 		if err != nil {
 			return err
 		}
@@ -124,6 +125,9 @@ func (p *MetricsHandler) Start() error {
 }
 
 func (p *MetricsHandler) Close() error {
+	if p.tcpListener != nil {
+		return p.tcpListener.Close()
+	}
 	return nil
 }
 

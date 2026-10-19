@@ -67,3 +67,51 @@ func TestOnlineMapConcurrentProtocolSnapshots(t *testing.T) {
 		t.Fatalf("leaked source references: %d", om.Count())
 	}
 }
+
+func TestOnlineMapSessionTrafficFollowsContinuousOnlineEpoch(t *testing.T) {
+	om := stats.NewOnlineMap()
+	const ip = "203.0.113.10"
+	om.AddIPWithProtocol(ip, "vless")
+	online := om
+	uplink, downlink, ok := online.TrafficCounters(ip)
+	if !ok {
+		t.Fatal("online source has no traffic counters")
+	}
+	uplink.Add(123)
+	downlink.Add(456)
+
+	var firstSince int64
+	online.ForEachWithSessionTraffic(func(address string, lastSeen, onlineSince, up, down int64, protocols []string) bool {
+		if address != ip || lastSeen < onlineSince || up != 123 || down != 456 || !slices.Equal(protocols, []string{"vless"}) {
+			t.Fatalf("unexpected session snapshot: %q last=%d since=%d up=%d down=%d protocols=%v", address, lastSeen, onlineSince, up, down, protocols)
+		}
+		firstSince = onlineSince
+		return true
+	})
+	if firstSince <= 0 {
+		t.Fatal("online_since was not recorded")
+	}
+
+	// A second connection shares the same epoch and counters. Only the final close retires it.
+	om.AddIPWithProtocol(ip, "anytls")
+	uplink2, _, ok := online.TrafficCounters(ip)
+	if !ok {
+		t.Fatal("second reference lost traffic counters")
+	}
+	uplink2.Add(7)
+	om.RemoveIPWithProtocol(ip, "vless")
+	if om.Count() != 1 || uplink.Value() != 130 {
+		t.Fatalf("shared epoch count=%d uplink=%d", om.Count(), uplink.Value())
+	}
+	om.RemoveIPWithProtocol(ip, "anytls")
+	if om.Count() != 0 {
+		t.Fatalf("closed epoch still online: %d", om.Count())
+	}
+
+	// Reappearance is a new online epoch; previous bytes must not leak into it.
+	om.AddIPWithProtocol(ip, "vless")
+	newUplink, newDownlink, ok := online.TrafficCounters(ip)
+	if !ok || newUplink.Value() != 0 || newDownlink.Value() != 0 {
+		t.Fatalf("new epoch counters = %v/%v (ok=%v)", newUplink, newDownlink, ok)
+	}
+}

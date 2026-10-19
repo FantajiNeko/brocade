@@ -1,0 +1,490 @@
+{
+  "version": 1,
+  "source": {
+    "url": "https://raw.githubusercontent.com/v2fly/domain-list-community/ce6ab62747a59a2023412d355315e07b9d4d8c5c/dlc.dat",
+    "sha256": "405ad108a016ae20c4dfa94cf97384c93ed1bd688121acdc2c5a09c77cca2a4f"
+  },
+  "sites": [
+    {
+      "id": "xai",
+      "name": "Grok / xAI",
+      "domains": [
+        "grok.x.com"
+      ],
+      "geosite": [
+        "xai"
+      ]
+    },
+    {
+      "id": "youtube",
+      "name": "YouTube",
+      "domains": [
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "googlevideo.com",
+        "ytimg.com",
+        "youtubei.googleapis.com"
+      ],
+      "geosite": [
+        "youtube"
+      ]
+    },
+    {
+      "id": "netflix",
+      "name": "Netflix",
+      "domains": [
+        "netflix.com",
+        "netflix.net",
+        "nflxvideo.net",
+        "nflximg.net",
+        "nflximg.com",
+        "nflxso.net",
+        "nflxext.com",
+        "nflxsearch.net"
+      ],
+      "geosite": [
+        "netflix"
+      ]
+    },
+    {
+      "id": "disney",
+      "name": "Disney+",
+      "domains": [
+        "disneyplus.com",
+        "disney-plus.net",
+        "dssott.com",
+        "bamgrid.com",
+        "disneystreaming.com"
+      ],
+      "geosite": [
+        "disney"
+      ]
+    },
+    {
+      "id": "tiktok",
+      "name": "TikTok",
+      "domains": [
+        "tiktok.com",
+        "tiktokv.com",
+        "tiktokv.us",
+        "tiktokcdn.com",
+        "tiktokcdn-us.com"
+      ],
+      "geosite": [
+        "tiktok"
+      ]
+    },
+    {
+      "id": "telegram",
+      "name": "Telegram",
+      "domains": [
+        "telegram.org",
+        "telegram.me",
+        "t.me",
+        "telesco.pe"
+      ],
+      "geosite": [
+        "telegram"
+      ]
+    },
+    {
+      "id": "twitter",
+      "name": "X / Twitter",
+      "domains": [
+        "twitter.com",
+        "x.com",
+        "twimg.com",
+        "t.co"
+      ],
+      "geosite": [
+        "twitter"
+      ]
+    },
+    {
+      "id": "facebook",
+      "name": "Facebook",
+      "domains": [
+        "facebook.com",
+        "facebook.net",
+        "fb.com",
+        "fb.me",
+        "fb.watch"
+      ],
+      "geosite": [
+        "facebook"
+      ]
+    },
+    {
+      "id": "instagram",
+      "name": "Instagram",
+      "domains": [
+        "instagram.com",
+        "cdninstagram.com",
+        "igcdn.com",
+        "ig.me",
+        "instagr.am"
+      ],
+      "geosite": [
+        "instagram"
+      ]
+    },
+    {
+      "id": "meta-shared",
+      "name": "Meta 共享",
+      "domains": [
+        "fbcdn.net",
+        "fbcdn.com",
+        "fbsbx.com"
+      ]
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI / ChatGPT",
+      "domains": [
+        "openai.com",
+        "chatgpt.com",
+        "oaistatic.com",
+        "oaiusercontent.com"
+      ],
+      "geosite": [
+        "openai"
+      ]
+    },
+    {
+      "id": "anthropic",
+      "name": "Claude",
+      "domains": [
+        "anthropic.com",
+        "claude.ai",
+        "claude.com"
+      ],
+      "geosite": [
+        "anthropic"
+      ]
+    },
+    {
+      "id": "github",
+      "name": "GitHub",
+      "domains": [
+        "github.com",
+        "githubusercontent.com",
+        "githubassets.com",
+        "github.io",
+        "ghcr.io"
+      ],
+      "geosite": [
+        "github"
+      ]
+    },
+    {
+      "id": "steam",
+      "name": "Steam",
+      "domains": [
+        "steampowered.com",
+        "steamcommunity.com",
+        "steamcontent.com",
+        "steamstatic.com",
+        "steamserver.net"
+      ],
+      "geosite": [
+        "steam"
+      ]
+    },
+    {
+      "id": "discord",
+      "name": "Discord",
+      "domains": [
+        "discord.com",
+        "discord.gg",
+        "discordapp.com",
+        "discordapp.net",
+        "discord.media"
+      ],
+      "geosite": [
+        "discord"
+      ]
+    },
+    {
+      "id": "spotify",
+      "name": "Spotify",
+      "domains": [
+        "spotify.com",
+        "scdn.co",
+        "spotifycdn.com"
+      ],
+      "geosite": [
+        "spotify"
+      ]
+    },
+    {
+      "id": "perplexity",
+      "name": "Perplexity",
+      "domains": [],
+      "geosite": [
+        "perplexity"
+      ]
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "domains": [],
+      "geosite": [
+        "cursor"
+      ]
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "domains": [],
+      "geosite": [
+        "huggingface"
+      ]
+    },
+    {
+      "id": "whatsapp",
+      "name": "WhatsApp",
+      "domains": [],
+      "geosite": [
+        "whatsapp"
+      ]
+    },
+    {
+      "id": "reddit",
+      "name": "Reddit",
+      "domains": [],
+      "geosite": [
+        "reddit"
+      ]
+    },
+    {
+      "id": "twitch",
+      "name": "Twitch",
+      "domains": [],
+      "geosite": [
+        "twitch"
+      ]
+    },
+    {
+      "id": "gitlab",
+      "name": "GitLab",
+      "domains": [],
+      "geosite": [
+        "gitlab"
+      ]
+    },
+    {
+      "id": "zoom",
+      "name": "Zoom",
+      "domains": [],
+      "geosite": [
+        "zoom"
+      ]
+    },
+    {
+      "id": "slack",
+      "name": "Slack",
+      "domains": [],
+      "geosite": [
+        "slack"
+      ]
+    },
+    {
+      "id": "line",
+      "name": "LINE",
+      "domains": [],
+      "geosite": [
+        "line"
+      ]
+    },
+    {
+      "id": "signal",
+      "name": "Signal",
+      "domains": [],
+      "geosite": [
+        "signal"
+      ]
+    },
+    {
+      "id": "speedtest",
+      "name": "Speedtest",
+      "domains": [],
+      "geosite": [
+        "ookla-speedtest"
+      ]
+    },
+    {
+      "id": "douyin",
+      "name": "抖音",
+      "domains": [],
+      "geosite": [
+        "douyin"
+      ]
+    },
+    {
+      "id": "bilibili",
+      "name": "哔哩哔哩",
+      "domains": [],
+      "geosite": [
+        "bilibili"
+      ]
+    },
+    {
+      "id": "bytedance",
+      "name": "字节跳动",
+      "domains": [],
+      "geosite": [
+        "bytedance"
+      ]
+    },
+    {
+      "id": "baidu",
+      "name": "百度",
+      "domains": [],
+      "geosite": [
+        "baidu"
+      ]
+    },
+    {
+      "id": "tencent",
+      "name": "腾讯",
+      "domains": [],
+      "geosite": [
+        "tencent"
+      ]
+    },
+    {
+      "id": "alibaba",
+      "name": "阿里巴巴",
+      "domains": [],
+      "geosite": [
+        "alibaba"
+      ]
+    },
+    {
+      "id": "netease",
+      "name": "网易",
+      "domains": [],
+      "geosite": [
+        "netease"
+      ]
+    },
+    {
+      "id": "jd",
+      "name": "京东",
+      "domains": [],
+      "geosite": [
+        "jd"
+      ]
+    },
+    {
+      "id": "huawei",
+      "name": "华为",
+      "domains": [],
+      "geosite": [
+        "huawei"
+      ]
+    },
+    {
+      "id": "xiaomi",
+      "name": "小米",
+      "domains": [],
+      "geosite": [
+        "xiaomi"
+      ]
+    },
+    {
+      "id": "kuaishou",
+      "name": "快手",
+      "domains": [],
+      "geosite": [
+        "kuaishou"
+      ]
+    },
+    {
+      "id": "meituan",
+      "name": "美团",
+      "domains": [],
+      "geosite": [
+        "meituan"
+      ]
+    },
+    {
+      "id": "pinduoduo",
+      "name": "拼多多",
+      "domains": [],
+      "geosite": [
+        "pinduoduo"
+      ]
+    },
+    {
+      "id": "google",
+      "name": "Google",
+      "domains": [
+        "google.com",
+        "googleapis.com",
+        "gstatic.com",
+        "googleusercontent.com",
+        "google.com.hk"
+      ],
+      "geosite": [
+        "google"
+      ]
+    },
+    {
+      "id": "microsoft",
+      "name": "Microsoft",
+      "domains": [
+        "microsoft.com",
+        "microsoftonline.com",
+        "live.com",
+        "office.com",
+        "office.net",
+        "onedrive.com",
+        "windowsupdate.com"
+      ],
+      "geosite": [
+        "microsoft"
+      ]
+    },
+    {
+      "id": "apple",
+      "name": "Apple",
+      "domains": [
+        "apple.com",
+        "icloud.com",
+        "icloud-content.com",
+        "mzstatic.com"
+      ],
+      "geosite": [
+        "apple"
+      ]
+    },
+    {
+      "id": "other",
+      "name": "其他站点",
+      "domains": []
+    },
+    {
+      "id": "sniffing-failed",
+      "name": "嗅探失败",
+      "domains": []
+    },
+    {
+      "id": "unidentified",
+      "name": "未识别",
+      "domains": []
+    }
+  ],
+  "overrides": [
+    {
+      "id": "meta-shared",
+      "name": "Meta 共享",
+      "domains": [
+        "fbcdn.net",
+        "fbcdn.com",
+        "fbsbx.com"
+      ]
+    }
+  ]
+}

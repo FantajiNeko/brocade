@@ -19,6 +19,11 @@ online_source_protocols = true
 
 # Selected upstream backports; the full-tree baseline above remains unchanged.
 [[backports]]
+commit = "1d62941bd2a0f1ca410c7b81c1aeb198dd105825"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6041"
+description = "Partial backport: isolate retained UDP fragment payloads from reusable read buffers; preserve legacy Hy2 protocol"
+
+[[backports]]
 commit = "8f15190c230fe6975c9b18e31316c6bc494f3863"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6471"
 description = "Reject truncated QUIC header-protection samples before slicing"

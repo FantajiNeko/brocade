@@ -28,7 +28,17 @@ func NewStatsServer(manager feature_stats.Manager) StatsServiceServer {
 	}
 }
 
+func (s *statsServer) checkReset(reset bool) error {
+	if guard, ok := s.stats.(interface{ AccountingResetAllowed() bool }); reset && ok && !guard.AccountingResetAllowed() {
+		return status.Error(codes.FailedPrecondition, "delegated accounting counters cannot be reset")
+	}
+	return nil
+}
+
 func (s *statsServer) GetStats(ctx context.Context, request *GetStatsRequest) (*GetStatsResponse, error) {
+	if err := s.checkReset(request.Reset_); err != nil {
+		return nil, err
+	}
 	c := s.stats.GetCounter(request.Name)
 	if c == nil {
 		return nil, status.Error(codes.NotFound, request.Name+" not found.")
@@ -87,6 +97,9 @@ func (s *statsServer) GetAllOnlineUsers(ctx context.Context, request *GetAllOnli
 }
 
 func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsRequest) (*GetUsersStatsResponse, error) {
+	if err := s.checkReset(request.Reset_); err != nil {
+		return nil, err
+	}
 	userMap := make(map[string]*UserStat)
 
 	s.stats.VisitOnlineMaps(func(name string, om feature_stats.OnlineMap) bool {
@@ -98,18 +111,34 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 		email, _, _ := strings.Cut(rest, ">>>")
 
 		user := &UserStat{Email: email}
-		appendIP := func(ip string, lastSeen int64, protocols []string) bool {
+		appendIP := func(
+			ip string,
+			lastSeen int64,
+			onlineSince int64,
+			uplinkBytes int64,
+			downlinkBytes int64,
+			protocols []string,
+		) bool {
 			user.Ips = append(user.Ips, &OnlineIPEntry{
-				Ip:        ip,
-				LastSeen:  lastSeen,
-				Protocols: protocols,
+				Ip:            ip,
+				LastSeen:      lastSeen,
+				Protocols:     protocols,
+				OnlineSince:   onlineSince,
+				UplinkBytes:   uplinkBytes,
+				DownlinkBytes: downlinkBytes,
 			})
 			return true
 		}
-		if protocols, ok := om.(feature_stats.ProtocolOnlineMap); ok {
-			protocols.ForEachWithProtocols(appendIP)
+		if traffic, ok := om.(feature_stats.SessionTrafficOnlineMap); ok {
+			traffic.ForEachWithSessionTraffic(appendIP)
+		} else if protocols, ok := om.(feature_stats.ProtocolOnlineMap); ok {
+			protocols.ForEachWithProtocols(func(ip string, lastSeen int64, names []string) bool {
+				return appendIP(ip, lastSeen, 0, 0, 0, names)
+			})
 		} else {
-			om.ForEach(func(ip string, lastSeen int64) bool { return appendIP(ip, lastSeen, nil) })
+			om.ForEach(func(ip string, lastSeen int64) bool {
+				return appendIP(ip, lastSeen, 0, 0, 0, nil)
+			})
 		}
 		if len(user.Ips) > 0 {
 			userMap[email] = user
@@ -169,6 +198,37 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 }
 
 func (s *statsServer) QueryStats(ctx context.Context, request *QueryStatsRequest) (*QueryStatsResponse, error) {
+	if request.Pattern == feature_stats.SniffingFailedPattern {
+		if request.Reset_ {
+			return nil, status.Error(codes.InvalidArgument, "failed-sniff observations are read-only")
+		}
+		response := &QueryStatsResponse{}
+		if provider, ok := s.stats.(interface {
+			SniffingFailedSnapshot() []feature_stats.DetailUsageStat
+		}); ok {
+			for _, stat := range provider.SniffingFailedSnapshot() {
+				response.Stat = append(response.Stat, &Stat{Name: stat.Name, Value: stat.Value})
+			}
+		}
+		return response, nil
+	}
+	if request.Pattern == feature_stats.OtherDomainPattern {
+		if request.Reset_ {
+			return nil, status.Error(codes.InvalidArgument, "domain observations are read-only")
+		}
+		response := &QueryStatsResponse{}
+		if provider, ok := s.stats.(interface {
+			OtherDomainSnapshot() []feature_stats.OtherDomainStat
+		}); ok {
+			for _, stat := range provider.OtherDomainSnapshot() {
+				response.Stat = append(response.Stat, &Stat{Name: stat.Name, Value: stat.Value})
+			}
+		}
+		return response, nil
+	}
+	if err := s.checkReset(request.Reset_); err != nil {
+		return nil, err
+	}
 	response := &QueryStatsResponse{}
 	for name, value := range mux.GetReverseHealthMetrics() {
 		if strings.Contains(name, request.Pattern) {

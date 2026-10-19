@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const [sourceArg, outputArg] = process.argv.slice(2);
+if (!sourceArg || !outputArg) throw new Error('usage: prepare-integration.cjs ISOLATED_V6_SOURCE NEW_OUTPUT_DIRECTORY');
+const source = fs.realpathSync(sourceArg), output = path.resolve(outputArg);
+if (fs.existsSync(output)) throw new Error('refuse to replace existing integration preparation');
+fs.mkdirSync(output, {recursive:true});
+const original = path.join(source, 'testing/handofflab/handoff_test.go');
+let content = fs.readFileSync(original,'utf8');
+const start = content.indexOf('func (f *fixture) startProcess(');
+const end = content.indexOf('\nfunc ', start + 1);
+if(start < 0 || end < 0 || !content.slice(start,end).includes('cmd.Wait()')) throw new Error('unexpected frozen helper: process collector replacement not safe');
+content = content.slice(0,start) + content.slice(end);
+fs.writeFileSync(path.join(output,'handoff-process-overlay_test.go'),content);
+const replace = {};
+replace[original] = path.join(output,'handoff-process-overlay_test.go');
+replace[path.join(source,'testing/handofflab/h7_test.go')] = path.join(__dirname,'h9_topology_test.go');
+for (const name of ['h9_test.go','h9_process_test.go']) replace[path.join(source,'testing/handofflab',name)] = path.join(__dirname,name);
+fs.writeFileSync(path.join(output,'overlay.json'),JSON.stringify({Replace:replace},null,2)+'\n');
+console.log(JSON.stringify({source,output,overlay:path.join(output,'overlay.json')}));

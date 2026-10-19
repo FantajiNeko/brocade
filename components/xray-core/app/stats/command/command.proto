@@ -63,6 +63,11 @@ message OnlineIPEntry {
   // Current authenticated inbound protocols; empty/absent is unknown to older readers.
   // IP cardinality and the existing user traffic counter names remain unchanged.
   repeated string protocols = 3;
+  // Start of the current continuous online epoch. Bytes below reset when the source's online
+  // reference count reaches zero; they are not billing totals and are never persisted by Xray.
+  int64 online_since = 4;
+  int64 uplink_bytes = 5;
+  int64 downlink_bytes = 6;
 }
 
 message TrafficUserStat {

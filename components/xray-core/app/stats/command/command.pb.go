@@ -557,7 +557,12 @@ type OnlineIPEntry struct {
 	LastSeen int64                  `protobuf:"varint,2,opt,name=last_seen,json=lastSeen,proto3" json:"last_seen,omitempty"`
 	// Current authenticated inbound protocols; empty/absent is unknown to older readers.
 	// IP cardinality and the existing user traffic counter names remain unchanged.
-	Protocols     []string `protobuf:"bytes,3,rep,name=protocols,proto3" json:"protocols,omitempty"`
+	Protocols []string `protobuf:"bytes,3,rep,name=protocols,proto3" json:"protocols,omitempty"`
+	// Start of the current continuous online epoch. Bytes below reset when the source's online
+	// reference count reaches zero; they are not billing totals and are never persisted by Xray.
+	OnlineSince   int64 `protobuf:"varint,4,opt,name=online_since,json=onlineSince,proto3" json:"online_since,omitempty"`
+	UplinkBytes   int64 `protobuf:"varint,5,opt,name=uplink_bytes,json=uplinkBytes,proto3" json:"uplink_bytes,omitempty"`
+	DownlinkBytes int64 `protobuf:"varint,6,opt,name=downlink_bytes,json=downlinkBytes,proto3" json:"downlink_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -611,6 +616,27 @@ func (x *OnlineIPEntry) GetProtocols() []string {
 		return x.Protocols
 	}
 	return nil
+}
+
+func (x *OnlineIPEntry) GetOnlineSince() int64 {
+	if x != nil {
+		return x.OnlineSince
+	}
+	return 0
+}
+
+func (x *OnlineIPEntry) GetUplinkBytes() int64 {
+	if x != nil {
+		return x.UplinkBytes
+	}
+	return 0
+}
+
+func (x *OnlineIPEntry) GetDownlinkBytes() int64 {
+	if x != nil {
+		return x.DownlinkBytes
+	}
+	return 0
 }
 
 type TrafficUserStat struct {
@@ -1060,11 +1086,14 @@ const file_app_stats_command_command_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\"\x1a\n" +
 	"\x18GetAllOnlineUsersRequest\"1\n" +
 	"\x19GetAllOnlineUsersResponse\x12\x14\n" +
-	"\x05users\x18\x01 \x03(\tR\x05users\"Z\n" +
+	"\x05users\x18\x01 \x03(\tR\x05users\"\xc7\x01\n" +
 	"\rOnlineIPEntry\x12\x0e\n" +
 	"\x02ip\x18\x01 \x01(\tR\x02ip\x12\x1b\n" +
 	"\tlast_seen\x18\x02 \x01(\x03R\blastSeen\x12\x1c\n" +
-	"\tprotocols\x18\x03 \x03(\tR\tprotocols\"E\n" +
+	"\tprotocols\x18\x03 \x03(\tR\tprotocols\x12!\n" +
+	"\fonline_since\x18\x04 \x01(\x03R\vonlineSince\x12!\n" +
+	"\fuplink_bytes\x18\x05 \x01(\x03R\vuplinkBytes\x12%\n" +
+	"\x0edownlink_bytes\x18\x06 \x01(\x03R\rdownlinkBytes\"E\n" +
 	"\x0fTrafficUserStat\x12\x16\n" +
 	"\x06uplink\x18\x01 \x01(\x03R\x06uplink\x12\x1a\n" +
 	"\bdownlink\x18\x02 \x01(\x03R\bdownlink\"\x9c\x01\n" +

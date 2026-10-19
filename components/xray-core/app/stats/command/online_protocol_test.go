@@ -23,6 +23,12 @@ func TestGetUsersStatsReportsProtocolsWithoutChangingLabelsOrTraffic(t *testing.
 	}
 	om.(featurestats.ProtocolOnlineMap).AddIPWithProtocol("203.0.113.10", "vless")
 	om.(featurestats.ProtocolOnlineMap).AddIPWithProtocol("203.0.113.10", "hysteria")
+	uplink, downlink, ok := om.(featurestats.SessionTrafficOnlineMap).TrafficCounters("203.0.113.10")
+	if !ok {
+		t.Fatal("online source has no session counters")
+	}
+	uplink.Add(12)
+	downlink.Add(34)
 	counter, err := m.RegisterCounter("user>>>" + label + ">>>traffic>>>uplink")
 	if err != nil {
 		t.Fatal(err)
@@ -46,5 +52,8 @@ func TestGetUsersStatsReportsProtocolsWithoutChangingLabelsOrTraffic(t *testing.
 	user := decoded.Users[0]
 	if !slices.Equal(user.Ips[0].Protocols, []string{"hysteria", "vless"}) || user.Traffic.Uplink != 123 || counter.Value() != 123 {
 		t.Fatalf("protocol/traffic mismatch: %v", user)
+	}
+	if user.Ips[0].OnlineSince <= 0 || user.Ips[0].UplinkBytes != 12 || user.Ips[0].DownlinkBytes != 34 {
+		t.Fatalf("source session mismatch: %v", user.Ips[0])
 	}
 }

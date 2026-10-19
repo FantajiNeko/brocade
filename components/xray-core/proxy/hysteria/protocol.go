@@ -212,6 +212,11 @@ func ParseUDPMessage(msg []byte) (*UDPMessage, error) {
 	}
 	m.Addr = string(bs[:lAddr])
 	m.Data = bs[lAddr:]
+	// Reassembly retains fragments across reads into the caller's reusable
+	// buffer. Only fragmented payloads need independent storage.
+	if m.FragCount > 1 {
+		m.Data = bytes.Clone(m.Data)
+	}
 	return m, nil
 }
 

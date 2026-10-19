@@ -182,6 +182,17 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 	if user != nil && len(user.Email) > 0 {
 		p := d.policy.ForLevel(user.Level)
+		var sourceUplink, sourceDownlink stats.Counter
+		if p.Stats.UserOnline {
+			sourceUplink, sourceDownlink = trackOnlineIP(
+				ctx,
+				d.stats,
+				user.Email,
+				sessionInbound.Source.Address.String(),
+				sessionInbound.Name,
+			)
+		}
+		var uplinkCounter stats.Counter
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, err := stats.GetOrRegisterCounter(d.stats, name); err != nil {
@@ -190,12 +201,13 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 				common.Interrupt(downlinkWriter)
 				return inboundLink, outboundLink
 			} else if c != nil {
-				inboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  inboundLink.Writer,
-				}
+				uplinkCounter = siteCounter(ctx, c, true)
 			}
 		}
+		if uplinkCounter = withSecondaryCounter(uplinkCounter, sourceUplink); uplinkCounter != nil {
+			inboundLink.Writer = &SizeStatWriter{Counter: uplinkCounter, Writer: inboundLink.Writer}
+		}
+		var downlinkCounter stats.Counter
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, err := stats.GetOrRegisterCounter(d.stats, name); err != nil {
@@ -204,15 +216,11 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 				common.Interrupt(downlinkWriter)
 				return inboundLink, outboundLink
 			} else if c != nil {
-				outboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  outboundLink.Writer,
-				}
+				downlinkCounter = siteCounter(ctx, c, false)
 			}
 		}
-
-		if p.Stats.UserOnline {
-			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String(), sessionInbound.Name)
+		if downlinkCounter = withSecondaryCounter(downlinkCounter, sourceDownlink); downlinkCounter != nil {
+			outboundLink.Writer = &SizeStatWriter{Counter: downlinkCounter, Writer: outboundLink.Writer}
 		}
 	}
 
@@ -231,6 +239,17 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
+		var sourceUplink, sourceDownlink stats.Counter
+		if p.Stats.UserOnline {
+			sourceUplink, sourceDownlink = trackOnlineIP(
+				ctx,
+				statsManager,
+				user.Email,
+				sessionInbound.Source.Address.String(),
+				sessionInbound.Name,
+			)
+		}
+		var uplinkCounter stats.Counter
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
 			if c, err := stats.GetOrRegisterCounter(statsManager, name); err != nil {
@@ -239,9 +258,11 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 				common.Interrupt(link.Writer)
 				return link
 			} else if c != nil {
-				link.Reader.(*buf.TimeoutWrapperReader).Counter = c
+				uplinkCounter = siteCounter(ctx, c, true)
 			}
 		}
+		link.Reader.(*buf.TimeoutWrapperReader).Counter = withSecondaryCounter(uplinkCounter, sourceUplink)
+		var downlinkCounter stats.Counter
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, err := stats.GetOrRegisterCounter(statsManager, name); err != nil {
@@ -250,31 +271,35 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 				common.Interrupt(link.Writer)
 				return link
 			} else if c != nil {
-				link.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  link.Writer,
-				}
+				downlinkCounter = siteCounter(ctx, c, false)
 			}
 		}
-		if p.Stats.UserOnline {
-			trackOnlineIP(ctx, statsManager, user.Email, sessionInbound.Source.Address.String(), sessionInbound.Name)
+		if downlinkCounter = withSecondaryCounter(downlinkCounter, sourceDownlink); downlinkCounter != nil {
+			link.Writer = &SizeStatWriter{Counter: downlinkCounter, Writer: link.Writer}
 		}
 	}
 
 	return link
 }
 
-func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip, protocol string) {
+func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip, protocol string) (stats.Counter, stats.Counter) {
 	name := "user>>>" + email + ">>>online"
 	if om, _ := stats.GetOrRegisterOnlineMap(sm, name); om != nil {
 		if protocols, ok := om.(stats.ProtocolOnlineMap); ok {
 			protocols.AddIPWithProtocol(ip, protocol)
 			context.AfterFunc(ctx, func() { protocols.RemoveIPWithProtocol(ip, protocol) })
-			return
+			if traffic, ok := om.(stats.SessionTrafficOnlineMap); ok {
+				uplink, downlink, found := traffic.TrafficCounters(ip)
+				if found {
+					return uplink, downlink
+				}
+			}
+			return nil, nil
 		}
 		om.AddIP(ip)
 		context.AfterFunc(ctx, func() { om.RemoveIP(ip) })
 	}
+	return nil, nil
 }
 
 func (d *DefaultDispatcher) sniffOverrideReason(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) string {
@@ -331,6 +356,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	}
 
 	sniffingRequest := content.SniffingRequest
+	ctx = withSiteUsage(ctx, d.stats)
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled {
 		logSniffDecision(ctx, sniffingRequest, destination, nil, nil, "disabled", "none", 0)
@@ -347,6 +373,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 			if err == nil {
 				content.Protocol = result.Protocol()
+				recordSiteDomain(ctx, result.Domain())
 			}
 			reason := ""
 			if err == nil {
@@ -400,6 +427,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
 	}
+	ctx = withSiteUsage(ctx, d.stats)
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
@@ -416,6 +444,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 		if err == nil {
 			content.Protocol = result.Protocol()
+			recordSiteDomain(ctx, result.Domain())
 		}
 		reason := ""
 		if err == nil {
@@ -511,6 +540,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
+	d.bindSiteUsage(ctx, destination)
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 

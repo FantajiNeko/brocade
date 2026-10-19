@@ -30,6 +30,7 @@ type Hub struct {
 	cache        chan *udp.Packet
 	capacity     int
 	recvOrigDest bool
+	handoff      internet.PacketHandoffGate
 }
 
 func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, options ...HubOption) (*Hub, error) {
@@ -58,10 +59,14 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 
 	var err error
-	hub.conn, err = internet.ListenSystemPacket(ctx, &net.UDPAddr{
-		IP:   address.IP(),
-		Port: int(port),
-	}, sockopt)
+	logicalAddress := (&net.UDPAddr{IP: address.IP(), Port: int(port)}).String()
+	hub.conn, hub.handoff, err = internet.OpenPacketHandoffListener(logicalAddress, sockopt, func(bindAddress string) (net.PacketConn, error) {
+		udpAddress, err := net.ResolveUDPAddr("udp", bindAddress)
+		if err != nil {
+			return nil, err
+		}
+		return internet.ListenSystemPacket(ctx, udpAddress, sockopt)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -86,9 +91,14 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 
 // Close implements net.Listener.
 func (h *Hub) Close() error {
+	if h.handoff != nil {
+		h.handoff.Close()
+	}
 	h.conn.Close()
 	return nil
 }
+
+func (h *Hub) Handoff() internet.PacketHandoffGate { return h.handoff }
 
 func (h *Hub) WriteTo(payload []byte, dest net.Destination) (int, error) {
 	return h.conn.WriteTo(payload, &net.UDPAddr{

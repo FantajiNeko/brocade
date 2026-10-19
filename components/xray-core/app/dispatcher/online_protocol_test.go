@@ -59,3 +59,25 @@ func TestTrackOnlineProtocolsSurviveConcurrentRegistrationAndIndependentClose(t 
 	closeVless()
 	check(nil, 0)
 }
+
+func TestTrackOnlineIPExposesCurrentSourceSessionCounters(t *testing.T) {
+	m, err := appstats.NewManager(context.Background(), &appstats.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	uplink, downlink := trackOnlineIP(ctx, m, "alice@example.test#i-main", "203.0.113.10", "vless")
+	if uplink == nil || downlink == nil {
+		t.Fatal("source session counters are unavailable")
+	}
+	uplink.Add(123)
+	downlink.Add(456)
+	online := m.GetOnlineMap("user>>>alice@example.test#i-main>>>online").(stats.SessionTrafficOnlineMap)
+	online.ForEachWithSessionTraffic(func(ip string, _, onlineSince, up, down int64, protocols []string) bool {
+		if ip != "203.0.113.10" || onlineSince <= 0 || up != 123 || down != 456 || !slices.Equal(protocols, []string{"vless"}) {
+			t.Fatalf("unexpected source session: ip=%q since=%d up=%d down=%d protocols=%v", ip, onlineSince, up, down, protocols)
+		}
+		return true
+	})
+	cancel()
+}

@@ -11,6 +11,7 @@ type counterJournal interface {
 }
 
 const accountingJournalEnv = "XRAY_BROCADE_ACCOUNTING_FILE"
+const accountingSharedEnv = "XRAY_BROCADE_ACCOUNTING_SHARED"
 
 func journalCounterName(name string) bool {
 	return (strings.HasPrefix(name, "user>>>") || strings.HasPrefix(name, "inbound>>>fwd:")) && strings.Contains(name, ">>>traffic>>>")

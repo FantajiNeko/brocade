@@ -1,0 +1,21 @@
+#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const {spawnSync} = require('node:child_process');
+const [sourceArg,timerArg,outputArg] = process.argv.slice(2);
+if(!outputArg) throw new Error('usage: build-runtime.cjs ISOLATED_V6_SOURCE TIMER_SOURCE NEW_OUTPUT_DIRECTORY');
+const source=fs.realpathSync(sourceArg), timer=fs.realpathSync(timerArg), output=path.resolve(outputArg);
+if(fs.existsSync(output)) throw new Error('refuse to overwrite frozen build');
+fs.mkdirSync(output,{recursive:true});
+const frozen=path.join(output,'timer.go');fs.copyFileSync(timer,frozen);
+const overlay=path.join(output,'overlay.json');
+fs.writeFileSync(overlay,JSON.stringify({Replace:{[path.join(source,'common/signal/timer.go')]:frozen}},null,2)+'\n');
+const args=['build','-buildvcs=false','-overlay',overlay,'-o',path.join(output,'xray'),'./main'];
+const built=spawnSync('go',args,{cwd:source,env:{...process.env,CGO_ENABLED:'1',GOOS:'linux',GOARCH:'amd64',GOAMD64:'v1'},encoding:'utf8',timeout:600000});
+fs.writeFileSync(path.join(output,'build.log'),(built.stdout||'')+(built.stderr||''));
+if(built.status!==0) throw new Error('runtime build failed: '+(built.error||built.signal||built.status));
+const sha=file=>crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+fs.writeFileSync(path.join(output,'manifest.json'),JSON.stringify({source,timer_sha256:sha(frozen),binary_sha256:sha(path.join(output,'xray')),args},null,2)+'\n');
+console.log(fs.readFileSync(path.join(output,'manifest.json'),'utf8'));

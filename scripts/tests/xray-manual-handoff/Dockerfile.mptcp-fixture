@@ -1,0 +1,7 @@
+# Local frozen images only; this fixture image is never a deployment artifact.
+FROM brocade-h7-netlab:local AS python-runtime
+FROM brocade-mptcp-v6:lab
+COPY --from=python-runtime /usr/bin/python3.12 /usr/bin/python3
+COPY --from=python-runtime /usr/lib/python3.12 /usr/lib/python3.12
+COPY --from=python-runtime /lib/x86_64-linux-gnu/libexpat.so.* /lib/x86_64-linux-gnu/
+RUN python3 -c "import ctypes, hashlib, socket, subprocess, tempfile; assert hasattr(hashlib, 'file_digest')"

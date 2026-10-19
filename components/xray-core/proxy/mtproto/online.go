@@ -49,13 +49,22 @@ func (t *onlineObservationTracker) observe(
 	email string,
 	sourceIP string,
 ) func() {
+	_, _, release := t.observeWithTraffic(manager, email, sourceIP)
+	return release
+}
+
+func (t *onlineObservationTracker) observeWithTraffic(
+	manager featurestats.Manager,
+	email string,
+	sourceIP string,
+) (featurestats.Counter, featurestats.Counter, func()) {
 	if t == nil || manager == nil || email == "" || sourceIP == "" {
-		return func() {}
+		return nil, nil, func() {}
 	}
 
 	online, _ := featurestats.GetOrRegisterOnlineMap(manager, "user>>>"+email+">>>online")
 	if online == nil {
-		return func() {}
+		return nil, nil, func() {}
 	}
 	add := func() { online.AddIP(sourceIP) }
 	remove := func() { online.RemoveIP(sourceIP) }
@@ -79,13 +88,15 @@ func (t *onlineObservationTracker) observe(
 		lease.active++
 		lease.touch()
 		t.mu.Unlock()
-		return t.releaseOnce(key, lease)
+		uplink, downlink := sourceTrafficCounters(online, sourceIP)
+		return uplink, downlink, t.releaseOnce(key, lease)
 	}
 	if t.maxRetained <= 0 || len(t.leases) >= t.maxRetained {
 		t.mu.Unlock()
 		add()
+		uplink, downlink := sourceTrafficCounters(online, sourceIP)
 		var once sync.Once
-		return func() { once.Do(remove) }
+		return uplink, downlink, func() { once.Do(remove) }
 	}
 
 	add()
@@ -96,7 +107,23 @@ func (t *onlineObservationTracker) observe(
 	}
 	t.leases[key] = lease
 	t.mu.Unlock()
-	return t.releaseOnce(key, lease)
+	uplink, downlink := sourceTrafficCounters(online, sourceIP)
+	return uplink, downlink, t.releaseOnce(key, lease)
+}
+
+func sourceTrafficCounters(
+	online featurestats.OnlineMap,
+	sourceIP string,
+) (featurestats.Counter, featurestats.Counter) {
+	traffic, ok := online.(featurestats.SessionTrafficOnlineMap)
+	if !ok {
+		return nil, nil
+	}
+	uplink, downlink, ok := traffic.TrafficCounters(sourceIP)
+	if !ok {
+		return nil, nil
+	}
+	return uplink, downlink
 }
 
 func (t *onlineObservationTracker) releaseOnce(

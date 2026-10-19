@@ -823,12 +823,20 @@ func (f *IPSetFactory) GetOrCreateFromGeoIPRules(rules []*GeoIPRule) (*IPSet, er
 
 	ipset, err := f.createFrom(func(add func(*CIDR)) error {
 		for _, r := range rules {
-			cidrs, err := loadIP(r.File, r.Code)
+			baseCode, family, err := splitGeoIPFamily(r.Code)
+			if err != nil {
+				return err
+			}
+			cidrs, err := loadIP(r.File, baseCode)
 			if err != nil {
 				return err
 			}
 			for i, c := range cidrs {
-				add(c)
+				isIPv4 := len(c.GetIp()) == net.IPv4len
+				isIPv6 := len(c.GetIp()) == net.IPv6len
+				if family == geoIPFamilyAny || (family == geoIPFamilyIPv4 && isIPv4) || (family == geoIPFamilyIPv6 && isIPv6) {
+					add(c)
+				}
 				cidrs[i] = nil // peak mem
 			}
 		}

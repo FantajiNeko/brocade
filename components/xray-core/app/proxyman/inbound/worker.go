@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,7 +47,8 @@ type tcpWorker struct {
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
-	hub internet.Listener
+	hub        internet.Listener
+	forwarding *forwardingConnections
 
 	ctx context.Context
 }
@@ -59,7 +61,17 @@ func getTProxyType(s *internet.MemoryStreamConfig) internet.SocketConfig_TProxyM
 }
 
 func (w *tcpWorker) callback(conn stat.Connection) {
+	defer tcp.FinishHandoffConnection(conn)
 	ctx, cancel := context.WithCancel(w.ctx)
+	if w.forwarding != nil {
+		entry := w.forwarding.add(conn, cancel)
+		if entry == nil {
+			cancel()
+			conn.Close()
+			return
+		}
+		defer w.forwarding.remove(entry)
+	}
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
 
@@ -132,6 +144,9 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 }
 
 func (w *tcpWorker) Start() error {
+	if strings.HasPrefix(w.tag, "fwd:") {
+		w.forwarding = &forwardingConnections{}
+	}
 	ctx := context.Background()
 
 	type HysteriaInboundValidator interface{ HysteriaInboundValidator() *account.Validator }
@@ -152,6 +167,11 @@ func (w *tcpWorker) Start() error {
 
 func (w *tcpWorker) Close() error {
 	var errs []interface{}
+	if w.forwarding != nil {
+		if err := w.forwarding.close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if w.hub != nil {
 		if err := common.Close(w.hub); err != nil {
 			errs = append(errs, err)
@@ -324,6 +344,14 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		b.UDP = &originalDest
 	}
 	conn, existing := w.getConnection(id)
+	if !existing {
+		if handoff := w.hub.Handoff(); handoff != nil && !handoff.StartConnection() {
+			conn.Close()
+			w.removeConn(id)
+			b.Release()
+			return
+		}
+	}
 
 	// payload will be discarded in pipe is full.
 	conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
@@ -332,6 +360,9 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		common.Must(w.checker.Start())
 
 		go func() {
+			if handoff := w.hub.Handoff(); handoff != nil {
+				defer handoff.FinishConnection()
+			}
 			ctx, cancel := context.WithCancel(w.ctx)
 			conn.cancel = cancel
 			sid := session.NewID()

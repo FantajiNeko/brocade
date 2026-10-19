@@ -400,6 +400,25 @@ func TestIPMatcher4CN(t *testing.T) {
 	}
 }
 
+func TestIPMatcherCNIPv4SelectorExcludesIPv6(t *testing.T) {
+	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+
+	allFamilies := buildIPMatcher("geoip:cn")
+	ipv4Only := buildIPMatcher("geoip:cn@ipv4")
+	chinaIPv4 := xnet.ParseAddress("114.114.114.114").IP()
+	chinaIPv6 := xnet.ParseAddress("240e::1").IP()
+
+	if !allFamilies.Match(chinaIPv4) || !ipv4Only.Match(chinaIPv4) {
+		t.Fatal("expected the IPv4 selector to retain Chinese IPv4 ranges")
+	}
+	if !allFamilies.Match(chinaIPv6) {
+		t.Fatal("test fixture must be a Chinese IPv6 range")
+	}
+	if ipv4Only.Match(chinaIPv6) {
+		t.Fatal("expected the IPv4 selector to exclude Chinese IPv6 ranges")
+	}
+}
+
 func TestIPMatcher6US(t *testing.T) {
 	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
 

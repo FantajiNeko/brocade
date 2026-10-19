@@ -13,6 +13,8 @@ func TestParseIPRules(t *testing.T) {
 	rules := []string{
 		"geoip:us",
 		"geoip:cn",
+		"geoip:cn@ipv4",
+		"geoip:cn@ipv6",
 		"!geoip:cn",
 		"!!geoip:cn",
 		"geoip:!cn",
@@ -35,6 +37,14 @@ func TestParseIPRules(t *testing.T) {
 	_, err := geodata.ParseIPRules(rules)
 	if err != nil {
 		t.Fatalf("Failed to parse ip rules, got %s", err)
+	}
+}
+
+func TestParseIPRuleRejectsUnknownFamily(t *testing.T) {
+	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
+
+	if _, err := geodata.ParseIPRules([]string{"geoip:cn@ipv5"}); err == nil {
+		t.Fatal("expected an unknown geoip address family to be rejected")
 	}
 }
 

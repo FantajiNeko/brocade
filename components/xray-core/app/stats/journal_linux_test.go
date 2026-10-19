@@ -5,6 +5,7 @@ package stats
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -138,5 +139,100 @@ func TestJournalCountersStayAtomicAndWriterIsExclusive(t *testing.T) {
 	defer unix.Munmap(reopened.data)
 	if reopened.Counters()["user>>>fixture>>>traffic>>>uplink"].Value() != 16000 {
 		t.Fatal("reset counter")
+	}
+}
+
+func TestSharedJournalGenerationsRegisterAndAddCounters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounting.bin")
+	owner, err := openMappedCounterJournalMode(path, journalSharedOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.file.Close()
+	defer owner.registrationLock.Close()
+	defer unix.Munmap(owner.data)
+	owned, err := owner.Register("user>>>fixture>>>traffic>>>downlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned.Add(40)
+
+	joined, err := openMappedCounterJournalMode(path, journalSharedJoin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer joined.file.Close()
+	defer joined.registrationLock.Close()
+	defer unix.Munmap(joined.data)
+	shared, err := joined.Register("user>>>fixture>>>traffic>>>downlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared.Add(2)
+	if got := owned.Value(); got != 42 {
+		t.Fatalf("shared atomic addition = %d, want 42", got)
+	}
+	joinedNew, err := joined.Register("user>>>new>>>traffic>>>downlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedNew.Add(7)
+	ownerNew, err := owner.Register("user>>>new>>>traffic>>>downlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerNew.Add(5)
+	if got := joinedNew.Value(); got != 12 {
+		t.Fatalf("counter created by join generation = %d, want 12", got)
+	}
+	if _, err := openMappedCounterJournal(path); err == nil {
+		t.Fatal("legacy exclusive owner entered an active shared generation")
+	}
+}
+
+func TestSharedJournalSerializesCrossGenerationRegistration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounting.bin")
+	owner, err := openMappedCounterJournalMode(path, journalSharedOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.file.Close()
+	defer owner.registrationLock.Close()
+	defer unix.Munmap(owner.data)
+	joined, err := openMappedCounterJournalMode(path, journalSharedJoin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer joined.file.Close()
+	defer joined.registrationLock.Close()
+	defer unix.Munmap(joined.data)
+
+	start := make(chan struct{})
+	errors := make(chan error, 2)
+	register := func(j *mappedCounterJournal, amount int64) {
+		<-start
+		counter, err := j.Register("user>>>concurrent>>>traffic>>>uplink")
+		if err == nil {
+			counter.Add(amount)
+		}
+		errors <- err
+	}
+	go register(owner, 11)
+	go register(joined, 13)
+	close(start)
+	for range 2 {
+		if err := <-errors; err != nil {
+			t.Fatal(err)
+		}
+	}
+	ownerCounter, err := owner.Register("user>>>concurrent>>>traffic>>>uplink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ownerCounter.Value(); got != 24 {
+		t.Fatalf("cross-generation registration counter = %d, want 24", got)
+	}
+	if got := int(binary.LittleEndian.Uint32(owner.data[24:28])); got != 1 {
+		t.Fatalf("published record count = %d, want 1", got)
 	}
 }

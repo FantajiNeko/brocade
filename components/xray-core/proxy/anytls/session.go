@@ -71,6 +71,15 @@ type session struct {
 	dieHookMu     sync.Mutex
 	dieHook       func()
 	cancel        context.CancelFunc
+	workers       sync.WaitGroup
+}
+
+func (s *session) startWorker(work func()) {
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		work()
+	}()
 }
 
 func (s *session) peerVersionValue() byte {
@@ -200,7 +209,9 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	if s.isClosed() {
 		return errors.New("anytls: session closed")
 	}
-	dispatchCtx := ctx
+	// Each logical stream owns its sniffed attributes and routing state. Reusing the
+	// connection context lets concurrent dispatcher goroutines write the same map.
+	dispatchCtx := sessionctx.SubContextFromMuxInbound(ctx)
 	var downlinkSplicer *framedDownlinkSplicer
 	if _, ok := v2tls.KernelTLSRawConn(s.conn); ok && (framedDownlinkSpliceEnabled() || kernelTLSVectoredWriteEnabled()) {
 		if inbound := sessionctx.InboundFromContext(ctx); inbound != nil {
@@ -213,7 +224,7 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 				useSplice: framedDownlinkSpliceEnabled(),
 			}
 			streamInbound.FramedDownlinkSplicer = downlinkSplicer
-			dispatchCtx = sessionctx.ContextWithInbound(ctx, streamInbound)
+			dispatchCtx = sessionctx.ContextWithInbound(dispatchCtx, streamInbound)
 		}
 	}
 	l, err := s.dispatcher.Dispatch(dispatchCtx, dest)
@@ -250,7 +261,7 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		}
 	}
 	s.startStreamDelivery(st)
-	go s.pumpDownlink(st.sid, l)
+	s.startWorker(func() { s.pumpDownlink(st.sid, l) })
 	return nil
 }
 
@@ -288,7 +299,8 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 		if s.isClosed() {
 			return errors.New("anytls: session closed")
 		}
-		link, err := s.dispatcher.Dispatch(ctx, requestDest)
+		dispatchCtx := sessionctx.SubContextFromMuxInbound(ctx)
+		link, err := s.dispatcher.Dispatch(dispatchCtx, requestDest)
 		if err != nil {
 			errors.LogWarning(ctx, "anytls: UDP dispatcher error, streamId=", st.sid, " err=", err)
 			_ = s.sendFrame(newFrame(cmdFIN, st.sid))
@@ -314,7 +326,7 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 		}
 
 		s.startStreamDelivery(st)
-		go s.pumpDownlink(st.sid, link)
+		s.startWorker(func() { s.pumpDownlink(st.sid, link) })
 		return nil
 	}
 
@@ -487,6 +499,7 @@ func (s *session) close(err error) {
 	for _, st := range streams {
 		st.close(err)
 	}
+	s.workers.Wait()
 	s.dieHookMu.Lock()
 	hook := s.dieHook
 	s.dieHook = nil
@@ -531,7 +544,9 @@ func (s *session) reservePeerStreamID(sid uint32, createStream bool) error {
 	s.lastPeerSID = sid
 	if createStream {
 		if _, ok := s.streams[sid]; !ok {
-			s.streams[sid] = newStream(sid, nil)
+			st := newStream(sid, nil)
+			st.startWorker = s.startWorker
+			s.streams[sid] = st
 		}
 	}
 	return nil

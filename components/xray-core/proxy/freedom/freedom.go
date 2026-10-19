@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -52,32 +51,6 @@ func responseSpliceAllowed(enabled bool, inbound *session.Inbound) bool {
 	return state == session.SpliceCopyDirect || state == session.SpliceCopyWaiting
 }
 
-var defaultPrivateBlockIP = []string{
-	"0.0.0.0/8",
-	"10.0.0.0/8",
-	"100.64.0.0/10",
-	"127.0.0.0/8",
-	"169.254.0.0/16",
-	"172.16.0.0/12",
-	"192.0.0.0/24",
-	"192.0.2.0/24",
-	"192.88.99.0/24",
-	"192.168.0.0/16",
-	"198.18.0.0/15",
-	"198.51.100.0/24",
-	"203.0.113.0/24",
-	"224.0.0.0/3",
-	"::/127",
-	"fc00::/7",
-	"fe80::/10",
-	"ff00::/8",
-}
-
-var defaultPrivateBlockIPMatcher = func() geodata.IPMatcher {
-	rules := common.Must2(geodata.ParseIPRules(defaultPrivateBlockIP))
-	return common.Must2(geodata.IPReg.BuildIPMatcher(rules))
-}()
-
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		h := new(Handler)
@@ -107,6 +80,8 @@ type Handler struct {
 func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.config = config
 	h.policyManager = pm
+	// Freedom permits every destination unless the outbound names rules explicitly. Admission
+	// policy belongs to routing; an absent option must not create a protocol-dependent guard.
 	if config.IpsBlocked != nil && len(config.IpsBlocked.Rules) > 0 {
 		m, err := geodata.IPReg.BuildIPMatcher(config.IpsBlocked.Rules)
 		if err != nil {
@@ -131,28 +106,6 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 	return a != net.AnyIP && a != net.AnyIPv6
 }
 
-func (h *Handler) getBlockedIPMatcher(ctx context.Context, inbound *session.Inbound) geodata.IPMatcher {
-	if h.blockedIPMatcher != nil {
-		return h.blockedIPMatcher
-	}
-	if h.config.IpsBlocked != nil && len(h.config.IpsBlocked.Rules) == 0 { // "ipsBlocked": []
-		return nil
-	}
-	if inbound == nil {
-		return nil
-	}
-	switch inbound.Name {
-	case "vmess", "trojan", "hysteria", "wireguard":
-		errors.LogInfo(ctx, "applying default private IP blocking policy for inbound ", inbound.Name)
-		return defaultPrivateBlockIPMatcher
-	}
-	if strings.HasPrefix(inbound.Name, "vless") || strings.HasPrefix(inbound.Name, "shadowsocks") {
-		errors.LogInfo(ctx, "applying default private IP blocking policy for inbound ", inbound.Name)
-		return defaultPrivateBlockIPMatcher
-	}
-	return nil
-}
-
 func isBlockedAddress(matcher geodata.IPMatcher, addr net.Address) bool {
 	return matcher != nil && addr != nil && addr.Family().IsIP() && matcher.Match(addr.IP())
 }
@@ -167,7 +120,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Name = "freedom"
 	ob.CanSpliceCopy.Store(session.SpliceCopyDirect)
 	inbound := session.InboundFromContext(ctx)
-	blockedIPMatcher := h.getBlockedIPMatcher(ctx, inbound)
+	blockedIPMatcher := h.blockedIPMatcher
 	if blockedIPMatcher != nil {
 		ctx = internet.ContextWithIPBlocker(ctx, blockedIPMatcher.Match)
 	}

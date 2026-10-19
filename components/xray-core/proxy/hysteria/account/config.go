@@ -36,7 +36,9 @@ type Validator struct {
 	emails map[string]struct{}
 	users  map[string]*protocol.MemoryUser
 
-	mutex sync.Mutex
+	mutex    sync.Mutex
+	sessions protocol.UserSessions
+	managed  bool
 }
 
 func NewValidator() *Validator {
@@ -49,6 +51,10 @@ func NewValidator() *Validator {
 func (v *Validator) Add(u *protocol.MemoryUser) error {
 	v.mutex.Lock()
 	defer v.mutex.Unlock()
+	u = &protocol.MemoryUser{Account: u.Account, Email: u.Email, Level: u.Level}
+	if _, exists := v.users[u.Account.(*MemoryAccount).Auth]; exists {
+		return errors.New("Hysteria authentication already exists")
+	}
 
 	if u.Email != "" {
 		if _, ok := v.emails[u.Email]; ok {
@@ -57,8 +63,17 @@ func (v *Validator) Add(u *protocol.MemoryUser) error {
 		v.emails[u.Email] = struct{}{}
 	}
 	v.users[u.Account.(*MemoryAccount).Auth] = u
+	v.managed = true
 
 	return nil
+}
+
+// Managed mode remains enabled after the last dynamic user is removed. Falling back to a
+// static transport password at that point would turn a complete revocation into a bypass.
+func (v *Validator) IsManaged() bool {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+	return v.managed
 }
 
 func (v *Validator) Del(email string) error {
@@ -67,20 +82,30 @@ func (v *Validator) Del(email string) error {
 	}
 
 	v.mutex.Lock()
-	defer v.mutex.Unlock()
 
 	if _, ok := v.emails[email]; !ok {
+		v.mutex.Unlock()
 		return errors.New("User ", email, " not found.")
 	}
 	delete(v.emails, email)
+	var removed *protocol.MemoryUser
 	for key, user := range v.users {
 		if user.Email == email {
 			delete(v.users, key)
+			removed = user
 			break
 		}
 	}
+	v.mutex.Unlock()
+	v.sessions.CloseUser(removed)
 
 	return nil
+}
+
+func (v *Validator) RegisterConnection(user *protocol.MemoryUser, close func()) (func(), bool) {
+	return v.sessions.Register(user, func() bool {
+		return v.Get(user.Account.(*MemoryAccount).Auth) == user
+	}, close)
 }
 
 func (v *Validator) Get(auth string) *protocol.MemoryUser {

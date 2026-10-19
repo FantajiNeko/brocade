@@ -554,6 +554,19 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		errors.LogWarningInner(ctx, err, "unable to set back read deadline")
 	}
 	errors.LogInfo(ctx, "received request for ", request.Destination())
+	ctx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
+	releaseSession, admitted := h.validator.RegisterConnection(request.User, func() {
+		cancelSession()
+		// Close this authenticated stream, not an underlying shared HTTP/2 carrier. An expired
+		// deadline also prevents a TLS close_notify from waiting on a backpressured peer.
+		_ = connection.SetDeadline(time.Now())
+		_ = connection.Close()
+	})
+	if !admitted {
+		return errors.New("VLESS authorization was revoked during handshake")
+	}
+	defer releaseSession()
 
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil {

@@ -250,6 +250,55 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 // depends on the real upstream socket endpoints, so it has to attach the same counters and online
 // map directly after authentication. The 64-byte authentication header is deliberately excluded,
 // just as the ordinary dispatched protocols exclude their own handshake from user traffic.
+type mirroredTrafficCounter struct {
+	primary featurestats.Counter
+	source  featurestats.Counter
+}
+
+func (c *mirroredTrafficCounter) Value() int64 {
+	if c.primary != nil {
+		return c.primary.Value()
+	}
+	return c.source.Value()
+}
+
+func (c *mirroredTrafficCounter) Set(value int64) int64 {
+	var previous int64
+	if c.primary != nil {
+		previous = c.primary.Set(value)
+	} else {
+		previous = c.source.Value()
+	}
+	if c.source != nil {
+		c.source.Set(value)
+	}
+	return previous
+}
+
+func (c *mirroredTrafficCounter) Add(value int64) int64 {
+	var current int64
+	if c.primary != nil {
+		current = c.primary.Add(value)
+	}
+	if c.source != nil {
+		source := c.source.Add(value)
+		if c.primary == nil {
+			current = source
+		}
+	}
+	return current
+}
+
+func mirrorSourceTraffic(primary, source featurestats.Counter) featurestats.Counter {
+	if primary == nil {
+		return source
+	}
+	if source == nil {
+		return primary
+	}
+	return &mirroredTrafficCounter{primary: primary, source: source}
+}
+
 func accountConnection(
 	manager featurestats.Manager,
 	onlineTracker *onlineObservationTracker,
@@ -262,6 +311,27 @@ func accountConnection(
 		return conn, func() {}, nil
 	}
 
+	var sourceUplink, sourceDownlink featurestats.Counter
+	stopAccounting := func() {}
+	if userPolicy.Stats.UserOnline && sourceIP != "" {
+		if onlineTracker != nil {
+			sourceUplink, sourceDownlink, stopAccounting =
+				onlineTracker.observeWithTraffic(manager, email, sourceIP)
+		} else {
+			online, _ := featurestats.GetOrRegisterOnlineMap(manager, "user>>>"+email+">>>online")
+			if online != nil {
+				if protocols, ok := online.(featurestats.ProtocolOnlineMap); ok {
+					protocols.AddIPWithProtocol(sourceIP, protocolName)
+					stopAccounting = func() { protocols.RemoveIPWithProtocol(sourceIP, protocolName) }
+				} else {
+					online.AddIP(sourceIP)
+					stopAccounting = func() { online.RemoveIP(sourceIP) }
+				}
+				sourceUplink, sourceDownlink = sourceTrafficCounters(online, sourceIP)
+			}
+		}
+	}
+
 	var uplinkCounter, downlinkCounter featurestats.Counter
 	var err error
 	if userPolicy.Stats.UserUplink {
@@ -270,6 +340,7 @@ func accountConnection(
 			"user>>>"+email+">>>traffic>>>uplink",
 		)
 		if err != nil {
+			stopAccounting()
 			return conn, func() {}, err
 		}
 	}
@@ -279,9 +350,18 @@ func accountConnection(
 			"user>>>"+email+">>>traffic>>>downlink",
 		)
 		if err != nil {
+			stopAccounting()
 			return conn, func() {}, err
 		}
 	}
+	if uplinkCounter != nil || downlinkCounter != nil {
+		// MTProxy authenticates a Telegram-only protocol and bypasses the
+		// generic dispatcher; its service identity does not require SNI.
+		uplinkCounter = featurestats.WithSiteCounter(manager, email, "telegram", "uplink", uplinkCounter)
+		downlinkCounter = featurestats.WithSiteCounter(manager, email, "telegram", "downlink", downlinkCounter)
+	}
+	uplinkCounter = mirrorSourceTraffic(uplinkCounter, sourceUplink)
+	downlinkCounter = mirrorSourceTraffic(downlinkCounter, sourceDownlink)
 	if uplinkCounter != nil || downlinkCounter != nil {
 		conn = &stat.CounterConnection{
 			Connection:   conn,
@@ -289,23 +369,7 @@ func accountConnection(
 			WriteCounter: downlinkCounter,
 		}
 	}
-
-	if !userPolicy.Stats.UserOnline || sourceIP == "" {
-		return conn, func() {}, nil
-	}
-	if onlineTracker != nil {
-		return conn, onlineTracker.observe(manager, email, sourceIP), nil
-	}
-	online, _ := featurestats.GetOrRegisterOnlineMap(manager, "user>>>"+email+">>>online")
-	if online == nil {
-		return conn, func() {}, nil
-	}
-	if protocols, ok := online.(featurestats.ProtocolOnlineMap); ok {
-		protocols.AddIPWithProtocol(sourceIP, protocolName)
-		return conn, func() { protocols.RemoveIPWithProtocol(sourceIP, protocolName) }, nil
-	}
-	online.AddIP(sourceIP)
-	return conn, func() { online.RemoveIP(sourceIP) }, nil
+	return conn, stopAccounting, nil
 }
 
 // Telegram encrypts the complete 64-byte initialization payload before sending its first 56

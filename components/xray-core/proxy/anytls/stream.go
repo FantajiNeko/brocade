@@ -39,6 +39,7 @@ type stream struct {
 	deliveryDoneHook  func()
 	deliveryFinished  bool
 	synAckReceived    atomic.Bool
+	startWorker       func(func())
 
 	isUDP      bool
 	udpTarget  *xnet.Destination
@@ -168,7 +169,11 @@ func (st *stream) startDeliveryWorker(deliver func(buf.MultiBuffer) error) {
 			st.close(errors.New("anytls: stream delivery is unavailable"))
 			return
 		}
-		go st.deliveryLoop(deliver)
+		if st.startWorker != nil {
+			st.startWorker(func() { st.deliveryLoop(deliver) })
+		} else {
+			go st.deliveryLoop(deliver)
+		}
 	})
 }
 

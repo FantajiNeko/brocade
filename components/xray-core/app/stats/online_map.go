@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	featurestats "github.com/xtls/xray-core/features/stats"
 )
 
 const (
@@ -13,16 +15,19 @@ const (
 )
 
 type ipEntry struct {
-	refCount  int
-	lastSeen  int64
-	protocols map[string]int
+	refCount    int
+	lastSeen    int64
+	onlineSince int64
+	protocols   map[string]int
+	uplink      Counter
+	downlink    Counter
 }
 
 // OnlineMap is a refcount-based implementation of stats.OnlineMap.
 // IPs are tracked by reference counting: AddIP increments, RemoveIP decrements.
 // An IP is removed from the map when its reference count reaches zero.
 type OnlineMap struct {
-	entries map[string]ipEntry
+	entries map[string]*ipEntry
 	access  sync.Mutex
 	count   atomic.Int64
 }
@@ -30,7 +35,7 @@ type OnlineMap struct {
 // NewOnlineMap creates a new OnlineMap instance.
 func NewOnlineMap() *OnlineMap {
 	return &OnlineMap{
-		entries: make(map[string]ipEntry),
+		entries: make(map[string]*ipEntry),
 	}
 }
 
@@ -50,12 +55,12 @@ func (om *OnlineMap) AddIPWithProtocol(ip, protocol string) {
 		e.refCount++
 		e.lastSeen = now
 		e.protocols[protocol]++
-		om.entries[ip] = e
 	} else {
-		om.entries[ip] = ipEntry{
-			refCount:  1,
-			lastSeen:  now,
-			protocols: map[string]int{protocol: 1},
+		om.entries[ip] = &ipEntry{
+			refCount:    1,
+			lastSeen:    now,
+			onlineSince: now,
+			protocols:   map[string]int{protocol: 1},
 		}
 		om.count.Add(1)
 	}
@@ -80,8 +85,6 @@ func (om *OnlineMap) RemoveIPWithProtocol(ip, protocol string) {
 	if e.refCount <= 0 {
 		delete(om.entries, ip)
 		om.count.Add(-1)
-	} else {
-		om.entries[ip] = e
 	}
 }
 
@@ -107,12 +110,52 @@ func (om *OnlineMap) ForEachWithProtocols(fn func(string, int64, []string) bool)
 	om.access.Lock()
 	defer om.access.Unlock()
 	for ip, e := range om.entries {
-		protocols := make([]string, 0, len(e.protocols))
-		for protocol := range e.protocols {
-			protocols = append(protocols, protocol)
-		}
-		slices.Sort(protocols)
+		protocols := protocolSnapshot(e)
 		if !fn(ip, e.lastSeen, protocols) {
+			break
+		}
+	}
+}
+
+func protocolSnapshot(e *ipEntry) []string {
+	protocols := make([]string, 0, len(e.protocols))
+	for protocol := range e.protocols {
+		protocols = append(protocols, protocol)
+	}
+	slices.Sort(protocols)
+	return protocols
+}
+
+// TrafficCounters returns the current epoch's two counters for an already-online source. The
+// entry pointer stays valid for the connection that obtained it even if a concurrent final close
+// removes the address from future snapshots.
+func (om *OnlineMap) TrafficCounters(ip string) (uplink, downlink featurestats.Counter, ok bool) {
+	om.access.Lock()
+	defer om.access.Unlock()
+	e, ok := om.entries[ip]
+	if !ok {
+		return nil, nil, false
+	}
+	return &e.uplink, &e.downlink, true
+}
+
+// ForEachWithSessionTraffic snapshots membership, protocol references and session counters under
+// one lock so the command API never combines byte totals from one epoch with another epoch's
+// online-since timestamp.
+func (om *OnlineMap) ForEachWithSessionTraffic(
+	fn func(string, int64, int64, int64, int64, []string) bool,
+) {
+	om.access.Lock()
+	defer om.access.Unlock()
+	for ip, e := range om.entries {
+		if !fn(
+			ip,
+			e.lastSeen,
+			e.onlineSince,
+			e.uplink.Value(),
+			e.downlink.Value(),
+			protocolSnapshot(e),
+		) {
 			break
 		}
 	}
