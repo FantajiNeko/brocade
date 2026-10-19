@@ -33,7 +33,7 @@ runs:
     # The runner is clean and loses this on every run, so what gets cached is the unpacked directory.
     - name: Cache zig
       id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ~/.local/zig-x86_64-linux-${{ steps.pin.outputs.version }}
         key: zig-${{ steps.pin.outputs.version }}-${{ runner.os }}

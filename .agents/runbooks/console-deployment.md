@@ -51,6 +51,23 @@ sha256sum /opt/brocade/brocade-console
 
 ## 数据库兼容
 
+### 首次上线向导
+
+新安装在创建系统管理员时会同时写入 `first_run_onboarding` 单例，随后由向导纳管首台机器、
+创建链和首个用户，并以真实授权拨测完成。初始化不再创建固定的 `zero` 用户。
+
+既有环境在停写、备份并于隔离恢复库验证后，以应用角色执行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade \
+  -f scripts/compat-first-run-onboarding.sql
+```
+
+脚本只建表、不插入单例；缺少单例明确表示“不适用”，因此升级不会把已经运行的 Console
+重定向进入向导，也不会删除历史上已有的 `zero`。核对表、外键和检查约束，并确认本次
+`0001_init.sql` 的其它差异都已兼容后，再按目标二进制更新 version 1 的 SQLx SHA-384。
+旧 Console 会忽略该表；回退时可以保留，但须恢复旧 checksum。
+
 ### 发布工单阶段时间
 
 发布详情的步骤时间来自控制面阶段切换，不再复用 Agent 领取目标时写入且会随租约刷新的
@@ -72,6 +89,44 @@ psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
 核对表、主键、外键、检查约束、所有权和回填结果，并审查本次 `0001_init.sql` 的其它差异
 都已兼容后，才按目标二进制更新 version 1 的 SQLx SHA-384。旧 Console 会忽略新增表；
 回退旧二进制时可以保留该表，但必须恢复旧 checksum。无需升级 Agent 或 Xray。
+
+### 用户机器流量
+
+用户统计页的机器 × 时间矩阵使用新增 `usage_user_node_rollups` 保存用户、入口机器的日汇总，
+与已接受的接入记账窗口在同一事务中累加。转发复用已有日汇总；不修改计费、Agent/Xray 或协议。
+当天/当周从保留的用量明细按小时读取，当月按日读取，均沿用 UTC+8 和窗口起点的账本归属。
+
+停写并备份后，以应用角色运行 `scripts/compat-user-machine-usage.sql`；先在生产备份的隔离
+恢复库验证。脚本从尚存的接入明细回填，故意拒绝重复执行，不修改 SQLx checksum。
+核对 owner、主键/外键、每日已归属总量不超过原账本，以及未按机器记录的差额；
+只有审查目标 0001 全部差异后，才能设置与目标二进制相同的 SHA-384。
+历史差额不能均摊到机器或小时；缺失上报证据不能解释为零流量。
+
+回退旧 Console 时可保留新增表并恢复对应 checksum，但旧版本会停止维护此投影。
+再次启用前须停写并核对中断期间的明细是否仍在保留期内，按缺失区间补齐；
+无法补齐的部分继续作为未按机器记录。不能恢复旧数据库覆盖新账单。
+
+### 机器流入统计
+
+机器详情「流量」页签的流入统计使用新增 `usage_user_ingress_rollups`：按机器、+08 日、用户与入口
+累计接入流量，在接受记账窗口的同一事务中写入，并冻结写入时入口所属的接入链。同时为
+`user_site_usage_hourly` 增加 `(node_id, bucket)` 索引，供流出统计读取单台机器。端口转发复用
+已有日汇总；不修改计费、Agent/Xray 或协议。
+
+停写并备份后，以应用角色运行（先在生产备份的隔离恢复库验证）：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-user-ingress-usage.sql
+```
+
+脚本从尚存的接入明细回填，故意拒绝重复执行，不修改 SQLx checksum。核对 owner、主键/外键、
+索引，以及每日接入链汇总不超过 `usage_user_node_rollups`；明细保留期以外的差额在页面上显示为
+「未按接入链记录」，不能均摊到接入链。只有审查目标 0001 全部差异后，才能设置与目标二进制相同的
+SHA-384。
+
+回退旧 Console 时可保留新增表与索引并恢复对应 checksum，但旧版本会停止维护此投影；再次启用前
+须停写，从仍在保留期内的明细补齐中断区间，无法补齐的部分继续作为「未按接入链记录」。
 
 ### 用户实时流量
 
@@ -221,6 +276,26 @@ Agent/Xray；启用 MTProxy 配置前需另走二进制发布流程，使目标�
 旧二进制可忽略新增列，回退时保留该列和全部事件，只恢复对应 checksum 和旧程序。
 旧 UI 不理解清空游标，回退期间可能重新展示旧通知；不能通过恢复整库回退界面状态。
 
+### VPN Gate 总开关与任务集合拆分
+
+新安装的 VPN Gate 总开关默认关闭。已有环境部署前停止 Console 写入、备份数据库与旧二进制，
+记录 version 1 migration checksum，并先在生产备份的隔离恢复库执行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-vpngate-worker-sets.sql
+```
+
+脚本把旧的组合集合重命名为 `vpngate_catalog_nodes`，另建
+`vpngate_intelligence_nodes`，并把原选择复制到两张表，因此升级不会静默丢失任务分配；新
+Console 上线后两套集合可独立修改。脚本同时把总开关当前值和默认值设为关闭，保留目录、候选、
+选择及已发布 Chain。核对两表的列、约束、所有者和复制行数，以及总开关为关闭后，确认目标
+`0001_init.sql` 的其它差异也已兼容，才更新 version 1 的 SQLx SHA-384。
+
+这是非向后兼容的表形状变更：执行脚本后不能直接回退旧 Console。若新 Console 尚未写入，
+可在维护窗口从已验证备份恢复旧数据库与 checksum；新 Console 已写入后，两套集合可能已经
+分歧，必须先导出并人工决定合并规则，不能自动覆盖其中一套选择。Agent 与 Xray 协议不变。
+
 ### 稀疏用量明细与 VPN Gate 索引
 
 仅改 `0001`：新 `usage_node_windows` 表替代 `node_usage_windows` UNION 视图，按
@@ -353,6 +428,43 @@ psql -X -v ON_ERROR_STOP=1 -d brocade \
 恢复应优先修复新版本；确需旧版时须停写并另行验证反向适配或恢复方案，不能自动
 恢复整库覆盖转换后业务数据。保留部署备份不等于建立历史 Agent/Xray 产物仓库。
 
+#### Xray 平滑交接策略与发布期双进程观测
+
+统一发布账本已存在的环境，升级到支持 `restart` / `handoff` / `handoff-force` 的
+Console 前，先停止 Console 写入并备份数据库，再以应用角色执行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade \
+  -f scripts/compat-xray-handoff-release.sql
+```
+
+脚本只增加发布策略、排空超时、强制退役证据和 `node_agent_state.xray_upgrade` 临时
+观测列，并在事务内设置锁与语句超时；它故意拒绝重复执行。旧发布记录的策略保持
+NULL，由新 Console 按既有的直接重启语义读取，不能回填成未经证明的平滑交接。
+核对列、检查约束、现有发布记录数和目标记录数后，按目标 `0001_init.sql` 更新 SQLx
+version 1 SHA-384。回滚旧 Console 前可保留这些可空列，但必须恢复旧 schema checksum。
+
+数据库扩列不等于节点具备平滑交接。只有协议版本满足要求且 Agent 实时上报
+`xray_handoff.state=ready` 的机器才能创建 handoff 发布；`blocked`、`busy`、缺失或
+过期状态都必须阻止下发。`xray_upgrade` 只在一次发布尝试中显示，终态运行报告应将
+其清为 NULL；流量计量仍读取原有单一累计账本，不能把两个 PID 的数值相加。
+
+配置发布默认在 300 秒排空超时后强制退役上一代。已有库还需在停写和备份后、启动新
+Console 前，以应用角色执行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade \
+  -f scripts/compat-config-xray-force-retirement.sql
+```
+
+该表保存系统管理员或后一张可执行配置单对一张旧配置单、一个节点和一次 claim generation
+的精确授权；
+配置发布的默认超时强退由 Agent 的持久运行态决定，不依赖 Console 在线。协议 v33 的 Agent
+也会把 v32 遗留且已过期的配置 `handoff` 视为待强退，先收口旧代，下一轮再领取新配置。
+Console 会拒绝向低于 v33 的 Agent 下发新配置，所以上线顺序是：兼容 SQL、Console、Agent，
+确认节点协议为 v33 后再创建配置发布。核对表、约束和唯一部分索引后再更新 SQLx version 1
+SHA-384；回滚旧 Console 时仍须恢复旧 checksum。
+
 ### 在线来源协议字段兼容
 
 协议感知版本在 `user_online_sources` 增加可空 `protocols JSONB`；只维护
@@ -393,6 +505,27 @@ COMMIT;
 显示「协议未知」，IP 来源统计正常。字段为向后兼容扩展，不提高最低协议版本。
 回滚保留可空列；旧程序忽略它，恢复旧二进制前必须核对并恢复其迁移 checksum。
 Agent 和 Xray 发布仍需要独立授权、灰度与观察，不能因部署 Console 自动执行。
+
+### 在线来源会话指标兼容
+
+接入链会话版在 `user_online_sources` 增加可空的 `online_since_at`、
+`session_uplink_bytes` 和 `session_downlink_bytes`。已有环境必须先停止旧 Console 写入、
+备份并记录原 `0001` checksum，再以应用角色运行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-user-online-session.sql
+```
+
+脚本只扩展现有表，不回填历史行，也不从月用量推算来源 IP 流量；三个字段必须同时为空或
+同时有效。检查列类型和 `user_online_sources_session_shape` 与 `0001_init.sql` 一致，并确认
+本次 `0001` 没有其它未兼容差异后，才按目标二进制内嵌值更新 SQLx version 1 checksum。
+
+部署顺序为数据库兼容 → Console → 灰度 Agent/Xray。新字段在部署协议和 Xray protobuf
+中均为可选扩展，不提高最低 Agent 协议版本；旧组件继续上报 IP、入口和协议，新 Console
+将本次流量与在线时长显示为「—」。回滚时保留可空列，恢复旧 Console 前仍须恢复旧
+checksum。来源会话计数只存在 Xray 内存中，Xray 重启后从下一次认证连接重新起算，不影响
+计费用量账本。
 
 ### 用户自助转发兼容
 
@@ -620,6 +753,20 @@ Console 启动时根据 `BROCADE_NOTIFICATION_WEBHOOK_URL` 收敛通道状态：
 `<80%` 九十秒恢复；Webhook envelope 升为 schema v2，并为事件增加结构化指标字段。
 回滚旧 Console 时保留兼容列、状态表和事件，并先恢复旧 checksum；旧版本会忽略
 `suppressed` 行以及新的 steal 事件。
+
+### 机器地区手动覆盖兼容
+
+机器详情的手动地区只修正 Console 展示，不进入模型修订或节点产物。已有数据库部署对应
+Console 前，先停止写入、备份并记录原 migration checksum，再以应用角色执行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
+  -f scripts/compat-node-region-overrides.sql
+```
+
+确认 `node_region_overrides` 的主键、外键和两个输入约束与目标 `0001_init.sql` 一致，并审查
+本次 `0001` 的其它差异后，才更新 version 1 的 SQLx SHA-384。旧 Console 不读取这张表，
+回滚时可以保留手动选择记录，但必须恢复与旧二进制匹配的 migration checksum。
 
 ## 上传与原子替换
 
