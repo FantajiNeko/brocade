@@ -468,6 +468,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
 export const AGENT_PROTOCOL_VERSION = 36;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
+export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
 export const XRAY_HANDOFF_PROTOCOL_VERSION = 30;
 export const CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION = 33;
 export const VPNGATE_MAX_CANDIDATES = 16;

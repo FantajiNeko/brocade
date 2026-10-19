@@ -145,7 +145,12 @@ describe('fleet traffic matrix', () => {
       ),
     };
 
-    const matrix = buildFleetTrafficMatrix(payload, [], [user('alice')], NOW);
+    const matrix = buildFleetTrafficMatrix(
+      payload,
+      [{ ...nodeState('agent-old'), agent_protocol_version: 26 }],
+      [user('alice')],
+      NOW,
+    );
     const phase = Object.fromEntries(matrix.nodes.map(node => [node.id, [node.phase, node.partial]]));
 
     expect(phase).toEqual({
@@ -164,6 +169,38 @@ describe('fleet traffic matrix', () => {
     expect(matrix.users[0].cells.get('forwarding')?.state).toBe('unknown');
     expect(matrix.users[0].unknown).toBe(6);
     expect(matrix.nicNodes).toBe(6);
+  });
+
+  it('treats the first NIC-only frame and an unopened stream as loading, without inventing zero rates', () => {
+    const nicOnly = (id: string) => {
+      const node = liveNode(id, NOW, []);
+      delete (node.samples[0].sample as { user_traffic?: unknown }).user_traffic;
+      return node;
+    };
+    const payload: FleetTrafficSnapshot = {
+      policy: { enabled: true },
+      nodes: [nicOnly('modern'), nicOnly('unknown')],
+      expected: ['modern', 'unknown', 'opening'].map(node_id => ({
+        node_id,
+        users: [{ tenant_id: 'platform', user_id: 'alice' }],
+      })),
+    };
+    const states = [{ ...nodeState('modern'), agent_protocol_version: 36 }, nodeState('unknown'), nodeState('opening')];
+
+    const matrix = buildFleetTrafficMatrix(payload, states, [user('alice')], NOW);
+
+    expect(matrix.nodes.every(node => node.phase === 'pending' && !node.complete)).toBe(true);
+    expect(matrix.nodes.find(node => node.id === 'opening')?.current).toBe(false);
+    expect(matrix.users[0].unknown).toBe(3);
+    expect([...matrix.users[0].cells.values()].every(cell => cell.state === 'unknown')).toBe(true);
+    expect(matrix.currentNodes).toBe(0);
+    expect(matrix.nicNodes).toBe(2);
+
+    payload.nodes[0] = liveNode('modern', NOW, []);
+    const ready = buildFleetTrafficMatrix(payload, states, [user('alice')], NOW);
+    expect(ready.nodes.find(node => node.id === 'modern')?.phase).toBe('ready');
+    expect(ready.users[0].cells.get('modern')?.state).toBe('idle');
+    expect(ready.currentNodes).toBe(1);
   });
 
   it('groups machines by region, larger regions first, and leaves out users with nothing to show', () => {

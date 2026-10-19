@@ -222,6 +222,54 @@ describe('fleet realtime traffic panel', () => {
     expect(rest).toEqual(['空闲 1 位bob', '读数不完整 1 台台北 家宽（实时通道未连接）']);
   });
 
+  it('groups initial user-rate loading as connecting and clears it when reports arrive', async () => {
+    const payload = snapshot();
+    delete payload.nodes[0].samples[0].sample.user_traffic;
+    payload.nodes[1].samples[0].sample.user_traffic!.state = 'warming';
+    payload.nodes[2].samples = [];
+    serve(payload);
+    const view = mount();
+
+    const list = await view.findByLabelText('按用户的当前速率');
+    expect(view.getByRole('status').textContent).toBe('连接中');
+    expect(within(list).getByText('正在等待速率数据')).toBeTruthy();
+    expect(list.querySelector('.flt-list-rest')?.textContent).toBe('连接中：香港 HKIX、东京 IIJ、台北 家宽');
+    expect(within(list).queryByText(/读数不完整|尚未支持用户速率|空闲/)).toBeNull();
+    expect(view.queryByRole('alert')).toBeNull();
+
+    Object.assign(payload, snapshot());
+    await waitFor(() => expect(view.getByRole('status').textContent).toBe('实时 · 每秒更新'), {
+      timeout: 4_000,
+    });
+    expect(within(list).queryByText('连接中：')).toBeNull();
+    expect(within(list).getByText('空闲 1 位')).toBeTruthy();
+  });
+
+  it('keeps a large connecting fleet concise instead of repeating one message for every machine', async () => {
+    const payload = snapshot();
+    const extra = Array.from({ length: 22 }, (_, index) => ({
+      node_id: `extra-${String(index).padStart(2, '0')}`,
+      connected: false,
+      active: false,
+      interval_secs: 1,
+      samples: [],
+    }));
+    payload.nodes = [...payload.nodes.map(node => ({ ...node, samples: [] })), ...extra];
+    payload.expected = payload.nodes.map(node => ({
+      node_id: node.node_id,
+      users: [{ tenant_id: 'platform', user_id: 'alice' }],
+    }));
+    serve(payload);
+    const view = mount();
+
+    const list = await view.findByLabelText('按用户的当前速率');
+    const line = list.querySelector('.flt-list-rest')!;
+    expect(line.textContent).toMatch(/^连接中：.* 等 25 台$/);
+    expect(line.querySelector('span')?.title.split('、')).toHaveLength(25);
+    expect(line.textContent).not.toContain('extra-21');
+    expect(within(list).queryByText(/读数不完整|尚未支持用户速率/)).toBeNull();
+  });
+
   it('shows public viewers the complete matrix without any detail action', async () => {
     serve(snapshot());
     const visitor = mount(false);

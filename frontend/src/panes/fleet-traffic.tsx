@@ -1,7 +1,13 @@
 import { useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
-import { fetchNodes, fetchUsers, type NodeAgentStateItem, type UserListItem } from '../api';
+import {
+  fetchNodes,
+  fetchUsers,
+  REALTIME_USER_TRAFFIC_PROTOCOL_VERSION,
+  type NodeAgentStateItem,
+  type UserListItem,
+} from '../api';
 import { navigate } from '../forge/route';
 import type { NodeRealtimeEvent } from '../node-realtime';
 import { NodeTrafficDialog } from '../node-traffic';
@@ -33,6 +39,7 @@ const ACTIVE_HOLD_MILLIS = 30_000;
 const FLOW_PREVIEW = 3;
 /** 窄屏空闲用户名单最多写出的名字数。 */
 const IDLE_NAMES = 12;
+const CONNECTING_NAMES = 4;
 
 type CellState = 'rate' | 'idle' | 'unknown' | 'not-entitled';
 
@@ -111,14 +118,24 @@ function machinePhase(
   live: FleetTrafficNode | undefined,
   event: NodeRealtimeEvent | null,
   nowMillis: number,
+  agentProtocol: number | null | undefined,
 ): { phase: FleetMachinePhase; partial: boolean } {
   if (!enabled) return { phase: 'disabled', partial: false };
+  if (!live || !event) return { phase: 'pending', partial: false };
   const freshness = Math.max(MIN_FRESH_MILLIS, (live?.interval_secs ?? 1) * 3_000);
-  if (!live?.connected || !live.active || !event || nowMillis - event.received_at_unix_millis > freshness) {
+  if (!live.connected || !live.active || nowMillis - event.received_at_unix_millis > freshness) {
     return { phase: 'offline', partial: false };
   }
   const report = event.sample.user_traffic;
-  if (!report) return { phase: 'unsupported', partial: false };
+  // The first frame can contain NIC rates before the user-rate demand reaches the Agent.
+  // Absence proves a missing capability only when its reported protocol is actually too old.
+  if (!report) {
+    return {
+      phase:
+        agentProtocol != null && agentProtocol < REALTIME_USER_TRAFFIC_PROTOCOL_VERSION ? 'unsupported' : 'pending',
+      partial: false,
+    };
+  }
   if (report.state === 'unavailable') return { phase: 'unavailable', partial: false };
   if (report.state !== 'ready') return { phase: 'pending', partial: false };
   if (report.forwarding_expected && !report.forwarding_supported) {
@@ -194,8 +211,14 @@ export function buildFleetTrafficMatrix(
       const state = activeNodeStates.get(id);
       const live = liveNodes.get(id);
       const event = live ? latest(live) : null;
-      const { phase, partial } = machinePhase(payload.policy.enabled, live, event, nowMillis);
-      const current = phase !== 'offline' && phase !== 'disabled';
+      const { phase, partial } = machinePhase(
+        payload.policy.enabled,
+        live,
+        event,
+        nowMillis,
+        state?.agent_protocol_version,
+      );
+      const current = phase !== 'offline' && phase !== 'disabled' && event !== null;
       const report = current ? event?.sample.user_traffic : null;
       const complete = phase === 'ready' && !partial;
       const rates = new Map<string, { down: number; up: number }>();
@@ -831,11 +854,12 @@ function FleetList({
   multiTenant: boolean;
   allowDetails: boolean;
 }) {
-  const issues = matrix.nodes.filter(node => machineIssue(node) !== null);
+  const connecting = matrix.nodes.filter(node => node.phase === 'pending');
+  const issues = matrix.nodes.filter(node => node.phase !== 'pending' && machineIssue(node) !== null);
   return (
     <section className="flt-list" aria-label="按用户的当前速率">
       {rows.length === 0 ? (
-        <p className="flt-list-empty">当前没有用户流量</p>
+        <p className="flt-list-empty">{connecting.length > 0 ? '正在等待速率数据' : '当前没有用户流量'}</p>
       ) : (
         <ul className="flt-flows">
           {rows.map(user => {
@@ -905,6 +929,18 @@ function FleetList({
             .map(user => user.userId)
             .join('、')}
           {idle.length > IDLE_NAMES ? ' 等' : ''}
+        </p>
+      )}
+      {connecting.length > 0 && (
+        <p className="flt-list-rest">
+          <b>连接中：</b>
+          <span title={connecting.map(node => node.name).join('、')}>
+            {connecting
+              .slice(0, CONNECTING_NAMES)
+              .map(node => node.name)
+              .join('、')}
+            {connecting.length > CONNECTING_NAMES ? ` 等 ${connecting.length} 台` : ''}
+          </span>
         </p>
       )}
       {issues.length > 0 && (
@@ -980,7 +1016,7 @@ function FleetCockpit({
           <FleetList
             matrix={matrix}
             rows={listRows}
-            idle={matrix.users.filter(user => !recent(user))}
+            idle={matrix.users.filter(user => !recent(user) && user.unknown === 0)}
             multiTenant={multiTenant}
             allowDetails={allowMachineDetails}
           />
@@ -1037,10 +1073,17 @@ export function FleetTrafficTab({ allowMachineDetails = true }: { allowMachineDe
 
   const enabled = source.payload.policy.enabled;
   const warn = enabled && source.failed;
+  const connecting = matrix.currentNodes === 0 && matrix.nodes.some(node => node.phase === 'pending');
   const status = (
     <span className={`rut-status${warn ? ' warn' : ''}`} role="status">
-      <i className={`node-lamp${!enabled ? ' idle' : warn ? ' warn' : ''}`} />
-      {!enabled ? PHASE_TEXT.disabled : warn ? `${PHASE_TEXT.offline} · 保留最近读数` : PHASE_TEXT.ready}
+      <i className={`node-lamp${warn ? ' warn' : !enabled || connecting ? ' idle' : ''}`} />
+      {!enabled
+        ? PHASE_TEXT.disabled
+        : warn
+          ? `${PHASE_TEXT.offline} · 保留最近读数`
+          : connecting
+            ? '连接中'
+            : PHASE_TEXT.ready}
     </span>
   );
   return (

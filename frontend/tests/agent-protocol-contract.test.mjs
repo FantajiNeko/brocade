@@ -24,6 +24,14 @@ test('frontend and compiler expose the same VPN Gate candidate bound', () => {
   assert.equal(frontendLimit, rustLimit);
 });
 
+test('frontend and Agent agree on the first protocol with user-rate reports', () => {
+  const rustVersion = rust.match(/pub const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION: u32 = (\d+);/)?.[1];
+  const frontendVersion = api.match(/export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = (\d+);/)?.[1];
+  assert.ok(rustVersion, 'Rust user-rate protocol constant is missing');
+  assert.ok(frontendVersion, 'Frontend user-rate protocol constant is missing');
+  assert.equal(frontendVersion, rustVersion);
+});
+
 test('frontend and runtime expose the same VPN Gate connection timeout ceiling', () => {
   const rustTimeout = core.match(/pub const VPNGATE_CONNECT_THRESHOLD_MAX_MS: u32 = ([\d_]+);/)?.[1];
   const frontendTimeout = api.match(/export const VPNGATE_CONNECT_THRESHOLD_MAX_MS = ([\d_]+);/)?.[1];
