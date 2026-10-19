@@ -442,9 +442,7 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
             </option>
           ))}
         </select>
-        <span className="note">
-          {available.length ? '接入面开在这台机器上，用户从这里接入。' : '先去「机器」纳管一台，再回来选择入口。'}
-        </span>
+        {!available.length && <span className="note">先去「机器」纳管一台，再回来选择入口。</span>}
       </div>
     );
   }

@@ -1256,7 +1256,6 @@ export function ChainWizard({
                       </button>
                     )}
                   </span>
-                  <span className="sp" />
                   <button
                     type="button"
                     className="btn sm"

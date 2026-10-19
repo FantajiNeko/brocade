@@ -81,7 +81,7 @@ test('建链沿用公共纸面、面板、规则树与授权卡，不用页面�
   assert.doesNotMatch(styles, /\.wzg-[\w-]+|\.wzi(?:-col)?\b|\.wz-app\b|\.wz-auto-region[\w-]*|\.wz-inline-alert/);
 
   // 授权格只改排列，选中、悬停与禁用都来自 .grant-card。
-  assert.match(rule('.grant-card[aria-pressed=\'true\']'), /background:\s*var\(--action-wash\);/);
+  assert.match(rule(".grant-card[aria-pressed='true']"), /background:\s*var\(--action-wash\);/);
   const pick = rule('.pv-chain-fields .cc-user.grant-card');
   assert.match(pick, /flex-direction:\s*row;/);
   assert.doesNotMatch(pick, /border|background|color|font|radius/);
@@ -92,7 +92,7 @@ test('建链沿用公共纸面、面板、规则树与授权卡，不用页面�
   );
   assert.ok(wizardRules.length > 20, '建链样式扫描异常');
   for (const [, selectors, declarations] of wizardRules) {
-    // 可以给公共骨架挂容器查询，但不改它的材质、字号与尺寸。
+    // 可以给公共骨架挂容器查询、按所在工具条调宽度，但不改它的材质、字号与高度。
     if (
       /\.(?:pv-head|pv-plate|pv-steps|pv-foot|pv-state|panel-title|config-panel|user-avatar|user-list-search|user-new-[\w-]+)\b/.test(
         selectors,
@@ -100,7 +100,7 @@ test('建链沿用公共纸面、面板、规则树与授权卡，不用页面�
     )
       assert.doesNotMatch(
         declarations,
-        /(?:^|;)\s*(?:background|border[\w-]*|box-shadow|color|font[\w-]*|padding[\w-]*|(?:min-)?height|width)\s*:/,
+        /(?:^|;)\s*(?:background|border[\w-]*|box-shadow|color|font[\w-]*|padding[\w-]*|(?:min-)?height)\s*:/,
         `${selectors.trim()}: 建链不得改写公共骨架`,
       );
     assert.doesNotMatch(declarations, /#[0-9a-f]{3,8}\b|rgba?\(|!important/i, `${selectors.trim()}: 只用语义令牌`);

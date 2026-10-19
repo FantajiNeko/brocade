@@ -17513,10 +17513,6 @@ body.fg-dragging * {
   width: 100%;
   min-height: 28px;
 }
-.pv-chain-fields .wzp-body .wzp-hop-summary {
-  display: inline-block;
-  margin-right: 7px;
-}
 .pv-chain-fields .wzp-body textarea.wzp-padding-custom {
   display: block;
   box-sizing: border-box;
@@ -17595,6 +17591,14 @@ body.fg-dragging * {
   flex-wrap: wrap;
   margin: 0 0 10px;
 }
+/* 搜索框随工具条伸缩，360px 宽的手机上仍与三个按钮同行。 */
+.pv-chain-fields .cc-users-tools > .user-list-search {
+  flex: 1 1 72px;
+  width: auto;
+  min-width: 0;
+  max-width: 280px;
+  margin-right: auto;
+}
 .pv-chain-fields .cc-users-tools + .user-new-row {
   margin-bottom: 10px;
 }
@@ -17605,6 +17609,13 @@ body.fg-dragging * {
   margin: -3px;
   padding: 3px;
   overflow: auto;
+}
+/* 触屏页面用文档滚动：窄屏不在卡片里再套一层滚动区。 */
+@media (max-width: 820px) {
+  .pv-chain-fields .cc-user-list {
+    max-height: none;
+    overflow: visible;
+  }
 }
 .pv-chain-fields .cc-user-grid {
   display: grid;
