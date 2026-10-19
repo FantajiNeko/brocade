@@ -40,6 +40,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+
 use brocade_core::model::{ExternalOutbound, ExternalOutboundProtocol};
 
 use brocade_deployment::protocol::{
@@ -1086,6 +1089,34 @@ impl Drop for ProbeProcess {
     }
 }
 
+/// Bind a throwaway probe to the Agent process which launched it.
+///
+/// The serving Xray and VPN Gate backends deliberately survive an Agent restart. Probe Xrays do
+/// not: once the worker holding `ProbeProcess` disappears, nobody can reap them and their loopback
+/// listeners and resident memory accumulate. A property on this child, rather than the Agent's
+/// systemd cgroup, keeps those two lifecycle policies separate.
+#[cfg(target_os = "linux")]
+fn kill_probe_with_parent(command: &mut Command) {
+    let parent_pid = unsafe { libc::getpid() };
+    // SAFETY: `prctl` and `getppid` are async-signal-safe syscalls. The closure neither allocates
+    // nor touches shared process state between fork and exec. Checking the parent after `prctl`
+    // closes the race where the Agent exits after fork but before the death signal is installed.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_probe_with_parent(_command: &mut Command) {}
+
 fn spawn_xray(
     target: &E2eProbeTarget,
     member: Option<ChainedMember<'_>>,
@@ -1137,11 +1168,14 @@ where
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("打不开探测日志：{error}"))?;
-    let child = Command::new(xray_binary)
+    let mut command = Command::new(xray_binary);
+    command
         .args(["-config", &file.path])
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stderr(Stdio::from(stderr));
+    kill_probe_with_parent(&mut command);
+    let child = command
         .spawn()
         .map_err(|error| format!("起不了探测进程 {}：{error}", xray_binary.display()))?;
     Ok(ProbeProcess {
@@ -1767,6 +1801,79 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         assert!(started.elapsed() < Duration::from_secs(1));
         server.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_child_exits_when_its_parent_disappears() {
+        let dir = std::env::temp_dir().join(format!(
+            "brocade-probe-parent-death-test-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let mut launcher = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::spawn_parent_bound_probe_test_helper",
+                "--nocapture",
+            ])
+            .env("BROCADE_PROBE_PARENT_DEATH_TEST_PID", &pid_file)
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert_ne!(linux_process_state(pid), None);
+        assert!(launcher.wait().unwrap().success());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while linux_process_state(pid).is_some_and(|state| state != 'Z')
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(linux_process_state(pid), None | Some('Z')));
+        std::fs::remove_file(pid_file).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    // The helper must abandon its child to reproduce the lifecycle this regression protects.
+    #[allow(clippy::zombie_processes)]
+    fn spawn_parent_bound_probe_test_helper() {
+        let Some(pid_file) = std::env::var_os("BROCADE_PROBE_PARENT_DEATH_TEST_PID") else {
+            return;
+        };
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        kill_probe_with_parent(&mut command);
+        let child = command.spawn().unwrap();
+        std::fs::write(pid_file, child.id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat[stat.rfind(')')? + 1..]
+            .split_whitespace()
+            .next()?
+            .chars()
+            .next()
     }
 
     /// "Cannot check" must be its own outcome. Counted as a pass, a misconfigured

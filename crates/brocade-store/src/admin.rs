@@ -274,8 +274,7 @@ impl AdminContext {
     }
 
     pub fn can_view_user_realtime_traffic(&self) -> bool {
-        self.operator_id != PUBLIC_OPERATOR_ID
-            && matches!(self.role, AdminRole::SystemAdmin | AdminRole::TenantAdmin)
+        self.operator_id != PUBLIC_OPERATOR_ID && self.role != AdminRole::User
     }
 
     /// Sharing a speed-test link exposes the user's deployed node credentials to its holder.
@@ -480,22 +479,15 @@ pub async fn init_admin(pool: &PgPool, request: AdminInitRequest) -> Result<Admi
 /// The HTTP bootstrap used to create the first administrator, then ask the browser to create the
 /// root tenant. A refresh between those requests permanently closed the initialization screen
 /// while leaving no tenant to hold users or nodes. Keep the operator-only `init_admin` entry point
-/// for administrative callers and tests, but make the product bootstrap atomic: root tenant,
-/// default passwordless `zero` network user are committed together. It exists as the first usage
-/// subject, but receives no login identity until an administrator explicitly enables one later.
+/// for administrative callers and tests, but make the product bootstrap atomic: administrator,
+/// root tenant and the durable first-run checkpoint are committed together. The first network
+/// user is an operator choice made later in that resumable flow; initialization must not invent
+/// an identity such as `zero`.
 pub async fn init_system(pool: &PgPool, request: SystemInitRequest) -> Result<SystemInitResult> {
     let operator_id = required_text(&request.operator_id, "admin operator id")?;
     let display_name = required_text(&request.display_name, "admin operator display_name")?;
     let root_tenant = required_text(&request.root_tenant, "root tenant")?;
     let password_hash = hash_admin_password(&request.password)?;
-    let default_user_id = "zero";
-    let default_user_operator_id = format!("{root_tenant}/{default_user_id}");
-    if operator_id == default_user_operator_id {
-        return Err(StoreError::InvalidData(format!(
-            "administrator id {operator_id} conflicts with the default user identity"
-        )));
-    }
-
     let mut tx = pool.begin().await?;
     sqlx::query("LOCK TABLE admin_operators IN EXCLUSIVE MODE")
         .execute(&mut *tx)
@@ -525,8 +517,8 @@ pub async fn init_system(pool: &PgPool, request: SystemInitRequest) -> Result<Sy
     .await?;
 
     let actor = AdminContext::system_admin(operator_id.clone());
-    crate::console::bootstrap_tenant_and_user_tx(&mut tx, &actor, &root_tenant, default_user_id)
-        .await?;
+    crate::console::bootstrap_root_tenant_tx(&mut tx, &actor, &root_tenant).await?;
+    crate::onboarding::start_tx(&mut tx, &actor, &root_tenant).await?;
     tx.commit().await?;
 
     let session = issue_admin_session(pool, &operator_id).await?;
@@ -1668,19 +1660,18 @@ mod tests {
     use super::{tenant_in_scope, tenant_scope_like_pattern, AdminContext, AdminRole};
 
     #[test]
-    fn realtime_user_traffic_is_administrator_only() {
+    fn realtime_user_traffic_is_for_signed_in_operators_but_not_visitors_or_users() {
+        assert!(
+            !AdminContext::new("operator", AdminRole::User, Some("platform".to_owned()))
+                .can_view_user_realtime_traffic()
+        );
         for role in [
-            AdminRole::User,
             AdminRole::Readonly,
             AdminRole::Editor,
             AdminRole::Publisher,
+            AdminRole::TenantAdmin,
+            AdminRole::SystemAdmin,
         ] {
-            assert!(
-                !AdminContext::new("operator", role, Some("platform".to_owned()))
-                    .can_view_user_realtime_traffic()
-            );
-        }
-        for role in [AdminRole::TenantAdmin, AdminRole::SystemAdmin] {
             assert!(
                 AdminContext::new("operator", role, Some("platform".to_owned()))
                     .can_view_user_realtime_traffic()

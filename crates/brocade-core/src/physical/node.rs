@@ -9,7 +9,7 @@ use crate::{
     hash::hex_lower,
     ir::{
         hops::{HopDialWire, HopPath},
-        routing::{egress_tag as routing_egress_tag, AppIr, DestMatch, Ingress, Rule},
+        routing::{egress_tag as routing_egress_tag, AppIr, AppNode, DestMatch, Ingress, Rule},
         system::{Dial, Link, LinkWrap, SystemIr, SystemNode},
     },
     model::{
@@ -429,6 +429,9 @@ pub struct XrayWarpMasquePlan {
 pub struct XrayRoutingRulePlan {
     pub selector: XrayRuleSelector,
     pub dest_match: DestMatch,
+    /// Source-address conditions are separate from `dest_match`: Xray ANDs both when present,
+    /// while an ingress GeoIP admission rule needs to match every destination.
+    pub source_ips: Vec<String>,
     pub outbound_tag: String,
 }
 
@@ -600,6 +603,13 @@ pub fn project_node(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> NodePlan {
         grant_sync: grant_sync_plan(apps, node_id),
         hy2_port_hops: hy2_port_hops(apps, node_id),
     }
+}
+
+/// Project only hot-synchronized accounts. `None` has the same workload meaning as an absent
+/// Xray plan, without constructing its listeners, routes or any other node artifacts.
+pub fn project_grants(apps: &[AppIr], node_id: &str) -> Option<GrantSyncPlan> {
+    xray_node(apps, node_id)?;
+    Some(grant_sync_plan(apps, node_id))
 }
 
 /// The redirects this machine needs, in a fixed order so that repeated builds are byte-identical.
@@ -822,11 +832,15 @@ fn peer_plan(
     })
 }
 
-fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> {
-    let app_node = sorted_apps(apps)
+fn xray_node<'a>(apps: &'a [AppIr], node_id: &str) -> Option<&'a AppNode> {
+    sorted_apps(apps)
         .into_iter()
         .flat_map(|app| app.nodes.iter())
-        .find(|node| node.id == node_id)?;
+        .find(|node| node.id == node_id)
+}
+
+fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> {
+    let app_node = xray_node(apps, node_id)?;
     let system_node = sys.nodes.iter().find(|node| node.id == node_id);
 
     let mut plan = XrayPlan {
@@ -867,23 +881,20 @@ fn xray_plan(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Option<XrayPlan> 
         external_outbounds: xray_external_outbounds(apps, node_id),
         reverse_portals: xray_reverse_portals(apps, node_id, &sys.settings),
         reverse_bridges: xray_reverse_bridges(apps, node_id, &sys.settings),
-        // Counts only `Action::Block` step rules, not ingress guards — a known gap, left as-is
-        // for now. A guard also compiles to deny rules pointing at `out:block` (the guard loop in
-        // `xray_routing_rules`), so a node whose only blocking comes from a guard — a guarded
-        // ingress with no `Action::Block` among its steps — leaves this false, and the artifact
-        // never builds the `out:block` blackhole while those deny rules still name it. xray
-        // 26.3.27 loads that config anyway and drops traffic dispatched to the undefined tag, so
-        // the guard still fails closed and blocks as intended (verified end to end). It is not the
-        // designed shape: `BLOCK_OUTBOUND_TAG` is meant to be built wherever a rule denies, and
-        // relying on an undefined outbound tag is not guaranteed across xray versions. The fix
-        // would be to also set this where any ingress on the node carries a non-empty guard;
-        // affects VLESS guards identically, so it is not specific to Hysteria 2.
+        // Both explicit chain blocks and fixed ingress guards target `out:block`. Emitting rules
+        // that name an undefined outbound happened to fail closed on one Xray version, but it is
+        // not a stable contract and source-admission rules must not rely on it.
         block_outbound: apps.iter().any(|app| {
             app.steps
                 .iter()
                 .filter(|step| step.node == node_id)
                 .flat_map(|step| step.rules.iter())
                 .any(|rule| matches!(rule.action, Action::Block))
+                || app.ingresses.iter().any(|ingress| {
+                    ingress.node == node_id
+                        && !ingress.guard.blocks_nothing()
+                        && !ingress_inbound_tags(app, ingress).is_empty()
+                })
         }),
         routing_rules: xray_routing_rules(sys, apps, node_id),
         geodata: sys.settings.geodata.clone(),
@@ -1749,10 +1760,11 @@ fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<Xray
                 continue;
             }
             let selector = XrayRuleSelector::InboundTags(inbound_tags);
-            for dest_match in guard_matches(&ingress.guard, sys.overlay_cidr) {
+            for guard_match in guard_matches(&ingress.guard, sys.overlay_cidr) {
                 rules.push(XrayRoutingRulePlan {
                     selector: selector.clone(),
-                    dest_match,
+                    dest_match: guard_match.dest_match,
+                    source_ips: guard_match.source_ips,
                     // The same tag `Action::Block` compiles to. Written out here rather than
                     // shared through a constant, because the artifact layer owns that name and
                     // this layer already writes it once, twelve lines below.
@@ -1805,6 +1817,7 @@ fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<Xray
                     rules.push(XrayRoutingRulePlan {
                         selector: selector.clone(),
                         dest_match: rule.dest_match.clone(),
+                        source_ips: Vec::new(),
                         outbound_tag: action_tag(app, &step.chain, &step.node, rule),
                     });
                 }
@@ -1998,36 +2011,52 @@ fn action_tag(app: &AppIr, chain: &str, node: &str, rule: &Rule) -> String {
 ///
 /// Their order is fixed rather than incidental, so a machine's rule table reads the same on every
 /// build and a diff between two compilations indicates an actual change.
-fn guard_matches(guard: &IngressGuard, overlay: ipnet::Ipv4Net) -> Vec<DestMatch> {
+struct IngressGuardMatch {
+    dest_match: DestMatch,
+    source_ips: Vec<String>,
+}
+
+impl IngressGuardMatch {
+    fn destination(dest_match: DestMatch) -> Self {
+        Self {
+            dest_match,
+            source_ips: Vec::new(),
+        }
+    }
+}
+
+fn guard_matches(guard: &IngressGuard, overlay: ipnet::Ipv4Net) -> Vec<IngressGuardMatch> {
     let mut matches = Vec::new();
     if guard.no_private {
         // The overlay is listed as an explicit CIDR beside `geoip:private` rather than relying
         // on it. The overlay is an RFC1918 range and geoip's private list currently covers it,
         // but that list is a downloaded file the fleet does not control, and the fleet's own
         // range is the one this rule must never stop covering.
-        matches.push(DestMatch::IpCidr(vec![
+        matches.push(IngressGuardMatch::destination(DestMatch::IpCidr(vec![
             "geoip:private".to_owned(),
             overlay.to_string(),
-        ]));
+        ])));
     }
     if guard.no_bittorrent {
-        matches.push(DestMatch::Protocol(vec!["bittorrent".to_owned()]));
+        matches.push(IngressGuardMatch::destination(DestMatch::Protocol(vec![
+            "bittorrent".to_owned(),
+        ])));
     }
     if guard.no_mail {
         // Submission and SMTPS alongside 25. Blocking only 25 moves the abuse to 587 with no
         // other effect.
-        matches.push(DestMatch::Port(
+        matches.push(IngressGuardMatch::destination(DestMatch::Port(
             INGRESS_GUARD_MAIL_PORTS
                 .iter()
                 .map(|port| port.to_string())
                 .collect(),
-        ));
+        )));
     }
     if guard.no_udp_amplification {
         // UDP only: TCP on these ports is used by legitimate services such as LDAP. DNS is not
         // in this list: proxied system resolvers normally need UDP/53, and silently blackholing it
         // turns an otherwise healthy VLESS or AnyTLS connection into repeated lookup timeouts.
-        matches.push(DestMatch::All(vec![
+        matches.push(IngressGuardMatch::destination(DestMatch::All(vec![
             DestMatch::Network(Network::Udp),
             DestMatch::Port(
                 INGRESS_GUARD_AMPLIFICATION_PORTS
@@ -2035,13 +2064,24 @@ fn guard_matches(guard: &IngressGuard, overlay: ipnet::Ipv4Net) -> Vec<DestMatch
                     .map(|port| port.to_string())
                     .collect(),
             ),
-        ]));
+        ])));
     }
     if guard.tcp_and_quic_only {
-        matches.push(DestMatch::All(vec![
+        matches.push(IngressGuardMatch::destination(DestMatch::All(vec![
             DestMatch::Network(Network::Udp),
             DestMatch::PortExcept(vec![443]),
-        ]));
+        ])));
+    }
+    let cn_source = match guard.cn_source_block {
+        crate::model::CnSourceBlock::Off => None,
+        crate::model::CnSourceBlock::Ipv4 => Some("geoip:cn@ipv4"),
+        crate::model::CnSourceBlock::Ipv4AndIpv6 => Some("geoip:cn"),
+    };
+    if let Some(source) = cn_source {
+        matches.push(IngressGuardMatch {
+            dest_match: DestMatch::Any,
+            source_ips: vec![source.to_owned()],
+        });
     }
     matches
 }

@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useNow } from './clock';
+import { useMetricQuery, useMetricValue } from './metric-cadence';
+import { olderRealtimeEvent } from '../realtime-order';
 import { fetchNodeNicListWindows, type NodeNicView } from '../api';
 import { Icon } from './icons';
 import { observeBpsReading, observeBpsReadingParts } from './observe-chart';
@@ -10,12 +12,12 @@ const FLEET_TRAFFIC_WINDOWS = 1;
 const FLEET_TRAFFIC_REFETCH_MS = 30_000;
 const FLEET_TRAFFIC_FRESH_SECS = 90;
 const FLEET_REALTIME_MIN_FRESH_MS = 10_000;
-const FLEET_REALTIME_DISPLAY_MS = 1_000;
 
 interface FleetRealtimeEvent {
   node_id: string;
   received_at_unix_millis: number;
   sample: {
+    sequence?: number;
     rx_bytes_per_sec: number;
     tx_bytes_per_sec: number;
     has_gap: boolean;
@@ -32,7 +34,6 @@ interface FleetRealtimeNode {
 interface FleetRealtimeView {
   nodes: Map<string, FleetRealtimeNode>;
   nowMillis: number;
-  streaming: boolean;
 }
 
 export interface FleetTrafficSummary {
@@ -100,6 +101,7 @@ function parseRealtimeEvent(value: unknown): FleetRealtimeEvent | null {
     node_id: event.node_id,
     received_at_unix_millis: event.received_at_unix_millis,
     sample: {
+      sequence: finiteRate(sample.sequence) ? sample.sequence : undefined,
       rx_bytes_per_sec: sample.rx_bytes_per_sec,
       tx_bytes_per_sec: sample.tx_bytes_per_sec,
       has_gap: sample.has_gap,
@@ -158,8 +160,14 @@ function realtimeSummary(
 
 function useFleetRealtime(): FleetRealtimeView {
   const [nodes, setNodes] = useState<Map<string, FleetRealtimeNode>>(() => new Map());
-  const [nowMillis, setNowMillis] = useState(() => Date.now());
-  const [streaming, setStreaming] = useState(false);
+  const nowMillis = useNow();
+  const displayedNodes = useMetricValue(
+    nodes,
+    'fleet',
+    JSON.stringify(
+      [...nodes].map(([id, node]) => [id, node.connected, node.active, node.latest?.sample.has_gap ?? false]),
+    ),
+  );
 
   useEffect(() => {
     if (typeof EventSource === 'undefined') return;
@@ -171,8 +179,8 @@ function useFleetRealtime(): FleetRealtimeView {
       if (stopped) return;
       const opened = new EventSource('/realtime/nodes/events', { withCredentials: true });
       source = opened;
-      opened.onopen = () => setStreaming(true);
       opened.addEventListener('snapshot', raw => {
+        if (stopped || source !== opened) return;
         try {
           const payload = recordOf(JSON.parse((raw as MessageEvent).data));
           if (!Array.isArray(payload?.nodes)) throw new Error('fleet realtime snapshot has no nodes');
@@ -180,25 +188,30 @@ function useFleetRealtime(): FleetRealtimeView {
           for (const value of payload.nodes) {
             const node = recordOf(value);
             if (typeof node?.node_id !== 'string') continue;
+            const incoming = latestRealtimeEvent(node.samples);
+            const previous = pendingNodes.get(node.node_id)?.latest;
             next.set(node.node_id, {
-              connected: node.connected === true,
+              connected:
+                payload.policy && recordOf(payload.policy)?.enabled === false ? false : node.connected === true,
               active: node.active === true,
               intervalSecs: finiteRate(node.interval_secs) ? node.interval_secs : 5,
-              latest: latestRealtimeEvent(node.samples),
+              latest: incoming && olderRealtimeEvent(incoming, previous) ? previous! : incoming,
             });
           }
           pendingNodes = next;
-          setStreaming(true);
+          setNodes(next);
         } catch {
-          setStreaming(false);
+          // Keep the last valid reading until its original freshness deadline.
         }
       });
       opened.addEventListener('sample', raw => {
+        if (stopped || source !== opened) return;
         try {
           const event = parseRealtimeEvent(JSON.parse((raw as MessageEvent).data));
           if (!event) throw new Error('invalid fleet realtime sample');
           const next = new Map(pendingNodes);
           const previous = pendingNodes.get(event.node_id);
+          if (olderRealtimeEvent(event, previous?.latest)) return;
           next.set(event.node_id, {
             connected: true,
             active: true,
@@ -206,12 +219,13 @@ function useFleetRealtime(): FleetRealtimeView {
             latest: event,
           });
           pendingNodes = next;
-          setStreaming(true);
+          setNodes(next);
         } catch {
-          setStreaming(false);
+          // Keep the last valid reading until its original freshness deadline.
         }
       });
       opened.addEventListener('status', raw => {
+        if (stopped || source !== opened) return;
         try {
           const status = recordOf(JSON.parse((raw as MessageEvent).data));
           if (typeof status?.node_id !== 'string') return;
@@ -225,34 +239,28 @@ function useFleetRealtime(): FleetRealtimeView {
             latest: previous?.latest ?? null,
           });
           pendingNodes = next;
+          setNodes(next);
         } catch {
-          setStreaming(false);
+          // Keep the last valid reading until its original freshness deadline.
         }
       });
       opened.addEventListener('reset', () => {
         opened.close();
-        setStreaming(false);
         if (source === opened && !stopped) reopenTimer = setTimeout(open, 0);
       });
-      opened.onerror = () => setStreaming(false);
+      // SSE reconnects and authorization resets are transport events, not a new measurement.
+      // Fresh samples remain usable; never flash the slower historical average on reconnect.
+      opened.onerror = () => undefined;
     };
     open();
-    // Agents report independently, so a fleet stream can deliver several events within one
-    // second. Keep every newest per-node sample in the buffer, but publish one coherent fleet
-    // reading per second so the numbers remain readable instead of repainting on every arrival.
-    const timer = setInterval(() => {
-      setNodes(new Map(pendingNodes));
-      setNowMillis(Date.now());
-    }, FLEET_REALTIME_DISPLAY_MS);
     return () => {
       stopped = true;
       source?.close();
       if (reopenTimer) clearTimeout(reopenTimer);
-      clearInterval(timer);
     };
   }, []);
 
-  return { nodes, nowMillis, streaming };
+  return { nodes: displayedNodes, nowMillis };
 }
 
 function TrafficReading({ direction, value, reference }: { direction: 'rx' | 'tx'; value: number; reference: number }) {
@@ -283,7 +291,7 @@ function FleetTrafficReadout({ summary }: { summary: FleetTrafficSummary }) {
 
 /** The root-page breadcrumb replacement shared by every primary Console page. */
 export function FleetTrafficMeter() {
-  const query = useQuery({
+  const query = useMetricQuery({
     queryKey: ['node-nic-list', 'windows', FLEET_TRAFFIC_WINDOWS],
     queryFn: () => fetchNodeNicListWindows(FLEET_TRAFFIC_WINDOWS),
     refetchInterval: FLEET_TRAFFIC_REFETCH_MS,
@@ -295,8 +303,8 @@ export function FleetTrafficMeter() {
   );
   const realtime = useFleetRealtime();
   const realtimeReading = useMemo(
-    () => (realtime.streaming ? realtimeSummary(realtime.nodes, realtime.nowMillis, summary) : null),
-    [realtime.nodes, realtime.nowMillis, realtime.streaming, summary],
+    () => realtimeSummary(realtime.nodes, realtime.nowMillis, summary),
+    [realtime.nodes, realtime.nowMillis, summary],
   );
   const reading = realtimeReading ?? summary;
 
@@ -328,8 +336,19 @@ export function FleetTrafficMeter() {
     );
   }
   return (
-    <span className="ft" aria-label="整批机器实时流量">
+    <span
+      className="ft"
+      aria-label="整批机器实时流量"
+      title={`${realtimeReading ? '各机最近有效速率合计，非同一采样窗口' : '最近 30 秒窗口均值'} · ${reading.sampledNodes} / ${reading.totalNodes} 台有读数`}
+    >
       <FleetTrafficReadout summary={reading} />
+      {!realtimeReading ? (
+        <span className="ft-state">30 秒均值</span>
+      ) : reading.sampledNodes < reading.totalNodes ? (
+        <span className="ft-state">
+          {reading.sampledNodes}/{reading.totalNodes}
+        </span>
+      ) : null}
     </span>
   );
 }

@@ -730,10 +730,17 @@ mod tests {
     }
 
     #[test]
-    fn release_installer_prints_a_reachable_bootstrap_flow() {
+    fn release_installer_records_access_and_database_choices() {
         const INSTALLER: &str = include_str!("../../../install.sh");
 
-        assert!(INSTALLER.contains("sudo brocade up --tunnel"));
+        assert!(INSTALLER.contains("Cloudflare Quick Tunnel"));
+        assert!(INSTALLER.contains("已有 HTTPS 站点"));
+        assert!(INSTALLER.contains("DNS、TLS 与反向代理需要自行配置"));
+        assert!(INSTALLER.contains("BROCADE_AGENT_PUBLIC_URL"));
+        assert!(INSTALLER.contains("Brocade 托管 PostgreSQL"));
+        assert!(INSTALLER.contains("--managed-db"));
+        assert!(INSTALLER.contains("--external-db"));
+        assert!(INSTALLER.contains("set -- \"$@\" --tunnel"));
         assert!(INSTALLER.contains("启动后显示的“初始化地址”HTTPS 链接"));
         assert!(INSTALLER.contains("ssh -N -L 8080:127.0.0.1:8080 <用户>@<服务器>"));
         assert!(INSTALLER.contains("sudo cat /var/lib/brocade/bootstrap-token"));

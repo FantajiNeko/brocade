@@ -1,0 +1,32 @@
+.fwd-tcp-ping {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.fwd-tcp-ping-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+.fwd-tcp-ping-row code {
+  overflow-wrap: anywhere;
+}
+.fwd-tcp-ping .fwd-st {
+  line-height: 1.5;
+  white-space: normal;
+}
+.fwd-tcp-ping .fwd-st.ok {
+  color: var(--ok);
+}
+.fwd-tcp-ping-row time,
+.fwd-tcp-ping-note {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.fwd-tcp-ping-note {
+  margin: 8px 0 0;
+  line-height: 1.6;
+}

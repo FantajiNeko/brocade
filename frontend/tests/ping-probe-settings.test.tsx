@@ -68,6 +68,12 @@ describe('Ping probe settings', () => {
     });
   });
 
+  it('accepts six targets and rejects a seventh', () => {
+    const targets = Array.from({ length: 7 }, (_, index) => target('icmp', `192.0.2.${index + 1}`, null));
+    expect(pingProbeFormError(settings(...targets.slice(0, 6)))).toBeNull();
+    expect(pingProbeFormError(settings(...targets))).toEqual({ text: '最多配置 6 个目标' });
+  });
+
   it('points a field error at its row and family', () => {
     expect(pingProbeFormError(settings(target('icmp', '1.1.1.1', null), target('tcp', null, 'example.com')))).toEqual({
       text: 'target：TCP 地址格式应为 主机:端口',

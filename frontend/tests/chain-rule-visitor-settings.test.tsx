@@ -25,6 +25,7 @@ const ingress: SnapshotIngress = {
     no_mail: true,
     no_udp_amplification: true,
     tcp_and_quic_only: false,
+    cn_source_block: 'off',
   },
   identity: { public_key: 'public-key', short_ids: ['0123456789abcdef'] },
   wires: { vless: { kind: 'vless-reality' } },

@@ -743,6 +743,9 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<TunnelProbeList
     let now_unix_secs: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(pool)
         .await?;
+    let retention_days = crate::retention::ttl_hours(pool, "external_outbound_probe_runs")
+        .await?
+        .div_ceil(24);
     let settings = crate::settings::load_settings(pool).await?;
     let serving = load_serving_topology_optional(pool).await?;
 
@@ -770,7 +773,7 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<TunnelProbeList
     Ok(TunnelProbeList {
         origin: "console",
         endpoint_url: settings.probe.endpoint_url,
-        retention_days: TUNNEL_PROBE_RETENTION_DAYS,
+        retention_days,
         items,
     })
 }
@@ -985,10 +988,13 @@ pub async fn detail(
         .iter()
         .map(run_from_row)
         .collect::<Result<Vec<_>>>()?;
+    let retention_days = crate::retention::ttl_hours(pool, "external_outbound_probe_runs")
+        .await?
+        .div_ceil(24);
 
     Ok(TunnelProbeView {
         item,
-        retention_days: TUNNEL_PROBE_RETENTION_DAYS,
+        retention_days,
         slow_ttfb_ms: SLOW_TTFB_MS,
         summary: TunnelProbeSummary {
             window_secs,
@@ -1773,15 +1779,19 @@ pub async fn fail_claim(
 }
 
 pub async fn prune(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = retain_days.clamp(1, 365);
+    prune_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     Ok(sqlx::query(
         "DELETE FROM external_outbound_probe_runs WHERE id IN (
              SELECT id FROM external_outbound_probe_runs
-              WHERE finished_at < now() - make_interval(days => $1)
+              WHERE finished_at < now() - make_interval(secs => $1::double precision)
               ORDER BY finished_at LIMIT $2
          )",
     )
-    .bind(i32::try_from(retain_days).unwrap_or(365))
+    .bind(retain_secs)
     .bind(PRUNE_BATCH)
     .execute(pool)
     .await?

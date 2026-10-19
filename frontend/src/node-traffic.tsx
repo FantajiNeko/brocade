@@ -1,0 +1,646 @@
+import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import {
+  fetchNodeInflowUsage,
+  fetchSnapshot,
+  type ConsoleSnapshot,
+  type NodeInflowRow,
+  type NodeInflowUsage,
+  type SiteUsagePeriod,
+} from './api';
+import { fallbackSource, NodeUserTrafficCard, type TrafficSource } from './user-traffic-realtime';
+import { NodeRealtimeProvider } from './node-realtime';
+import { NodeSiteUsageCard } from './user-site-usage';
+import { ErrorBox, SegmentedControl } from './ui/bits';
+import { DialogClose, DialogLayer } from './ui/dialog';
+import { bytes, shareOf } from './ui/format';
+import { Icon, PanelTitle } from './ui/icons';
+import { PanelLoading } from './ui/loading';
+import { useMetricQuery } from './ui/metric-cadence';
+import { RegionFlag } from './ui/region-flag';
+import { GeneratedUserAvatar } from './ui/user-avatar';
+import './node-traffic.css';
+
+const PERIODS = [
+  { value: 'day', label: '当天' },
+  { value: 'week', label: '当周' },
+  { value: 'month', label: '当月' },
+] as const;
+const COLORS = ['--observe-1', '--observe-6', '--observe-4', '--observe-5', '--observe-7'];
+const FOLD = 12;
+const sourceId = (row: NodeInflowRow) =>
+  row.source === 'chain' ? JSON.stringify([row.app_id, row.chain_id, row.ingress_id]) : row.source;
+
+/** Names come from the current model; attribution always comes from the recorded row. */
+export function trafficSources(snapshot: ConsoleSnapshot | undefined) {
+  const sources = new Map<string, TrafficSource>();
+  for (const app of snapshot?.snapshot.apps ?? []) {
+    for (const chain of app.chains) {
+      const source: TrafficSource = {
+        key: JSON.stringify([app.id, chain.id, null]),
+        name: chain.name || chain.id,
+        country: chain.subscription_country ?? null,
+      };
+      sources.set(source.key, source);
+      for (const ingress of app.ingresses.filter(ingress => ingress.chain === chain.id))
+        sources.set(`ingress:${ingress.id}`, source);
+    }
+  }
+  return (key: string): TrafficSource => sources.get(key) ?? fallbackSource(key);
+}
+/** Keep authorized idle users in the summary without duplicating users with several ingress grants. */
+export function trafficUserKeys(snapshot: ConsoleSnapshot | undefined, nodeId: string): string[] {
+  return [
+    ...new Set(
+      (snapshot?.snapshot.apps ?? []).flatMap(app => {
+        const ingresses = new Set(app.ingresses.filter(ingress => ingress.node === nodeId).map(ingress => ingress.id));
+        return app.grants.filter(grant => ingresses.has(grant.ingress)).map(grant => `${grant.tenant}/${grant.user}`);
+      }),
+    ),
+  ];
+}
+interface Cell {
+  total: number;
+  down: number;
+  up: number;
+  gap: boolean;
+}
+interface InflowUser extends Cell {
+  id: string;
+  name: string;
+  cells: Map<string, Cell>;
+}
+interface InflowSource extends TrafficSource {
+  id: string;
+  color: string;
+  total: number;
+  kind: NodeInflowRow['source'];
+}
+
+function inflowModel(data: NodeInflowUsage, sourceOf: (key: string) => TrafficSource) {
+  const users = new Map<string, InflowUser>();
+  const sources = new Map<string, InflowSource>();
+  for (const row of data.rows) {
+    const id = sourceId(row);
+    const total = row.downlink_bytes + row.uplink_bytes;
+    if (total === 0) continue;
+    const userId = `${row.tenant_id}/${row.user_id}`;
+    const user = users.get(userId) ?? {
+      id: userId,
+      name: row.user_id,
+      total: 0,
+      down: 0,
+      up: 0,
+      gap: false,
+      cells: new Map<string, Cell>(),
+    };
+    const cell = user.cells.get(id) ?? { total: 0, down: 0, up: 0, gap: false };
+    cell.total += total;
+    cell.down += row.downlink_bytes;
+    cell.up += row.uplink_bytes;
+    cell.gap ||= row.has_gap;
+    user.total += total;
+    user.down += row.downlink_bytes;
+    user.up += row.uplink_bytes;
+    user.gap ||= row.has_gap;
+    user.cells.set(id, cell);
+    users.set(userId, user);
+    const known = sourceOf(id);
+    const name =
+      row.source === 'forwarding'
+        ? '端口转发'
+        : row.source === 'unattributed'
+          ? '未按接入链记录'
+          : !known.muted
+            ? known.name
+            : row.chain_id
+              ? `接入链 ${row.chain_id}`
+              : `历史接入点 ${row.ingress_id ?? ''}`;
+    const source = sources.get(id) ?? { ...known, id, key: id, name, kind: row.source, total: 0, color: '' };
+    source.total += total;
+    sources.set(id, source);
+  }
+  const rows = [...users.values()].sort((a, b) => b.total - a.total || a.id.localeCompare(b.id));
+  const views = [...sources.values()].sort((a, b) => b.total - a.total || a.id.localeCompare(b.id));
+  return { rows, views, grand: rows.reduce((sum, row) => sum + row.total, 0) };
+}
+function ChainName({ view }: { view: InflowSource }) {
+  return (
+    <span className="nt-chain">
+      {view.kind === 'forwarding' ? (
+        <Icon of="forwarding" size={13} className="traffic-source-icon" />
+      ) : (
+        view.country && <RegionFlag code={view.country} />
+      )}
+      <span className="nt-chain-name">{view.name}</span>
+    </span>
+  );
+}
+function Swatch({ view }: { view: InflowSource }) {
+  return <i className="nt-swatch" style={{ background: view.color }} aria-hidden="true" />;
+}
+function Who({ row }: { row: InflowUser }) {
+  return (
+    <span className="nti-who" title={row.name}>
+      <GeneratedUserAvatar id={row.name} variant="mini" />
+      <span className="nti-name">{row.name}</span>
+    </span>
+  );
+}
+const cellText = (row: InflowUser, view: InflowSource) => {
+  const cell = row.cells.get(view.id);
+  return `${row.name} → ${view.name} · ${bytes(cell?.total ?? 0)} · 下行 ${bytes(cell?.down ?? 0)} · 上行 ${bytes(cell?.up ?? 0)}${cell?.gap ? ' · 采集有缺口，仅含已记录的流量' : ''}`;
+};
+type BodyProps = ReturnType<typeof inflowModel>;
+function BarsBody({ rows, views, grand }: BodyProps) {
+  const [focus, setFocus] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const ordered = focus
+    ? [...views.filter(view => view.id === focus), ...views.filter(view => view.id !== focus)]
+    : views;
+  return (
+    <>
+      <div className="nti-legend" role="group" aria-label="接入链（点击聚焦）">
+        {views.map(view => (
+          <button
+            key={view.id}
+            type="button"
+            className={`nti-key${focus === view.id ? ' on' : ''}`}
+            aria-pressed={focus === view.id}
+            onClick={() => setFocus(focus === view.id ? null : view.id)}
+          >
+            <Swatch view={view} />
+            <ChainName view={view} />
+            <b>{bytes(view.total)}</b>
+            <span className="nti-share">{shareOf(view.total, grand)}</span>
+          </button>
+        ))}
+      </div>
+      <ol className="nti-bars">
+        {(expanded ? rows : rows.slice(0, FOLD)).map(row => (
+          <li key={row.id} className={`nti-bar-row${open === row.id ? ' open' : ''}`}>
+            <button
+              type="button"
+              className="nti-bar-btn"
+              aria-label={`${row.name} · ${bytes(row.total)}`}
+              aria-expanded={open === row.id}
+              onClick={() => setOpen(open === row.id ? null : row.id)}
+            >
+              <Who row={row} />
+              <span className="nti-track">
+                <span className="nti-bar" style={{ width: `${(row.total / rows[0].total) * 100}%` }}>
+                  {ordered.map(view => {
+                    const cell = row.cells.get(view.id);
+                    return (
+                      cell && (
+                        <i
+                          key={view.id}
+                          title={cellText(row, view)}
+                          className={focus && focus !== view.id ? 'dim' : ''}
+                          style={{ flexGrow: cell.total, background: view.color }}
+                        />
+                      )
+                    );
+                  })}
+                </span>
+              </span>
+              <span className="nti-num">{bytes(row.total)}</span>
+              <span className="nti-pct">{shareOf(row.total, grand)}</span>
+            </button>
+            {open === row.id && (
+              <div className="nti-detail">
+                {views
+                  .filter(view => row.cells.has(view.id))
+                  .map(view => (
+                    <span key={view.id} className="nti-dchip" title={cellText(row, view)}>
+                      <Swatch view={view} />
+                      <ChainName view={view} />
+                      <b>{bytes(row.cells.get(view.id)!.total)}</b>
+                    </span>
+                  ))}
+                <span className="nti-detail-note">
+                  下行 {bytes(row.down)} · 上行 {bytes(row.up)}
+                  {row.gap && ' · 采集有缺口'}
+                </span>
+              </div>
+            )}
+          </li>
+        ))}
+      </ol>
+      {rows.length > FOLD && (
+        <button
+          type="button"
+          className="btn sm nti-more"
+          aria-expanded={expanded}
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? '收起' : `展开其余 ${rows.length - FOLD} 位用户`}
+        </button>
+      )}
+    </>
+  );
+}
+function FlowBody({ rows, views, grand }: BodyProps) {
+  const box = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  const [narrow, setNarrow] = useState(true);
+  const [hot, setHot] = useState<{ user: string | null; col: string | null } | null>(null);
+  const [allUsers, setAllUsers] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+  useLayoutEffect(() => {
+    const element = box.current;
+    if (!element) return;
+    const measure = () => {
+      setWidth(element.getBoundingClientRect().width);
+      setNarrow(
+        (element.closest('.nti-card')?.getBoundingClientRect().width ?? element.getBoundingClientRect().width) < 720,
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const rest = allUsers ? [] : rows.slice(10);
+  const restRow: InflowUser = {
+    id: 'rest',
+    name: `其余 ${rest.length} 位`,
+    down: 0,
+    up: 0,
+    total: 0,
+    gap: false,
+    cells: new Map(),
+  };
+  for (const row of rest) {
+    restRow.total += row.total;
+    restRow.down += row.down;
+    restRow.up += row.up;
+    restRow.gap ||= row.gap;
+    for (const [key, cell] of row.cells) {
+      const prior = restRow.cells.get(key) ?? { total: 0, down: 0, up: 0, gap: false };
+      restRow.cells.set(key, {
+        total: prior.total + cell.total,
+        down: prior.down + cell.down,
+        up: prior.up + cell.up,
+        gap: prior.gap || cell.gap,
+      });
+    }
+  }
+  const left = rest.length > 0 ? [...rows.slice(0, 10), restRow] : rows;
+  const labelLeft = 186,
+    labelRight = 250,
+    node = 10,
+    gap = 6;
+  const plot = Math.max(120, width - labelLeft - labelRight);
+  const scale = (Math.max(200, Math.max(left.length, views.length) * 28) * 0.72) / grand;
+  const layout = (values: number[]) => values.map(value => Math.max(value * scale, 24));
+  const lslots = layout(left.map(row => row.total)),
+    rslots = layout(views.map(view => view.total));
+  const sum = (slots: number[]) => slots.reduce((a, b) => a + b, 0) + gap * (slots.length - 1);
+  const height = Math.max(sum(lslots), sum(rslots));
+  const positions = (values: number[], slots: number[]) => {
+    let cursor = (height - sum(slots)) / 2;
+    return values.map((value, i) => {
+      const h = value * scale;
+      const out = { y: cursor + (slots[i] - h) / 2, h };
+      cursor += slots[i] + gap;
+      return out;
+    });
+  };
+  const lp = positions(
+      left.map(row => row.total),
+      lslots,
+    ),
+    rp = positions(
+      views.map(view => view.total),
+      rslots,
+    );
+  const usedLeft = left.map(() => 0),
+    usedRight = views.map(() => 0),
+    mid = plot / 2;
+  const links = left.flatMap((row, i) =>
+    views.flatMap((view, j) => {
+      const value = row.cells.get(view.id)?.total ?? 0;
+      if (value <= 0) return [];
+      const h = value * scale,
+        y0 = lp[i].y + usedLeft[i],
+        y1 = rp[j].y + usedRight[j];
+      usedLeft[i] += h;
+      usedRight[j] += h;
+      return [
+        {
+          row,
+          view,
+          d: `M${node} ${y0}C${mid} ${y0} ${mid} ${y1} ${plot - node} ${y1}L${plot - node} ${y1 + h}C${mid} ${y1 + h} ${mid} ${y0 + h} ${node} ${y0 + h}Z`,
+        },
+      ];
+    }),
+  );
+  const state = (user: string | null, col: string | null) =>
+    !hot ? '' : (hot.user === null || hot.user === user) && (hot.col === null || hot.col === col) ? ' on' : ' dim';
+  const selectedRow = left.find(row => row.id === selected);
+  return (
+    <div ref={box}>
+      {!narrow ? (
+        <>
+          <div className="ntf-box" style={{ height }} onMouseLeave={() => setHot(null)}>
+            <div className="ntf-labels left" style={{ width: labelLeft }}>
+              {left.map((row, i) => (
+                <button
+                  type="button"
+                  key={row.id}
+                  className={`ntf-label left${state(row.id, null)}`}
+                  aria-label={`${row.name} · ${bytes(row.total)}`}
+                  style={{ top: lp[i].y + lp[i].h / 2 }}
+                  title={`${row.name} · 下行 ${bytes(row.down)} · 上行 ${bytes(row.up)}`}
+                  aria-expanded={selected === row.id}
+                  onClick={() => setSelected(selected === row.id ? null : row.id)}
+                  onMouseEnter={() => setHot({ user: row.id, col: null })}
+                  onFocus={() => setHot({ user: row.id, col: null })}
+                  onBlur={() => setHot(null)}
+                >
+                  <span className="ntf-name">{row.name}</span>
+                  <b>{bytes(row.total)}</b>
+                </button>
+              ))}
+            </div>
+            <svg
+              className="ntf-svg"
+              width={plot}
+              height={height}
+              style={{ left: labelLeft }}
+              role="img"
+              aria-label="用户到接入链的流向，带宽与流量成正比"
+            >
+              {links.map(({ row, view, d }) => (
+                <path
+                  key={`${row.id}/${view.id}`}
+                  className={`ntf-link${state(row.id, view.id)}`}
+                  d={d}
+                  style={{ fill: view.color }}
+                  onMouseEnter={() => setHot({ user: row.id, col: view.id })}
+                >
+                  <title>{cellText(row, view)}</title>
+                </path>
+              ))}
+              {left.map((row, i) => (
+                <rect
+                  key={row.id}
+                  className={`ntf-node${state(row.id, null)}`}
+                  x={0}
+                  y={lp[i].y}
+                  width={node}
+                  height={lp[i].h}
+                  rx={2}
+                />
+              ))}
+              {views.map((view, i) => (
+                <rect
+                  key={view.id}
+                  className={`ntf-node${state(null, view.id)}`}
+                  x={plot - node}
+                  y={rp[i].y}
+                  width={node}
+                  height={rp[i].h}
+                  rx={2}
+                  style={{ fill: view.color }}
+                />
+              ))}
+            </svg>
+            <div className="ntf-labels right" style={{ width: labelRight }}>
+              {views.map((view, i) => (
+                <button
+                  type="button"
+                  key={view.id}
+                  className={`ntf-label right${state(null, view.id)}`}
+                  style={{ top: rp[i].y + rp[i].h / 2 }}
+                  aria-label={`${view.name} · ${bytes(view.total)}`}
+                  onClick={() =>
+                    setHot(hot?.col === view.id && hot.user === null ? null : { user: null, col: view.id })
+                  }
+                  onMouseEnter={() => setHot({ user: null, col: view.id })}
+                  onFocus={() => setHot({ user: null, col: view.id })}
+                  onBlur={() => setHot(null)}
+                >
+                  <ChainName view={view} />
+                  <b>{bytes(view.total)}</b>
+                  <span className="nti-share">{shareOf(view.total, grand)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {selectedRow && (
+            <div className="nti-detail" aria-label={`${selectedRow.name}的接入链明细`}>
+              {views
+                .filter(view => selectedRow.cells.has(view.id))
+                .map(view => (
+                  <span key={view.id} className="nti-dchip">
+                    {cellText(selectedRow, view)}
+                  </span>
+                ))}
+            </div>
+          )}
+          {rows.length > 10 && (
+            <button
+              type="button"
+              className="btn sm nti-more"
+              aria-expanded={allUsers}
+              onClick={() => setAllUsers(!allUsers)}
+            >
+              {allUsers ? '收起用户' : `展开全部 ${rows.length} 位用户`}
+            </button>
+          )}
+        </>
+      ) : (
+        <BarsBody rows={rows} views={views} grand={grand} />
+      )}
+    </div>
+  );
+}
+
+export function NodeInflowUsageCard({
+  nodeId,
+  period,
+  sourceOf = fallbackSource,
+}: {
+  nodeId: string;
+  period: SiteUsagePeriod;
+  sourceOf?: (key: string) => TrafficSource;
+}) {
+  const usage = useMetricQuery({
+    queryKey: ['node-inflow-usage', nodeId, period],
+    queryFn: () => fetchNodeInflowUsage(nodeId, period),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const month = useMetricQuery({
+    queryKey: ['node-inflow-usage', nodeId, 'month'],
+    queryFn: () => fetchNodeInflowUsage(nodeId, 'month'),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const model = useMemo(() => (usage.data ? inflowModel(usage.data, sourceOf) : null), [usage.data, sourceOf]);
+  const monthOrder = useMemo(
+    () =>
+      month.data
+        ? inflowModel(month.data, sourceOf)
+            .views.filter(view => view.kind === 'chain')
+            .map(view => view.id)
+        : [],
+    [month.data, sourceOf],
+  );
+  const paletteScope = `${nodeId}/${month.data?.range_start_unix_secs ?? ''}`;
+  const [assignment, setAssignment] = useState<{ scope: string; ids: string[] }>({ scope: '', ids: [] });
+  const newIds = assignment.scope === paletteScope ? monthOrder.filter(id => !assignment.ids.includes(id)) : monthOrder;
+  const palette = assignment.scope === paletteScope ? assignment.ids : monthOrder;
+  if (month.data && (assignment.scope !== paletteScope || newIds.length > 0))
+    setAssignment({
+      scope: paletteScope,
+      ids: assignment.scope === paletteScope ? [...assignment.ids, ...newIds] : monthOrder,
+    });
+  const views = model?.views.map(view => ({
+    ...view,
+    color:
+      view.kind === 'forwarding'
+        ? 'color-mix(in srgb, var(--ink) 40%, transparent)'
+        : view.kind === 'unattributed'
+          ? 'color-mix(in srgb, var(--ink) 20%, transparent)'
+          : `var(${COLORS[palette.indexOf(view.id)] ?? '--observe-10'})`,
+  }));
+  return (
+    <section className="panel config-panel nti-card" aria-label="流入统计">
+      <header>
+        <PanelTitle of="usage">流入统计</PanelTitle>
+        <span className="site-usage-note">用户 → 接入链 · 含端口转发</span>
+      </header>
+      <div className="nti-body panel-full-bleed-body" aria-busy={usage.isFetching}>
+        {usage.isPending && <p role="status">正在读取流入统计…</p>}
+        {usage.isError && (
+          <p role="alert">
+            流入统计{usage.data ? '刷新失败，当前显示上次读取的数据。' : '读取失败。'}
+            <button type="button" className="btn text sm" onClick={() => usage.refetch()}>
+              重试
+            </button>
+          </p>
+        )}
+        {month.isError && (
+          <p role="alert">
+            本月接入链颜色参考读取失败。
+            <button type="button" className="btn text sm" onClick={() => month.refetch()}>
+              重试
+            </button>
+          </p>
+        )}
+        {model && views && (
+          <>
+            <div className="site-usage-head nti-head">
+              <span className="site-usage-total">{bytes(model.grand)}</span>
+              <span className="site-usage-label">
+                {model.rows.length} 位用户 · {views.length} 个来源
+              </span>
+              <span className="site-usage-meta">
+                下行 {bytes(model.rows.reduce((sum, row) => sum + row.down, 0))} · 上行{' '}
+                {bytes(model.rows.reduce((sum, row) => sum + row.up, 0))}
+              </span>
+            </div>
+            {model.grand > 0 ? (
+              <FlowBody key={`${nodeId}/${period}`} rows={model.rows} views={views} grand={model.grand} />
+            ) : (
+              <p className="site-usage-state">
+                {usage.data?.latest_report_unix_secs === null
+                  ? '本机尚无流量上报，不能视为零流量。'
+                  : '所选范围没有已记录的流入流量。'}
+              </p>
+            )}
+            {model.rows.some(row => row.gap) && <p className="site-usage-note warn">采集有缺口，仅含已记录的流量。</p>}
+            {views.some(view => view.kind === 'unattributed') && (
+              <p className="site-usage-note">「未按接入链记录」是按链统计上线前的用户合计，不估算、不均摊到现有链。</p>
+            )}
+            {!!usage.data?.idle_users.length && (
+              <p className="site-usage-note">另有 {usage.data.idle_users.length} 位已授权用户在本范围无流入记录。</p>
+            )}
+          </>
+        )}
+        <p className="site-usage-note">
+          只统计本机认证接入与端口转发，中继与落地流量不含用户身份；仅含已记录流量，不表示全时段采集完整。
+        </p>
+      </div>
+    </section>
+  );
+}
+export function NodeTrafficDetails({
+  nodeId,
+  snapshot,
+  period,
+}: {
+  nodeId: string;
+  snapshot?: ConsoleSnapshot;
+  period: SiteUsagePeriod;
+}) {
+  const sourceOf = useMemo(() => trafficSources(snapshot), [snapshot]);
+  const targets = useMemo(() => trafficUserKeys(snapshot, nodeId), [snapshot, nodeId]);
+  return (
+    <div className="nt-details">
+      <NodeUserTrafficCard nodeId={nodeId} sourceOf={sourceOf} targets={targets} />
+      <NodeInflowUsageCard nodeId={nodeId} period={period} sourceOf={sourceOf} />
+      <NodeSiteUsageCard nodeId={nodeId} period={period} />
+    </div>
+  );
+}
+
+/** Shared machine usage overlay; the model and live subscription are acquired only when opened. */
+export function NodeTrafficDialog({
+  nodeId,
+  name,
+  country,
+  initialPeriod = 'day',
+  onClose,
+}: {
+  nodeId: string;
+  name: string;
+  country: string | null;
+  initialPeriod?: SiteUsagePeriod;
+  onClose: () => void;
+}) {
+  const titleId = useId();
+  const [period, setPeriod] = useState<SiteUsagePeriod>(initialPeriod);
+  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot(), staleTime: 30_000 });
+  return (
+    <DialogLayer label={`${name} · 用量`} onClose={onClose}>
+      <section className="dialog-surface node-usage-dialog" aria-labelledby={titleId}>
+        <header className="node-usage-header">
+          <div className="node-usage-identity">
+            {country && <RegionFlag code={country} square />}
+            <h2 id={titleId} title={name}>
+              {name}
+            </h2>
+          </div>
+          <div className="node-usage-actions">
+            <div className="node-usage-period" title="统计周期（UTC+8）· 仅影响流入、流出统计">
+              <span className="node-usage-period-label">统计</span>
+              <SegmentedControl ariaLabel="流入与流出统计范围" value={period} options={PERIODS} onChange={setPeriod} />
+            </div>
+            <DialogClose className="btn sm node-usage-close" aria-label="关闭机器用量" title="关闭">
+              <Icon of="close" size={16} />
+            </DialogClose>
+          </div>
+        </header>
+        <div
+          className="node-usage-body"
+          tabIndex={0}
+          aria-label="机器用量内容"
+          aria-busy={snapshot.isPending || undefined}
+        >
+          {snapshot.error && <ErrorBox error={snapshot.error} />}
+          {snapshot.isPending && <PanelLoading label="加载机器用量" />}
+          {snapshot.data && (
+            <NodeRealtimeProvider key={nodeId} nodeId={nodeId}>
+              <NodeTrafficDetails nodeId={nodeId} snapshot={snapshot.data} period={period} />
+            </NodeRealtimeProvider>
+          )}
+        </div>
+      </section>
+    </DialogLayer>
+  );
+}

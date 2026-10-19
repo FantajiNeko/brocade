@@ -43,30 +43,40 @@ test('单租户阶段不在导航菜单暴露租户页', () => {
   assert.doesNotMatch(panes, /TenantsPane|case 'tab:tenants'/);
 });
 
-test('隧道页位于线路前并接入主导航、路由和页面容器', () => {
+test('账户菜单按隧道、预测、拓扑排序，宽窄屏共用入口', () => {
   const nav = shell.match(/const NAV: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
+  const more = shell.match(/const MORE: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
   const mobileMore = shell.match(/const MOBILE_MORE = ([^;]+);/)?.[1] ?? '';
   const routable = state.match(/export const NAV_KEYS = \[([\s\S]*?)\n\]/)?.[1] ?? '';
-  assert.match(nav, /key: 'tunnels'/);
-  assert.ok(nav.indexOf("key: 'tunnels'") < nav.indexOf("key: 'chains'"));
-  assert.match(mobileMore, /f\.key === 'tunnels'/);
+  assert.match(nav, /key: 'nodes'/);
+  assert.doesNotMatch(nav, /key: 'tunnels'/);
+  assert.deepEqual(
+    [...more.matchAll(/key: '([^']+)'/g)].map(match => match[1]),
+    ['settings', 'tunnels', 'capacity', 'topo'],
+  );
+  assert.match(mobileMore, /NAV\.filter/);
+  assert.doesNotMatch(mobileMore, /tunnels/);
+  assert.match(shell, /visible\(narrow \? \[\.\.\.MOBILE_MORE, \.\.\.MORE\] : MORE, who\)/);
   assert.match(routable, /'tunnels'/);
   assert.match(panes, /TunnelsPane|case 'tab:tunnels'/);
 });
 
-test('流量预测是管理员独立页面，手机端从账户菜单进入', () => {
+test('流量预测是管理员独立页面，桌面与手机都从账户菜单进入', () => {
   const nav = shell.match(/const NAV: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
+  const more = shell.match(/const MORE: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
   const mobileNav = shell.match(/const MOBILE_NAV = ([^;]+);/)?.[1] ?? '';
   const mobileMore = shell.match(/const MOBILE_MORE = ([\s\S]*?);\n/)?.[1] ?? '';
   const routable = state.match(/export const NAV_KEYS = \[([\s\S]*?)\n\]/)?.[1] ?? '';
   assert.match(mobileNav, /f\.key === 'nodes'/);
   assert.match(mobileNav, /f\.key === 'chains'/);
+  assert.match(mobileNav, /f\.key === 'users'/);
   assert.match(mobileNav, /f\.key === 'usage'/);
-  assert.doesNotMatch(mobileNav, /users|tunnels|deploy|capacity/);
-  for (const key of ['users', 'tunnels', 'deploy', 'capacity'])
-    assert.match(mobileMore, new RegExp(`f\\.key === '${key}'`));
-  assert.doesNotMatch(mobileMore, /usage/);
-  assert.match(nav, /key: 'capacity'[\s\S]*?label: '预测'[\s\S]*?hideFromPublic: true/);
+  assert.doesNotMatch(mobileNav, /tunnels|deploy|capacity/);
+  assert.match(mobileMore, /f\.key === 'deploy'/);
+  assert.doesNotMatch(mobileMore, /users|usage|capacity/);
+  assert.match(nav, /key: 'nodes'/);
+  assert.doesNotMatch(nav, /key: 'capacity'/);
+  assert.match(more, /key: 'capacity'[\s\S]*?label: '预测'[\s\S]*?hideFromPublic: true/);
   assert.match(routable, /'capacity'/);
   assert.match(panes, /CapacityPane|case 'tab:capacity'/);
   assert.doesNotMatch(usage, /MachineCapacity|机器配额|usage-machine-model/);
@@ -183,7 +193,9 @@ test('产物与诊断收入账户菜单，顶栏只保留无框通知和账户�
   assert.equal((shell.match(/publicView=\{isPublic\(who\)\}/g) ?? []).length, 2);
   assert.match(shell, /<Icon of="artifactFolder" size=\{14\} className="fg-menu-icon" \/>/);
   assert.match(shell, /<Icon of="diag" size=\{14\} className="fg-menu-icon" \/>/);
-  assert.match(shell, /诊断<small>\{diagnosticsMenuHint\}<\/small>/);
+  assert.match(shell, /<span className="fg-menu-copy">产物<\/span>/);
+  assert.match(shell, /<span className="fg-menu-copy">诊断<\/span>/);
+  assert.doesNotMatch(shell, /diagnosticsMenuHint|这一版编译出了什么|产物栏已展开|没有阻断项/);
   assert.match(shell, /disabled=\{!artifacts\}/);
   assert.match(styles, /\.fg-tgl-label\s*\{[^}]*clip-path:\s*inset\(50%\)/);
   // 通知计数仍压在图标右上角。

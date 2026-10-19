@@ -15,6 +15,8 @@ import { ListIcon } from '../ui/icons';
 import { useNodeCountries } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
 import { trafficGapReason } from '../ui/traffic-gap';
+import { GeneratedUserAvatar } from '../ui/user-avatar';
+import { machineQuotaBytes, machineQuotaTiB } from '../ui/machine-traffic-quota';
 
 const DAY = 86_400;
 const KiB = 1024;
@@ -35,34 +37,10 @@ function volume(n: number): string {
   return `${n.toFixed(0)} B`;
 }
 
-function quotaTiB(value: string | null): string {
-  if (!value) return '';
-  try {
-    const bytes = BigInt(value);
-    const factor = 1024n ** 4n;
-    const hundredths = (bytes * 100n + factor / 2n) / factor;
-    return hundredths % 100n === 0n
-      ? (hundredths / 100n).toString()
-      : `${hundredths / 100n}.${(hundredths % 100n).toString().padStart(2, '0').replace(/0+$/, '')}`;
-  } catch {
-    return '';
-  }
-}
-
-function quotaBytes(value: string): string | null | undefined {
-  const trimmed = value.trim();
-  if (trimmed === '') return null;
-  if (!/^\d+(?:\.\d{1,2})?$/.test(trimmed)) return undefined;
-  const [whole, fraction = ''] = trimmed.split('.');
-  const hundredths = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
-  if (hundredths <= 0n) return undefined;
-  return ((hundredths * 1024n ** 4n + 50n) / 100n).toString();
-}
-
 /** 配额按 TiB 录入、最多两位小数；能还原成录入值的配额照录入的写法显示（1 TiB、0.5 TiB）。 */
 function quotaText(quota: string): string {
-  const tib = quotaTiB(quota);
-  return quotaBytes(tib) === quota ? `${tib} TiB` : volume(Number(quota));
+  const tib = machineQuotaTiB(quota);
+  return machineQuotaBytes(tib) === quota ? `${tib} TiB` : volume(Number(quota));
 }
 
 const pad2 = (n: number) => String(n).padStart(2, '0');
@@ -776,6 +754,7 @@ function UserShares({ machine }: { machine: Machine }) {
   const restShare = machine.used > 0 ? unattributed / machine.used : 0;
   const shares = node.users.map(user => user.share_basis_points / 10_000);
   const largest = Math.max(...shares, restShare, 0.0001);
+  // 用户行带与用户页名册同一张身份牌；「未归因」不是用户，留出同宽的空位让名称对齐。
   const row = (
     key: string,
     className: string,
@@ -784,11 +763,19 @@ function UserShares({ machine }: { machine: Machine }) {
     share: number,
     current: number,
     projected: number,
+    person: boolean,
   ) => (
     <div className={`cap-user${className}`} key={key}>
       <span className="cap-who">
-        <b>{who}</b>
-        <small>{sub}</small>
+        {person ? (
+          <GeneratedUserAvatar id={who} variant="cell" />
+        ) : (
+          <span className="cap-avatar-slot" aria-hidden="true" />
+        )}
+        <span className="cap-who-text">
+          <b>{who}</b>
+          <small>{sub}</small>
+        </span>
       </span>
       <span className="cap-share">
         <i aria-hidden="true">
@@ -823,10 +810,11 @@ function UserShares({ machine }: { machine: Machine }) {
             `${user.tenant_id}/${user.user_id}`,
             '',
             user.user_id,
-            `${user.tenant_id} · ${user.apps.join('、') || '当前线路'}`,
+            user.apps.join('、') || '当前线路',
             shares[index],
             Number(user.attributed_bytes),
             Number(user.projected_bytes),
+            true,
           ),
         )}
         {row(
@@ -837,6 +825,7 @@ function UserShares({ machine }: { machine: Machine }) {
           restShare,
           unattributed,
           Number(node.projected_unattributed_bytes),
+          false,
         )}
       </div>
     </>
@@ -846,13 +835,14 @@ function UserShares({ machine }: { machine: Machine }) {
 function QuotaEditor({ node, onDone }: { node: MachineTrafficModelNode; onDone: () => void }) {
   const qc = useQueryClient();
   const errorId = useId();
-  const [draft, setDraft] = useState(() => quotaTiB(node.quota_bytes));
+  const [draft, setDraft] = useState(() => machineQuotaTiB(node.quota_bytes));
   const [attempted, setAttempted] = useState(false);
-  const parsed = quotaBytes(draft);
+  const parsed = machineQuotaBytes(draft);
   const save = useMutation({
     mutationFn: (quota: string | null) =>
       saveNodeTraffic(node.node_id, {
         cycle_kind: node.cycle_kind,
+        accounting_mode: node.accounting_mode,
         reset_month: node.reset_month,
         reset_day: node.reset_day,
         quota_bytes: quota,

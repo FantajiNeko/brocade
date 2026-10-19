@@ -4,8 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AdminRole, ConsoleSnapshot, SnapshotIngress, UserListItem, UserPresenceList } from '../src/api';
 import { draft } from '../src/draft';
 import * as route from '../src/forge/route';
-import { quotaStage, UsersPane } from '../src/panes/users';
+import { quotaStage, sessionDurationText, UsersPane } from '../src/panes/users';
 import { SessionProvider } from '../src/session';
+import { Icon } from '../src/ui/icons';
 import type { Win } from '../src/wm/store';
 
 const GiB = 1024 ** 3;
@@ -44,10 +45,16 @@ const snapshot = {
       {
         id: 'tokyo',
         label: '东京',
-        chains: [{ id: 'jp-iij', name: '东京 IIJ', subscription_country: 'JP' }],
+        chains: [
+          { id: 'jp-iij', name: '东京 IIJ', subscription_country: 'JP' },
+          { id: 'mo-cmi', name: '澳门 CMI', subscription_country: 'MO' },
+        ],
         steps: [],
         fronts: [],
-        ingresses: [{ id: 'tyo-iij', chain: 'jp-iij', node: 'n1', port: 443 } as SnapshotIngress],
+        ingresses: [
+          { id: 'tyo-iij', chain: 'jp-iij', node: 'n1', port: 443 } as SnapshotIngress,
+          { id: 'mfm-cmi', chain: 'mo-cmi', node: 'n2', port: 443 } as SnapshotIngress,
+        ],
         grants: ['alice', 'erin'].map(user => ({ tenant, user, ingress: 'tyo-iij' })),
       },
     ],
@@ -70,6 +77,19 @@ const forwardingEmpty = (path: string) => {
   const [, , tenantId, userId] = path.split('/');
   return { tenant_id: tenantId, user_id: userId, entitlements: [], rules: [] };
 };
+// 订阅地址是访问凭据：只在详情标题栏打开订阅与节点弹窗的「订阅」页签时读取（管理员读用户的，用户本人读 /me 的）。
+const isSubscriptionRead = (path: string) =>
+  /^\/users\/[^/]+\/[^/]+\/clash-subscription$/.test(path) || path === '/me/clash-subscription';
+const subscriptionUrl = 'https://sub.example/sub/v1/2d2304da-f114-4574-8d44-625afdb1db5c/clash.yaml';
+const subscription = {
+  url: subscriptionUrl,
+  urls: { both: subscriptionUrl, v4: `${subscriptionUrl}?family=v4`, v6: `${subscriptionUrl}?family=v6` },
+  template: 'SubBoost 标准版',
+  haitun: null,
+  remaining_bytes: null,
+  reset_at: '2026-10-01T00:00:00+08:00',
+  usage_has_gap: false,
+};
 beforeEach(() => {
   vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   vi.stubGlobal(
@@ -79,10 +99,52 @@ beforeEach(() => {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
       }
       if (isForwardingRead(String(input))) return Response.json(forwardingEmpty(String(input)));
+      if (isSubscriptionRead(String(input))) return Response.json(subscription);
       if (String(input).endsWith('/realtime/snapshot')) return Response.json({ policy: { enabled: true }, nodes: [] });
       if (String(input).endsWith('/realtime/history')) {
         return Response.json({ range_start_unix_secs: 0, range_end_unix_secs: 3_600, nodes: [], series: [] });
       }
+      if (String(input).includes('/machine-usage?'))
+        return Response.json({
+          period: 'day',
+          range_start_unix_secs: 0,
+          range_end_unix_secs: 3600,
+          period_end_unix_secs: 86400,
+          bucket_secs: 3600,
+          reporting_nodes: 0,
+          expected_nodes: 1,
+          rows: [],
+        });
+      if (String(input).includes('/site-usage?'))
+        return Response.json({
+          collection_enabled: true,
+          catalog_version: 1,
+          period: 'day',
+          range_start_unix_secs: 0,
+          range_end_unix_secs: 3600,
+          period_end_unix_secs: 86_400,
+          bucket_secs: 3600,
+          series: [],
+          reporting_nodes: 0,
+          expected_nodes: 1,
+          limited: false,
+          latest_report_unix_secs: null,
+          observed_since_unix_secs: null,
+          rows: [],
+        });
+      if (/\/(other-domains|sniffing-failed-targets)\?/.test(String(input)))
+        return Response.json({
+          collection_enabled: false,
+          top_n: 128,
+          range_start_unix_secs: 0,
+          range_end_unix_secs: 3600,
+          reporting_nodes: 0,
+          expected_nodes: 1,
+          limited: false,
+          latest_report_unix_secs: null,
+          observed_since_unix_secs: null,
+          rows: [],
+        });
       // 详情打开即读取离线来源；默认没有离线记录
       const history = String(input).match(/^\/users\/([^/]+)\/([^/]+)\/presence-history$/);
       if (history) {
@@ -99,19 +161,29 @@ beforeEach(() => {
   );
 });
 
-// 详情打开后的后台读取只有拨测能力、转发授权、当前用户的离线来源与实时流量（快照和近 1 小时），
-// 其余请求都来自显式操作。
+// 详情打开后的后台读取只有转发授权、当前用户的离线来源、站点统计与实时流量（快照和近 1 小时），
+// 其余请求都来自显式操作：订阅地址、节点链接与拨测都在弹窗打开后才读取。
 const backgroundReadsOnly = () =>
   vi
     .mocked(fetch)
     .mock.calls.every(
       ([input]) =>
-        String(input) === '/grant-probes/capability' ||
         String(input).endsWith('/presence-history') ||
         String(input).endsWith('/realtime/snapshot') ||
         String(input).endsWith('/realtime/history') ||
+        String(input).includes('/site-usage?') ||
+        String(input).includes('/machine-usage?') ||
+        String(input).includes('/other-domains?') ||
+        String(input).includes('/sniffing-failed-targets?') ||
         isForwardingRead(String(input)),
     );
+// 查询缓存的写入在 React Query 的下一个调度点才通知观察者：在 act 内把这一拍走完再交互。
+const seedUsers = async (client: QueryClient, list: UserListItem[]) => {
+  await act(async () => {
+    client.setQueryData(['users'], { users: list });
+    await new Promise(resolve => setTimeout(resolve, 0));
+  });
+};
 const readingOf = (card: HTMLElement) => card.querySelector('header .rt')?.textContent;
 const two = (value: number) => String(value).padStart(2, '0');
 const HOUR = 3_600_000;
@@ -120,9 +192,23 @@ const offlineSource = (ip: string, lastSeen: number, protocols: string[]) => ({
   first_observed_at: new Date(lastSeen - HOUR).toISOString(),
   last_observed_at: new Date(lastSeen).toISOString(),
   xray_last_seen_at: new Date(lastSeen - 60_000).toISOString(),
+  online_since_at: new Date(lastSeen - HOUR).toISOString(),
+  session_uplink_bytes: 1_024,
+  session_downlink_bytes: 2_048,
   node_ids: ['n1'],
   ingress_ids: ['tyo-iij'],
-  accesses: [{ node_id: 'n1', ingress_id: 'tyo-iij', protocols }],
+  accesses: [
+    {
+      node_id: 'n1',
+      ingress_id: 'tyo-iij',
+      protocols,
+      last_observed_at: new Date(lastSeen).toISOString(),
+      xray_last_seen_at: new Date(lastSeen - 60_000).toISOString(),
+      online_since_at: new Date(lastSeen - HOUR).toISOString(),
+      session_uplink_bytes: 1_024,
+      session_downlink_bytes: 2_048,
+    },
+  ],
 });
 afterEach(() => {
   cleanup();
@@ -160,8 +246,23 @@ function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 
             first_observed_at: '2026-09-29T00:00:00Z',
             last_observed_at: '2026-09-29T00:01:00Z',
             xray_last_seen_at: '2026-09-29T00:00:58Z',
+            online_since_at: '2026-09-28T23:01:00Z',
+            session_uplink_bytes: 1_024,
+            session_downlink_bytes: 2_048,
             node_ids: ['n1'],
             ingress_ids: ['tyo-iij'],
+            accesses: [
+              {
+                node_id: 'n1',
+                ingress_id: 'tyo-iij',
+                protocols: null,
+                last_observed_at: '2026-09-29T00:01:00Z',
+                xray_last_seen_at: '2026-09-29T00:00:58Z',
+                online_since_at: '2026-09-28T23:01:00Z',
+                session_uplink_bytes: 1_024,
+                session_downlink_bytes: 2_048,
+              },
+            ],
           },
         ],
       },
@@ -232,6 +333,381 @@ function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 
 }
 
 describe('user roster rows', () => {
+  it('shows single/double accounting and recalculates billed monthly usage without changing raw directions', async () => {
+    const originalFetch = fetch;
+    const profileWrites: unknown[] = [];
+    const singleDescription = '单向计量：按代理层有效流量计量，同一业务数据仅计一次。';
+    const doubleDescription = '双向计量：合计服务器入站与出站流量，同一业务数据在接收和转发阶段各计一次。';
+    const doubleAlice = users.map(user =>
+      user.id === 'alice' ? { ...user, traffic_accounting_mode: 'double' as const } : user,
+    );
+    const nativeConfirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === `/users/${tenant}/alice/profile` && init?.method === 'PUT') {
+          profileWrites.push(JSON.parse(String(init.body)));
+          return Promise.resolve(Response.json(doubleAlice[0]));
+        }
+        if (path === '/users?include_disabled=true') return Promise.resolve(Response.json({ users: doubleAlice }));
+        if (path === '/model/snapshot') return Promise.resolve(Response.json(snapshot));
+        return originalFetch(input, init);
+      }),
+    );
+    const { view } = mount();
+
+    const card = view.container.querySelector<HTMLElement>('.user-usage-card')!;
+    const description = within(card).getByText(singleDescription).parentElement!;
+    const help = within(card).getByRole('button', { name: '计量口径说明' });
+    expect(description.hidden).toBe(true);
+    expect(help.getAttribute('aria-expanded')).toBe('false');
+    expect(help.getAttribute('aria-controls')).toBe(description.id);
+    fireEvent.click(help);
+    expect(description.hidden).toBe(false);
+    expect(help.getAttribute('aria-expanded')).toBe('true');
+    expect(within(description).getByText(doubleDescription)).toBeTruthy();
+    expect(
+      within(card).getByText('切换后将按新口径重算本月用量，可能立即暂停或恢复受额度控制的接入线路或转发入口。'),
+    ).toBeTruthy();
+    const accountingControl = view.getByRole('group', { name: '用户流量计量口径' });
+    expect(card.querySelector(':scope > header button')).toBeNull();
+    expect(accountingControl.closest('.user-usage-ledger')).toBeTruthy();
+    expect(accountingControl.parentElement?.previousElementSibling).toBe(card.querySelector('.user-usage-compose'));
+    fireEvent.click(help);
+    expect(description.hidden).toBe(true);
+    fireEvent.click(within(accountingControl).getByRole('button', { name: '双向' }));
+    const confirmation = view.getByRole('dialog', { name: '切换为双向计量' });
+    expect(within(confirmation).getByText(/本月的接入与转发用量将按新口径重新核算/)).toBeTruthy();
+    expect(within(confirmation).getByText(/重算后若额度耗尽，相关线路或转发入口将自动暂停/)).toBeTruthy();
+    expect(profileWrites).toEqual([]);
+    expect(within(accountingControl).getByRole('button', { name: '单向', pressed: true })).toBeTruthy();
+    fireEvent.click(within(confirmation).getByRole('button', { name: '切换并重算' }));
+    await vi.waitFor(() =>
+      expect(profileWrites).toEqual([{ account_type: 'formal', traffic_accounting_mode: 'double' }]),
+    );
+    expect(nativeConfirm).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(view.queryByRole('dialog', { name: '切换为双向计量' })).toBeNull());
+    expect(await within(card).findByText(doubleDescription)).toBeTruthy();
+    expect(view.container.querySelector('.user-monthly-badge')?.textContent).toBe('108.20 GiB');
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    const forwardingCard = view.container.querySelector<HTMLElement>('.user-forwarding-usage')!;
+    const forwardingAccounting = within(forwardingCard).getByRole('group', { name: '用户流量计量口径' });
+    expect(forwardingAccounting.closest('.fwd-ledger')).toBeTruthy();
+    expect(within(forwardingAccounting).getByRole('button', { name: '双向', pressed: true })).toBeTruthy();
+    expect(within(forwardingCard).getByText(doubleDescription).parentElement?.hidden).toBe(true);
+    fireEvent.click(within(forwardingAccounting).getByRole('button', { name: '单向' }));
+    const singleConfirmation = view.getByRole('dialog', { name: '切换为单向计量' });
+    expect(within(singleConfirmation).getByText(/因额度耗尽而暂停的线路或转发入口将自动恢复/)).toBeTruthy();
+  });
+
+  it.each(['接入', '转发'])('cancels accounting changes from %s without saving and restores focus', async tab => {
+    const nativeConfirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const { view } = mount();
+    fireEvent.click(view.getByRole('tab', { name: tab }));
+    const control = await view.findByRole('group', { name: '用户流量计量口径' });
+    const double = within(control).getByRole('button', { name: '双向' });
+    double.focus();
+    fireEvent.click(double);
+    fireEvent.click(within(view.getByRole('dialog', { name: '切换为双向计量' })).getByRole('button', { name: '取消' }));
+    await vi.waitFor(() => expect(document.querySelector('.dialog-layer')).toBeNull());
+    expect(document.activeElement).toBe(double);
+    fireEvent.click(double);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await vi.waitFor(() => expect(document.querySelector('.dialog-layer')).toBeNull());
+    expect(document.activeElement).toBe(double);
+    expect(within(control).getByRole('button', { name: '单向', pressed: true })).toBeTruthy();
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+    expect(nativeConfirm).not.toHaveBeenCalled();
+  });
+
+  it('keeps the accounting confirmation open on failure and allows retry from forwarding', async () => {
+    const originalFetch = fetch;
+    let attempts = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === `/users/${tenant}/alice/profile` && init?.method === 'PUT') {
+          attempts += 1;
+          return Promise.resolve(
+            attempts === 1
+              ? Response.json({ error: '保存失败，请重试' }, { status: 503 })
+              : Response.json({ ...users[0], traffic_accounting_mode: 'double' }),
+          );
+        }
+        if (String(input) === '/users?include_disabled=true') {
+          return Promise.resolve(
+            Response.json({
+              users: users.map(user => (user.id === 'alice' ? { ...user, traffic_accounting_mode: 'double' } : user)),
+            }),
+          );
+        }
+        if (String(input) === '/model/snapshot') return Promise.resolve(Response.json(snapshot));
+        return originalFetch(input, init);
+      }),
+    );
+    const { view } = mount();
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    const control = await view.findByRole('group', { name: '用户流量计量口径' });
+    fireEvent.click(within(control).getByRole('button', { name: '双向' }));
+    const confirmation = view.getByRole('dialog', { name: '切换为双向计量' });
+    fireEvent.click(within(confirmation).getByRole('button', { name: '切换并重算' }));
+    expect(await within(confirmation).findByText(/保存失败，请重试/)).toBeTruthy();
+    expect(within(control).getByRole('button', { name: '单向', pressed: true })).toBeTruthy();
+    fireEvent.click(within(confirmation).getByRole('button', { name: '切换并重算' }));
+    await vi.waitFor(() => expect(view.queryByRole('dialog', { name: '切换为双向计量' })).toBeNull());
+    expect(attempts).toBe(2);
+    expect(within(control).getByRole('button', { name: '双向', pressed: true })).toBeTruthy();
+  });
+
+  it('formats the current online epoch without falling back to historical first-seen time', () => {
+    const started = '2026-10-19T00:00:00Z';
+    expect(sessionDurationText(started, Date.parse('2026-10-19T00:00:30Z'))).toBe('30秒');
+    expect(sessionDurationText(started, Date.parse('2026-10-19T00:01:00Z'))).toBe('1分');
+    expect(sessionDurationText(started, Date.parse('2026-10-19T03:12:00Z'))).toBe('3小时 12分');
+    expect(sessionDurationText(started, Date.parse('2026-10-21T05:00:00Z'))).toBe('2天 5小时');
+    expect(sessionDurationText(undefined, Date.now())).toBe('—');
+  });
+
+  it('groups cards in the confirmed order and exposes a single panel at a time', async () => {
+    const { view } = mount();
+    const expected = render(<Icon of="forwarding" />).container.querySelector('svg')!.innerHTML;
+    expect(view.getAllByRole('tab').map(tab => tab.textContent)).toEqual(['接入', '转发', '统计']);
+    expect(view.getByRole('tab', { name: '转发' }).querySelector('svg')?.innerHTML).toBe(expected);
+    const titles = () =>
+      [...view.getByRole('tabpanel').querySelectorAll(':scope > .panel > header h4')].map(title => title.textContent);
+    // 订阅与节点（含网络拨测）回到标题栏按钮打开的弹窗，不占「接入」页签的位置。
+    expect(titles()).toEqual(['用量与额度', '在线设备', '接入授权']);
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    expect(titles()).toEqual(['用量与额度', '转发入口']);
+    expect(view.getByRole('heading', { name: '转发入口' }).querySelector('svg')?.innerHTML).toBe(expected);
+    fireEvent.click(view.getByRole('tab', { name: '统计' }));
+    expect(titles()).toEqual(['实时流量', '机器流量', '站点流量']);
+    const selected = view.getByRole('tab', { selected: true });
+    expect(view.getByRole('tabpanel').getAttribute('aria-labelledby')).toBe(selected.id);
+    expect(selected.getAttribute('aria-controls')).toBe(view.getByRole('tabpanel').id);
+  });
+
+  it('opens the subscription and node dialog from the detail header and reads the address only then', async () => {
+    const { view } = mount();
+    const reads = () => vi.mocked(fetch).mock.calls.map(([input]) => String(input));
+    expect(reads().some(isSubscriptionRead)).toBe(false);
+    expect(reads()).not.toContain('/grant-probes/capability');
+
+    fireEvent.click(view.getByRole('button', { name: '订阅' }));
+    const dialog = await view.findByRole('dialog', { name: 'alice 的订阅与节点' });
+    expect(within(dialog).getByRole('tab', { name: '订阅' }).getAttribute('aria-selected')).toBe('true');
+    expect(await within(dialog).findByText('Clash 订阅')).toBeTruthy();
+    expect(reads()).toContain(`/users/${tenant}/alice/clash-subscription`);
+
+    // 「节点」页签并入网络拨测：页签内读取本机拨测能力。
+    fireEvent.click(within(dialog).getByRole('tab', { name: '节点' }));
+    expect(within(dialog).getByRole('tab', { name: '节点' }).getAttribute('aria-selected')).toBe('true');
+    await vi.waitFor(() => expect(reads()).toContain('/grant-probes/capability'));
+  });
+
+  it('opens the node tab directly and keeps the entries disabled for roles that cannot read artifacts', async () => {
+    const admin = mount();
+    fireEvent.click(admin.view.getByRole('button', { name: '节点' }));
+    const dialog = await admin.view.findByRole('dialog', { name: 'alice 的订阅与节点' });
+    expect(within(dialog).getByRole('tab', { name: '节点' }).getAttribute('aria-selected')).toBe('true');
+    cleanup();
+
+    const reviewer = mount('readonly');
+    expect((reviewer.view.getByRole('button', { name: '节点' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((reviewer.view.getByRole('button', { name: '订阅' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('keeps the detail header to identity, one status line and the two common entries', async () => {
+    const uuid = '1ec1d194-83bd-4fee-9da2-2898771b2eaa';
+    const { view, selectUser, client } = mount();
+    await seedUsers(
+      client,
+      users.map(user => (user.id === 'alice' ? { ...user, uuid } : user)),
+    );
+    const header = () => view.container.querySelector<HTMLElement>('.user-dhead-main')!;
+    expect(
+      within(header())
+        .getAllByRole('tab')
+        .map(tab => tab.textContent),
+    ).toEqual(['接入', '转发', '统计']);
+    expect(
+      [...header().querySelectorAll('.user-dhead-tools button')].map(
+        button => button.getAttribute('aria-label') ?? button.textContent,
+      ),
+    ).toEqual(['节点', '订阅', '更多操作']);
+    // 状态交给头像灯，名称旁只显示「用量图标 + 数值」；第二行直接显示完整 UUID。
+    const status = header().querySelector('.dsub')!;
+    const usageBadge = header().querySelector('.user-monthly-badge')!;
+    expect(usageBadge.textContent).toBe('54.10 GiB');
+    expect(usageBadge.querySelector('.ui-icon')).toBeTruthy();
+    expect([...status.children].map(child => child.textContent)).toEqual([uuid]);
+    expect(status.textContent).not.toContain('可用');
+    expect(status.textContent).not.toContain('本月');
+    expect(status.textContent).not.toContain('接入点');
+    expect(status.querySelector('.user-summary-uuid')?.textContent).toBe(uuid);
+    expect(header().querySelector('.dstat, .user-duuid, .segsw')).toBeNull();
+    expect(within(header()).queryByText('修改密码')).toBeNull();
+
+    act(() => selectUser('carol'));
+    expect(within(header()).getByText('测试').classList.contains('test')).toBe(true);
+    expect(header().querySelector('.dsub > .bad')).toBeNull();
+    act(() => selectUser('erin'));
+    // 已停用等详细原因留在状态灯，不再挤进 UUID 行。
+    expect(header().querySelector('.node-lamp.bad')?.getAttribute('aria-label')).toContain('已停用');
+  });
+
+  it('collects UUID, account type, password and lifecycle actions in the more menu', async () => {
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+    const uuid = '1ec1d194-83bd-4fee-9da2-2898771b2eaa';
+    const withAlice = (extra: Partial<UserListItem>) =>
+      users.map(user => (user.id === 'alice' ? { ...user, uuid, login_enabled: true, ...extra } : user));
+    const originalFetch = fetch;
+    const profileWrites: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === `/users/${tenant}/alice/profile` && init?.method === 'PUT') {
+          profileWrites.push(JSON.parse(String(init.body)));
+          return Promise.resolve(Response.json({ ...person('alice'), uuid, account_type: 'test' }));
+        }
+        if (path === '/users?include_disabled=true')
+          return Promise.resolve(Response.json({ users: withAlice({ account_type: 'test' }) }));
+        if (path === '/model/snapshot') return Promise.resolve(Response.json(snapshot));
+        return originalFetch(input, init);
+      }),
+    );
+    const { view, client } = mount();
+    await seedUsers(client, withAlice({}));
+
+    fireEvent.click(view.getByRole('button', { name: '更多操作' }));
+    const menu = view.getByRole('menu');
+    expect(
+      within(menu)
+        .getAllByRole('menuitem')
+        .map(item => item.firstElementChild?.nextSibling?.textContent),
+    ).toEqual([
+      `复制 UUID${uuid}`,
+      '标为测试账号名册中单独标注，可按「测试」筛选',
+      '修改密码为该用户设置新的登录密码',
+      '重置登录密码生成一次性密码并注销现有会话',
+      '生成直达登录页无需输入密码即可登录',
+      '停用用户旧凭据将立即失效',
+      '更换 UUID当前连接将断开，订阅需要重新导入',
+    ]);
+
+    // 复制 UUID 不关闭菜单，结果直接写在这一项上。
+    fireEvent.click(within(menu).getByRole('menuitem', { name: new RegExp(`^复制 UUID${uuid}$`) }));
+    await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith(uuid));
+    expect(await within(menu).findByRole('menuitem', { name: new RegExp(`^UUID 已复制${uuid}$`) })).toBeTruthy();
+    expect(view.getByRole('menu')).toBe(menu);
+
+    // 账号类型从标题栏的开关移进菜单：一项切换，写入后菜单关闭。
+    fireEvent.click(within(menu).getByRole('menuitem', { name: /^标为测试账号/ }));
+    expect(view.queryByRole('menu')).toBeNull();
+    await vi.waitFor(() => expect(profileWrites).toEqual([{ account_type: 'test' }]));
+
+    fireEvent.click(view.getByRole('button', { name: '更多操作' }));
+    fireEvent.click(view.getByRole('menuitem', { name: /^修改密码/ }));
+    expect(await view.findByRole('dialog', { name: /alice/ })).toBeTruthy();
+  });
+
+  it('opens the more menu for read-only reviewers only to copy the UUID', async () => {
+    const { view, client } = mount('readonly');
+    const uuid = '1ec1d194-83bd-4fee-9da2-2898771b2eaa';
+    // 没有 UUID 时菜单里没有可用项，按钮禁用。
+    expect((view.getByRole('button', { name: '更多操作' }) as HTMLButtonElement).disabled).toBe(true);
+    await seedUsers(
+      client,
+      users.map(user => (user.id === 'alice' ? { ...user, uuid } : user)),
+    );
+    fireEvent.click(view.getByRole('button', { name: '更多操作' }));
+    const items = within(view.getByRole('menu')).getAllByRole('menuitem') as HTMLButtonElement[];
+    expect(items.filter(item => !item.disabled).map(item => item.textContent)).toEqual([`复制 UUID${uuid}`]);
+    expect(items.some(item => /停用用户|重置登录密码|生成直达登录页/.test(item.textContent ?? ''))).toBe(false);
+  });
+
+  it('moves keyboard focus through the more menu and returns it on Escape', async () => {
+    const { view } = mount();
+    const trigger = view.getByRole('button', { name: '更多操作' });
+
+    fireEvent.keyDown(trigger, { key: 'ArrowDown' });
+    const menu = view.getByRole('menu', { name: 'alice 更多操作' });
+    const enabledItems = within(menu)
+      .getAllByRole('menuitem')
+      .filter(item => !(item as HTMLButtonElement).disabled);
+    await vi.waitFor(() => expect(document.activeElement).toBe(enabledItems[0]));
+
+    fireEvent.keyDown(document.activeElement!, { key: 'End' });
+    expect(document.activeElement).toBe(enabledItems.at(-1));
+    fireEvent.keyDown(document.activeElement!, { key: 'Home' });
+    expect(document.activeElement).toBe(enabledItems[0]);
+
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+    await vi.waitFor(() => {
+      expect(view.queryByRole('menu', { name: 'alice 更多操作' })).toBeNull();
+      expect(document.activeElement).toBe(trigger);
+    });
+  });
+
+  it('supports roving keyboard focus without changing the URL and retains the tab across users', () => {
+    const { view, selectUser } = mount();
+    const before = location.href;
+    const access = view.getByRole('tab', { name: '接入' });
+    access.focus();
+    fireEvent.keyDown(access, { key: 'ArrowLeft' });
+    expect(document.activeElement).toBe(view.getByRole('tab', { name: '统计', selected: true }));
+    fireEvent.keyDown(document.activeElement!, { key: 'Home' });
+    expect(document.activeElement).toBe(access);
+    fireEvent.keyDown(access, { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(view.getByRole('tab', { name: '转发', selected: true }));
+    expect(access.tabIndex).toBe(-1);
+    selectUser('dave');
+    expect(view.getByRole('tab', { name: '转发', selected: true }).tabIndex).toBe(0);
+    fireEvent.keyDown(view.getByRole('tab', { selected: true }), { key: 'End' });
+    expect(document.activeElement).toBe(view.getByRole('tab', { name: '统计', selected: true }));
+    expect(location.href).toBe(before);
+  });
+
+  it('keeps the forwarding filter while switching tabs but resets it for a different user', async () => {
+    const { view, selectUser } = mount();
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    const search = await view.findByRole('searchbox', { name: '搜索规则' });
+    fireEvent.change(search, { target: { value: 'unsubmitted-filter' } });
+    fireEvent.click(view.getByRole('tab', { name: '接入' }));
+    expect(view.queryByRole('searchbox', { name: '搜索规则' })).toBeNull();
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    expect(view.getByRole('searchbox', { name: '搜索规则' })).toBe(search);
+    expect((search as HTMLInputElement).value).toBe('unsubmitted-filter');
+    await act(async () => selectUser('dave'));
+    expect(((await view.findByRole('searchbox', { name: '搜索规则' })) as HTMLInputElement).value).toBe('');
+  });
+
+  it('places site reports inside the selected user detail, not the user roster or global settings', async () => {
+    const { view, selectUser } = mount();
+    expect(view.container.querySelector('.user-split-roster .site-usage')).toBeNull();
+    await act(async () => selectUser('alice'));
+    fireEvent.click(view.getByRole('tab', { name: '统计' }));
+    const report = await view.findByRole('region', { name: '站点流量' });
+    // 其他站点与嗅探失败的明细并入站点流量卡，不再是单独的卡片。
+    expect(view.queryByRole('region', { name: '其他站点 Top N' })).toBeNull();
+    expect(report.closest('.user-split-detail')?.querySelector('.dname')?.textContent).toContain('alice');
+    expect(view.queryByRole('region', { name: '全局站点统计' })).toBeNull();
+    expect(
+      vi.mocked(fetch).mock.calls.some(([path]) => String(path) === `/users/${tenant}/alice/site-usage?period=day`),
+    ).toBe(true);
+    await act(async () => selectUser('dave'));
+    expect(
+      view.getByRole('region', { name: '站点流量' }).closest('.user-split-detail')?.querySelector('.dname')
+        ?.textContent,
+    ).toContain('dave');
+    expect(
+      vi.mocked(fetch).mock.calls.some(([path]) => String(path) === `/users/${tenant}/dave/site-usage?period=day`),
+    ).toBe(true);
+  });
+
   it('counts forwarding in user totals but does not apply it to line quotas', async () => {
     const { view, row, selectUser, client } = mount();
     await act(async () => {
@@ -254,10 +730,12 @@ describe('user roster rows', () => {
     });
     expect(row('alice').querySelector('.user-row-usage')?.textContent).toContain('3');
     expect(row('alice').querySelector('.user-row-quota')?.textContent).toContain('余裕');
-    expect(view.getByRole('region', { name: '本月用量' }).textContent).toContain('转发 2.00 GiB');
-    expect(
-      view.getByRole('region', { name: '本月用量' }).querySelector('.user-usage-hero-value')?.textContent,
-    ).toContain('3');
+    const access = view.getByRole('region', { name: '本月接入' });
+    expect(access.querySelector('.user-usage-hero-value')?.textContent).toBe('1.00 GiB');
+    expect(view.getByRole('list', { name: '各线路的用量与额度' }).textContent).not.toContain('Web');
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    expect(view.getByRole('tabpanel', { name: '转发' })).toBeTruthy();
+    expect(view.queryByRole('region', { name: '本月接入' })).toBeNull();
   });
   it('hides forwarding from the public visitor without starting its protected request', async () => {
     const { view, selectUser } = mount('readonly', 'public');
@@ -267,6 +745,8 @@ describe('user roster rows', () => {
       await Promise.resolve();
     });
 
+    expect(view.queryByRole('tablist')).toBeNull();
+    expect(view.queryByRole('tabpanel', { name: '接入' })).toBeTruthy();
     expect(view.queryByText('转发入口')).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => isForwardingRead(String(input)))).toBe(false);
   });
@@ -318,6 +798,18 @@ describe('user roster rows', () => {
     expect(view.getByRole('listbox', { name: '用户列表' })).toBe(roster);
     expect(view.container.querySelector('.user-split-detail .dname > b')?.textContent).toBe('alice');
     expect(quotaInput()).toBeNull();
+  });
+
+  it('preserves an unsaved quota edit when switching tabs', () => {
+    const { view } = mount();
+    fireEvent.click(view.getByRole('button', { name: '改额度' }));
+    const input = view.getByRole('textbox', { name: '东京 的月度额度（GiB）' }) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '120' } });
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    expect(view.queryByRole('textbox', { name: '东京 的月度额度（GiB）' })).toBeNull();
+    fireEvent.click(view.getByRole('tab', { name: '接入' }));
+    expect(view.getByRole('textbox', { name: '东京 的月度额度（GiB）' })).toBe(input);
+    expect(input.value).toBe('120');
   });
 
   it('reads the month and every route of the selected user in one usage card', () => {
@@ -421,13 +913,14 @@ describe('user roster rows', () => {
     expect(recent.classList.contains('off')).toBe(true);
     expect(recent.querySelector('.user-presence-time')?.textContent).toBe('00:01');
     expect(within(recent).getByText('日本 · 教育网')).toBeTruthy();
-    const accessToggle = within(recent).getByRole('button', { name: '展开 1 个入口详情' });
+    const accessToggle = within(recent).getByRole('button', { name: '展开 1 条接入链详情' });
     expect(accessToggle.getAttribute('aria-expanded')).toBe('false');
-    expect(within(recent).queryByRole('button', { name: '东京测试节点' })).toBeNull();
+    expect(within(recent).queryByRole('button', { name: '东京 IIJ' })).toBeNull();
     fireEvent.click(accessToggle);
     expect(accessToggle.getAttribute('aria-expanded')).toBe('true');
-    expect(within(recent).getByRole('button', { name: '东京测试节点' })).toBeTruthy();
+    expect(within(recent).getByRole('button', { name: '东京 IIJ' })).toBeTruthy();
     expect(within(recent).getByText('Hysteria2')).toBeTruthy();
+    expect(within(recent).getAllByText('3 KiB').length).toBeGreaterThan(0);
     expect(within(recent).getByRole('button', { name: '复制历史来源 IP 8.8.8.8' })).toBeTruthy();
     expect(within(card).getByText('9.9.9.9')).toBeTruthy();
     expect(within(card).getByText('2001:db8::5')).toBeTruthy();
@@ -520,30 +1013,72 @@ describe('user roster rows', () => {
 
     expect(alice.querySelector('.user-row-presence')?.textContent).toBe('1 个接入点');
     expect(view.queryByText('在线来源')).toBeNull();
-    expect(view.queryByText('在线接入')).toBeNull();
+    expect(view.queryByText('在线设备')).toBeNull();
     expect(view.queryByText('台湾')).toBeNull();
     expect(view.queryByText('1.1.1.1')).toBeNull();
     expect(view.container.querySelector('.user-presence-card')).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/presence'))).toBe(false);
   });
 
-  it('shows local source location and node names with working node navigation', async () => {
+  it('shows local source location and chain names with working chain navigation', async () => {
     const navigate = vi.spyOn(route, 'navigate').mockReturnValue(true);
     const { view } = mount();
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
-    expect(within(card).getByText('在线接入')).toBeTruthy();
+    expect(within(card).getByText('在线设备')).toBeTruthy();
     await vi.waitFor(() => expect(readingOf(card)).toBe('在线 1 · 30 天 1 个地址'));
     expect(within(card).getByText('台湾')).toBeTruthy();
     expect(within(card).getByRole('img', { name: 'TW 地区旗' })).toBeTruthy();
-    expect(within(card).getByText('1 个入口 · 协议未知')).toBeTruthy();
-    fireEvent.click(within(card).getByRole('button', { name: '展开 1 个入口详情' }));
-    fireEvent.click(within(card).getByRole('button', { name: '东京测试节点' }));
-    expect(navigate).toHaveBeenCalledExactlyOnceWith('nodes', { p: 'node', id: 'n1' });
-    expect(view.getByLabelText('已授权 1 个接入点')).toBeTruthy();
+    expect(within(card).getByText('东京 IIJ · 协议未知')).toBeTruthy();
+    expect(within(card).queryByText('东京测试节点')).toBeNull();
+    expect(within(card).getByText('3 KiB')).toBeTruthy();
+    expect(within(card).getByLabelText('本次会话流量 3 KiB')).toBeTruthy();
+    expect(within(card).queryByLabelText(/^在线时长 /)).toBeNull();
+    fireEvent.click(within(card).getByRole('button', { name: '展开 1 条接入链详情' }));
+    const chain = within(card)
+      .getByRole('button', { name: '东京 IIJ' })
+      .closest<HTMLElement>('.user-presence-access-item')!;
+    const duration = within(chain).getByLabelText(/^在线时长 /);
+    expect(duration.nextElementSibling).toBe(within(chain).getByLabelText('本次会话流量 3 KiB'));
+    expect(card.querySelector(':scope .user-presence-row > .user-presence-session .user-presence-duration')).toBeNull();
+    fireEvent.click(within(card).getByRole('button', { name: '东京 IIJ' }));
+    expect(navigate).toHaveBeenCalledExactlyOnceWith('chains', { p: 'chain', app: 'tokyo', chain: 'jp-iij' });
+    fireEvent.click(within(card).getByRole('button', { name: '收起 1 条接入链详情' }));
+    expect(within(card).queryByLabelText(/^在线时长 /)).toBeNull();
+    expect(within(card).getByLabelText('本次会话流量 3 KiB')).toBeTruthy();
+    expect(view.container.querySelector('.user-dhead .node-lamp')?.getAttribute('aria-label')).toContain('可用');
+    expect(view.container.querySelector('.user-dhead .dsub')?.textContent).not.toContain('接入点');
     expect(backgroundReadsOnly()).toBe(true);
   });
 
-  it('summarizes shared source entry points and expands every node without recounting the address', async () => {
+  it('hides unreported device traffic even when the session start is known', async () => {
+    const { view, client } = mount();
+    const key = ['user-presence', 'system-admin'];
+    const data = client.getQueryData<UserPresenceList>(key)!;
+    act(() =>
+      client.setQueryData(key, {
+        ...data,
+        users: [
+          {
+            ...data.users[0],
+            sources: [
+              {
+                ...data.users[0].sources[0],
+                session_uplink_bytes: undefined,
+                session_downlink_bytes: undefined,
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    await vi.waitFor(() => {
+      const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
+      expect(row.querySelector(':scope > .user-presence-session')).toBeNull();
+    });
+  });
+
+  it('summarizes shared source entry points and expands every chain without recounting the address', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
@@ -558,8 +1093,24 @@ describe('user roster rows', () => {
             expected_nodes: 5,
             reporting_nodes: 5,
             sources: [
-              { ...source, node_ids: ['n1', 'n2'], ingress_ids: ['i1', 'i2'] },
-              { ...source, ip: '2001:db8::1', node_ids: ['n2'], ingress_ids: ['i2'] },
+              {
+                ...source,
+                node_ids: ['n1', 'n2'],
+                ingress_ids: ['tyo-iij', 'mfm-cmi'],
+                accesses: [
+                  { ...source.accesses![0], node_id: 'n1', ingress_id: 'tyo-iij' },
+                  { ...source.accesses![0], node_id: 'n2', ingress_id: 'mfm-cmi' },
+                ],
+                session_uplink_bytes: 2_048,
+                session_downlink_bytes: 4_096,
+              },
+              {
+                ...source,
+                ip: '2001:db8::1',
+                node_ids: ['n2'],
+                ingress_ids: ['mfm-cmi'],
+                accesses: [{ ...source.accesses![0], node_id: 'n2', ingress_id: 'mfm-cmi' }],
+              },
             ],
           },
         ],
@@ -568,18 +1119,18 @@ describe('user roster rows', () => {
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
     await vi.waitFor(() => expect(readingOf(card)).toBe('在线 2 · 30 天 2 个地址'));
     const shared = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
-    expect(within(shared).getByText('2 个入口 · 协议未知')).toBeTruthy();
-    expect(within(shared).queryByRole('button', { name: '东京测试节点' })).toBeNull();
-    const accessToggle = within(shared).getByRole('button', { name: '展开 2 个入口详情' });
+    expect(within(shared).getByText('2 条接入链 · 协议未知')).toBeTruthy();
+    expect(within(shared).queryByRole('button', { name: '东京 IIJ' })).toBeNull();
+    const accessToggle = within(shared).getByRole('button', { name: '展开 2 条接入链详情' });
     fireEvent.click(accessToggle);
     expect(accessToggle.getAttribute('aria-expanded')).toBe('true');
-    expect(within(shared).getByRole('button', { name: '东京测试节点' })).toBeTruthy();
-    expect(within(shared).getByRole('button', { name: '澳门测试节点' })).toBeTruthy();
+    expect(within(shared).getByRole('button', { name: '东京 IIJ' })).toBeTruthy();
+    expect(within(shared).getByRole('button', { name: '澳门 CMI' })).toBeTruthy();
     expect(within(shared).getAllByText('协议未知')).toHaveLength(2);
     expect(within(shared).getByText('位置未知')).toBeTruthy();
-    fireEvent.click(within(shared).getByRole('button', { name: '收起 2 个入口详情' }));
+    fireEvent.click(within(shared).getByRole('button', { name: '收起 2 条接入链详情' }));
     expect(accessToggle.getAttribute('aria-expanded')).toBe('false');
-    expect(within(shared).queryByRole('button', { name: '东京测试节点' })).toBeNull();
+    expect(within(shared).queryByRole('button', { name: '东京 IIJ' })).toBeNull();
     const v6 = view.getByText('2001:db8::1').closest<HTMLElement>('.user-presence-row')!;
     expect(within(v6).getByText('澳门')).toBeTruthy();
   });
@@ -589,8 +1140,8 @@ describe('user roster rows', () => {
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
     const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
-    expect(within(row).getByText('1 个入口 · 协议未知')).toBeTruthy();
-    fireEvent.click(within(row).getByRole('button', { name: '展开 1 个入口详情' }));
+    expect(within(row).getByText('东京 IIJ · 协议未知')).toBeTruthy();
+    fireEvent.click(within(row).getByRole('button', { name: '展开 1 条接入链详情' }));
     expect(within(row).getByText('协议未知')).toBeTruthy();
     act(() =>
       client.setQueryData(key, {
@@ -602,9 +1153,8 @@ describe('user roster rows', () => {
               {
                 ...data.users[0].sources[0],
                 accesses: [
-                  { node_id: 'n1', ingress_id: 'i1', protocols: ['vless', 'anytls'] },
-                  { node_id: 'n1', ingress_id: 'i2', protocols: ['vless'] },
-                  { node_id: 'n1', ingress_id: 'i3', protocols: null },
+                  { node_id: 'n1', ingress_id: 'tyo-iij', protocols: ['vless', 'anytls'] },
+                  { node_id: 'n2', ingress_id: 'mfm-cmi', protocols: null },
                 ],
               },
             ],
@@ -612,11 +1162,12 @@ describe('user roster rows', () => {
         ],
       }),
     );
-    expect(await within(row).findByText('VLESS · AnyTLS · 协议未知')).toBeTruthy();
+    expect(await within(row).findByText('VLESS · AnyTLS')).toBeTruthy();
+    expect(within(row).getAllByText('协议未知').length).toBeGreaterThan(0);
     expect(backgroundReadsOnly()).toBe(true);
   });
 
-  it('keeps protocols associated with their own node', async () => {
+  it('keeps protocols associated with their own chain', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
@@ -631,8 +1182,8 @@ describe('user roster rows', () => {
                 ...data.users[0].sources[0],
                 node_ids: ['n1', 'n2'],
                 accesses: [
-                  { node_id: 'n1', ingress_id: 'i1', protocols: ['vless'] },
-                  { node_id: 'n2', ingress_id: 'i2', protocols: ['hysteria2', 'anytls'] },
+                  { node_id: 'n1', ingress_id: 'tyo-iij', protocols: ['vless'] },
+                  { node_id: 'n2', ingress_id: 'mfm-cmi', protocols: ['hysteria2', 'anytls'] },
                 ],
               },
             ],
@@ -641,12 +1192,12 @@ describe('user roster rows', () => {
       }),
     );
     const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
-    fireEvent.click(await within(row).findByRole('button', { name: '展开 2 个入口详情' }));
-    const tokyo = (await within(row).findByRole('button', { name: '东京测试节点' })).closest<HTMLElement>(
+    fireEvent.click(await within(row).findByRole('button', { name: '展开 2 条接入链详情' }));
+    const tokyo = (await within(row).findByRole('button', { name: '东京 IIJ' })).closest<HTMLElement>(
       '.user-presence-access-item',
     )!;
     const macau = within(row)
-      .getByRole('button', { name: '澳门测试节点' })
+      .getByRole('button', { name: '澳门 CMI' })
       .closest<HTMLElement>('.user-presence-access-item')!;
     expect(within(tokyo).getByText('VLESS')).toBeTruthy();
     expect(within(tokyo).queryByText(/AnyTLS/)).toBeNull();
@@ -736,7 +1287,7 @@ describe('user roster rows', () => {
     },
   );
 
-  it('marks incomplete online counts as lower bounds and falls back to unknown node IDs', async () => {
+  it('marks incomplete online counts as lower bounds without exposing node IDs', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
@@ -756,11 +1307,45 @@ describe('user roster rows', () => {
     );
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
     await vi.waitFor(() => expect(readingOf(card)).toBe('在线至少 1 · 30 天 1 个地址'));
-    expect(within(card).getByText('当前仅收到 1 / 2 台入口节点的最新快照，在线来源可能不完整')).toBeTruthy();
-    fireEvent.click(within(card).getByRole('button', { name: '展开 1 个入口详情' }));
-    expect(within(card).getByRole('button', { name: 'retired-node' })).toBeTruthy();
+    expect(within(card).getByText(/2 台入口机器中，1 台统计已更新/)).toBeTruthy();
+    expect(within(card).getByText(/在线数量可能少算；不代表机器离线/)).toBeTruthy();
+    fireEvent.click(within(card).getByRole('button', { name: '展开 1 条接入链详情' }));
+    expect(within(card).getByRole('button', { name: '东京 IIJ' })).toBeTruthy();
+    expect(within(card).queryByText('retired-node')).toBeNull();
     expect(within(card).getByText('位置未知')).toBeTruthy();
   });
+
+  it.each(['partial', 'unavailable'] as const)(
+    'identifies stale and never-reported ingress machines for %s source coverage',
+    async state => {
+      const { view, client } = mount();
+      const key = ['user-presence', 'system-admin'];
+      const data = client.getQueryData<UserPresenceList>(key)!;
+      act(() =>
+        client.setQueryData(key, {
+          ...data,
+          users: [
+            {
+              ...data.users[0],
+              state,
+              expected_nodes: state === 'partial' ? 3 : 2,
+              reporting_nodes: state === 'partial' ? 1 : 0,
+              missing_nodes: [
+                { node_id: 'n1', last_reported_at: new Date(Date.now() - 13 * 60_000).toISOString() },
+                { node_id: 'n2', last_reported_at: null },
+              ],
+            },
+          ],
+        }),
+      );
+      const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
+      const note = await within(card).findByText(/在线来源统计不完整/);
+      expect(note.textContent).toContain('东京测试节点（上次更新');
+      expect(note.textContent).toContain('澳门测试节点（尚未收到统计）');
+      expect(note.textContent).toContain('在线数量可能少算；不代表机器离线');
+      expect(note.textContent).not.toContain('快照');
+    },
+  );
 
   it('keeps the last snapshot visible but explicitly marks a failed presence refresh', async () => {
     const { view, client } = mount();
@@ -856,16 +1441,26 @@ describe('user roster rows', () => {
     );
   });
 
-  it.each(['user', 'readonly', 'editor', 'publisher'] as AdminRole[])('hides realtime user rates from %s', role => {
-    const { view } = mount(role);
-    expect(view.queryByRole('region', { name: '用户实时流量' })).toBeNull();
+  it('hides realtime user rates from self-service users', () => {
+    const { view } = mount('user');
+    expect(view.queryByRole('tab', { name: '统计' })).toBeNull();
+    expect(view.queryByRole('region', { name: '实时流量' })).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/realtime/'))).toBe(false);
+    expect(view.queryByRole('region', { name: '站点流量' })).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/site-usage'))).toBe(false);
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/machine-usage'))).toBe(false);
+    expect(view.queryByRole('region', { name: '其他站点 Top N' })).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/other-domains'))).toBe(false);
   });
 
-  it('shows realtime user rates only to administrators', () => {
-    const { view } = mount();
-    expect(view.getByRole('region', { name: '用户实时流量' })).toBeTruthy();
-  });
+  it.each(['readonly', 'editor', 'publisher', 'tenant-admin', 'system-admin'] as AdminRole[])(
+    'shows realtime user rates to signed-in %s operators',
+    role => {
+      const { view } = mount(role);
+      fireEvent.click(view.getByRole('tab', { name: '统计' }));
+      expect(view.getByRole('region', { name: '实时流量' })).toBeTruthy();
+    },
+  );
 
   it('lays out issued direct-login credentials with separately named copy actions', async () => {
     const originalFetch = fetch;
@@ -896,7 +1491,13 @@ describe('user roster rows', () => {
 
   it('never subscribes to user rates as a visitor', () => {
     const { view } = mount('readonly', 'public');
-    expect(view.queryByRole('region', { name: '用户实时流量' })).toBeNull();
+    expect(view.queryByRole('tab', { name: '统计' })).toBeNull();
+    expect(view.queryByRole('region', { name: '实时流量' })).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/realtime/'))).toBe(false);
+    expect(view.queryByRole('region', { name: '站点流量' })).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/site-usage'))).toBe(false);
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/machine-usage'))).toBe(false);
+    expect(view.queryByRole('region', { name: '其他站点 Top N' })).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/other-domains'))).toBe(false);
   });
 });

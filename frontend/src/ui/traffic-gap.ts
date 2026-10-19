@@ -1,4 +1,4 @@
-/** 物理网卡账本缺口原因的文案。机器详情「流量统计」与流量预测页共用这一份映射。
+/** 物理网卡账本缺口原因的文案。机器列表卡片的本月累计提示与流量预测页共用这一份映射。
  *  原因为空时缺口来自记账起点晚于本期起点。 */
 export function trafficGapReason(reason: string | null): string {
   switch (reason) {

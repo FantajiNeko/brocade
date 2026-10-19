@@ -174,8 +174,7 @@
     {
       "protocol": "freedom",
       "settings": {
-        "domainStrategy": "UseIP",
-        "ipsBlocked": []
+        "domainStrategy": "UseIP"
       },
       "tag": "out:forward"
     },

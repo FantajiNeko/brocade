@@ -48,6 +48,7 @@ import {
   type XhttpMode,
 } from '../api';
 import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
+import { useInitialReady } from '../ui/use-initial-ready';
 import { ConfigSecretInput } from '../ui/config-secret-input';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { DialogClose, DialogLayer } from '../ui/dialog';
@@ -272,6 +273,7 @@ interface RuleDraftHandle {
   /* 只有草稿语义变化时才替换总线中的 handle，避免父子 effect 形成重渲染循环。 */
   version: string;
   dirty: boolean;
+  disabled: boolean;
   /* 机器 DNS 单独保存，不应因为它变更而追加任何链路清理操作。 */
   structuralDirty: boolean;
   /* 将组件内状态同步写入可跨页面保留的浏览器草稿所需的完整操作。 */
@@ -387,7 +389,9 @@ export function RuleDraftScope({
 
   const handles = slots.flatMap(slot => (slot.handle ? [slot.handle] : []));
   const pending = handles.filter(h => h.dirty);
+  const blocked = handles.some(h => h.disabled);
   const stagePending = () => {
+    if (blocked) throw new Error('配置正在更新或读取失败，请等待更新完成后再保存');
     for (const h of pending) stageRuleDraft(h.stage);
     // 与显式保存保持相同的操作顺序：所有规则先写入，最后再按完整链图清理。
     for (const key of new Set(pending.filter(h => h.structuralDirty).map(h => `${h.appId}\u0000${h.chainId}`))) {
@@ -450,6 +454,7 @@ export function RuleDraftScope({
   };
 
   const saveAll = async () => {
+    if (blocked) return;
     setSaving(true);
     setError(null);
     try {
@@ -474,6 +479,7 @@ export function RuleDraftScope({
 
   /* 库中已存在的悬空记录，立即清理——不涉及任何草稿，服务端按库中当前数据计算。 */
   const pruneNow = async () => {
+    if (blocked) return;
     setSaving(true);
     setError(null);
     try {
@@ -504,7 +510,7 @@ export function RuleDraftScope({
           )}
           <span className="sp" />
           {strandedNames.length > 0 && (
-            <button className="btn" disabled={saving} onClick={() => void pruneNow()}>
+            <button className="btn" disabled={saving || blocked} onClick={() => void pruneNow()}>
               清理未被指向的节点
             </button>
           )}
@@ -512,9 +518,15 @@ export function RuleDraftScope({
       )}
       <DraftSaveToolbar
         hint={hint}
-        status={pending.length === 0 ? '没有待保存的改动' : `${pending.length} 项配置有改动`}
+        status={
+          blocked
+            ? '配置更新完成后可保存'
+            : pending.length === 0
+              ? '没有待保存的改动'
+              : `${pending.length} 项配置有改动`
+        }
         saving={saving}
-        canSave={pending.length > 0}
+        canSave={pending.length > 0 && !blocked}
         onSave={() => void saveAll()}
       />
     </RuleDraftCtx.Provider>
@@ -1760,19 +1772,26 @@ export function RuleEditor(props: RuleEditorProps) {
     (!readOnly && (settings.isPending || revisions.isPending || (current != null && compiled.isPending)));
   const error =
     snapshot.error ?? nodes.error ?? (!readOnly ? (settings.error ?? revisions.error ?? compiled.error) : null);
-  if (pending) return <Loading variant="editor" />;
   const blockingError =
     (!snapshot.data && snapshot.error) ||
     (!nodes.data && nodes.error) ||
     (!readOnly && ((!settings.data && settings.error) || (!revisions.data && revisions.error))) ||
     (!readOnly && current != null && !compiled.data && compiled.error);
-  if (blockingError) return <ErrorBox error={blockingError} />;
-  // 后台刷新失败但仍有完整缓存时保留内容供核对，同时禁用整棵表单；不能把旧数据当成
-  // 最新结果继续写，也不应把正在查看的规则整页替换掉。
+  const revealed = useInitialReady(!pending && !blockingError, `${props.appId}/${props.chainId}/${props.nodeId}`);
+  if (!revealed) {
+    if (blockingError) return <ErrorBox error={blockingError} />;
+    return <Loading variant="editor" />;
+  }
+  // 新修订等待或刷新失败时保留已经打开的编辑器，同时禁用整棵表单；保留本地输入
+  // 不代表端口依赖已经就绪，也不能借批量保存或离页暂存绕过这道门。
   return (
-    <fieldset disabled={!!error} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+    <fieldset
+      disabled={pending || !!error}
+      aria-busy={pending}
+      style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
+    >
       {error && <ErrorBox error={error} />}
-      <RuleEditorReady {...props} editorDisabled={!!error} />
+      <RuleEditorReady {...props} editorDisabled={pending || !!error} />
     </fieldset>
   );
 }
@@ -2274,11 +2293,13 @@ function RuleEditorReady({
     dnsOrder: dnsOrderDirty ? { nodeId, selectors: [...orderedSelectors, ...appendedSelectors] } : null,
   };
   const stagePlanKey = JSON.stringify(stagePlan);
-  useUnsavedChanges(!readOnly && dirty && bus === null, `${nodeId} 的规则表`, undefined, () =>
-    stageRuleDraft(stagePlanKey),
-  );
+  const stageCurrent = () => {
+    if (editorDisabled) throw new Error('配置正在更新或读取失败，请等待更新完成后再保存');
+    return stageRuleDraft(stagePlanKey);
+  };
+  useUnsavedChanges(!readOnly && dirty && bus === null, `${nodeId} 的规则表`, undefined, stageCurrent);
   const save = useMutation({
-    mutationFn: async (_opts?: { keepOpen?: boolean }) => stageRuleDraft(stagePlanKey),
+    mutationFn: async (_opts?: { keepOpen?: boolean }) => stageCurrent(),
     onSuccess: (_data, opts) => {
       // Every DNS override in this editor has just been copied into the global browser draft.
       // Keeping a second local copy makes "discard draft" reveal it again against the committed
@@ -2301,7 +2322,15 @@ function RuleEditorReady({
   const registeredRules = useMemo(() => JSON.parse(rulesKey) as Rule[], [rulesKey]);
   const registeredSteps = useMemo(() => JSON.parse(stepsKey) as SnapshotStep[], [stepsKey]);
   const saveAsync = save.mutateAsync;
-  const handleVersion = JSON.stringify([dirty, structuralDirty, stagePlanKey, root, rulesKey, stepsKey]);
+  const handleVersion = JSON.stringify([
+    dirty,
+    editorDisabled,
+    structuralDirty,
+    stagePlanKey,
+    root,
+    rulesKey,
+    stepsKey,
+  ]);
   // 计算无引用节点需要整条链的规则表，因此草稿和链的当前状态都交由总线管理
   // （见 RuleDraftScope）。各表自行计算时无法读取其他表的草稿——这是此前误删的原因。
   // 只读时不注册到总线：注册后末尾的按钮会显示为存在待保存的改动，
@@ -2313,6 +2342,7 @@ function RuleEditorReady({
       id: handleId,
       version: handleVersion,
       dirty,
+      disabled: editorDisabled,
       structuralDirty,
       stage: stagePlanKey,
       save: () => saveAsync({}),
@@ -2328,6 +2358,7 @@ function RuleEditorReady({
     bus,
     chainId,
     dirty,
+    editorDisabled,
     handleId,
     handleVersion,
     nodeId,

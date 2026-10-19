@@ -1,6 +1,10 @@
-import { useCallback, useState, useSyncExternalStore } from 'react';
+import { useCallback, useSyncExternalStore } from 'react';
 
 import type { NodeRealtimeEvent } from './node-realtime';
+import { useNow } from './ui/clock';
+import { useMetricValue } from './ui/metric-cadence';
+import { realtimeFacts } from './realtime-facts';
+import { olderRealtimeEvent } from './realtime-order';
 
 /* 用户详情的实时订阅源：一位用户的各台入口机器最近一帧秒级采样。
    「用户实时流量」与「转发入口」两张卡同时需要它；订阅按用户引用计数共享，一页只开一条
@@ -24,8 +28,6 @@ export interface UserTrafficSnapshot {
 interface SourceState {
   payload: UserTrafficSnapshot | null;
   failed: boolean;
-  /* 每秒推进一次，读数按它判断新鲜度。0 表示尚未开始订阅。 */
-  now: number;
 }
 
 interface SourceEntry {
@@ -35,7 +37,7 @@ interface SourceEntry {
   stop: () => void;
 }
 
-const IDLE: SourceState = { payload: null, failed: false, now: 0 };
+const IDLE: SourceState = { payload: null, failed: false };
 const entries = new Map<string, SourceEntry>();
 
 function start(tenantId: string, userId: string, entry: SourceEntry) {
@@ -56,7 +58,15 @@ function start(tenantId: string, userId: string, entry: SourceEntry) {
   };
   const snapshot = (payload: UserTrafficSnapshot) => {
     if (!Array.isArray(payload.nodes)) return;
-    set({ payload, failed: false });
+    const previous = new Map(entry.state.payload?.nodes.map(node => [node.node_id, node]));
+    const nodes = payload.nodes.map(node => {
+      const incoming = node.samples.at(-1);
+      const before = previous.get(node.node_id);
+      return incoming && olderRealtimeEvent(incoming, before?.samples.at(-1))
+        ? { ...node, samples: before!.samples }
+        : node;
+    });
+    set({ payload: { ...payload, nodes }, failed: false });
   };
   const poll = async () => {
     pollAbort = new AbortController();
@@ -86,6 +96,7 @@ function start(tenantId: string, userId: string, entry: SourceEntry) {
     const opened = new EventSource(`${base}/events`, { withCredentials: true });
     source = opened;
     opened.addEventListener('snapshot', e => {
+      if (stopped || source !== opened) return;
       try {
         snapshot(JSON.parse((e as MessageEvent).data) as UserTrafficSnapshot);
       } catch {
@@ -93,14 +104,20 @@ function start(tenantId: string, userId: string, entry: SourceEntry) {
       }
     });
     opened.addEventListener('sample', e => {
+      if (stopped || source !== opened) return;
       try {
         const event = JSON.parse((e as MessageEvent).data) as NodeRealtimeEvent;
-        updateNodes(node => (node.node_id === event.node_id ? { ...node, connected: true, samples: [event] } : node));
+        updateNodes(node =>
+          node.node_id === event.node_id && !olderRealtimeEvent(event, node.samples.at(-1))
+            ? { ...node, connected: true, samples: [event] }
+            : node,
+        );
       } catch {
         /* Keep the last valid frame until it expires. */
       }
     });
     opened.addEventListener('status', e => {
+      if (stopped || source !== opened) return;
       try {
         const status = JSON.parse((e as MessageEvent).data) as {
           node_id: string;
@@ -119,13 +136,11 @@ function start(tenantId: string, userId: string, entry: SourceEntry) {
     opened.onerror = startPolling;
   };
   open();
-  const timer = setInterval(() => set({ now: Date.now() }), 1000);
   return () => {
     stopped = true;
     source?.close();
     pollAbort?.abort();
     if (pollTimer) clearTimeout(pollTimer);
-    clearInterval(timer);
   };
 }
 
@@ -134,7 +149,7 @@ function acquire(key: string, tenantId: string, userId: string, listener: () => 
   if (!entry) {
     const created: SourceEntry = {
       refs: 0,
-      state: { payload: null, failed: false, now: Date.now() },
+      state: { payload: null, failed: false },
       listeners: new Set(),
       stop: () => undefined,
     };
@@ -168,8 +183,18 @@ export function useUserTrafficSource(tenantId: string, userId: string, enabled =
     () => (enabled ? (entries.get(key)?.state ?? IDLE) : IDLE),
     () => IDLE,
   );
-  const [mountedAt] = useState(() => Date.now());
-  return { payload: state.payload, now: state.now || mountedAt, failed: state.failed };
+  const now = useNow();
+  const facts = JSON.stringify([
+    state.payload?.policy.enabled,
+    state.payload?.nodes.map(node => [
+      node.node_id,
+      node.connected,
+      node.active,
+      realtimeFacts(node.samples.at(-1), now),
+    ]),
+  ]);
+  const payload = useMetricValue(state.payload, key, facts);
+  return { payload, now, failed: state.failed };
 }
 
 export interface ForwardingRuleRates {

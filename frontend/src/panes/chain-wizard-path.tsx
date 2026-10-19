@@ -89,6 +89,15 @@ interface WizardPathEditorProps {
   onDnsChange: (node: string, selector: DestMatch, resolution: EgressDnsResolution | null) => void;
 }
 
+const MATCH_PREFERENCE: readonly DestMatch['t'][] = ['geosite', 'domain_keyword'];
+const wizardMatchPriority = (kind: DestMatch['t']) => {
+  const index = MATCH_PREFERENCE.indexOf(kind);
+  return index < 0 ? MATCH_PREFERENCE.length : index;
+};
+const WIZARD_MATCH_KINDS = [...MATCH_KINDS].sort(
+  (left, right) => wizardMatchPriority(left.t) - wizardMatchPriority(right.t),
+);
+
 /** The creation page edits the same Rule/Step graph as the chain detail page. */
 export function WizardPathEditor(props: WizardPathEditorProps) {
   const {
@@ -370,7 +379,7 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
     const rows = [...(tables[source] ?? [fallbackFor(source)])];
     const terminal = rows.findIndex(isPinnedTerminalRule);
     rows.splice(terminal < 0 ? rows.length : terminal, 0, {
-      m: { t: 'domain_suffix', v: [] },
+      m: buildMatch(MATCH_PREFERENCE[0], ''),
       a: egressAllowed(source) ? { t: 'egress', send_through: null } : { t: 'block' },
     });
     commit({ ...tables, [source]: pinTerminalRules(rows) });
@@ -531,13 +540,6 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
           <>
             <div className="chain-rule-body" hidden={!expanded}>
               <fieldset className="panel rule-editor rule-ro wzr-editor">
-                <div className="toolbar wzr-rule-heading">
-                  <b className="mono">
-                    {chainId} / {id}
-                  </b>
-                  <span className="note">规则自上而下匹配，末位「任意」兜底。</span>
-                  <span className="sp" />
-                </div>
                 <table className="tbl rule-table wzr-table">
                   <tbody>
                     {rows.map((rule, ruleIndex) => {
@@ -617,7 +619,7 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
                                 })
                               }
                             >
-                              {MATCH_KINDS.map(kind => (
+                              {WIZARD_MATCH_KINDS.map(kind => (
                                 <option
                                   key={kind.t}
                                   value={kind.t}
@@ -1201,7 +1203,6 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
                     >
                       <header>
                         <PanelTitle of="chains">本链监听</PanelTitle>
-                        <span className="hint">端口和协议属于目标监听；拨号属于当前链边</span>
                       </header>
                       <div className="listener-reference-list">
                         <div className="listener-reference-row hop-target-row">
@@ -1261,14 +1262,6 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
                               </select>
                             </label>
                           </div>
-                          <p className="hop-target-note">
-                            <span>
-                              端口开在 {nameOf(host)}，连接由 {nameOf(reverse ? target : id)} 发起；目标端口必须唯一。
-                            </span>
-                            <span>
-                              {action.pool.t === 'mux' ? '当前多条流复用同一条隧道。' : '当前每条业务流单独建连。'}
-                            </span>
-                          </p>
                         </div>
                       </div>
                       {wire === 'reality' && (
@@ -1328,7 +1321,6 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
               </option>
             ))}
           </select>
-          <span className="note">点机器名展开它的规则表。</span>
         </div>
       </div>
     </>

@@ -1,11 +1,16 @@
-import { Fragment, memo, useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react';
-import { keepPreviousData, useMutation, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  ApiError,
+  Fragment,
+  memo,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from 'react';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
   createUser,
-  cancelGrantProbe,
-  fetchGrantProbeCapability,
-  fetchGrantProbeJob,
   fetchMyUser,
   fetchQuotas,
   fetchSnapshot,
@@ -14,8 +19,6 @@ import {
   fetchUserOnlineSourceHistory,
   fetchUserPresence,
   fetchUsers,
-  fetchUserGrantProbePlan,
-  grantProbeEventsUrl,
   issueUserDirectLogin,
   issueUserLogin,
   revokeUserDirectLogin,
@@ -24,36 +27,35 @@ import {
   setQuota,
   setUserPassword,
   setUserStatus,
-  startUserGrantProbe,
   updateUserProfile,
   upsertGrant,
   type SnapshotApp,
-  type GrantProbeJob,
-  type GrantProbeJobItem,
-  type GrantProbePlanItem,
   type GrantWrite,
   type IssuedUserDirectLogin,
   type NetworkOperator,
   type UsageMonthlyViewRow,
-  type UsageForwardingMonthlyRow,
   type UserListItem,
+  type UserTrafficAccountingMode,
+  type UserOnlineSourceAccess,
   type UserOnlineSource,
   type UserPresence,
 } from '../api';
 import { can, isPublic, isVisitor, useSession } from '../session';
-import { Ago, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
+import { Ago, Confirm, EmptyState, ErrorBox, Loading, SegmentedControl } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { bytes, shareOf } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
+import { GeneratedUserAvatar, type AvatarLamp } from '../ui/user-avatar';
 import { FieldLoading } from '../ui/loading';
 import { useNow } from '../ui/clock';
 import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { isValidSlug } from './ports';
 import { SubscriptionViewer, type SubscriptionKind } from './subscription';
+import { GRANT_MUTATION_KEY, GRANT_REFRESH_MS, GRANT_REFRESH_WINDOW_MS, useGrantEdits } from '../grant-edits';
 import { navigate } from '../forge/route';
-import { CopyButton } from '../ui/copy-button';
+import { CopyButton, copyStateIcon } from '../ui/copy-button';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { PASSWORD_MIN_LENGTH, passwordConfirmation } from '../ui/password-policy';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
@@ -61,6 +63,9 @@ import { useNarrow } from '../ui/viewport';
 import { directLoginUrl } from '../ui/login';
 import { canViewUserRealtimeTraffic } from '../session';
 import { UserRealtimeTrafficCard } from '../user-traffic-realtime';
+import { UserSiteUsageCard } from '../user-site-usage';
+import { UserMachineUsageCard } from '../user-machine-usage';
+import { UserTrafficAccountingSetting } from '../user-traffic-accounting';
 import { UserForwardingCard } from './user-forwarding';
 
 // 用户列表：一行一个用户，点击后就地展开。
@@ -68,7 +73,8 @@ import { UserForwardingCard } from './user-forwarding';
 // 一列月流量，三个线路九个接入点即 13 列，打开产物栏后必然横向滚动。改为展开式后，授权项
 // 以网格排列，接入点增多只会换行，不增加版面宽度。
 //
-// 一个授权项对应一条 grant。点击只触发 grant-sync 批次，不重启进程，不断开连接。
+// 一个授权项对应一条 grant。卡片选择先留在本地，显式保存后才触发 grant-sync 批次；
+// grant-sync 不重启进程，也不断开连接。
 //
 // 新用户直接作为名册中的一条可编辑行出现；添加成功即写库并刷新名册，无需再提交草稿。
 
@@ -103,6 +109,8 @@ export const monthlyUsageText = (state: MonthlyUsageState, rowCount: number, tot
   return rowCount > 0 ? bytes(total) : '—';
 };
 
+const trafficMultiplier = (mode: UserTrafficAccountingMode | undefined) => (mode === 'double' ? 2 : 1);
+
 const userTone = (f: UserFacts): UserTone =>
   f.status === 'disabled' || f.exhausted.length > 0 || f.suspended > 0 ? 'bad' : f.grants === 0 ? 'idle' : 'ok';
 
@@ -114,57 +122,6 @@ const userLampTitle = (f: UserFacts) => {
   if (causes.length > 0) return `无法连接 · ${causes.join('；')}`;
   return f.grants === 0 ? '未授权任何接入点，无法连接' : `可用 · ${f.grants} 个接入点`;
 };
-
-// 名册与详情标题条的两字缩写牌。仅取用户名前两位字母数字：它是身份记号，不表示位置
-// （位置刻度 .lst-no 在双栏里已撤，见 UserList 的说明）。
-const initialsOf = (id: string) => {
-  const s = id.replace(/[^A-Za-z0-9]/g, '');
-  return (s.slice(0, 2) || id.slice(0, 2) || '··').toUpperCase();
-};
-
-type UserAvatarStyle = CSSProperties & {
-  '--avatar-hue': number;
-};
-
-// 同一用户名始终生成同一张抽象头像；不把随机值存在数据库，也不在每次 render 时变化。
-// FNV-1a 的分布足够承担视觉种子，不承担任何安全用途。
-const userAvatarStyle = (id: string): UserAvatarStyle => {
-  let hash = 0x811c9dc5;
-  for (const char of id) {
-    hash ^= char.codePointAt(0) ?? 0;
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return {
-    '--avatar-hue': hash % 360,
-  };
-};
-
-interface AvatarLamp {
-  tone: '' | 'bad' | 'idle';
-  title: string;
-}
-
-// 名册行（row）、详情身份栏（plate）、订阅与节点弹窗标题（mini）共用同一张身份牌。
-// 名册行只在需要处理时给灯，详情身份栏始终给灯；lamp 为空时不渲染状态灯。
-function GeneratedUserAvatar({
-  id,
-  variant = 'row',
-  lamp = null,
-}: {
-  id: string;
-  variant?: 'row' | 'plate' | 'mini';
-  lamp?: AvatarLamp | null;
-}) {
-  const shape = variant === 'plate' ? 'plate' : variant === 'mini' ? 'user-avatar mini' : 'user-avatar';
-  return (
-    <span className={`${shape} user-generated-avatar`} style={userAvatarStyle(id)}>
-      {initialsOf(id)}
-      {lamp && (
-        <i className={`node-lamp${lamp.tone ? ` ${lamp.tone}` : ''}`} title={lamp.title} aria-label={lamp.title} />
-      )}
-    </span>
-  );
-}
 
 export const userMatchesSearch = (user: UserListItem, rawQuery: string) => {
   const query = rawQuery.trim().toLocaleLowerCase();
@@ -220,8 +177,7 @@ const SOURCE_PROTOCOL_NAMES = new Map([
   ['unknown', '协议未知'],
 ]);
 
-function sourceProtocols(source: UserOnlineSource, nodeId: string): string {
-  const accesses = source.accesses?.filter(access => access.node_id === nodeId) ?? [];
+function protocolText(accesses: UserOnlineSourceAccess[]): string {
   const protocols = new Set(
     accesses.flatMap(access =>
       access.protocols?.length
@@ -236,9 +192,9 @@ function sourceProtocols(source: UserOnlineSource, nodeId: string): string {
     .join(' · ');
 }
 
-function sourceProtocolSummary(source: UserOnlineSource): string {
+function protocolSummary(accesses: UserOnlineSourceAccess[]): string {
   const protocols = new Set(
-    (source.accesses ?? []).flatMap(access =>
+    accesses.flatMap(access =>
       access.protocols?.length
         ? access.protocols.map(protocol => (SOURCE_PROTOCOL_NAMES.has(protocol) ? protocol : 'unknown'))
         : ['unknown'],
@@ -249,15 +205,60 @@ function sourceProtocolSummary(source: UserOnlineSource): string {
   return labels.length <= 2 ? labels.join(' / ') : `${labels.length} 种协议`;
 }
 
-function PresenceNodeLink({ id, nameOf }: { id: string; nameOf: (id: string) => string }) {
+type PresenceChain = {
+  key: string;
+  appId: string | null;
+  chainId: string | null;
+  name: string;
+  accesses: UserOnlineSourceAccess[];
+};
+
+function chainsOf(source: UserOnlineSource, apps: SnapshotApp[]): PresenceChain[] {
+  const ingressIndex = new Map(
+    apps.flatMap(app =>
+      app.ingresses.map(ingress => {
+        const chain = app.chains.find(item => item.id === ingress.chain);
+        return [ingress.id, { app, ingress, chain }] as const;
+      }),
+    ),
+  );
+  const accesses = source.accesses?.length
+    ? source.accesses
+    : source.ingress_ids.map(ingressId => ({
+        node_id: '',
+        ingress_id: ingressId,
+        protocols: null,
+      }));
+  const grouped = new Map<string, PresenceChain>();
+  for (const access of accesses) {
+    const resolved = ingressIndex.get(access.ingress_id);
+    const key = resolved?.chain ? `${resolved.app.id}/${resolved.chain.id}` : `unknown/${access.ingress_id}`;
+    const current = grouped.get(key);
+    if (current) {
+      current.accesses.push(access);
+      continue;
+    }
+    grouped.set(key, {
+      key,
+      appId: resolved?.chain ? resolved.app.id : null,
+      chainId: resolved?.chain?.id ?? null,
+      name: resolved?.chain?.name ?? `接入链未知 · ${access.ingress_id}`,
+      accesses: [access],
+    });
+  }
+  return [...grouped.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN') || a.key.localeCompare(b.key));
+}
+
+function PresenceChainLink({ chain }: { chain: PresenceChain }) {
+  if (!chain.appId || !chain.chainId) return <span className="user-presence-chain-unknown">{chain.name}</span>;
   return (
     <button
       type="button"
-      className="user-presence-node-link"
-      title={id}
-      onClick={() => navigate('nodes', { p: 'node', id })}
+      className="user-presence-chain-link"
+      title={`${chain.appId} / ${chain.chainId}`}
+      onClick={() => navigate('chains', { p: 'chain', app: chain.appId!, chain: chain.chainId! })}
     >
-      {nameOf(id)}
+      {chain.name}
     </button>
   );
 }
@@ -305,15 +306,6 @@ const monthDayOf = (t: number) => {
 const calendarDaysAgo = (t: number, today: number) =>
   Math.round((today - new Date(t).setHours(0, 0, 0, 0)) / 86_400_000);
 
-// 首次出现：今天只写时刻，昨天加「昨天」，更早写月-日与时刻
-function firstSeenLabel(t: number, today: number): string {
-  if (Number.isNaN(t)) return '—';
-  const days = calendarDaysAgo(t, today);
-  if (days <= 0) return clockOf(t);
-  if (days === 1) return `昨天 ${clockOf(t)}`;
-  return `${monthDayOf(t)} ${clockOf(t)}`;
-}
-
 const localTime = (at: string) => {
   const t = observedAt(at);
   return Number.isNaN(t) ? at : new Date(t).toLocaleString();
@@ -321,10 +313,82 @@ const localTime = (at: string) => {
 
 const observedTitle = (source: UserOnlineSource, online: boolean) =>
   [
+    ...(source.online_since_at ? [`本次上线 ${localTime(source.online_since_at)}`] : []),
     `首次出现 ${localTime(source.first_observed_at)}`,
-    `${online ? '最近观测' : '最后出现'} ${localTime(source.last_observed_at)}`,
+    `${online ? '最近确认在线' : '确认离线'} ${localTime(source.last_observed_at)}`,
     `最近新建连接 ${localTime(source.xray_last_seen_at)}`,
   ].join('\n');
+
+export function sessionDurationText(from: string | null | undefined, until: number): string {
+  if (!from) return '—';
+  const started = observedAt(from);
+  if (Number.isNaN(started) || Number.isNaN(until) || until < started) return '—';
+  const elapsed = until - started;
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 1) return `${Math.floor(elapsed / 1_000)}秒`;
+  const days = Math.floor(minutes / 1_440);
+  const hours = Math.floor((minutes % 1_440) / 60);
+  const rest = minutes % 60;
+  if (days > 0) return `${days}天${hours > 0 ? ` ${hours}小时` : ''}`;
+  if (hours > 0) return `${hours}小时${rest > 0 ? ` ${rest}分` : ''}`;
+  return `${rest}分`;
+}
+
+const accessMetric = (accesses: UserOnlineSourceAccess[], key: 'session_uplink_bytes' | 'session_downlink_bytes') => {
+  if (accesses.length === 0 || accesses.some(access => access[key] == null)) return null;
+  return accesses.reduce((sum, access) => sum + (access[key] ?? 0), 0);
+};
+
+const accessOnlineSince = (accesses: UserOnlineSourceAccess[]) => {
+  const values = accesses.map(access => access.online_since_at).filter((value): value is string => !!value);
+  if (values.length !== accesses.length) return null;
+  return values.reduce((earliest, value) => (observedAt(value) < observedAt(earliest) ? value : earliest));
+};
+
+const accessLastObserved = (accesses: UserOnlineSourceAccess[], fallback: string) =>
+  accesses
+    .map(access => access.last_observed_at)
+    .filter((value): value is string => !!value)
+    .reduce((latest, value) => (observedAt(value) > observedAt(latest) ? value : latest), fallback);
+
+function SessionFacts({
+  uplink,
+  downlink,
+  onlineSince,
+  until,
+}: {
+  uplink: number | null | undefined;
+  downlink: number | null | undefined;
+  onlineSince?: string | null;
+  until: number;
+}) {
+  const hasTraffic = uplink != null && downlink != null;
+  if (!hasTraffic && !onlineSince) return null;
+  return (
+    <span className="user-presence-session">
+      {onlineSince && (
+        <span
+          className="user-presence-duration"
+          aria-label={`在线时长 ${sessionDurationText(onlineSince, until)}`}
+          title={`本次上线 ${localTime(onlineSince)}`}
+        >
+          <Icon of="clock" size={11} />
+          <b>{sessionDurationText(onlineSince, until)}</b>
+        </span>
+      )}
+      {hasTraffic && (
+        <span
+          className="user-presence-traffic"
+          aria-label={`本次会话流量 ${bytes(uplink + downlink)}`}
+          title={`本次会话流量：下行 ${bytes(downlink)} · 上行 ${bytes(uplink)}`}
+        >
+          <Icon of="usage" size={11} />
+          <b>{bytes(uplink + downlink)}</b>
+        </span>
+      )}
+    </span>
+  );
+}
 
 // 时间线分组：在线来源在最前，离线来源按最后出现分到今天、昨天、7 天内与保留期内。
 type PresenceBucket = 'online' | 'today' | 'yesterday' | 'week' | 'retention';
@@ -360,7 +424,8 @@ function SourceAddress({ ip }: { ip: string }) {
   );
 }
 
-// 时间线的一行：最后出现时刻 │ 节点 │ 来源 IP │ 网络 │ 接入（机器 + 协议）│ 首次出现。
+// 时间线的一行：最后出现时刻 │ 来源 IP │ 网络 │ 接入链 │ 本次流量。
+// 在线时长只在展开后的接入链明细中显示，排在该链流量之前。
 // 在线来源不写时刻，所在分组「在线」已经表达它此刻仍在线。卡片每秒随时钟重渲染，
 // 行只在数据或日期变化时重渲染。
 const PresenceRow = memo(function PresenceRow({
@@ -369,16 +434,16 @@ const PresenceRow = memo(function PresenceRow({
   older,
   country,
   operator,
-  nameOf,
-  today,
+  apps,
+  now,
 }: {
   source: UserOnlineSource;
   online: boolean;
   older: boolean;
   country: string | undefined;
   operator: NetworkOperator | undefined;
-  nameOf: (id: string) => string;
-  today: number;
+  apps: SnapshotApp[];
+  now: number;
 }) {
   const [accessExpanded, setAccessExpanded] = useState(false);
   const accessId = useId();
@@ -387,8 +452,16 @@ const PresenceRow = memo(function PresenceRow({
   const title = observedTitle(source, online);
   const time = online ? '' : Number.isNaN(lastSeen) ? '—' : older ? monthDayOf(lastSeen) : clockOf(lastSeen);
   const past = online ? '' : '历史';
-  const accessCount = source.node_ids.length;
-  const accessSummary = accessCount === 0 ? '接入节点未知' : `${accessCount} 个入口 · ${sourceProtocolSummary(source)}`;
+  const chains = chainsOf(source, apps);
+  const accessCount = chains.length;
+  const allAccesses = chains.flatMap(chain => chain.accesses);
+  const accessSummary =
+    accessCount === 0
+      ? '接入链未知'
+      : accessCount === 1
+        ? `${chains[0].name} · ${protocolSummary(allAccesses)}`
+        : `${accessCount} 条接入链 · ${protocolSummary(allAccesses)}`;
+  const until = online ? now : lastSeen;
   return (
     <li className={`user-presence-row${online ? '' : ' off'}${accessExpanded ? ' expanded' : ''}`}>
       <span className="user-presence-time" title={title}>
@@ -416,7 +489,7 @@ const PresenceRow = memo(function PresenceRow({
           className="user-presence-access-toggle"
           aria-expanded={accessExpanded}
           aria-controls={accessId}
-          aria-label={`${accessExpanded ? '收起' : '展开'} ${accessCount} 个入口详情`}
+          aria-label={`${accessExpanded ? '收起' : '展开'} ${accessCount} 条接入链详情`}
           disabled={accessCount === 0}
           onClick={() => setAccessExpanded(expanded => !expanded)}
         >
@@ -428,17 +501,29 @@ const PresenceRow = memo(function PresenceRow({
           )}
         </button>
       </span>
-      <span className="user-presence-first" title={title}>
-        首次 {firstSeenLabel(observedAt(source.first_observed_at), today)}
-      </span>
+      <SessionFacts uplink={source.session_uplink_bytes} downlink={source.session_downlink_bytes} until={until} />
       {accessExpanded && accessCount > 0 && (
         <div id={accessId} className="user-presence-access">
-          {source.node_ids.map(id => (
-            <span key={id} className="user-presence-access-item">
-              <PresenceNodeLink id={id} nameOf={nameOf} />
-              <span className="user-presence-protocols">{sourceProtocols(source, id)}</span>
-            </span>
-          ))}
+          {chains.map(chain => {
+            const uplink = accessMetric(chain.accesses, 'session_uplink_bytes');
+            const downlink = accessMetric(chain.accesses, 'session_downlink_bytes');
+            const onlineSince = accessOnlineSince(chain.accesses);
+            const lastObserved = accessLastObserved(chain.accesses, source.last_observed_at);
+            return (
+              <span key={chain.key} className="user-presence-access-item">
+                <span className="user-presence-access-name">
+                  <PresenceChainLink chain={chain} />
+                  <span className="user-presence-protocols">{protocolText(chain.accesses)}</span>
+                </span>
+                <SessionFacts
+                  uplink={uplink}
+                  downlink={downlink}
+                  onlineSince={onlineSince}
+                  until={online ? now : observedAt(lastObserved)}
+                />
+              </span>
+            );
+          })}
         </div>
       )}
     </li>
@@ -460,7 +545,7 @@ function UserPresenceCard({
   presence,
   countries,
   operators,
-  nameOf,
+  apps,
   pending,
   error,
 }: {
@@ -468,12 +553,14 @@ function UserPresenceCard({
   presence: UserPresence | undefined;
   countries: Record<string, string> | undefined;
   operators: Record<string, NetworkOperator> | undefined;
-  nameOf: (id: string) => string;
+  apps: SnapshotApp[];
   pending: boolean;
   error: unknown;
 }) {
+  const nameOf = useNodeNames();
   const [historyExpanded, setHistoryExpanded] = useState(false);
-  const today = new Date(useNow()).setHours(0, 0, 0, 0);
+  const now = useNow();
+  const today = new Date(now).setHours(0, 0, 0, 0);
   const online = presence?.sources ?? [];
   // 在线与离线来源排在同一条时间线上，打开详情即读取离线来源。名册只轮询在线来源，历史只为
   // 当前打开的这一位用户读取（见 store 的 history 说明）。刚离线的地址要立即出现在历史里：
@@ -549,16 +636,46 @@ function UserPresenceCard({
     '暂无在线连接'
   );
   // 状态行：快照不完整或不可用时为金色点；确认无在线来源时为空心点。错误由 ErrorBox 单独说明。
-  const notice: { tone: 'warn' | 'idle'; text: string } | null =
+  const coverageNotice = presence && (
+    <>
+      在线来源统计不完整：{presence.expected_nodes} 台入口机器中，{presence.reporting_nodes} 台统计已更新
+      {presence.missing_nodes?.length ? (
+        <>
+          ；缺少{' '}
+          {presence.missing_nodes.map((node, index) => (
+            <Fragment key={node.node_id}>
+              {index > 0 && '、'}
+              {nameOf(node.node_id)}（
+              {node.last_reported_at ? (
+                <>
+                  上次更新 <Ago at={node.last_reported_at} />
+                </>
+              ) : (
+                '尚未收到统计'
+              )}
+              ）
+            </Fragment>
+          ))}
+        </>
+      ) : null}
+      。这些机器的在线连接暂未计入，在线数量可能少算；不代表机器离线。
+    </>
+  );
+  const notice: { tone: 'warn' | 'idle'; text: ReactNode } | null =
     error || pending
       ? null
       : presence?.state === 'partial'
         ? {
             tone: 'warn',
-            text: `当前仅收到 ${presence.reporting_nodes} / ${presence.expected_nodes} 台入口节点的最新快照，在线来源可能不完整`,
+            text: coverageNotice,
           }
         : !presence || presence.state === 'unavailable'
-          ? { tone: 'warn', text: '在线来源暂不可用：Agent 尚未上报，或在线来源统计尚未启用' }
+          ? {
+              tone: 'warn',
+              text: presence?.expected_nodes
+                ? coverageNotice
+                : '尚未收到在线来源统计，暂时无法判断是否在线；这不代表用户已离线。',
+            }
           : online.length > 0
             ? null
             : offline.length > 0
@@ -570,8 +687,8 @@ function UserPresenceCard({
   return (
     <section className="panel config-panel user-dcard user-presence-card">
       <header>
-        <PanelTitle of="client">在线接入</PanelTitle>
-        <span className="rt" title="按公网 IP 去重，不等于连接数；跨节点的同一 IP 只计一次">
+        <PanelTitle of="client">在线设备</PanelTitle>
+        <span className="rt" title="按公网 IP 去重，不等于连接数；同一 IP 可同时使用多条接入链">
           {reading}
         </span>
       </header>
@@ -594,8 +711,8 @@ function UserPresenceCard({
                     older={OLDER_PRESENCE_BUCKETS.has(bucket)}
                     country={bucket === 'online' ? countries?.[source.ip] : historyCountries.get(source.ip)}
                     operator={bucket === 'online' ? operators?.[source.ip] : historyOperators.get(source.ip)}
-                    nameOf={nameOf}
-                    today={today}
+                    apps={apps}
+                    now={now}
                   />
                 ))}
               </Fragment>
@@ -902,21 +1019,28 @@ function UserUsageLedger({
   state,
   rows,
   monthEnd,
+  accountingMode,
+  accountingDisabled,
+  onAccountingModeChange,
 }: {
   state: MonthlyUsageState;
-  rows: (UsageMonthlyViewRow | UsageForwardingMonthlyRow)[];
+  rows: UsageMonthlyViewRow[];
   monthEnd: string | null;
+  accountingMode: UserTrafficAccountingMode;
+  accountingDisabled: boolean;
+  onAccountingModeChange: (mode: UserTrafficAccountingMode) => void;
 }) {
   const uplink = rows.reduce((sum, row) => sum + row.uplink_bytes, 0);
   const downlink = rows.reduce((sum, row) => sum + row.downlink_bytes, 0);
-  const total = uplink + downlink;
+  const rawTotal = uplink + downlink;
+  const total = rawTotal * trafficMultiplier(accountingMode);
   const known = state === 'ready' && rows.length > 0;
   const [figure, unit] = bytes(total).split(' ');
-  const upShare = total > 0 ? (uplink / total) * 100 : 0;
+  const upShare = rawTotal > 0 ? (uplink / rawTotal) * 100 : 0;
   return (
-    <section className="user-usage-ledger" aria-label="本月用量">
+    <section className="user-usage-ledger" aria-label="本月接入">
       <div className="user-usage-hero">
-        <span className="user-usage-hero-label">本月合计</span>
+        <span className="user-usage-hero-label">本月接入</span>
         {known ? (
           <strong className="user-usage-hero-value">
             {figure} <small>{unit}</small>
@@ -927,16 +1051,6 @@ function UserUsageLedger({
         {monthEnd && <QuotaReset monthEnd={monthEnd} />}
       </div>
       <div className="user-usage-compose">
-        <span className="muted">
-          接入{' '}
-          {bytes(
-            rows.filter(row => 'app_id' in row).reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0),
-          )}
-          {' · '}转发{' '}
-          {bytes(
-            rows.filter(row => 'rule_id' in row).reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0),
-          )}
-        </span>
         {/* 下方两行写出同样的数值；组成条只表示比例。 */}
         <div className="usage-split" aria-hidden="true">
           {known && total > 0 && (
@@ -953,7 +1067,7 @@ function UserUsageLedger({
               上行
             </dt>
             <dd>{known ? bytes(uplink) : '—'}</dd>
-            <dd className="usage-share">{known ? shareOf(uplink, total) : ''}</dd>
+            <dd className="usage-share">{known ? shareOf(uplink, rawTotal) : ''}</dd>
           </div>
           <div className="down">
             <dt>
@@ -961,10 +1075,15 @@ function UserUsageLedger({
               下行
             </dt>
             <dd>{known ? bytes(downlink) : '—'}</dd>
-            <dd className="usage-share">{known ? shareOf(downlink, total) : ''}</dd>
+            <dd className="usage-share">{known ? shareOf(downlink, rawTotal) : ''}</dd>
           </div>
         </dl>
       </div>
+      <UserTrafficAccountingSetting
+        mode={accountingMode}
+        disabled={accountingDisabled}
+        onChange={onAccountingModeChange}
+      />
     </section>
   );
 }
@@ -1195,467 +1314,206 @@ function UserDirectLoginIssuedDialog({
   );
 }
 
-type GrantProbeDisplayItem = GrantProbePlanItem & Partial<Pick<GrantProbeJobItem, 'status' | 'ttfb_ms' | 'detail'>>;
-
-const GRANT_PROBE_SLOTS = [
-  { protocol: 'vless', family: 'ipv4', protocolLabel: 'VLESS', familyLabel: 'V4' },
-  { protocol: 'vless', family: 'ipv6', protocolLabel: 'VLESS', familyLabel: 'V6' },
-  { protocol: 'vless-encryption', family: 'ipv4', protocolLabel: 'VLESS · Encryption', familyLabel: 'V4' },
-  { protocol: 'vless-encryption', family: 'ipv6', protocolLabel: 'VLESS · Encryption', familyLabel: 'V6' },
-  { protocol: 'anytls', family: 'ipv4', protocolLabel: 'AnyTLS', familyLabel: 'V4' },
-  { protocol: 'anytls', family: 'ipv6', protocolLabel: 'AnyTLS', familyLabel: 'V6' },
-  { protocol: 'hysteria2', family: 'ipv4', protocolLabel: 'Hysteria2', familyLabel: 'V4' },
-  { protocol: 'hysteria2', family: 'ipv6', protocolLabel: 'Hysteria2', familyLabel: 'V6' },
-] as const;
-
-type GrantProbeMatrixStyle = CSSProperties & { '--grant-probe-slot-count': number };
-
-const GRANT_PROBE_POLL_MS = 1_000;
-const GRANT_REFRESH_MS = 3_000;
-const GRANT_REFRESH_WINDOW_MS = 60_000;
-const GRANT_MUTATION_KEY = ['grant'] as const;
-
-function grantWrite(value: unknown): GrantWrite | null {
-  if (!value || typeof value !== 'object') return null;
-  if (
-    !('app_id' in value) ||
-    typeof value.app_id !== 'string' ||
-    !('tenant_id' in value) ||
-    typeof value.tenant_id !== 'string' ||
-    !('user_id' in value) ||
-    typeof value.user_id !== 'string' ||
-    !('ingress_id' in value) ||
-    typeof value.ingress_id !== 'string' ||
-    !('enabled' in value) ||
-    typeof value.enabled !== 'boolean'
-  )
-    return null;
-  return {
-    app_id: value.app_id,
-    tenant_id: value.tenant_id,
-    user_id: value.user_id,
-    ingress_id: value.ingress_id,
-    enabled: value.enabled,
-  };
-}
-
-function grantRevision(value: unknown): number | null {
-  return value &&
-    typeof value === 'object' &&
-    'revision_id' in value &&
-    typeof value.revision_id === 'number' &&
-    Number.isSafeInteger(value.revision_id)
-    ? value.revision_id
-    : null;
-}
-
 const grantKey = (value: GrantWrite) => `${value.app_id}/${value.tenant_id}/${value.user_id}/${value.ingress_id}`;
 
-function useGrantEdits() {
-  return useMutationState({
-    filters: { mutationKey: GRANT_MUTATION_KEY, exact: true },
-    select: mutation => ({
-      write: grantWrite(mutation.state.variables),
-      revision: grantRevision(mutation.state.data),
-      status: mutation.state.status,
-      submittedAt: mutation.state.submittedAt,
-      error: mutation.state.error,
-    }),
-  });
-}
+type GrantColumn = { app: SnapshotApp; ingress: SnapshotApp['ingresses'][number] };
 
-// Each mounted card keeps its own mutation observer (including an unconfirmed write receipt).
-// A global single "busy" value lets clicking B unlock A; a refetch promise alone is also not an
-// acknowledgement, because cancellation or a failed refresh can resolve without newer data.
-function GrantToggle({
-  write,
+const selectedGrantKey = (appId: string, tenantId: string, userId: string, ingressId: string) =>
+  `${appId}/${tenantId}/${userId}/${ingressId}`;
+
+const sameGrantSelection = (left: Set<string>, right: Set<string>) =>
+  left.size === right.size && [...left].every(key => right.has(key));
+
+function UserGrantEditor({
+  user,
+  columns,
+  granted,
+  suspended,
+  editable,
   confirmedRevision,
-  disabled,
-  className,
-  title,
+  snapshotUnavailable,
+  unconfirmedGrantKeys,
+  nameOf,
   refresh,
-  children,
 }: {
-  write: GrantWrite;
+  user: UserListItem;
+  columns: GrantColumn[];
+  granted: Set<string>;
+  suspended: Set<string>;
+  editable: boolean;
   confirmedRevision: number;
-  disabled: boolean;
-  className: string;
-  title: string;
+  snapshotUnavailable: boolean;
+  unconfirmedGrantKeys: Set<string>;
+  nameOf: ReturnType<typeof useNodeNames>;
   refresh: () => Promise<void>;
-  children: ReactNode;
 }) {
   const qc = useQueryClient();
-  const mutation = useMutation({
+  const [draftSelection, setDraftSelection] = useState<Set<string> | null>(null);
+  const [submittedRevision, setSubmittedRevision] = useState<number | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const serverSelection = new Set(
+    columns.flatMap(({ app, ingress }) =>
+      granted.has(`${user.tenant_id}/${user.id}/${ingress.id}`)
+        ? [selectedGrantKey(app.id, user.tenant_id, user.id, ingress.id)]
+        : [],
+    ),
+  );
+  const acknowledged = submittedRevision !== null && confirmedRevision >= submittedRevision;
+  const activeDraftSelection = acknowledged ? null : draftSelection;
+  const selection = activeDraftSelection ?? serverSelection;
+  const dirty = activeDraftSelection !== null && !sameGrantSelection(activeDraftSelection, serverSelection);
+  const guardScope = `user-grants:${user.tenant_id}:${user.id}`;
+  useUnsavedChanges(dirty, `${user.id} 的接入授权`, guardScope);
+  const save = useMutation({
     mutationKey: GRANT_MUTATION_KEY,
     mutationFn: upsertGrant,
     onSettled: (_result, _error, value) => {
       void qc.invalidateQueries({ queryKey: ['grant-probe-plan', value.tenant_id, value.user_id] });
-      return refresh();
     },
   });
-  const waiting = mutation.isPending || (mutation.data?.revision_id ?? 0) > confirmedRevision;
-  return (
-    <button
-      className={className}
-      title={title}
-      aria-pressed={!write.enabled}
-      aria-busy={waiting}
-      disabled={disabled || waiting}
-      onClick={() => mutation.mutate(write)}
-    >
-      {children}
-    </button>
-  );
-}
+  const waiting = submitting || (submittedRevision !== null && !acknowledged);
 
-const probeBaseName = (item: GrantProbeDisplayItem) => {
-  const withoutFamily = item.family === 'ipv6' ? item.name.replace(/ \| v6$/, '') : item.name;
-  if (item.protocol === 'hysteria2') return withoutFamily.replace(/ \| QUIC$/, '');
-  if (item.protocol === 'anytls') return withoutFamily.replace(/ \| AnyTLS$/, '');
-  if (item.protocol === 'vless-encryption') return withoutFamily.replace(/ \| VLESS Encryption$/, '');
-  return withoutFamily;
-};
-
-const probeStatusText = (item: GrantProbeDisplayItem) => {
-  switch (item.status) {
-    case 'waiting':
-      return '等待';
-    case 'running':
-      return '连接中…';
-    case 'passed':
-      return item.ttfb_ms === null || item.ttfb_ms === undefined ? '通过' : `通过 · ${item.ttfb_ms}ms`;
-    case 'failed':
-      return '失败';
-    case 'canceled':
-      return '已取消';
-    default:
-      return '';
-  }
-};
-
-const probeVisibleStatusText = (item: GrantProbeDisplayItem) => {
-  if (item.status === 'passed' && item.ttfb_ms !== null && item.ttfb_ms !== undefined) return `${item.ttfb_ms}ms`;
-  return probeStatusText(item);
-};
-
-/**
- * 人工网络拨测。它与周期 E2E 有意分开：此处用真实用户凭据，回答“alice 现在能不能
- * 从这个授权入口走通”；周期 E2E 用专用 probe 身份，回答线路总体是否健康。
- */
-export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem; readOnly?: boolean }) {
-  const qc = useQueryClient();
-  const edits = useGrantEdits();
-  const latestEdit = edits.reduce(
-    (latest, edit) =>
-      edit.write?.tenant_id === user.tenant_id && edit.write.user_id === user.id
-        ? Math.max(latest, edit.submittedAt)
-        : latest,
-    0,
-  );
-  const capability = useQuery({
-    queryKey: ['grant-probe-capability'],
-    queryFn: fetchGrantProbeCapability,
-    staleTime: 60_000,
-    enabled: !readOnly,
-  });
-  const plan = useQuery({
-    queryKey: ['grant-probe-plan', user.tenant_id, user.id],
-    queryFn: async () => {
-      try {
-        return await fetchUserGrantProbePlan(user.tenant_id, user.id);
-      } catch (error) {
-        // Revoking the last Serving grant returns 404. Cache an explicit empty plan so an older
-        // successful result (or completed probe job) cannot keep advertising a removed entry.
-        if (error instanceof ApiError && error.status === 404) return null;
-        throw error;
-      }
-    },
-    // 只读访客只需要无连接材料的 Serving 计划，不读取本机 Xray 能力，更不会创建任务。
-    enabled: readOnly || capability.data?.available === true,
-    retry: false,
-    // Head changes precede Serving. Refresh only this user's recently edited plan, and stop
-    // after a bounded window even when a node is offline or an order is halted.
-    refetchInterval: () =>
-      latestEdit > 0 && Date.now() < latestEdit + GRANT_REFRESH_WINDOW_MS ? GRANT_REFRESH_MS : false,
-  });
-  const [job, setJob] = useState<GrantProbeJob | null>(null);
-  const [showEncryption, setShowEncryption] = useState(false);
-  const activeJobId = job?.id;
-  const activeJobStatus = job?.status;
-
-  useEffect(() => {
-    if (!activeJobId || activeJobStatus !== 'running') return;
-    let closed = false;
-    let polling = false;
-    const events = new EventSource(grantProbeEventsUrl(activeJobId), { withCredentials: true });
-    const update = (event: Event) => {
-      try {
-        setJob(JSON.parse((event as MessageEvent<string>).data) as GrantProbeJob);
-      } catch {
-        /* A malformed frame is ignored; the next snapshot is complete and catches up. */
-      }
-    };
-    const poll = () => {
-      if (closed || polling) return;
-      polling = true;
-      void fetchGrantProbeJob(activeJobId).then(
-        snapshot => {
-          if (!closed) setJob(snapshot);
-          polling = false;
-        },
-        error => {
-          polling = false;
-          if (closed || !(error instanceof ApiError) || error.status !== 404) return;
-          // Jobs are intentionally memory-only. A Console restart forgets them; without this
-          // terminal projection an already open browser would retain "running" forever.
-          setJob(current => {
-            if (!current || current.id !== activeJobId || current.status !== 'running') return current;
-            return {
-              ...current,
-              status: 'canceled',
-              message: '拨测任务已失效，请重新发起',
-              finished_at_unix_secs: Math.floor(Date.now() / 1_000),
-              items: current.items.map(item =>
-                item.status === 'waiting' || item.status === 'running'
-                  ? { ...item, status: 'canceled', ttfb_ms: null, detail: null }
-                  : item,
-              ),
-            };
-          });
-        },
-      );
-    };
-    events.addEventListener('snapshot', update);
-    events.onerror = poll;
-    // SSE is the fast path. Polling is a bounded fallback for proxies that buffer an event or a
-    // browser that silently loses the stream without firing a useful error.
-    const timer = window.setInterval(poll, GRANT_PROBE_POLL_MS);
-    return () => {
-      closed = true;
-      window.clearInterval(timer);
-      events.close();
-    };
-  }, [activeJobId, activeJobStatus]);
-
-  const start = useMutation({
-    mutationFn: (ids: string[]) => startUserGrantProbe(user.tenant_id, user.id, ids),
-    onSuccess: response => setJob(response.job),
-  });
-  const cancel = useMutation({
-    mutationFn: (id: string) => cancelGrantProbe(id),
-    onSuccess: setJob,
-  });
-
-  useEffect(() => {
-    if (!activeJobStatus || activeJobStatus === 'running') return;
-    void qc.invalidateQueries({ queryKey: ['grant-probe-plan', user.tenant_id, user.id] });
-  }, [activeJobStatus, qc, user.id, user.tenant_id]);
-
-  // A row probe returns only the selected items.  Keep the complete frozen plan on screen and
-  // project the current job state over it; otherwise every unrelated authorization disappears
-  // while one row is being tested.
-  const jobItems = new Map(job?.items.map(item => [item.id, item]) ?? []);
-  const source: GrantProbeDisplayItem[] = (plan.data === null ? [] : (plan.data?.items ?? job?.items ?? [])).map(
-    item => ({
-      ...item,
-      ...jobItems.get(item.id),
-    }),
-  );
-  // 同一接入点同时提供 VLESS 与 VLESS Encryption 时，Encryption 项默认不显示，勾选后才进入
-  // 矩阵和「拨测全部」。只提供 Encryption 的接入点没有其他拨测项，隐藏后该接入点会从列表中
-  // 消失，因此始终显示。
-  const groupKey = (item: GrantProbePlanItem) => `${item.app_id}/${item.chain_id}/${item.ingress_id}`;
-  const plainGroups = new Set(source.filter(item => item.protocol !== 'vless-encryption').map(groupKey));
-  const optionalEncryption = (item: GrantProbePlanItem) =>
-    item.protocol === 'vless-encryption' && plainGroups.has(groupKey(item));
-  const optionalEncryptionCount = source.filter(optionalEncryption).length;
-  const isShown = (item: GrantProbePlanItem) => showEncryption || !optionalEncryption(item);
-  const shown = source.filter(isShown);
-  // 只画本次 Serving 计划中确实存在的协议 / 地址族列。固定画满所有能力会让完全没有
-  // 启用 Encryption 的授权列表仍出现两个空列，读起来像“尚未验证”，而不是“没有此入口”。
-  const visibleSlots = GRANT_PROBE_SLOTS.filter(slot =>
-    shown.some(item => item.protocol === slot.protocol && item.family === slot.family),
-  );
-  const matrixStyle: GrantProbeMatrixStyle = {
-    '--grant-probe-slot-count': visibleSlots.length,
+  const toggle = (key: string) => {
+    save.reset();
+    setSubmittedRevision(null);
+    setDraftSelection(current => {
+      const next = new Set(acknowledged ? serverSelection : (current ?? serverSelection));
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return sameGrantSelection(next, serverSelection) ? null : next;
+    });
   };
-  const groups = new Map<string, { name: string; items: GrantProbeDisplayItem[] }>();
-  for (const item of shown) {
-    const key = groupKey(item);
-    const group = groups.get(key) ?? {
-      name: probeBaseName(item),
-      items: [],
-    };
-    group.items.push(item);
-    groups.set(key, group);
-  }
-  const order = (item: GrantProbeDisplayItem) =>
-    (item.protocol === 'vless' ? 0 : item.protocol === 'vless-encryption' ? 2 : item.protocol === 'anytls' ? 4 : 6) +
-    (item.family === 'ipv6' ? 1 : 0);
-  for (const group of groups.values()) group.items.sort((a, b) => order(a) - order(b));
-
-  const busy = job?.status === 'running' || start.isPending || cancel.isPending;
-  // 进度与「重试失败项」只统计当前显示的项，隐藏的 Encryption 项不计入。
-  const jobItemsShown = job?.items.filter(isShown) ?? [];
-  const failedIds = jobItemsShown.filter(item => item.status === 'failed').map(item => item.id);
-  const complete = jobItemsShown.filter(item => ['passed', 'failed', 'canceled'].includes(item.status)).length;
-  const total = jobItemsShown.length;
-  const passed = jobItemsShown.filter(item => item.status === 'passed').length;
-  const failed = failedIds.length;
-  const waiting = jobItemsShown.filter(item => item.status === 'waiting').length;
-  const running = jobItemsShown.filter(item => item.status === 'running').length;
-  // 空列表表示服务端计划中的全部项；有项被隐藏时改为显式列出显示中的项。
-  const probeAllIds = shown.length < source.length ? shown.map(item => item.id) : [];
-  const unavailable = !readOnly && capability.data && !capability.data.available ? capability.data.reason : null;
-  const loadError = (readOnly ? null : capability.error) ?? plan.error ?? start.error ?? cancel.error;
-
-  const initialPending = readOnly
-    ? plan.isPending
-    : capability.isPending || (capability.data?.available === true && plan.isPending);
-  if (initialPending) return <Loading variant="users" />;
+  const cancel = () => {
+    if (waiting || !confirmDiscardChanges(guardScope)) return;
+    save.reset();
+    setDraftSelection(null);
+  };
+  const submit = async () => {
+    if (!dirty || waiting) return;
+    setSubmitting(true);
+    const writes = columns.flatMap(({ app, ingress }) => {
+      const key = selectedGrantKey(app.id, user.tenant_id, user.id, ingress.id);
+      const enabled = selection.has(key);
+      if (enabled === serverSelection.has(key)) return [];
+      return [
+        {
+          app_id: app.id,
+          tenant_id: user.tenant_id,
+          user_id: user.id,
+          ingress_id: ingress.id,
+          enabled,
+        } satisfies GrantWrite,
+      ];
+    });
+    let lastRevision = confirmedRevision;
+    let complete = false;
+    try {
+      for (const write of writes) {
+        const result = await save.mutateAsync(write);
+        lastRevision = Math.max(lastRevision, result.revision_id);
+      }
+      complete = true;
+      setSubmittedRevision(lastRevision);
+    } catch {
+      // The shared error surface renders the mutation error. Keep the intended selection open so
+      // a partial save can be reconciled against the refreshed snapshot and retried.
+    } finally {
+      try {
+        await refresh();
+      } catch {
+        // Query state owns refresh failures and keeps the revision-confirmation banner visible.
+      } finally {
+        setSubmitting(false);
+        if (complete && lastRevision <= confirmedRevision) {
+          setSubmittedRevision(null);
+          setDraftSelection(null);
+        }
+      }
+    }
+  };
 
   return (
-    <section className="panel config-panel user-dcard grant-probe">
+    <section className="panel config-panel user-dcard user-grant-editor">
       <header>
-        <PanelTitle of="diag">网络拨测</PanelTitle>
-        {plan.data && <span className="grant-probe-serving">Serving R{plan.data.serving_revision}</span>}
-        {optionalEncryptionCount > 0 && (
-          <label
-            className="grant-probe-toggle"
-            title={`同一接入点的 VLESS Encryption 拨测项，共 ${optionalEncryptionCount} 项`}
-          >
-            <input
-              type="checkbox"
-              checked={showEncryption}
-              disabled={busy}
-              onChange={event => setShowEncryption(event.target.checked)}
-            />
-            VLESS Encryption
-          </label>
-        )}
-        <span className="grant-probe-actions">
-          <button
-            className="btn grant-probe-retry"
-            disabled={readOnly || busy || failedIds.length === 0}
-            onClick={() => start.mutate(failedIds)}
-          >
-            重试失败项
-          </button>
-          <button
-            className={`btn${busy ? '' : ' primary'}`}
-            disabled={
-              readOnly ||
-              start.isPending ||
-              cancel.isPending ||
-              !!unavailable ||
-              !!capability.error ||
-              (!busy && (!plan.data || plan.data.items.length === 0))
-            }
-            onClick={() => {
-              if (job?.status === 'running') cancel.mutate(job.id);
-              else start.mutate(probeAllIds);
-            }}
-          >
-            {job?.status === 'running' ? '取消拨测' : start.isPending ? '创建中…' : '拨测全部'}
-          </button>
+        <PanelTitle of="access">接入授权</PanelTitle>
+        <span className="rt">
+          <b>{selection.size}</b> / {columns.length} 已授权
         </span>
       </header>
-      {unavailable && <div className="grant-probe-banner bad">{unavailable}</div>}
-      {loadError && !unavailable && (
-        <div className="grant-probe-banner warn">
-          {loadError instanceof Error ? loadError.message : '暂时无法读取 Serving 授权'}
-        </div>
-      )}
-      {job && (
-        <div className="grant-probe-progress">
-          <span className="grant-probe-progress-top">
-            <b>{job.message || (job.status === 'running' ? '正在并发拨测' : '本轮拨测结束')}</b>
-            <code>
-              通过 {passed} · 运行 {running} · 等待 {waiting} · 失败 {failed}
-            </code>
-          </span>
-          <i>
-            <b style={{ width: `${total ? Math.round((complete / total) * 100) : 0}%` }} />
-          </i>
-        </div>
-      )}
-      <div className="grant-probe-list">
-        {[...groups.values()].length > 0 && (
-          <div className="grant-probe-table-head" aria-hidden="true">
-            <span>线路 / Route</span>
-            <span className="grant-probe-matrix grant-probe-matrix-head" style={matrixStyle}>
-              {visibleSlots.map(slot => (
-                <span key={`${slot.protocol}/${slot.family}`}>
-                  {slot.protocolLabel} <i>○</i> {slot.familyLabel}
-                </span>
-              ))}
-            </span>
-            <span>拨测</span>
+      <div className="user-dcard-body">
+        {columns.length === 0 ? (
+          <span className="dim">尚无接入面，没有可授权的对象。</span>
+        ) : (
+          <div className="grant-cards">
+            {columns.map(({ app, ingress }) => {
+              const key = selectedGrantKey(app.id, user.tenant_id, user.id, ingress.id);
+              const selected = selection.has(key);
+              const heldByQuota =
+                !granted.has(`${user.tenant_id}/${user.id}/${ingress.id}`) && suspended.has(ingress.id);
+              const held = !selected && heldByQuota;
+              const chain = (app.chains ?? []).find(item => item.id === ingress.chain);
+              const chainName = chain?.name || ingress.chain;
+              const appName = app.label || app.id;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className={`grant-card${held ? ' held' : ''}`}
+                  title={
+                    heldByQuota
+                      ? '流量已用尽，系统已停用。补足额度后自动恢复；此时手动授权在下一轮仍会被撤销。'
+                      : `${chainName} · ${appName} · ${ingress.id} · ${selected ? '取消选择' : '选择授权'}`
+                  }
+                  aria-pressed={selected}
+                  aria-busy={waiting}
+                  disabled={
+                    !editable ||
+                    snapshotUnavailable ||
+                    waiting ||
+                    unconfirmedGrantKeys.has(selectedGrantKey(app.id, user.tenant_id, user.id, ingress.id))
+                  }
+                  onClick={() => toggle(key)}
+                >
+                  <span className="gc-head">
+                    <span className="gc-app">
+                      <span className="gc-name">
+                        <RegionFlag code={chain?.subscription_country} />
+                        <span>{chainName}</span>
+                      </span>
+                      <i>{ingress.chain}</i>
+                    </span>
+                    <span className="gc-mark" aria-hidden="true">
+                      {selected ? '✓' : held ? '⦸' : ''}
+                    </span>
+                  </span>
+                  <span className="gc-at">{held ? '流量用尽已停用' : `${nameOf(ingress.node)}:${ingress.port}`}</span>
+                  <span className="gc-wm">{appName}</span>
+                </button>
+              );
+            })}
           </div>
         )}
-        {[...groups.entries()].map(([key, group]) => {
-          const ids = group.items.map(item => item.id);
-          return (
-            <div className="grant-probe-row" key={key}>
-              <span className="grant-probe-name">
-                <b>{group.name}</b>
-              </span>
-              <span className="grant-probe-matrix" style={matrixStyle}>
-                {visibleSlots.map(slot => {
-                  const item = group.items.find(
-                    candidate => candidate.protocol === slot.protocol && candidate.family === slot.family,
-                  );
-                  const label = `${slot.protocolLabel} · ${slot.familyLabel}`;
-                  if (!item) {
-                    return (
-                      <span className="grant-probe-gap" key={`${slot.protocol}/${slot.family}`} aria-hidden="true" />
-                    );
-                  }
-                  const status = probeStatusText(item);
-                  const visibleStatus = probeVisibleStatusText(item);
-                  return (
-                    <span
-                      className={`grant-probe-result ${item.status ?? 'idle'}`}
-                      key={item.id}
-                      data-label={label}
-                      data-protocol={slot.protocolLabel}
-                      data-stack={slot.familyLabel}
-                      title={item.detail ? `${label}：${item.detail}` : `${label}：${status || '尚未验证'}`}
-                      aria-label={`${label}：${status || '尚未验证'}`}
-                    >
-                      <i className="grant-probe-dot" aria-hidden="true" />
-                      {visibleStatus && <b>{visibleStatus}</b>}
-                    </span>
-                  );
-                })}
-              </span>
-              <span className="grant-probe-row-action">
-                <button
-                  className="btn grant-probe-one"
-                  disabled={readOnly || busy || !plan.data}
-                  onClick={() => start.mutate(ids)}
-                >
-                  {group.items.some(item => item.status === 'failed') ? '重试' : '拨测'}
-                </button>
-              </span>
-            </div>
-          );
-        })}
-        {!loadError && !unavailable && source.length === 0 && (
-          <div className="grant-probe-empty">没有可拨测的生效授权</div>
-        )}
       </div>
-      {!readOnly && (
-        <footer
-          className="user-dcard-foot"
-          title="拨测只检查本次授权是否可用，不代替周期健康观测；每项会产生极小真实流量。"
-        >
-          {`使用 ${user.id} 当前生效的真实用户凭据从公网验证；流量计入该用户用量。`}
+      {activeDraftSelection !== null && (
+        <footer className="user-dcard-foot grant-editor-actions">
+          <button type="button" className="btn" disabled={waiting} onClick={cancel}>
+            取消
+          </button>
+          <button type="button" className="btn primary" disabled={!dirty || waiting} onClick={() => void submit()}>
+            {waiting ? '保存中…' : '保存'}
+          </button>
         </footer>
       )}
     </section>
   );
 }
+
+type UserDetailTab = 'access' | 'forwarding' | 'stats';
+const USER_DETAIL_TABS = [
+  { key: 'access', label: '接入', icon: 'access' },
+  { key: 'forwarding', label: '转发', icon: 'forwarding' },
+  { key: 'stats', label: '统计', icon: 'observe' },
+] as const;
 
 function UserList({
   drill,
@@ -1673,6 +1531,27 @@ function UserList({
   const qc = useQueryClient();
   const editable = can(who.role, 'edit');
   const canViewPresence = !isVisitor(who);
+  const [detailTab, setDetailTab] = useState<UserDetailTab>('access');
+  const detailTabId = useId();
+  const detailTabs = USER_DETAIL_TABS.filter(
+    tab => tab.key === 'access' || (tab.key === 'forwarding' ? !isPublic(who) : canViewUserRealtimeTraffic(who)),
+  );
+  const activeDetailTab = detailTabs.some(tab => tab.key === detailTab) ? detailTab : 'access';
+  const tabId = (tab: UserDetailTab) => `${detailTabId}-${tab}-tab`;
+  const panelId = (tab: UserDetailTab) => `${detailTabId}-${tab}-panel`;
+  const moveDetailTab = (event: ReactKeyboardEvent<HTMLButtonElement>, current: UserDetailTab) => {
+    const index = detailTabs.findIndex(tab => tab.key === current);
+    let next: number | null = null;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % detailTabs.length;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp')
+      next = (index - 1 + detailTabs.length) % detailTabs.length;
+    if (event.key === 'Home') next = 0;
+    if (event.key === 'End') next = detailTabs.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    setDetailTab(detailTabs[next].key);
+    document.getElementById(tabId(detailTabs[next].key))?.focus();
+  };
   const grantEdits = useGrantEdits();
   const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
   const presence = useQuery({
@@ -1714,7 +1593,13 @@ function UserList({
   /* 当前查看的订阅（用户 + 格式）。null 表示未打开。同时只显示一份，与上面的展开策略一致。 */
   const [sub, setSub] = useState<{ user: UserListItem; kind: SubscriptionKind } | null>(null);
   const [detailActionsOpen, setDetailActionsOpen] = useState(false);
+  const detailActionsButtonRef = useRef<HTMLButtonElement>(null);
+  const detailActionsMenuRef = useRef<HTMLDivElement>(null);
   const [passwordUser, setPasswordUser] = useState<UserListItem | null>(null);
+  const [accountingChange, setAccountingChange] = useState<{
+    user: UserListItem;
+    mode: UserTrafficAccountingMode;
+  } | null>(null);
   const [issuedLogin, setIssuedLogin] = useState<{
     user: UserListItem;
     value: { operator_id: string; password: string };
@@ -1732,7 +1617,9 @@ function UserList({
     if (!detailActionsOpen) return;
     const close = () => setDetailActionsOpen(false);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
+      if (event.key !== 'Escape') return;
+      close();
+      requestAnimationFrame(() => detailActionsButtonRef.current?.focus());
     };
     document.addEventListener('click', close);
     document.addEventListener('keydown', onKeyDown);
@@ -1742,6 +1629,30 @@ function UserList({
     };
   }, [detailActionsOpen]);
 
+  const focusDetailActionEdge = (edge: 'first' | 'last') => {
+    requestAnimationFrame(() => {
+      const items = detailActionsMenuRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)');
+      if (!items?.length) return;
+      items[edge === 'first' ? 0 : items.length - 1]?.focus();
+    });
+  };
+  const moveWithinDetailActions = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Tab') {
+      setDetailActionsOpen(false);
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+    if (items.length === 0) return;
+    event.preventDefault();
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    if (event.key === 'Home') return items[0]?.focus();
+    if (event.key === 'End') return items.at(-1)?.focus();
+    const step = event.key === 'ArrowDown' ? 1 : -1;
+    const next = current < 0 ? (step > 0 ? 0 : items.length - 1) : (current + step + items.length) % items.length;
+    items[next]?.focus();
+  };
+
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ['users'] });
     qc.invalidateQueries({ queryKey: ['revisions'] });
@@ -1750,8 +1661,15 @@ function UserList({
     return qc.invalidateQueries({ queryKey: ['snapshot'] });
   };
   const profile = useMutation({
-    mutationFn: (value: { user: UserListItem; accountType: 'formal' | 'test' }) =>
-      updateUserProfile(value.user.tenant_id, value.user.id, { account_type: value.accountType }),
+    mutationFn: (value: {
+      user: UserListItem;
+      accountType: 'formal' | 'test';
+      trafficMode?: UserTrafficAccountingMode;
+    }) =>
+      updateUserProfile(value.user.tenant_id, value.user.id, {
+        account_type: value.accountType,
+        traffic_accounting_mode: value.trafficMode,
+      }),
     onSuccess: refresh,
   });
   const login = useMutation({
@@ -1863,7 +1781,8 @@ function UserList({
     );
     return {
       rows,
-      total: rows.reduce((n, r) => n + r.uplink_bytes + r.downlink_bytes, 0),
+      total:
+        rows.reduce((n, r) => n + r.uplink_bytes + r.downlink_bytes, 0) * trafficMultiplier(u.traffic_accounting_mode),
     };
   };
 
@@ -1893,7 +1812,10 @@ function UserList({
         const key = `${u.tenant_id}/${u.id}/${a.id}`;
         const row = usageByView.get(key);
         // 月用量是可选观测；读取失败时显示未知，绝不能把未知当成 0 后再算出“额度充足”。
-        const used = monthlyState === 'ready' ? (row ? row.uplink_bytes + row.downlink_bytes : 0) : null;
+        const used =
+          monthlyState === 'ready'
+            ? (row ? row.uplink_bytes + row.downlink_bytes : 0) * trafficMultiplier(u.traffic_accounting_mode)
+            : null;
         const limit = quotaByView.get(key) ?? null;
         return { app: a, used, limit, over: limit !== null && used !== null && used >= limit };
       });
@@ -2015,10 +1937,15 @@ function UserList({
     const headCls = disabled ? 'off' : tone === 'idle' ? 'idle' : '';
     const lampCls = tone === 'ok' ? '' : tone; // '' | 'bad' | 'idle'
     const userPresence = presenceByUser.get(r.key);
-    const presenceText = userPresenceText(userPresence);
-    const presenceTitle = userPresence?.sources.length
-      ? userPresence.sources.map(source => source.ip).join(' · ')
-      : presenceText;
+    const statusText = userLampTitle(facts);
+    const testChip = accountTypeChip(u.account_type);
+    // UUID 也收在「更多」里：只读身份能看到 UUID 时，菜单为复制它而可用，其余项各自禁用。
+    const menuAvailable = editable || selfService || !!u.uuid;
+    const changeAccountingMode = (trafficMode: UserTrafficAccountingMode) => {
+      if (!editable || profile.isPending || trafficMode === (u.traffic_accounting_mode ?? 'single')) return;
+      profile.reset();
+      setAccountingChange({ user: u, mode: trafficMode });
+    };
     // 用量行名称下方的接入情况。被配额执行器停用的接入点与已授权的分开：撤销后 grants 里
     // 已没有这些记录，与授权卡的 held 判定相同。地区旗依次取已授权、被停用、线路全部的链。
     const routeAccessOf = (app: SnapshotApp): QuotaRouteAccess => {
@@ -2038,242 +1965,275 @@ function UserList({
     return (
       <section key={r.key} className="panel user-split-detail">
         <div className={`user-dhead${headCls ? ` ${headCls}` : ''}`}>
+          {/* 与机器详情同构：身份、页签和操作共用一条横梁；窄容器才把页签落到第二行。
+              UUID、账号类型、密码与登录、停用和换 UUID 仍收进「更多」，不让低频或危险操作常驻。 */}
           <div className="user-dhead-main">
-            <GeneratedUserAvatar id={u.id} variant="plate" lamp={{ tone: lampCls, title: userLampTitle(facts) }} />
-            <div className="dtitle">
-              <div className="dname">
-                <b className="mono">{u.id}</b>
-                {isMe && <span className="st st-ok">我</span>}
-                <span className="dsub">
-                  <span
-                    className="dstat"
-                    title={
-                      mine.length > 0
-                        ? `已授权 ${mine.length} 个接入点`
-                        : suspended.size > 0
-                          ? `${suspended.size} 个接入点已停用`
-                          : '尚未授权接入点'
-                    }
-                    aria-label={
-                      mine.length > 0
-                        ? `已授权 ${mine.length} 个接入点`
-                        : suspended.size > 0
-                          ? `${suspended.size} 个接入点已停用`
-                          : '尚未授权接入点'
-                    }
-                  >
-                    <Icon of="chains" size={12} className="dstat-ic" />
-                    <b>
-                      {mine.length > 0 ? '已授权' : suspended.size > 0 ? '已停用' : '已授权'}{' '}
-                      {mine.length || suspended.size}
-                    </b>
+            <div className="user-dhead-identity">
+              <GeneratedUserAvatar id={u.id} variant="plate" lamp={{ tone: lampCls, title: statusText }} />
+              <div className="dtitle">
+                <div className="dname">
+                  <b className="mono">{u.id}</b>
+                  <span className="user-monthly-badge" title={`本月流量 ${usageText}`}>
+                    <Icon of="usage" size={12} />
+                    <span className="mono">{usageText}</span>
                   </span>
-                  <span className="dstat" title={`本月合计 ${usageText}`} aria-label={`本月合计 ${usageText}`}>
-                    <Icon of="usage" size={12} className="dstat-ic" />
-                    <b className="user-usage-value">{usageText}</b>
-                  </span>
-                  {canViewPresence && (
-                    <span className="dstat" title={presenceTitle} aria-label={presenceText}>
-                      <Icon of="client" size={12} className="dstat-ic" />
-                      <b>{userPresence?.sources.length ?? '—'}</b>
-                    </span>
-                  )}
-                </span>
-              </div>
-              {u.uuid && (
-                <div className="user-duuid">
-                  <span>UUID</span>
-                  <code>{u.uuid}</code>
-                  <CopyButton
-                    className="user-fcopy user-duuid-copy"
-                    text={u.uuid}
-                    label="复制 UUID"
-                    successLabel="UUID 已复制"
-                    failureLabel="UUID 复制失败"
-                    iconOnly
-                  />
+                  {isMe && <span className="user-row-chip">我</span>}
+                  {testChip && <span className="user-row-chip test">{testChip}</span>}
                 </div>
-              )}
+                {/* 状态由头像灯表达，流量收进名称旁角标；第二行只留完整 UUID。 */}
+                <p className="dsub">
+                  <span className="mono user-summary-uuid">{u.uuid?.trim() || 'UUID —'}</span>
+                </p>
+              </div>
             </div>
-            <div className="user-dhead-actions">
+            {detailTabs.length > 1 && (
+              <div className="nd-tabs user-detail-tabs" role="tablist" aria-label={`${u.id} 详情页签`}>
+                <div className="nd-tabs-seg">
+                  {detailTabs.map(tab => (
+                    <button
+                      key={tab.key}
+                      type="button"
+                      role="tab"
+                      id={tabId(tab.key)}
+                      aria-controls={panelId(tab.key)}
+                      aria-selected={activeDetailTab === tab.key}
+                      tabIndex={activeDetailTab === tab.key ? 0 : -1}
+                      onClick={() => setDetailTab(tab.key)}
+                      onKeyDown={event => moveDetailTab(event, tab.key)}
+                    >
+                      <Icon of={tab.icon} size={14} className="nd-tab-ic" />
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="user-dhead-tools">
               <div className="user-dacts">
-                {!editable && selfService && <span className="user-readonly">自助访问</span>}
-                <span className="user-account-type" title="用户资料 · 账号类型">
-                  <SegSwitch
-                    checked={u.account_type === 'test'}
-                    disabled={!editable || profile.isPending}
-                    off="正式"
-                    on="测试"
-                    onChange={test =>
-                      profile.mutate({
-                        user: u,
-                        accountType: test ? 'test' : 'formal',
-                      })
-                    }
-                  />
-                </span>
                 <button
+                  type="button"
                   className="btn user-dact"
-                  disabled={selfService ? !u.login_enabled : !canManageLogin || !u.login_enabled}
-                  title={
-                    selfService
-                      ? u.login_enabled
-                        ? '修改自己的登录密码'
-                        : '当前只开通了直达登录，尚未设置密码'
-                      : u.login_enabled
-                        ? '为该用户设置新的登录密码'
-                        : '请先在“更多”中开通登录'
-                  }
-                  onClick={() => {
-                    if (selfService) {
-                      if (!u.login_enabled) return;
-                      navigate('password');
-                    } else {
-                      setPasswordUser(u);
-                    }
-                  }}
-                >
-                  <Icon of="security" size={13} className="user-dact-icon" />
-                  修改密码
-                </button>
-                <button
-                  className="btn user-dact"
+                  aria-label="节点"
                   disabled={!canOpenSubscription}
-                  title="打开该用户的 vless:// 节点，可选择地址族"
+                  title="打开该用户的节点链接：复制分享链接、拨测当前授权，可选择协议与地址族"
                   onClick={() => setSub({ user: u, kind: 'uri' })}
                 >
                   <Icon of="client" size={13} className="user-dact-icon" />
-                  节点
+                  <span className="user-dact-label">节点</span>
                 </button>
                 <button
+                  type="button"
                   className="btn user-dact"
+                  aria-label="订阅"
                   disabled={!canOpenSubscription}
-                  title="打开 Clash 订阅，可选择地址族"
+                  title="打开 Clash 订阅，可选择协议与地址族"
                   onClick={() => setSub({ user: u, kind: 'clash' })}
                 >
                   <Icon of="subscription" size={13} className="user-dact-icon" />
-                  订阅
+                  <span className="user-dact-label">订阅</span>
                 </button>
-                <div className="fg-menuwrap user-action-menuwrap">
-                  <button
-                    className="btn user-dact user-dact-more"
-                    disabled={!editable && !selfService}
-                    aria-label="更多操作"
-                    title="更多操作"
-                    aria-haspopup="menu"
-                    aria-expanded={detailActionsOpen}
-                    onClick={event => {
-                      event.stopPropagation();
-                      setDetailActionsOpen(open => !open);
-                    }}
+              </div>
+              <div className="fg-menuwrap user-action-menuwrap">
+                <button
+                  className="btn user-dact user-dact-more"
+                  ref={detailActionsButtonRef}
+                  disabled={!menuAvailable}
+                  aria-label="更多操作"
+                  title="更多操作"
+                  aria-haspopup="menu"
+                  aria-controls={`${detailTabId}-actions-menu`}
+                  aria-expanded={detailActionsOpen}
+                  onKeyDown={event => {
+                    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+                    event.preventDefault();
+                    setDetailActionsOpen(true);
+                    focusDetailActionEdge(event.key === 'ArrowDown' ? 'first' : 'last');
+                  }}
+                  onClick={event => {
+                    event.stopPropagation();
+                    setDetailActionsOpen(open => {
+                      if (!open) focusDetailActionEdge('first');
+                      return !open;
+                    });
+                  }}
+                >
+                  <Icon of="more" size={13} className="user-dact-icon" />
+                </button>
+                {detailActionsOpen && menuAvailable && (
+                  <div
+                    id={`${detailTabId}-actions-menu`}
+                    ref={detailActionsMenuRef}
+                    className="fg-menu user-action-menu"
+                    role="menu"
+                    aria-label={`${u.id} 更多操作`}
+                    onClick={() => setDetailActionsOpen(false)}
+                    onKeyDown={moveWithinDetailActions}
                   >
-                    <Icon of="more" size={13} className="user-dact-icon" />
-                  </button>
-                  {detailActionsOpen && (editable || selfService) && (
-                    <div className="fg-menu user-action-menu" role="menu" onClick={() => setDetailActionsOpen(false)}>
-                      {canManageLogin && (
-                        <button
+                    {u.uuid && (
+                      // 复制后菜单不关，结果直接写在这一项上。
+                      <div role="none" onClick={event => event.stopPropagation()}>
+                        <CopyButton
                           role="menuitem"
-                          className={u.login_enabled ? 'dg' : undefined}
-                          disabled={login.isPending}
-                          onClick={() => {
-                            if (
-                              u.login_enabled &&
-                              !window.confirm(`确定重置 ${u.id} 的登录密码？现有登录会话将失效。`)
-                            ) {
-                              return;
-                            }
-                            login.mutate(u);
-                          }}
+                          className="user-action-copy"
+                          text={u.uuid}
+                          label="复制 UUID"
+                          successLabel="UUID 已复制"
+                          failureLabel="UUID 复制失败"
                         >
-                          <Icon of="access" size={14} className="user-action-menu-icon" />
-                          <span>
-                            {u.login_enabled ? '重置登录密码' : '开通登录'}
-                            <small>
-                              {u.login_enabled ? '生成一次性密码并注销现有会话' : '生成该用户的首次登录密码'}
-                            </small>
-                          </span>
-                        </button>
-                      )}
-                      {canManageLogin && (
-                        <button
-                          role="menuitem"
-                          className={u.direct_login_enabled ? 'dg' : undefined}
-                          disabled={directLogin.isPending}
-                          onClick={() => {
-                            if (
-                              u.direct_login_enabled &&
-                              !window.confirm(`确定重新生成 ${u.id} 的直达登录页面？旧页面将立即失效。`)
-                            ) {
-                              return;
-                            }
-                            directLogin.mutate(u);
-                          }}
-                        >
-                          <Icon of="access" size={14} className="user-action-menu-icon" />
-                          <span>
-                            {u.direct_login_enabled ? '重新生成直达登录页' : '生成直达登录页'}
-                            <small>
-                              {u.direct_login_enabled ? '替换现有 UUID + TOKEN 登录链接' : '无需输入密码即可登录'}
-                            </small>
-                          </span>
-                        </button>
-                      )}
-                      {canManageLogin && u.direct_login_enabled && (
-                        <button
-                          role="menuitem"
-                          className="dg"
-                          disabled={revokeDirectLogin.isPending}
-                          onClick={() => {
-                            if (!window.confirm(`确定撤销 ${u.id} 的直达登录页面？`)) return;
-                            revokeDirectLogin.mutate(u);
-                          }}
-                        >
-                          <Icon of="dash" size={14} className="user-action-menu-icon" />
-                          <span>
-                            撤销直达登录页
-                            <small>已打开的会话不受影响，页面不能再用于登录</small>
-                          </span>
-                        </button>
-                      )}
-                      {editable && (
-                        <button
-                          role="menuitem"
-                          className={disabled ? undefined : 'dg'}
-                          disabled={status.isPending}
-                          onClick={() => status.mutate({ user: u, next: disabled ? 'active' : 'disabled' })}
-                        >
-                          <Icon of={disabled ? 'check' : 'dash'} size={14} className="user-action-menu-icon" />
-                          <span>
-                            {disabled ? '启用用户' : '停用用户'}
-                            <small>{disabled ? '恢复该用户的连接权限' : '旧凭据将立即失效'}</small>
-                          </span>
-                        </button>
-                      )}
+                          {(state, label) => (
+                            <>
+                              <Icon of={copyStateIcon(state)} size={14} className="user-action-menu-icon" />
+                              <span>
+                                {label}
+                                <small className="mono">{u.uuid}</small>
+                              </span>
+                            </>
+                          )}
+                        </CopyButton>
+                      </div>
+                    )}
+                    <button
+                      role="menuitem"
+                      disabled={!editable || profile.isPending}
+                      onClick={() => profile.mutate({ user: u, accountType: testChip ? 'formal' : 'test' })}
+                    >
+                      <Icon of="users" size={14} className="user-action-menu-icon" />
+                      <span>
+                        {testChip ? '改为正式账号' : '标为测试账号'}
+                        <small>
+                          {testChip ? '当前是测试账号，名册中单独标注' : '名册中单独标注，可按「测试」筛选'}
+                        </small>
+                      </span>
+                    </button>
+                    <hr />
+                    <button
+                      role="menuitem"
+                      disabled={selfService ? !u.login_enabled : !canManageLogin || !u.login_enabled}
+                      onClick={() => {
+                        if (selfService) navigate('password');
+                        else setPasswordUser(u);
+                      }}
+                    >
+                      <Icon of="security" size={14} className="user-action-menu-icon" />
+                      <span>
+                        修改密码
+                        <small>
+                          {selfService
+                            ? u.login_enabled
+                              ? '修改自己的登录密码'
+                              : '当前只开通了直达登录，尚未设置密码'
+                            : u.login_enabled
+                              ? '为该用户设置新的登录密码'
+                              : '请先开通登录'}
+                        </small>
+                      </span>
+                    </button>
+                    {canManageLogin && (
+                      <button
+                        role="menuitem"
+                        className={u.login_enabled ? 'dg' : undefined}
+                        disabled={login.isPending}
+                        onClick={() => {
+                          if (u.login_enabled && !window.confirm(`确定重置 ${u.id} 的登录密码？现有登录会话将失效。`)) {
+                            return;
+                          }
+                          login.mutate(u);
+                        }}
+                      >
+                        <Icon of="access" size={14} className="user-action-menu-icon" />
+                        <span>
+                          {u.login_enabled ? '重置登录密码' : '开通登录'}
+                          <small>{u.login_enabled ? '生成一次性密码并注销现有会话' : '生成该用户的首次登录密码'}</small>
+                        </span>
+                      </button>
+                    )}
+                    {canManageLogin && (
+                      <button
+                        role="menuitem"
+                        className={u.direct_login_enabled ? 'dg' : undefined}
+                        disabled={directLogin.isPending}
+                        onClick={() => {
+                          if (
+                            u.direct_login_enabled &&
+                            !window.confirm(`确定重新生成 ${u.id} 的直达登录页面？旧页面将立即失效。`)
+                          ) {
+                            return;
+                          }
+                          directLogin.mutate(u);
+                        }}
+                      >
+                        <Icon of="access" size={14} className="user-action-menu-icon" />
+                        <span>
+                          {u.direct_login_enabled ? '重新生成直达登录页' : '生成直达登录页'}
+                          <small>
+                            {u.direct_login_enabled ? '替换现有 UUID + TOKEN 登录链接' : '无需输入密码即可登录'}
+                          </small>
+                        </span>
+                      </button>
+                    )}
+                    {canManageLogin && u.direct_login_enabled && (
                       <button
                         role="menuitem"
                         className="dg"
-                        disabled={rotate.isPending}
+                        disabled={revokeDirectLogin.isPending}
                         onClick={() => {
-                          if (!window.confirm(`确定更换 ${u.id} 的 UUID？旧订阅和现有连接会立即失效。`)) return;
-                          rotate.mutate({ user: u, selfService });
+                          if (!window.confirm(`确定撤销 ${u.id} 的直达登录页面？`)) return;
+                          revokeDirectLogin.mutate(u);
                         }}
                       >
-                        <Icon of="settings" size={14} className="user-action-menu-icon" />
+                        <Icon of="dash" size={14} className="user-action-menu-icon" />
                         <span>
-                          更换 UUID
-                          <small>当前连接将断开，订阅需要重新导入</small>
+                          撤销直达登录页
+                          <small>已打开的会话不受影响，页面不能再用于登录</small>
                         </span>
                       </button>
-                    </div>
-                  )}
-                </div>
+                    )}
+                    <hr />
+                    {editable && (
+                      <button
+                        role="menuitem"
+                        className={disabled ? undefined : 'dg'}
+                        disabled={status.isPending}
+                        onClick={() => status.mutate({ user: u, next: disabled ? 'active' : 'disabled' })}
+                      >
+                        <Icon of={disabled ? 'check' : 'dash'} size={14} className="user-action-menu-icon" />
+                        <span>
+                          {disabled ? '启用用户' : '停用用户'}
+                          <small>{disabled ? '恢复该用户的连接权限' : '旧凭据将立即失效'}</small>
+                        </span>
+                      </button>
+                    )}
+                    <button
+                      role="menuitem"
+                      className="dg"
+                      disabled={rotate.isPending || (!editable && !selfService)}
+                      onClick={() => {
+                        if (!window.confirm(`确定更换 ${u.id} 的 UUID？旧订阅和现有连接会立即失效。`)) return;
+                        rotate.mutate({ user: u, selfService });
+                      }}
+                    >
+                      <Icon of="settings" size={14} className="user-action-menu-icon" />
+                      <span>
+                        更换 UUID
+                        <small>当前连接将断开，订阅需要重新导入</small>
+                      </span>
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </div>
         </div>
-        <div className="user-dbody">
-          {/* 用量与额度：左侧读数栏沿用用量页写法（本月合计、重置日、上下行），右侧每条线路一行。
+        {/* 页签只切可见性；表单与图表留在原位，切用户由详情 key 重置。 */}
+        <div
+          className="user-dbody"
+          role="tabpanel"
+          id={panelId('access')}
+          aria-labelledby={detailTabs.length > 1 ? tabId('access') : undefined}
+          aria-label={detailTabs.length === 1 ? '接入' : undefined}
+          hidden={activeDetailTab !== 'access'}
+        >
+          {/* 用量与额度：左侧读数栏沿用用量页写法（本月接入、重置日、上下行），右侧每条线路一行。
               合计已在读数栏，标题读数只写线路数。 */}
           <section className="panel config-panel user-dcard user-usage-card">
             <header>
@@ -2282,8 +2242,15 @@ function UserList({
                 <b>{quotaRows.length}</b> 条线路
               </span>
             </header>
-            <div className="user-dcard-body user-usage">
-              <UserUsageLedger state={monthlyState} rows={use.rows} monthEnd={monthly.data?.month_end ?? null} />
+            <div className="user-dcard-body panel-full-bleed-body user-usage">
+              <UserUsageLedger
+                state={monthlyState}
+                rows={use.rows.filter((row): row is UsageMonthlyViewRow => 'app_id' in row)}
+                monthEnd={monthly.data?.month_end ?? null}
+                accountingMode={u.traffic_accounting_mode ?? 'single'}
+                accountingDisabled={!editable || profile.isPending}
+                onAccountingModeChange={changeAccountingMode}
+              />
               {quotaRows.length === 0 ? (
                 <span className="dim qta-empty">尚未授权任何线路</span>
               ) : (
@@ -2307,10 +2274,6 @@ function UserList({
             </div>
           </section>
 
-          {canViewUserRealtimeTraffic(who) && (
-            <UserRealtimeTrafficCard key={`traffic:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
-          )}
-
           {canViewPresence && (
             <UserPresenceCard
               key={`presence:${r.key}`}
@@ -2322,84 +2285,60 @@ function UserList({
               operators={Object.fromEntries(
                 presence.data?.source_operators?.map(({ ip, operator }) => [ip, operator]) ?? [],
               )}
-              nameOf={nameOf}
+              apps={apps}
               pending={presence.isPending}
               error={presence.error}
             />
           )}
 
-          {/* 接入授权保留落地版：真实的授权卡（链名 + 节点:端口 + 线路水印 + ✓/⦸），
-              只补一层与用量卡一致的标题条。 */}
-          <section className="panel config-panel user-dcard">
-            <header>
-              <PanelTitle of="access">接入授权</PanelTitle>
-              <span className="rt">
-                <b>{mine.length}</b> / {columns.length} 已授权
-              </span>
-            </header>
-            <div className="user-dcard-body">
-              {columns.length === 0 ? (
-                <span className="dim">尚无接入面，没有可授权的对象。</span>
-              ) : (
-                <div className="grant-cards">
-                  {columns.map(({ app: a, ingress: c }) => {
-                    const gk = `${u.tenant_id}/${u.id}/${c.id}`;
-                    const on = granted.has(gk);
-                    const held = !on && suspended.has(c.id);
-                    const chain = (a.chains ?? []).find(x => x.id === c.chain);
-                    const chainName = chain?.name || c.chain;
-                    const appName = a.label || a.id;
-                    return (
-                      <GrantToggle
-                        key={`${a.id}/${gk}`}
-                        write={{ app_id: a.id, tenant_id: u.tenant_id, user_id: u.id, ingress_id: c.id, enabled: !on }}
-                        confirmedRevision={snapshot.data.snapshot.revision}
-                        refresh={refresh}
-                        className={`grant-card${held ? ' held' : ''}`}
-                        disabled={
-                          !editable ||
-                          !!snapshot.error ||
-                          snapshot.fetchStatus === 'paused' ||
-                          unconfirmedGrantKeys.has(`${a.id}/${gk}`)
-                        }
-                        title={
-                          held
-                            ? '流量已用尽，系统已停用。补足额度后自动恢复；此时手动授权在下一轮仍会被撤销。'
-                            : `${chainName} · ${appName} · ${c.id} · ${on ? '点击取消授权' : '点击授权'}`
-                        }
-                      >
-                        <span className="gc-head">
-                          <span className="gc-app">
-                            <span className="gc-name">
-                              <RegionFlag code={chain?.subscription_country} />
-                              <span>{chainName}</span>
-                            </span>
-                            <i>{c.chain}</i>
-                          </span>
-                          <span className="gc-mark" aria-hidden="true">
-                            {on ? '✓' : held ? '⦸' : ''}
-                          </span>
-                        </span>
-                        <span className="gc-at">{held ? '流量用尽已停用' : `${nameOf(c.node)}:${c.port}`}</span>
-                        <span className="gc-wm">{appName}</span>
-                      </GrantToggle>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </section>
-          {!isPublic(who) && (
+          <UserGrantEditor
+            key={`grants:${r.key}`}
+            user={u}
+            columns={columns}
+            granted={granted}
+            suspended={suspended}
+            editable={editable}
+            confirmedRevision={snapshot.data.snapshot.revision}
+            snapshotUnavailable={!!snapshot.error || snapshot.fetchStatus === 'paused'}
+            unconfirmedGrantKeys={unconfirmedGrantKeys}
+            nameOf={nameOf}
+            refresh={refresh}
+          />
+        </div>
+        {!isPublic(who) && (
+          <div
+            className="user-dbody"
+            role="tabpanel"
+            id={panelId('forwarding')}
+            aria-labelledby={tabId('forwarding')}
+            hidden={activeDetailTab !== 'forwarding'}
+          >
             <UserForwardingCard
+              key={`forwarding:${r.key}`}
               user={u}
               nodes={snapshot.data.snapshot.nodes ?? []}
               canAuthorize={can(who.role, 'manage-tenants')}
               canManageRules={editable || selfService}
               canViewRealtime={canViewUserRealtimeTraffic(who)}
+              accountingDisabled={!editable || profile.isPending}
+              onAccountingModeChange={changeAccountingMode}
             />
-          )}
-          <GrantProbePanel key={r.key} user={u} readOnly={!canReadArtifacts && !selfService} />
-        </div>
+          </div>
+        )}
+        {canViewUserRealtimeTraffic(who) && (
+          <div
+            className="user-dbody"
+            role="tabpanel"
+            id={panelId('stats')}
+            aria-labelledby={tabId('stats')}
+            hidden={activeDetailTab !== 'stats'}
+          >
+            <UserRealtimeTrafficCard key={`traffic:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
+            <UserMachineUsageCard key={`machines:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
+            {/* 站点分类、其他站点域名、嗅探失败目标合在同一张卡里（user-site-usage.tsx）。 */}
+            <UserSiteUsageCard key={`sites:${r.key}`} tenantId={u.tenant_id} userId={u.id} />
+          </div>
+        )}
       </section>
     );
   };
@@ -2483,8 +2422,8 @@ function UserList({
   const activeRows = rows.filter(row => row.u.status !== 'disabled');
   const disabledRows = rows.filter(row => row.u.status === 'disabled');
 
-  /* 名册与详情是两张同级面板：名册承担搜索和开户入口，详情只承担当前用户。
-     避免一条跨栏标题把名册读成详情的附属筛选器。 */
+  /* 名册与详情是两张同级面板：名册承担搜索和开户入口，详情保留块档背景，
+     内部使用机器详情的紧凑横向页头和独立内容卡。 */
   const body = (
     <>
       {(snapshot.error || needsGrantRefresh) && (
@@ -2520,7 +2459,7 @@ function UserList({
         />
       )}
       {list.length === 0 ? (
-        <section className="panel titled user-list-panel user-empty-panel">
+        <section className="panel titled user-list-panel user-empty-panel" data-page-title="true">
           <header>
             <ListIcon of="users" />
             <h4>用户</h4>
@@ -2560,7 +2499,7 @@ function UserList({
         // 双栏：左名册常驻可扫读，右详情随选中切换。名册项的结构见 rosterRow；
         // 已停用的用户在名册末尾单独成组。
         <div className={`user-split${drill.p === 'user' ? ' user-detail-route' : ''}`}>
-          <section className="panel titled user-list-panel user-split-roster">
+          <section className="panel titled user-list-panel user-split-roster" data-page-title="true">
             <header>
               <ListIcon of="users" />
               <h4>用户</h4>
@@ -2656,6 +2595,38 @@ function UserList({
   return (
     <>
       <div className="cardpage user-cardpage">{body}</div>
+      {accountingChange && (
+        <Confirm
+          title={`切换为${accountingChange.mode === 'double' ? '双向' : '单向'}计量`}
+          body={
+            <>
+              <p>用户「{accountingChange.user.id}」本月的接入与转发用量将按新口径重新核算。</p>
+              <p>
+                {accountingChange.mode === 'double'
+                  ? '同一业务数据在服务器接收和转发时各计一次。重算后若额度耗尽，相关线路或转发入口将自动暂停。'
+                  : '同一业务数据仅计一次。重算后若额度充足，因额度耗尽而暂停的线路或转发入口将自动恢复。'}
+              </p>
+              {profile.error && <ErrorBox error={profile.error} />}
+            </>
+          }
+          danger={false}
+          confirmLabel={profile.isPending ? '切换中…' : '切换并重算'}
+          confirmDisabled={profile.isPending}
+          onConfirm={() => {
+            if (profile.isPending) return;
+            profile.mutate(
+              {
+                user: accountingChange.user,
+                accountType: accountingChange.user.account_type ?? 'formal',
+                trafficMode: accountingChange.mode,
+              },
+              { onSuccess: () => setAccountingChange(null) },
+            );
+          }}
+          onCancel={() => setAccountingChange(null)}
+        />
+      )}
+      {/* 订阅与节点弹窗（subscription.tsx）：地址是访问凭据，打开时才读取；「节点」页签并入网络拨测。 */}
       {sub && (
         <SubscriptionViewer
           key={`${sub.user.tenant_id}/${sub.user.id}/${sub.kind}`}

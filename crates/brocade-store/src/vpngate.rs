@@ -481,6 +481,9 @@ pub struct UpdateVpngateProbeSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpngateIntelligenceCredentials {
     pub proxycheck_api_key_configured: bool,
+    /// First and last six characters only; omitted by Console for non-system administrators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxycheck_api_keys_masked: Option<Vec<String>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +590,19 @@ pub struct VpngateProbeNodeOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UpdateVpngateCatalogNode {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpngateCatalogNodeSelection {
+    pub node_id: String,
+    pub enabled: bool,
+    pub selected_at_unix_secs: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateVpngateIntelligenceNode {
     pub enabled: bool,
 }
@@ -612,22 +628,22 @@ pub async fn catalog_status(pool: &PgPool) -> Result<VpngateCatalogStatus> {
                 state.probe_shard_rotation_secs,
                 state.source_url,
                 EXTRACT(EPOCH FROM COALESCE(
-                    (SELECT MIN(catalogue_next_sync_at) FROM vpngate_intelligence_nodes),
+                    (SELECT MIN(catalogue_next_sync_at) FROM vpngate_catalog_nodes),
                     state.next_sync_at
                 ))::BIGINT AS next_sync_at_unix_secs,
                 (state.lease_until IS NOT NULL AND state.lease_until > now())
                     OR EXISTS (
-                        SELECT 1 FROM vpngate_intelligence_nodes
+                        SELECT 1 FROM vpngate_catalog_nodes
                          WHERE catalogue_lease_until > now()
                     ) AS syncing,
                 state.last_success_run_id,
                 CASE WHEN EXISTS (
-                    SELECT 1 FROM vpngate_intelligence_nodes collector
+                    SELECT 1 FROM vpngate_catalog_nodes collector
                      WHERE collector.catalogue_last_error_code = state.last_error_code
                        AND collector.catalogue_last_error_detail IS NOT DISTINCT FROM state.last_error_detail
                 ) THEN NULL::TEXT ELSE state.last_error_code END AS last_error_code,
                 CASE WHEN EXISTS (
-                    SELECT 1 FROM vpngate_intelligence_nodes collector
+                    SELECT 1 FROM vpngate_catalog_nodes collector
                      WHERE collector.catalogue_last_error_code = state.last_error_code
                        AND collector.catalogue_last_error_detail IS NOT DISTINCT FROM state.last_error_detail
                 ) THEN NULL::TEXT ELSE state.last_error_detail END AS last_error_detail,
@@ -767,14 +783,14 @@ async fn catalog_sync_history(pool: &PgPool) -> Result<Vec<VpngateSyncHistoryPoi
                 SELECT event.id, event.finished_at_unix_secs,
                        CASE WHEN EXISTS (
                                 SELECT 1
-                                  FROM vpngate_intelligence_nodes selected
+                                  FROM vpngate_catalog_nodes selected
                                   JOIN vpngate_sync_runs run ON run.worker_id = selected.node_id
                                  WHERE run.status = 'succeeded'
                                    AND run.finished_at <= event.finished_at
                             )
                             THEN (
                                 SELECT COUNT(DISTINCT observation.server_id)
-                                  FROM vpngate_intelligence_nodes selected
+                                  FROM vpngate_catalog_nodes selected
                                   JOIN LATERAL (
                                        SELECT run.id
                                          FROM vpngate_sync_runs run
@@ -913,16 +929,22 @@ pub async fn intelligence_policy(pool: &PgPool) -> Result<VpngateIntelligencePol
 }
 
 pub async fn intelligence_credentials(pool: &PgPool) -> Result<VpngateIntelligenceCredentials> {
-    let proxycheck_api_key_configured = sqlx::query_scalar::<_, bool>(
-        "SELECT proxycheck_api_key_sealed IS NOT NULL
+    let sealed = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT proxycheck_api_key_sealed
            FROM vpngate_catalog_state
           WHERE id = TRUE",
     )
     .fetch_one(pool)
     .await?;
-    Ok(VpngateIntelligenceCredentials {
-        proxycheck_api_key_configured,
-    })
+    let credentials = sealed
+        .as_deref()
+        .map(decode_proxycheck_credentials)
+        .transpose()?;
+    Ok(proxycheck_credentials_summary(
+        credentials
+            .as_ref()
+            .map_or(&[], |credentials| &credentials.keys),
+    ))
 }
 
 fn valid_proxycheck_api_key(value: &str) -> bool {
@@ -940,6 +962,18 @@ const MAX_PROXYCHECK_API_KEYS: usize = 32;
 struct StoredProxycheckCredentials {
     keys: Vec<String>,
     next_key_index: usize,
+}
+
+fn proxycheck_credentials_summary(keys: &[String]) -> VpngateIntelligenceCredentials {
+    VpngateIntelligenceCredentials {
+        proxycheck_api_key_configured: !keys.is_empty(),
+        proxycheck_api_keys_masked: Some(
+            keys.iter()
+                // Both saved and submitted keys have passed the four-group ASCII validation.
+                .map(|key| format!("{}-******-******-{}", &key[..6], &key[21..]))
+                .collect(),
+        ),
+    }
 }
 
 fn proxycheck_start_index(entropy: [u8; 8], key_count: usize) -> usize {
@@ -1046,6 +1080,7 @@ pub async fn update_intelligence_credentials(
     // An updated pool must not always spend the first listed key first. Choose one random starting
     // position, then retain the cursor so subsequent claims enumerate the complete pool fairly.
     let next_key_index = random_proxycheck_start_index(keys.len())?;
+    let summary = proxycheck_credentials_summary(&keys);
     let sealed = seal_proxycheck_credentials(&StoredProxycheckCredentials {
         keys,
         next_key_index,
@@ -1060,9 +1095,7 @@ pub async fn update_intelligence_credentials(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(VpngateIntelligenceCredentials {
-        proxycheck_api_key_configured: true,
-    })
+    Ok(summary)
 }
 
 pub async fn update_intelligence_policy(
@@ -1125,6 +1158,15 @@ pub async fn request_intelligence_refresh(
     actor: &AdminContext,
 ) -> Result<VpngateIntelligenceRefreshResult> {
     require_system_admin(actor, "refresh VPN Gate intelligence")?;
+    let enabled =
+        sqlx::query_scalar::<_, bool>("SELECT enabled FROM vpngate_catalog_state WHERE id = TRUE")
+            .fetch_one(pool)
+            .await?;
+    if !enabled {
+        return Err(StoreError::Conflict(
+            "VPN Gate is disabled; enable it in settings before refreshing intelligence".to_owned(),
+        ));
+    }
     let policy = intelligence_policy(pool).await?;
     let active_secs =
         intelligence_hours_to_secs("intelligence active window", policy.active_window_hours)?;
@@ -1990,11 +2032,17 @@ pub async fn update_settings(
         ));
     }
     let mut tx = pool.begin().await?;
+    // While disabled, next_sync_at becomes the immutable pause clock used by candidate freshness
+    // reads. Keep it stable across edits made during the pause; enabling makes it due immediately.
     sqlx::query(
         "UPDATE vpngate_catalog_state
             SET enabled = $1,
                 interval_secs = $2,
-                next_sync_at = CASE WHEN $1 THEN LEAST(next_sync_at, now()) ELSE next_sync_at END,
+                next_sync_at = CASE
+                    WHEN $1 THEN LEAST(next_sync_at, now())
+                    WHEN enabled THEN now()
+                    ELSE next_sync_at
+                END,
                 updated_at = now()
           WHERE id = TRUE",
     )
@@ -2004,7 +2052,7 @@ pub async fn update_settings(
     .await?;
     if request.enabled {
         sqlx::query(
-            "UPDATE vpngate_intelligence_nodes
+            "UPDATE vpngate_catalog_nodes
                 SET catalogue_next_sync_at = LEAST(catalogue_next_sync_at, now())",
         )
         .execute(&mut *tx)
@@ -2072,15 +2120,28 @@ pub async fn update_probe_settings(
 pub async fn request_sync(pool: &PgPool, actor: &AdminContext) -> Result<()> {
     require_system_admin(actor, "start a VPN Gate sync")?;
     let mut tx = pool.begin().await?;
+    let enabled = sqlx::query_scalar::<_, bool>(
+        "SELECT enabled
+           FROM vpngate_catalog_state
+          WHERE id = TRUE
+          FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !enabled {
+        return Err(StoreError::Conflict(
+            "VPN Gate is disabled; enable it in settings before starting a sync".to_owned(),
+        ));
+    }
     sqlx::query(
         "UPDATE vpngate_catalog_state
-            SET enabled = TRUE, next_sync_at = now(), updated_at = now()
+            SET next_sync_at = now(), updated_at = now()
           WHERE id = TRUE",
     )
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE vpngate_intelligence_nodes
+        "UPDATE vpngate_catalog_nodes
             SET catalogue_next_sync_at = now()",
     )
     .execute(&mut *tx)
@@ -2196,22 +2257,12 @@ pub async fn update_probe_node(
     })
 }
 
-pub async fn update_intelligence_node(
-    pool: &PgPool,
-    actor: &AdminContext,
+async fn validate_worker_node_selection(
+    tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
-    request: UpdateVpngateIntelligenceNode,
-) -> Result<VpngateIntelligenceNodeSelection> {
-    require_system_admin(
-        actor,
-        "choose VPN Gate catalogue and IP intelligence workers",
-    )?;
-    if node_id.trim().is_empty() || node_id.chars().count() > 128 {
-        return Err(StoreError::InvalidData(
-            "VPN Gate intelligence node id is invalid".to_owned(),
-        ));
-    }
-    let mut tx = pool.begin().await?;
+    task_name: &str,
+    enabled: bool,
+) -> Result<()> {
     let row = sqlx::query(
         "SELECT n.retired_at IS NULL
                     AND COALESCE(l.phase, 'active') = 'active' AS lifecycle_active,
@@ -2227,33 +2278,54 @@ pub async fn update_intelligence_node(
           FOR UPDATE OF n",
     )
     .bind(node_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+    if !enabled {
+        return Ok(());
+    }
+    let minimum_protocol = i32::try_from(MIN_AGENT_PROTOCOL_VERSION)
+        .expect("Agent protocol version is deliberately within PostgreSQL INTEGER");
+    let reason = if !row.try_get::<bool, _>("lifecycle_active")? {
+        Some("machine is not in the active lifecycle")
+    } else if row.try_get::<bool, _>("isolated")? {
+        Some("machine is operationally isolated")
+    } else if row
+        .try_get::<Option<i32>, _>("agent_protocol_version")?
+        .is_none_or(|version| version < minimum_protocol)
+    {
+        Some("machine does not report a compatible Agent protocol")
+    } else if !row.try_get::<bool, _>("runtime_fresh")? {
+        Some("machine has no fresh runtime report")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(StoreError::Conflict(format!(
+            "cannot enable VPN Gate {task_name}: {reason}"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn update_catalog_node(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: UpdateVpngateCatalogNode,
+) -> Result<VpngateCatalogNodeSelection> {
+    require_system_admin(actor, "choose VPN Gate catalogue workers")?;
+    if node_id.trim().is_empty() || node_id.chars().count() > 128 {
+        return Err(StoreError::InvalidData(
+            "VPN Gate catalogue node id is invalid".to_owned(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    validate_worker_node_selection(&mut tx, node_id, "catalogue collection", request.enabled)
+        .await?;
     if request.enabled {
-        let minimum_protocol = i32::try_from(MIN_AGENT_PROTOCOL_VERSION)
-            .expect("Agent protocol version is deliberately within PostgreSQL INTEGER");
-        let reason = if !row.try_get::<bool, _>("lifecycle_active")? {
-            Some("machine is not in the active lifecycle")
-        } else if row.try_get::<bool, _>("isolated")? {
-            Some("machine is operationally isolated")
-        } else if row
-            .try_get::<Option<i32>, _>("agent_protocol_version")?
-            .is_none_or(|version| version < minimum_protocol)
-        {
-            Some("machine does not report a compatible Agent protocol")
-        } else if !row.try_get::<bool, _>("runtime_fresh")? {
-            Some("machine has no fresh runtime report")
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            return Err(StoreError::Conflict(format!(
-                "cannot enable VPN Gate IP intelligence: {reason}"
-            )));
-        }
         sqlx::query(
-            "INSERT INTO vpngate_intelligence_nodes (node_id, selected_by, selected_at)
+            "INSERT INTO vpngate_catalog_nodes (node_id, selected_by, selected_at)
              VALUES ($1, $2, now())
              ON CONFLICT (node_id) DO UPDATE SET
                 selected_by = EXCLUDED.selected_by,
@@ -2270,7 +2342,7 @@ pub async fn update_intelligence_node(
                 SET status = 'failed', error_code = 'collector-disabled',
                     error_detail = 'collector was removed while this lease was active',
                     finished_at = now()
-               FROM vpngate_intelligence_nodes selected
+               FROM vpngate_catalog_nodes selected
               WHERE selected.node_id = $1
                 AND run.id = selected.catalogue_active_run_id
                 AND run.status = 'running'",
@@ -2278,11 +2350,59 @@ pub async fn update_intelligence_node(
         .bind(node_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM vpngate_intelligence_nodes WHERE node_id = $1")
+        sqlx::query("DELETE FROM vpngate_catalog_nodes WHERE node_id = $1")
             .bind(node_id)
             .execute(&mut *tx)
             .await?;
         refresh_current_catalog_union(&mut tx).await?;
+    }
+    let selected_at_unix_secs = sqlx::query_scalar::<_, i64>(
+        "SELECT EXTRACT(EPOCH FROM selected_at)::BIGINT
+           FROM vpngate_catalog_nodes
+          WHERE node_id = $1",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(VpngateCatalogNodeSelection {
+        node_id: node_id.to_owned(),
+        enabled: selected_at_unix_secs.is_some(),
+        selected_at_unix_secs,
+    })
+}
+
+pub async fn update_intelligence_node(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: UpdateVpngateIntelligenceNode,
+) -> Result<VpngateIntelligenceNodeSelection> {
+    require_system_admin(actor, "choose VPN Gate IP intelligence workers")?;
+    if node_id.trim().is_empty() || node_id.chars().count() > 128 {
+        return Err(StoreError::InvalidData(
+            "VPN Gate intelligence node id is invalid".to_owned(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    validate_worker_node_selection(&mut tx, node_id, "IP intelligence", request.enabled).await?;
+    if request.enabled {
+        sqlx::query(
+            "INSERT INTO vpngate_intelligence_nodes (node_id, selected_by, selected_at)
+             VALUES ($1, $2, now())
+             ON CONFLICT (node_id) DO UPDATE SET
+                selected_by = EXCLUDED.selected_by,
+                selected_at = now()",
+        )
+        .bind(node_id)
+        .bind(actor.operator_id())
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM vpngate_intelligence_nodes WHERE node_id = $1")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
     }
     let selected_at_unix_secs = sqlx::query_scalar::<_, i64>(
         "SELECT EXTRACT(EPOCH FROM selected_at)::BIGINT
@@ -2337,13 +2457,17 @@ pub async fn claim_exit_intelligence(
         return Ok(None);
     }
     let catalog = sqlx::query(
-        "SELECT intelligence_policy, proxycheck_api_key_sealed
+        "SELECT enabled, intelligence_policy, proxycheck_api_key_sealed
            FROM vpngate_catalog_state
           WHERE id = TRUE
           FOR UPDATE",
     )
     .fetch_one(&mut *tx)
     .await?;
+    if !catalog.try_get::<bool, _>("enabled")? {
+        tx.commit().await?;
+        return Ok(None);
+    }
     let policy = decode_intelligence_policy(catalog.try_get("intelligence_policy")?)?;
     let mut proxycheck_credentials = catalog
         .try_get::<Option<String>, _>("proxycheck_api_key_sealed")?
@@ -2438,7 +2562,7 @@ pub async fn claim_agent_catalog_sync(
                 selected.catalogue_next_sync_at <= now() AS due,
                 selected.catalogue_lease_until IS NULL
                     OR selected.catalogue_lease_until <= now() AS lease_available
-           FROM vpngate_intelligence_nodes selected
+           FROM vpngate_catalog_nodes selected
            JOIN nodes node ON node.id = selected.node_id
            JOIN node_agent_state state ON state.node_id = selected.node_id
            LEFT JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = selected.node_id
@@ -2497,7 +2621,7 @@ pub async fn claim_agent_catalog_sync(
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE vpngate_intelligence_nodes
+        "UPDATE vpngate_catalog_nodes
             SET catalogue_lease_generation = $2,
                 catalogue_lease_until = now() + make_interval(secs => $3),
                 catalogue_active_run_id = $4
@@ -2825,7 +2949,11 @@ pub async fn complete_sync(
         VpngateSyncLeaseKind::Global => {
             sqlx::query(
                 "UPDATE vpngate_catalog_state
-                    SET next_sync_at = now() + make_interval(secs => interval_secs),
+                    SET next_sync_at = CASE
+                            WHEN enabled
+                            THEN now() + make_interval(secs => interval_secs)
+                            ELSE next_sync_at
+                        END,
                         lease_owner = NULL, lease_until = NULL, active_run_id = NULL,
                         last_success_run_id = $1, last_error_code = NULL,
                         last_error_detail = NULL, updated_at = now()
@@ -2837,7 +2965,7 @@ pub async fn complete_sync(
         }
         VpngateSyncLeaseKind::Collector => {
             sqlx::query(
-                "UPDATE vpngate_intelligence_nodes
+                "UPDATE vpngate_catalog_nodes
                     SET catalogue_next_sync_at = now() + make_interval(secs => (
                             SELECT interval_secs FROM vpngate_catalog_state WHERE id = TRUE
                         )),
@@ -2855,11 +2983,14 @@ pub async fn complete_sync(
             refresh_current_catalog_union(&mut tx).await?;
             sqlx::query(
                 "UPDATE vpngate_catalog_state
-                    SET next_sync_at = COALESCE(
-                            (SELECT MIN(catalogue_next_sync_at)
-                               FROM vpngate_intelligence_nodes),
-                            next_sync_at
-                        ),
+                    SET next_sync_at = CASE
+                            WHEN enabled THEN COALESCE(
+                                (SELECT MIN(catalogue_next_sync_at)
+                                   FROM vpngate_catalog_nodes),
+                                next_sync_at
+                            )
+                            ELSE next_sync_at
+                        END,
                         last_success_run_id = $1,
                         last_error_code = NULL,
                         last_error_detail = NULL,
@@ -2919,9 +3050,12 @@ pub async fn fail_sync(
         VpngateSyncLeaseKind::Global => {
             sqlx::query(
                 "UPDATE vpngate_catalog_state
-                    SET next_sync_at = now() + make_interval(
-                            secs => GREATEST(60, LEAST(interval_secs, 300))
-                        ),
+                    SET next_sync_at = CASE
+                            WHEN enabled THEN now() + make_interval(
+                                secs => GREATEST(60, LEAST(interval_secs, 300))
+                            )
+                            ELSE next_sync_at
+                        END,
                         lease_owner = NULL, lease_until = NULL, active_run_id = NULL,
                         last_error_code = $1, last_error_detail = $2, updated_at = now()
                   WHERE id = TRUE",
@@ -2933,7 +3067,7 @@ pub async fn fail_sync(
         }
         VpngateSyncLeaseKind::Collector => {
             sqlx::query(
-                "UPDATE vpngate_intelligence_nodes
+                "UPDATE vpngate_catalog_nodes
                     SET catalogue_next_sync_at = now() + make_interval(secs => (
                             SELECT GREATEST(60, LEAST(interval_secs, 300))
                               FROM vpngate_catalog_state WHERE id = TRUE
@@ -2954,11 +3088,14 @@ pub async fn fail_sync(
             // and collector, but do not turn a partial-origin failure into a catalogue-wide error.
             sqlx::query(
                 "UPDATE vpngate_catalog_state
-                    SET next_sync_at = COALESCE(
-                            (SELECT MIN(catalogue_next_sync_at)
-                               FROM vpngate_intelligence_nodes),
-                            next_sync_at
-                        ),
+                    SET next_sync_at = CASE
+                            WHEN enabled THEN COALESCE(
+                                (SELECT MIN(catalogue_next_sync_at)
+                                   FROM vpngate_catalog_nodes),
+                                next_sync_at
+                            )
+                            ELSE next_sync_at
+                        END,
                         updated_at = now()
                   WHERE id = TRUE",
             )
@@ -3107,13 +3244,14 @@ pub async fn agent_desired_with_probe_origins(
         })
         .collect::<Vec<_>>();
     let catalog_row = sqlx::query(
-        "SELECT last_success_run_id, admission_policy, intelligence_policy,
+        "SELECT enabled, last_success_run_id, admission_policy, intelligence_policy,
                 probe_success_cooldown_secs, probe_performance_cooldown_secs,
                 probe_shard_rotation_secs
            FROM vpngate_catalog_state WHERE id = TRUE",
     )
     .fetch_one(pool)
     .await?;
+    let catalog_enabled: bool = catalog_row.try_get("enabled")?;
     let catalog_generation = catalog_row
         .try_get::<Option<i64>, _>("last_success_run_id")?
         .map(|value| i64_to_u64("catalog_generation", value))
@@ -3240,7 +3378,7 @@ pub async fn agent_desired_with_probe_origins(
             manual_switch,
         });
     }
-    let probe_assignments = if !isolated && openvpn_available {
+    let probe_assignments = if catalog_enabled && !isolated && openvpn_available {
         match probe_workers {
             Some(workers) => {
                 next_retained_probe_assignments(
@@ -3504,6 +3642,9 @@ async fn qualified_candidates(
         )?),
         VpngateStaleIntelligencePolicy::Retain | VpngateStaleIntelligencePolicy::Mark => None,
     };
+    // Candidate freshness advances with wall time only while collection is enabled. During a
+    // pause, next_sync_at records the switch-off instant so candidates that were already stale do
+    // not revive, while the automatic pools published to existing Chains remain usable.
     let rows = sqlx::query(
         "WITH eligible AS MATERIALIZED (
             SELECT sample.node_id, sample.server_id, sample.profile_sha256,
@@ -3518,7 +3659,9 @@ async fn qualified_candidates(
               LEFT JOIN vpngate_candidate_probe_state probe_state
                 ON probe_state.server_id = sample.server_id
                AND probe_state.profile_sha256 = sample.profile_sha256
-             WHERE sample.last_success_received_at >= now() - make_interval(
+             WHERE sample.last_success_received_at >=
+                   (CASE WHEN schedule.enabled THEN now() ELSE schedule.next_sync_at END)
+                   - make_interval(
                        secs => GREATEST(
                            $5,
                            schedule.probe_performance_cooldown_secs
@@ -3529,9 +3672,12 @@ async fn qualified_candidates(
                AND COALESCE(probe_state.consecutive_failures, 0) < $7
                AND (COALESCE(probe_state.consecutive_failures, 0) = 0
                     OR probe_state.failure_streak_started_at
-                        >= now() - make_interval(secs => $8))
+                        >= (CASE WHEN schedule.enabled THEN now() ELSE schedule.next_sync_at END)
+                           - make_interval(secs => $8))
                AND ($2::INTEGER IS NULL
-                    OR reputation.verified_at >= now() - make_interval(secs => $2))
+                    OR reputation.verified_at >=
+                       (CASE WHEN schedule.enabled THEN now() ELSE schedule.next_sync_at END)
+                       - make_interval(secs => $2))
                AND jsonb_array_length(reputation.ip_scores) >= 1
         ), qualified AS MATERIALIZED (
             SELECT sample.server_id, sample.profile_sha256,
@@ -3742,6 +3888,7 @@ async fn candidate_by_id(
                 COALESCE(verified.ip_networks, '[]'::jsonb) AS verified_ip_networks
            FROM vpngate_servers server
            JOIN vpngate_profiles profile ON profile.sha256 = server.profile_sha256
+          CROSS JOIN vpngate_catalog_state schedule
            LEFT JOIN LATERAL (
                 SELECT evidence.exit_ip, reputation.country_code,
                        reputation.ip_scores, reputation.ip_networks
@@ -3762,7 +3909,9 @@ async fn candidate_by_id(
                   JOIN vpngate_exit_reputations reputation
                     ON reputation.exit_ip = evidence.exit_ip
                  WHERE ($4::INTEGER IS NULL
-                        OR reputation.verified_at >= now() - make_interval(secs => $4))
+                        OR reputation.verified_at >=
+                           (CASE WHEN schedule.enabled THEN now() ELSE schedule.next_sync_at END)
+                           - make_interval(secs => $4))
                    AND jsonb_array_length(reputation.ip_scores) >= 1
                  ORDER BY (evidence.node_id = $3) DESC, evidence.probed_at DESC
                  LIMIT 1
@@ -4600,16 +4749,29 @@ pub async fn prune_history(
     candidate_retain_days: u32,
     observation_retain_days: u32,
 ) -> Result<u64> {
-    let candidate_retain_days =
-        i32::try_from(candidate_retain_days.clamp(1, 365)).expect("retention fits i32");
-    let observation_retain_days =
-        i32::try_from(observation_retain_days.clamp(1, 365)).expect("retention fits i32");
+    prune_history_hours(
+        pool,
+        candidate_retain_days.saturating_mul(24),
+        observation_retain_days.saturating_mul(24),
+    )
+    .await
+}
+
+pub(crate) async fn prune_history_hours(
+    pool: &PgPool,
+    candidate_retain_hours: u32,
+    observation_retain_hours: u32,
+) -> Result<u64> {
+    let candidate_retain_secs =
+        i64::from(candidate_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
+    let observation_retain_secs =
+        i64::from(observation_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let mut tx = pool.begin().await?;
     let candidate_rows = sqlx::query_scalar::<_, i64>(
         "WITH expired AS MATERIALIZED (
              SELECT ctid
                FROM vpngate_candidate_probe_samples
-              WHERE received_at < now() - make_interval(days => $1)
+              WHERE received_at < now() - make_interval(secs => $1::double precision)
               LIMIT $2
          ), deleted AS (
              DELETE FROM vpngate_candidate_probe_samples history
@@ -4619,7 +4781,7 @@ pub async fn prune_history(
          )
          SELECT count(*) FROM deleted",
     )
-    .bind(candidate_retain_days)
+    .bind(candidate_retain_secs)
     .bind(HISTORY_PRUNE_BATCH_ROWS)
     .fetch_one(&mut *tx)
     .await?;
@@ -4627,7 +4789,7 @@ pub async fn prune_history(
         "WITH expired AS MATERIALIZED (
              SELECT ctid
                FROM vpngate_server_observations
-              WHERE observed_at < now() - make_interval(days => $1)
+              WHERE observed_at < now() - make_interval(secs => $1::double precision)
               LIMIT $2
          ), deleted AS (
              DELETE FROM vpngate_server_observations history
@@ -4637,7 +4799,7 @@ pub async fn prune_history(
          )
          SELECT count(*), count(*) FILTER (WHERE country_code <> $3) FROM deleted",
     )
-    .bind(observation_retain_days)
+    .bind(observation_retain_secs)
     .bind(HISTORY_PRUNE_BATCH_ROWS)
     .bind(UNKNOWN_COUNTRY_CODE)
     .fetch_one(&mut *tx)
@@ -5050,7 +5212,7 @@ async fn lock_claim(
                     catalogue_lease_generation = $2 AND catalogue_active_run_id = $3,
                     FALSE
                 )
-           FROM vpngate_intelligence_nodes
+           FROM vpngate_catalog_nodes
           WHERE node_id = $1
           FOR UPDATE",
     )
@@ -5099,7 +5261,7 @@ async fn refresh_current_catalog_union(tx: &mut Transaction<'_, Postgres>) -> Re
         "WITH latest_per_collector AS (
              SELECT DISTINCT ON (run.worker_id) run.id
                FROM vpngate_sync_runs run
-               JOIN vpngate_intelligence_nodes selected
+               JOIN vpngate_catalog_nodes selected
                  ON selected.node_id = run.worker_id
               WHERE run.status = 'succeeded'
               ORDER BY run.worker_id, run.finished_at DESC, run.id DESC
@@ -5117,7 +5279,7 @@ async fn refresh_current_catalog_union(tx: &mut Transaction<'_, Postgres>) -> Re
            FROM desired
           WHERE server.id = desired.id
             AND server.current IS DISTINCT FROM desired.current
-            AND EXISTS (SELECT 1 FROM vpngate_intelligence_nodes)",
+            AND EXISTS (SELECT 1 FROM vpngate_catalog_nodes)",
     )
     .execute(&mut **tx)
     .await?;
@@ -5542,6 +5704,15 @@ impl crate::PgStore {
         request: UpdateVpngateIntelligenceNode,
     ) -> Result<VpngateIntelligenceNodeSelection> {
         update_intelligence_node(self.pool(), actor, node_id, request).await
+    }
+
+    pub async fn update_vpngate_catalog_node(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: UpdateVpngateCatalogNode,
+    ) -> Result<VpngateCatalogNodeSelection> {
+        update_catalog_node(self.pool(), actor, node_id, request).await
     }
 
     pub async fn claim_vpngate_sync(

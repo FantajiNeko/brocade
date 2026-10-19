@@ -57,24 +57,22 @@ export function VpngateObservationCard({ nodeId }: { nodeId: string }) {
   // 按需观测启动时可能先收到上一帧；同步完成前不展示这份已经失效的池状态。
   if (warming) {
     return (
-      <div className="panel ov-card" aria-label="VPN Gate 实时路径">
-        <header>
-          <PanelTitle of="outbound">VPN Gate 实时路径</PanelTitle>
-          <span className="sp" />
+      <section className="panel config-panel ov-card" aria-label="VPN Gate 网络">
+        <header className="realtime-panel-header">
+          <PanelTitle of="outbound">VPN Gate 网络</PanelTitle>
           <span className="hint">5 秒探活 · 最近 32 条切换事件</span>
         </header>
         <p className="rt-dx" role="status">
           正在获取实时状态…
         </p>
-      </div>
+      </section>
     );
   }
 
   return (
-    <div className="panel ov-card" aria-label="VPN Gate 实时路径">
-      <header>
-        <PanelTitle of="outbound">VPN Gate 实时路径</PanelTitle>
-        <span className="sp" />
+    <section className="panel config-panel ov-card" aria-label="VPN Gate 网络">
+      <header className="realtime-panel-header">
+        <PanelTitle of="outbound">VPN Gate 网络</PanelTitle>
         <span className="hint">5 秒探活 · 最近 32 条切换事件</span>
       </header>
 
@@ -186,6 +184,6 @@ export function VpngateObservationCard({ nodeId }: { nodeId: string }) {
           </table>
         )}
       </details>
-    </div>
+    </section>
   );
 }

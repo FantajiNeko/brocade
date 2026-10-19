@@ -15,6 +15,7 @@ import {
   saveBranding,
   scanCerts,
   fetchDistribution,
+  fetchDataRetention,
   fetchAgentLogPolicy,
   fetchHostNetworkTuning,
   fetchLinkMtu,
@@ -22,11 +23,10 @@ import {
   fetchSettings,
   hopMuxError,
   fetchPingProbeSettings,
-  fetchTunnelProbeCapability,
-  fetchTunnelProbes,
   fetchVpngateOverview,
   startVpngateIntelligenceRefresh,
   saveDistribution,
+  saveDataRetention,
   saveAgentLogDefault,
   saveHostNetworkTuning,
   saveNodeLogPolicy,
@@ -35,7 +35,9 @@ import {
   saveSettings,
   savePingProbeSettings,
   setVisitorAccess,
+  updateVpngateCatalogNode,
   updateVpngateIntelligenceNode,
+  updateVpngateCatalogSettings,
   updateVpngateAdmissionPolicy,
   updateVpngateIntelligenceCredentials,
   updateVpngateIntelligencePolicy,
@@ -50,6 +52,8 @@ import {
   type CertificateTrack,
   type BrandingSettings,
   type DistributionView,
+  type DataRetentionPolicy,
+  type DataRetentionView,
   type AgentLogLimits,
   type AgentLogLimitOverrides,
   type AgentLogPolicyNode,
@@ -65,6 +69,8 @@ import {
   type PingProbeKind,
   type PingProbeSettings,
   type VpngateAdmissionPolicy,
+  type VpngateCatalogStatus,
+  type VpngateIntelligenceCredentials,
   type VpngateIntelligencePolicy,
   type VpngateIpProvider,
   type VpngateOverview,
@@ -77,11 +83,16 @@ import { BrandIcon } from '../ui/branding';
 import { PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { LOG_MAX_MIB, LOG_MIN_MIB, validLogMib } from '../ui/log-policy';
-import { PING_FAMILY_LABEL } from '../ui/ping-probe';
+import {
+  MAX_PING_PROBE_TARGETS,
+  PING_FAMILY_LABEL,
+  PING_PROBE_PRESETS,
+  pingProbePresetTargets,
+} from '../ui/ping-probe';
 import { SettingsParameterSummary } from '../ui/settings-parameter-summary';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { REALITY_FINGERPRINT_OPTIONS } from '../reality';
-import { TunnelProbeSettingsSection } from '../tunnel-probe';
+import { SiteUsageSettingsCard } from '../site-usage-settings';
 
 // Kept as re-exports for callers that used the settings module before the values moved into a
 // lightweight shared module.
@@ -312,6 +323,7 @@ const NAV: NavItem[] = [
   { id: 'set-dist', label: '分发', icon: 'deploy' },
   { id: 'set-agent-logs', label: '日志保留', icon: 'artifacts' },
   { id: 'set-host-network', label: '主网卡调优', icon: 'observe' },
+  { id: 'set-site-usage', label: '站点统计', icon: 'usage' },
   { id: 'set-cert', label: '证书', icon: 'certificate' },
   { id: 'set-xray', label: 'XRAY', icon: 'protocol', key: 'xray' },
   { id: 'set-conn', label: '连接策略', icon: 'config', key: 'connection' },
@@ -321,8 +333,9 @@ const NAV: NavItem[] = [
   { id: 'set-probe', label: '端到端探测', icon: 'observe', key: 'probe' },
   { id: 'set-ping-probe', label: 'Ping 链路探测', icon: 'diag' },
   { id: 'set-geodata', label: '规则库更新', icon: 'dns', key: 'geodata' },
-  { id: 'set-tunnel-probes', label: '隧道监测', icon: 'tunnels' },
+  { id: 'set-vpngate', label: 'VPN Gate 能力', icon: 'tunnels' },
   { id: 'set-vpngate-intelligence', label: '情报任务', icon: 'observe' },
+  { id: 'set-data-retention', label: '数据保留', icon: 'artifacts' },
 ];
 
 const ICON_OF: Record<string, IconName> = Object.fromEntries(NAV.map(item => [item.id, item.icon]));
@@ -1959,6 +1972,167 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
   );
 }
 
+type RetentionUnit = 'hours' | 'days';
+
+const retentionUnitOf = (hours: number): RetentionUnit => (hours >= 24 && hours % 24 === 0 ? 'days' : 'hours');
+const retentionValueOf = (hours: number, unit: RetentionUnit) => String(unit === 'days' ? hours / 24 : hours);
+
+function formatRetentionDuration(hours: number) {
+  if (hours % (365 * 24) === 0) return `${hours / (365 * 24)} 年`;
+  if (hours % 24 === 0) return `${hours / 24} 天`;
+  return `${hours} 小时`;
+}
+
+function formatRetentionBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  const rank = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** rank;
+  return `${value >= 10 || rank === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[rank]}`;
+}
+
+function RetentionPolicyRow({ policy, editable }: { policy: DataRetentionPolicy; editable: boolean }) {
+  const qc = useQueryClient();
+  const initialUnit = retentionUnitOf(policy.ttl_hours);
+  const [unit, setUnit] = useState<RetentionUnit>(initialUnit);
+  const [raw, setRaw] = useState(retentionValueOf(policy.ttl_hours, initialUnit));
+  const numeric = Number(raw);
+  const ttlHours = numeric * (unit === 'days' ? 24 : 1);
+  const valid = Number.isInteger(ttlHours) && ttlHours >= policy.min_ttl_hours && ttlHours <= policy.max_ttl_hours;
+  const dirty = valid && ttlHours !== policy.ttl_hours;
+  useUnsavedChanges(dirty, `${policy.title} TTL`);
+  const save = useMutation({
+    mutationFn: () => saveDataRetention(policy.table_name, ttlHours),
+    onSuccess: async view => {
+      await qc.cancelQueries({ queryKey: ['data-retention'] });
+      qc.setQueryData(['data-retention'], view);
+    },
+  });
+
+  const saveRow = () => {
+    if (!dirty) return;
+    if (
+      ttlHours < policy.ttl_hours &&
+      !window.confirm(
+        `将 ${policy.title}（${policy.table_name}）的 TTL 从 ${formatRetentionDuration(policy.ttl_hours)} 缩短为 ${formatRetentionDuration(ttlHours)}。超过新 TTL 的数据会在后续清理中永久删除，是否继续？`,
+      )
+    ) {
+      return;
+    }
+    save.mutate();
+  };
+
+  return (
+    <div className="retention-policy-row" role="listitem">
+      <div className="retention-policy-copy">
+        <div className="retention-policy-heading">
+          <strong>{policy.title}</strong>
+          <code>{policy.table_name}</code>
+        </div>
+        <p>{policy.description}</p>
+        <small>
+          约 {policy.estimated_rows.toLocaleString()} 行 · {formatRetentionBytes(policy.total_bytes)} · 默认{' '}
+          {formatRetentionDuration(policy.default_ttl_hours)}
+        </small>
+      </div>
+      <div className="retention-policy-control">
+        <label>
+          <span>TTL</span>
+          <input
+            className={dirty ? 'f chg' : 'f'}
+            type="number"
+            min={unit === 'days' ? Math.max(1, Math.ceil(policy.min_ttl_hours / 24)) : policy.min_ttl_hours}
+            max={unit === 'days' ? Math.floor(policy.max_ttl_hours / 24) : policy.max_ttl_hours}
+            step={1}
+            value={raw}
+            disabled={!editable || save.isPending}
+            aria-label={`${policy.title} TTL`}
+            onChange={event => setRaw(event.target.value)}
+          />
+        </label>
+        <select
+          className="f"
+          aria-label={`${policy.title} TTL 单位`}
+          value={unit}
+          disabled={!editable || save.isPending}
+          onChange={event => {
+            const nextUnit = event.target.value as RetentionUnit;
+            const currentHours = valid ? ttlHours : policy.ttl_hours;
+            setUnit(nextUnit);
+            setRaw(
+              nextUnit === 'days'
+                ? String(Math.max(1, Math.ceil(currentHours / 24)))
+                : String(Math.max(1, Math.round(currentHours))),
+            );
+          }}
+        >
+          <option value="hours">小时</option>
+          <option value="days">天</option>
+        </select>
+        <button
+          className={dirty ? 'btn sm primary' : 'btn sm'}
+          type="button"
+          disabled={!editable || !dirty || save.isPending}
+          onClick={saveRow}
+        >
+          {save.isPending ? '保存中…' : '保存'}
+        </button>
+      </div>
+      {!valid && (
+        <span className="agent-log-invalid retention-policy-error">
+          TTL 需为 {formatRetentionDuration(policy.min_ttl_hours)}–{formatRetentionDuration(policy.max_ttl_hours)}
+          的整数小时
+        </span>
+      )}
+      {save.isSuccess && <span className="retention-policy-saved">已保存，下轮清理生效</span>}
+      {save.error && <ErrorBox error={save.error} />}
+    </div>
+  );
+}
+
+export function DataRetentionSection({ editable, data }: { editable: boolean; data: DataRetentionView }) {
+  const categories = [
+    {
+      key: 'history' as const,
+      label: '历史数据',
+      note: '供趋势、诊断和短期追溯使用；长期汇总与当前状态保存在其他表中。',
+    },
+    {
+      key: 'temporary' as const,
+      label: '临时数据',
+      note: '用于幂等响应或计算增量的短期中间状态，过期不会删除计费基线。',
+    },
+  ];
+  return (
+    <details className="panel config-panel data-retention-settings" id="set-data-retention">
+      <summary>
+        <SettingsTitle id="set-data-retention">数据保留</SettingsTitle>
+      </summary>
+      <p className="cardsub">只列出可按时间安全清理的历史与临时表；核心模型、发布审计和长期汇总不在此处</p>
+      <p className="settings-block-note data-retention-warning">
+        保存后不产生修订，也不需要发布。缩短 TTL 不会立即锁表清空，后台会按原有批次逐步清理；已删除的数据无法恢复。
+      </p>
+      {categories.map(category => {
+        const policies = data.policies.filter(policy => policy.category === category.key);
+        return (
+          <Group key={category.key} label={`${category.label} · ${policies.length} 张表`}>
+            <p className="settings-block-note">{category.note}</p>
+            <div className="retention-policy-list" role="list" aria-label={category.label}>
+              {policies.map(policy => (
+                <RetentionPolicyRow
+                  key={`${policy.table_name}:${policy.ttl_hours}`}
+                  policy={policy}
+                  editable={editable}
+                />
+              ))}
+            </div>
+          </Group>
+        );
+      })}
+    </details>
+  );
+}
+
 const HOST_GRO_MAX_NS = 1_000_000;
 const HOST_NAPI_DEFER_MAX = 64;
 
@@ -2154,7 +2328,7 @@ export interface PingProbeFormError {
 export function pingProbeFormError(form: PingProbeSettings): PingProbeFormError | null {
   if (!validPingProbeNumber(form.interval_secs, 5, 86_400)) return { text: '探测间隔必须为 5–86400 秒的整数' };
   if (!validPingProbeNumber(form.timeout_ms, 1, 120_000)) return { text: '探测超时必须为 1–120000 毫秒的整数' };
-  if (form.targets.length > 32) return { text: '最多配置 32 个目标' };
+  if (form.targets.length > MAX_PING_PROBE_TARGETS) return { text: `最多配置 ${MAX_PING_PROBE_TARGETS} 个目标` };
   const seen = new Set<string>();
   for (const [row, target] of form.targets.entries()) {
     const name = target.name.trim();
@@ -2266,15 +2440,30 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
         <section className="setgrp ping-probe-target-section">
           <div className="ping-probe-target-toolbar">
             <p className="eyebrow">
-              探测目标 <span>{form.targets.length}/32</span>
+              探测目标{' '}
+              <span>
+                {form.targets.length}/{MAX_PING_PROBE_TARGETS}
+              </span>
             </p>
             <div className="ping-probe-add">
+              {PING_PROBE_PRESETS.map(preset => (
+                <button
+                  className="btn sm"
+                  type="button"
+                  key={preset.label}
+                  title={preset.source}
+                  disabled={!editable}
+                  onClick={() => setForm(current => ({ ...current, targets: pingProbePresetTargets(preset) }))}
+                >
+                  {preset.label}
+                </button>
+              ))}
               {(['tcp', 'icmp'] as const).map(kind => (
                 <button
                   className="btn sm"
                   type="button"
                   key={kind}
-                  disabled={!editable || form.targets.length >= 32}
+                  disabled={!editable || form.targets.length >= MAX_PING_PROBE_TARGETS}
                   onClick={() =>
                     setForm(current => ({
                       ...current,
@@ -2459,40 +2648,39 @@ const DEFAULT_VPNGATE_INTELLIGENCE_POLICY: VpngateIntelligencePolicy = {
   stale_after_hours: 168,
 };
 
-function VpngateIntelligenceSection({
+function VpngateCapabilitiesSection({
+  status,
   nodes,
   admissionPolicy,
-  intelligencePolicy,
-  proxycheckApiKeyConfigured,
   editable,
 }: {
+  status: VpngateCatalogStatus;
   nodes: NodeAgentStateItem[];
   admissionPolicy: VpngateAdmissionPolicy;
-  intelligencePolicy: VpngateIntelligencePolicy;
-  proxycheckApiKeyConfigured: boolean;
   editable: boolean;
 }) {
   const queryClient = useQueryClient();
-  const [proxycheckApiKeyInputs, setProxycheckApiKeyInputs] = useState(['']);
+  const update = useMutation({
+    mutationFn: (enabled: boolean) => updateVpngateCatalogSettings({ enabled, interval_secs: status.interval_secs }),
+    onSuccess: saved => {
+      queryClient.setQueryData<VpngateOverview>(['vpngate'], current =>
+        current ? { ...current, status: saved } : current,
+      );
+    },
+  });
+
   const { form: admissionForm, setForm: setAdmissionForm, accept: acceptAdmission } = useServerForm(admissionPolicy);
-  const {
-    form: intelligenceForm,
-    setForm: setIntelligenceForm,
-    accept: acceptIntelligence,
-  } = useServerForm(intelligencePolicy);
   const admissionDirty = JSON.stringify(admissionForm) !== JSON.stringify(admissionPolicy);
-  const intelligenceDirty = JSON.stringify(intelligenceForm) !== JSON.stringify(intelligencePolicy);
   useUnsavedChanges(admissionDirty, 'VPN Gate 准入规则', 'vpngate-admission-policy');
-  useUnsavedChanges(intelligenceDirty, 'VPN Gate 情报更新规则', 'vpngate-intelligence-policy');
-  const selection = useMutation({
+  const catalogueSelection = useMutation({
     mutationFn: ({ nodeId, enabled }: { nodeId: string; enabled: boolean }) =>
-      updateVpngateIntelligenceNode(nodeId, enabled),
+      updateVpngateCatalogNode(nodeId, enabled),
     onSuccess: result => {
       queryClient.setQueryData<{ nodes: NodeAgentStateItem[] }>(['nodes'], current =>
         current
           ? {
               nodes: current.nodes.map(node =>
-                node.node_id === result.node_id ? { ...node, vpngate_intelligence_enabled: result.enabled } : node,
+                node.node_id === result.node_id ? { ...node, vpngate_catalog_enabled: result.enabled } : node,
               ),
             }
           : current,
@@ -2505,6 +2693,274 @@ function VpngateIntelligenceSection({
       acceptAdmission(saved, submitted);
       queryClient.setQueryData<VpngateOverview>(['vpngate'], current =>
         current ? { ...current, admission_policy: saved } : current,
+      );
+    },
+  });
+  const providerScore = (provider: VpngateIpProvider) =>
+    admissionForm.provider_rules.find(rule => rule.provider === provider)?.maximum_score ?? 80;
+  const setProviderScore = (provider: VpngateIpProvider, maximumScore: number) =>
+    setAdmissionForm({
+      ...admissionForm,
+      provider_rules: admissionForm.provider_rules.map(rule =>
+        rule.provider === provider ? { ...rule, maximum_score: maximumScore } : rule,
+      ),
+    });
+  const policyValid =
+    Number.isInteger(admissionForm.minimum_successful_sources) &&
+    admissionForm.minimum_successful_sources >= 1 &&
+    admissionForm.minimum_successful_sources <= 3 &&
+    admissionForm.provider_rules.length === 3 &&
+    admissionForm.provider_rules.every(
+      rule => Number.isInteger(rule.maximum_score) && rule.maximum_score >= 0 && rule.maximum_score <= 100,
+    );
+  const catalogueRows = nodes
+    .map(node => ({ node, eligibility: intelligenceEligibility(node) }))
+    .sort(
+      (left, right) =>
+        Number(right.node.vpngate_catalog_enabled) - Number(left.node.vpngate_catalog_enabled) ||
+        Number(right.eligibility.eligible) - Number(left.eligibility.eligible) ||
+        left.node.name.localeCompare(right.node.name),
+    );
+  const catalogueSelected = catalogueRows.filter(row => row.node.vpngate_catalog_enabled).length;
+
+  return (
+    <section className="panel config-panel vpngate-capabilities-settings" id="set-vpngate">
+      <header>
+        <SettingsTitle id="set-vpngate">VPN Gate 能力</SettingsTitle>
+        <span className="vpngate-selected-count">目录 {catalogueSelected}</span>
+      </header>
+      <p className="cardsub">统一控制目录同步、候选拨测与出口 IP 情报，不改变已发布的 Chain</p>
+      <div className="vpngate-capabilities-layout">
+        <div className="setgrp settings-block">
+          <Fld label="整体开关">
+            <SegmentedControl
+              ariaLabel="VPN Gate 总开关"
+              value={status.enabled}
+              disabled={!editable || update.isPending}
+              options={[
+                { value: false, label: '关闭' },
+                { value: true, label: '开启' },
+              ]}
+              onChange={enabled => update.mutate(enabled)}
+            />
+            <span className="hint" role="status">
+              {update.isPending
+                ? '正在保存…'
+                : status.enabled
+                  ? '后台目录同步、候选拨测和出口 IP 情报正常运行'
+                  : '后台任务已暂停，已配置 Chain 继续使用关闭前的候选与配置'}
+            </span>
+          </Fld>
+          <div className="guard">
+            关闭不会删除目录、节点选择或候选池，也不会修改已发布 Chain；再次开启后，后台任务从原状态恢复。
+          </div>
+          {update.error && <ErrorBox error={update.error} />}
+        </div>
+        <section className="setgrp settings-block vpngate-settings-section vpngate-admission-settings">
+          <p className="eyebrow">准入规则</p>
+          <div className="vpngate-admission-grid">
+            <Fld label="成功来源">
+              <select
+                className="f"
+                value={admissionForm.minimum_successful_sources}
+                onChange={event =>
+                  setAdmissionForm({ ...admissionForm, minimum_successful_sources: Number(event.target.value) })
+                }
+              >
+                <option value={1}>1 家（任一来源即可）</option>
+                <option value={2}>2 家</option>
+                <option value={3}>3 家</option>
+              </select>
+            </Fld>
+            <Fld label="地区判断">
+              <select
+                className="f"
+                value={admissionForm.country_policy}
+                onChange={event =>
+                  setAdmissionForm({
+                    ...admissionForm,
+                    country_policy: event.target.value as VpngateAdmissionPolicy['country_policy'],
+                  })
+                }
+              >
+                <option value="any_match">任一来源匹配即可</option>
+                <option value="all_match">所有已返回来源都要匹配</option>
+                <option value="ignore">不检查地区</option>
+              </select>
+            </Fld>
+            <Fld label="结论组合">
+              <select
+                className="f"
+                value={admissionForm.risk_decision_policy}
+                onChange={event =>
+                  setAdmissionForm({
+                    ...admissionForm,
+                    risk_decision_policy: event.target.value as VpngateAdmissionPolicy['risk_decision_policy'],
+                  })
+                }
+              >
+                <option value="all_available_pass">所有已返回来源分别通过</option>
+                <option value="any_available_pass">任一已返回来源通过</option>
+              </select>
+            </Fld>
+            {(['proxycheck', 'ffraud', 'iplogs'] as const).map(provider => (
+              <Fld label={VPNGATE_PROVIDER_LABEL[provider]} key={provider}>
+                <input
+                  className="f"
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={providerScore(provider)}
+                  onChange={event => setProviderScore(provider, Number(event.target.value))}
+                />
+                <span className="unit">分</span>
+              </Fld>
+            ))}
+          </div>
+          <SettingsSaveBar
+            dirty={admissionDirty}
+            saving={savePolicy.isPending}
+            savedText={savePolicy.isSuccess ? '准入规则已保存' : null}
+            editable={editable}
+            disabled={!policyValid}
+            title={policyValid ? undefined : '来源数量和风险分数超出范围'}
+            label="保存准入规则"
+            onSave={() => savePolicy.mutate(admissionForm)}
+          />
+          {savePolicy.error && <ErrorBox error={savePolicy.error} />}
+        </section>
+
+        <VpngateWorkerSetCard
+          id="vpngate-catalogue-agents"
+          title="目录收集 Agent"
+          description="选中的 Agent 负责抓取 VPN Gate 上游目录；无需安装 OpenVPN。"
+          rows={catalogueRows}
+          editable={editable}
+          pendingNodeId={catalogueSelection.isPending ? catalogueSelection.variables?.nodeId : undefined}
+          enabledOf={node => Boolean(node.vpngate_catalog_enabled)}
+          onToggle={(nodeId, enabled) => catalogueSelection.mutate({ nodeId, enabled })}
+          error={catalogueSelection.error}
+        />
+      </div>
+    </section>
+  );
+}
+
+type VpngateWorkerRow = {
+  node: NodeAgentStateItem;
+  eligibility: ReturnType<typeof intelligenceEligibility>;
+};
+
+function VpngateWorkerSetCard({
+  id,
+  title,
+  description,
+  rows,
+  editable,
+  pendingNodeId,
+  enabledOf,
+  onToggle,
+  error,
+}: {
+  id: string;
+  title: string;
+  description: string;
+  rows: VpngateWorkerRow[];
+  editable: boolean;
+  pendingNodeId?: string;
+  enabledOf: (node: NodeAgentStateItem) => boolean;
+  onToggle: (nodeId: string, enabled: boolean) => void;
+  error: Error | null;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const selected = rows.filter(({ node }) => enabledOf(node)).length;
+  const contentId = `${id}-nodes`;
+  return (
+    <section className="setgrp settings-block vpngate-settings-section vpngate-intelligence-agents">
+      <div className="vpngate-settings-card-head">
+        <p className="eyebrow">{title}</p>
+        <div className="vpngate-worker-actions">
+          <span className="vpngate-agent-count">
+            {selected}/{rows.length}
+          </span>
+          <button
+            type="button"
+            className="btn sm"
+            aria-expanded={expanded}
+            aria-controls={contentId}
+            aria-label={`${expanded ? '收起' : editable ? '修改' : '查看'} ${title} 集合`}
+            onClick={() => setExpanded(current => !current)}
+          >
+            {expanded ? '收起' : editable ? '修改' : '查看'}
+          </button>
+        </div>
+      </div>
+      <p className="vpngate-intelligence-agent-note">{description}</p>
+      {expanded && (
+        <div id={contentId} className="vpngate-intelligence-grid">
+          {rows.map(({ node, eligibility }) => {
+            const enabled = enabledOf(node);
+            const busy = pendingNodeId === node.node_id;
+            return (
+              <label className="vpngate-intelligence-node" key={node.node_id}>
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  disabled={!editable || busy || (!eligibility.eligible && !enabled)}
+                  onChange={event => onToggle(node.node_id, event.currentTarget.checked)}
+                />
+                <span>
+                  <b>{node.name}</b>
+                  <small className="mono">{node.node_id}</small>
+                </span>
+                {!eligibility.eligible && <span className="vpngate-agent-warning">{eligibility.reason}</span>}
+              </label>
+            );
+          })}
+          {rows.length === 0 && <p className="empty">机队中还没有 Agent。</p>}
+        </div>
+      )}
+      {error && <ErrorBox error={error} />}
+    </section>
+  );
+}
+
+function VpngateIntelligenceSection({
+  nodes,
+  intelligencePolicy,
+  intelligenceCredentials,
+  globalEnabled,
+  editable,
+}: {
+  nodes: NodeAgentStateItem[];
+  intelligencePolicy: VpngateIntelligencePolicy;
+  intelligenceCredentials?: VpngateIntelligenceCredentials;
+  globalEnabled: boolean;
+  editable: boolean;
+}) {
+  const queryClient = useQueryClient();
+  const [proxycheckApiKeyInputs, setProxycheckApiKeyInputs] = useState(['']);
+  const proxycheckApiKeyConfigured = intelligenceCredentials?.proxycheck_api_key_configured ?? false;
+  const savedProxycheckApiKeys = intelligenceCredentials?.proxycheck_api_keys_masked;
+  const {
+    form: intelligenceForm,
+    setForm: setIntelligenceForm,
+    accept: acceptIntelligence,
+  } = useServerForm(intelligencePolicy);
+  const intelligenceDirty = JSON.stringify(intelligenceForm) !== JSON.stringify(intelligencePolicy);
+  useUnsavedChanges(intelligenceDirty, 'VPN Gate 情报更新规则', 'vpngate-intelligence-policy');
+  const intelligenceSelection = useMutation({
+    mutationFn: ({ nodeId, enabled }: { nodeId: string; enabled: boolean }) =>
+      updateVpngateIntelligenceNode(nodeId, enabled),
+    onSuccess: result => {
+      queryClient.setQueryData<{ nodes: NodeAgentStateItem[] }>(['nodes'], current =>
+        current
+          ? {
+              nodes: current.nodes.map(node =>
+                node.node_id === result.node_id ? { ...node, vpngate_intelligence_enabled: result.enabled } : node,
+              ),
+            }
+          : current,
       );
     },
   });
@@ -2530,23 +2986,6 @@ function VpngateIntelligenceSection({
     mutationFn: startVpngateIntelligenceRefresh,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['vpngate'] }),
   });
-  const providerScore = (provider: VpngateIpProvider) =>
-    admissionForm.provider_rules.find(rule => rule.provider === provider)?.maximum_score ?? 80;
-  const setProviderScore = (provider: VpngateIpProvider, maximumScore: number) =>
-    setAdmissionForm({
-      ...admissionForm,
-      provider_rules: admissionForm.provider_rules.map(rule =>
-        rule.provider === provider ? { ...rule, maximum_score: maximumScore } : rule,
-      ),
-    });
-  const policyValid =
-    Number.isInteger(admissionForm.minimum_successful_sources) &&
-    admissionForm.minimum_successful_sources >= 1 &&
-    admissionForm.minimum_successful_sources <= 3 &&
-    admissionForm.provider_rules.length === 3 &&
-    admissionForm.provider_rules.every(
-      rule => Number.isInteger(rule.maximum_score) && rule.maximum_score >= 0 && rule.maximum_score <= 100,
-    );
   const intelligencePolicyValid = [
     intelligenceForm.active_window_hours,
     intelligenceForm.refresh_interval_hours,
@@ -2558,22 +2997,21 @@ function VpngateIntelligenceSection({
     proxycheckApiKeys.length <= 32 &&
     proxycheckApiKeys.every(key => /^[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{6}){3}$/.test(key)) &&
     new Set(proxycheckApiKeys).size === proxycheckApiKeys.length;
-  const rows = nodes
-    .map(node => ({ node, eligibility: intelligenceEligibility(node) }))
-    .sort(
-      (left, right) =>
-        Number(right.node.vpngate_intelligence_enabled) - Number(left.node.vpngate_intelligence_enabled) ||
-        Number(right.eligibility.eligible) - Number(left.eligibility.eligible) ||
-        left.node.name.localeCompare(right.node.name),
-    );
-  const selected = rows.filter(row => row.node.vpngate_intelligence_enabled).length;
+  const workerRows = nodes.map(node => ({ node, eligibility: intelligenceEligibility(node) }));
+  const intelligenceRows = [...workerRows].sort(
+    (left, right) =>
+      Number(right.node.vpngate_intelligence_enabled) - Number(left.node.vpngate_intelligence_enabled) ||
+      Number(right.eligibility.eligible) - Number(left.eligibility.eligible) ||
+      left.node.name.localeCompare(right.node.name),
+  );
+  const intelligenceSelected = intelligenceRows.filter(row => row.node.vpngate_intelligence_enabled).length;
   return (
     <section className="panel config-panel vpngate-intelligence-settings" id="set-vpngate-intelligence">
       <header>
         <SettingsTitle id="set-vpngate-intelligence">情报任务</SettingsTitle>
-        <span className="vpngate-selected-count">{selected} 台 Agent</span>
+        <span className="vpngate-selected-count">IP {intelligenceSelected}</span>
       </header>
-      <p className="cardsub">集中管理 VPN Gate 目录情报与出口 IP 情报</p>
+      <p className="cardsub">集中管理出口 IP 情报</p>
       <div className="vpngate-intelligence-layout">
         <section className="setgrp settings-block vpngate-settings-section vpngate-intelligence-policy-card">
           <div className="vpngate-settings-card-head">
@@ -2581,7 +3019,8 @@ function VpngateIntelligenceSection({
             <button
               type="button"
               className="btn sm"
-              disabled={!editable || refreshIntelligence.isPending}
+              disabled={!editable || !globalEnabled || refreshIntelligence.isPending}
+              title={globalEnabled ? undefined : '请先开启 VPN Gate 总开关'}
               onClick={() => refreshIntelligence.mutate()}
             >
               {refreshIntelligence.isPending ? '排队中…' : '立即刷新'}
@@ -2589,6 +3028,24 @@ function VpngateIntelligenceSection({
           </div>
           <Fld label="ProxyCheck API">
             <div className="vpngate-api-key-list" role="group" aria-label="ProxyCheck API 密钥">
+              <div className="vpngate-saved-api-keys" role="status">
+                <span className="hint">
+                  {savedProxycheckApiKeys
+                    ? `已保存 ${savedProxycheckApiKeys.length} 个 Key`
+                    : proxycheckApiKeyConfigured
+                      ? '已配置 Key 池'
+                      : '未配置 Key'}
+                </span>
+                {savedProxycheckApiKeys && savedProxycheckApiKeys.length > 0 && (
+                  <ol className="vpngate-saved-api-key-list" aria-label="已保存的 ProxyCheck API 密钥">
+                    {savedProxycheckApiKeys.map((key, index) => (
+                      <li key={index}>
+                        <code>{key}</code>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </div>
               {proxycheckApiKeyInputs.map((key, index) => (
                 <div className="vpngate-api-key-row" key={index}>
                   <ConfigSecretInput
@@ -2638,11 +3095,14 @@ function VpngateIntelligenceSection({
                 </button>
               </div>
             </div>
-            <span className="hint">
-              {proxycheckApiKeyConfigured ? '已配置；旧 Key 不回显，追加不会覆盖' : '未配置'} · 最多 32 个，随机起点轮换
-            </span>
+            <span className="hint">已保存的 Key 仅显示首尾各 6 位；追加不会覆盖 · 最多 32 个，随机起点轮换</span>
           </Fld>
           {saveIntelligenceCredentials.error && <ErrorBox error={saveIntelligenceCredentials.error} />}
+          {(['ffraud', 'iplogs'] as const).map(provider => (
+            <Fld label={`${VPNGATE_PROVIDER_LABEL[provider]} API`} key={provider}>
+              <span className="hint">无需配置 API Key</span>
+            </Fld>
+          ))}
           <Fld label="查询策略">
             <SegmentedControl
               value={intelligenceForm.refresh_mode}
@@ -2733,113 +3193,17 @@ function VpngateIntelligenceSection({
           {refreshIntelligence.error && <ErrorBox error={refreshIntelligence.error} />}
         </section>
 
-        <section className="setgrp settings-block vpngate-settings-section vpngate-admission-settings">
-          <p className="eyebrow">准入规则</p>
-          <div className="vpngate-admission-grid">
-            <Fld label="成功来源">
-              <select
-                className="f"
-                value={admissionForm.minimum_successful_sources}
-                onChange={event =>
-                  setAdmissionForm({ ...admissionForm, minimum_successful_sources: Number(event.target.value) })
-                }
-              >
-                <option value={1}>1 家（任一来源即可）</option>
-                <option value={2}>2 家</option>
-                <option value={3}>3 家</option>
-              </select>
-            </Fld>
-            <Fld label="地区判断">
-              <select
-                className="f"
-                value={admissionForm.country_policy}
-                onChange={event =>
-                  setAdmissionForm({
-                    ...admissionForm,
-                    country_policy: event.target.value as VpngateAdmissionPolicy['country_policy'],
-                  })
-                }
-              >
-                <option value="any_match">任一来源匹配即可</option>
-                <option value="all_match">所有已返回来源都要匹配</option>
-                <option value="ignore">不检查地区</option>
-              </select>
-            </Fld>
-            <Fld label="结论组合">
-              <select
-                className="f"
-                value={admissionForm.risk_decision_policy}
-                onChange={event =>
-                  setAdmissionForm({
-                    ...admissionForm,
-                    risk_decision_policy: event.target.value as VpngateAdmissionPolicy['risk_decision_policy'],
-                  })
-                }
-              >
-                <option value="all_available_pass">所有已返回来源分别通过</option>
-                <option value="any_available_pass">任一已返回来源通过</option>
-              </select>
-            </Fld>
-            {(['proxycheck', 'ffraud', 'iplogs'] as const).map(provider => (
-              <Fld label={VPNGATE_PROVIDER_LABEL[provider]} key={provider}>
-                <input
-                  className="f"
-                  type="number"
-                  min={0}
-                  max={100}
-                  value={providerScore(provider)}
-                  onChange={event => setProviderScore(provider, Number(event.target.value))}
-                />
-                <span className="unit">分</span>
-              </Fld>
-            ))}
-          </div>
-          <SettingsSaveBar
-            dirty={admissionDirty}
-            saving={savePolicy.isPending}
-            savedText={savePolicy.isSuccess ? '准入规则已保存' : null}
-            editable={editable}
-            disabled={!policyValid}
-            title={policyValid ? undefined : '来源数量和风险分数超出范围'}
-            label="保存准入规则"
-            onSave={() => savePolicy.mutate(admissionForm)}
-          />
-          {savePolicy.error && <ErrorBox error={savePolicy.error} />}
-        </section>
-
-        <section className="setgrp settings-block vpngate-settings-section vpngate-intelligence-agents">
-          <div className="vpngate-settings-card-head">
-            <p className="eyebrow">情报执行 Agent</p>
-            <span className="vpngate-agent-count">
-              {selected}/{rows.length}
-            </span>
-          </div>
-          <p className="vpngate-intelligence-agent-note">
-            选中的 Agent 同时执行 VPN Gate 上游目录采集和出口 IP 情报查询；无需安装 OpenVPN。
-          </p>
-          <div className="vpngate-intelligence-grid">
-            {rows.map(({ node, eligibility }) => {
-              const busy = selection.isPending && selection.variables?.nodeId === node.node_id;
-              return (
-                <label className="vpngate-intelligence-node" key={node.node_id}>
-                  <input
-                    type="checkbox"
-                    checked={Boolean(node.vpngate_intelligence_enabled)}
-                    disabled={!editable || busy || (!eligibility.eligible && !node.vpngate_intelligence_enabled)}
-                    onChange={event => selection.mutate({ nodeId: node.node_id, enabled: event.currentTarget.checked })}
-                  />
-                  <span>
-                    <b>{node.name}</b>
-                    <small className="mono">{node.node_id}</small>
-                  </span>
-                  {!eligibility.eligible && <span className="vpngate-agent-warning">{eligibility.reason}</span>}
-                </label>
-              );
-            })}
-          </div>
-          {rows.length === 0 && <p className="empty">机队中还没有 Agent。</p>}
-          {selection.error && <ErrorBox error={selection.error} />}
-        </section>
+        <VpngateWorkerSetCard
+          id="vpngate-intelligence-agents"
+          title="IP 情报 Agent"
+          description="选中的 Agent 负责领取出口 IP 情报查询任务；无需安装 OpenVPN。"
+          rows={intelligenceRows}
+          editable={editable}
+          pendingNodeId={intelligenceSelection.isPending ? intelligenceSelection.variables?.nodeId : undefined}
+          enabledOf={node => Boolean(node.vpngate_intelligence_enabled)}
+          onToggle={(nodeId, enabled) => intelligenceSelection.mutate({ nodeId, enabled })}
+          error={intelligenceSelection.error}
+        />
       </div>
     </section>
   );
@@ -2867,22 +3231,12 @@ export function SettingsPane() {
   });
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
+  const dataRetention = useQuery({ queryKey: ['data-retention'], queryFn: fetchDataRetention });
   const hostNetworkTuning = useQuery({
     queryKey: ['host-network-tuning'],
     queryFn: fetchHostNetworkTuning,
   });
   const pingProbe = useQuery({ queryKey: ['ping-probe-settings'], queryFn: fetchPingProbeSettings });
-  const tunnelProbes = useQuery({
-    queryKey: ['tunnel-probes'],
-    queryFn: fetchTunnelProbes,
-    staleTime: 30_000,
-    refetchInterval: 30_000,
-  });
-  const tunnelProbeCapability = useQuery({
-    queryKey: ['tunnel-probe-capability'],
-    queryFn: fetchTunnelProbeCapability,
-    staleTime: 60_000,
-  });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   const vpngate = useQuery({ queryKey: ['vpngate'], queryFn: fetchVpngateOverview });
   const [form, setForm] = useState<Form>(EMPTY);
@@ -3038,10 +3392,9 @@ export function SettingsPane() {
     certs.isPending ||
     dist.isPending ||
     logPolicy.isPending ||
+    dataRetention.isPending ||
     hostNetworkTuning.isPending ||
     pingProbe.isPending ||
-    tunnelProbes.isPending ||
-    tunnelProbeCapability.isPending ||
     vpngate.isPending ||
     nodes.isPending
   )
@@ -3053,10 +3406,9 @@ export function SettingsPane() {
     certs.error ??
     dist.error ??
     logPolicy.error ??
+    dataRetention.error ??
     hostNetworkTuning.error ??
     pingProbe.error ??
-    tunnelProbes.error ??
-    tunnelProbeCapability.error ??
     vpngate.error ??
     nodes.error;
   if (initialError) return <ErrorBox error={initialError} />;
@@ -3083,8 +3435,7 @@ export function SettingsPane() {
       {/* 非 system-admin 仍可查看实际配置，但整页必须是真正的只读控件。此前只禁用了
           保存按钮，输入框和分段开关仍能改出一份永远无法保存的“脏”表单。 */}
       <div className="duo settings-layout">
-        {/* 两栏各自成流，不对齐底部。代理池情报补在较短的左栏，隧道监测补在右栏；
-            两张运行时设置卡不再脱离双栏成为通栏。 */}
+        {/* 两栏各自成流，不对齐底部；数据保留放在第二栏末尾。 */}
         <div className="col">
           <fieldset className="settings-column-fields" disabled={!editable}>
             {save.error && <ErrorBox error={save.error} />}
@@ -3114,6 +3465,7 @@ export function SettingsPane() {
             ) : (
               <HostNetworkTuningSection editable={editable} data={hostNetworkTuning.data!} />
             )}
+            <SiteUsageSettingsCard editable={editable} />
             {certs.error ? <ErrorBox error={certs.error} /> : <CertSection editable={editable} view={certs.data!} />}
 
             <Section id="set-xray" name="XRAY" sub="伪装站点、接入兼容与 AnyTLS 全局填充" {...secProps('xray')}>
@@ -3219,13 +3571,17 @@ export function SettingsPane() {
                 )}
               </div>
             </Section>
-            <VpngateIntelligenceSection
+            <VpngateCapabilitiesSection
+              status={vpngate.data!.status}
               nodes={nodes.data!.nodes}
               admissionPolicy={vpngate.data!.admission_policy}
+              editable={editable}
+            />
+            <VpngateIntelligenceSection
+              nodes={nodes.data!.nodes}
               intelligencePolicy={vpngate.data!.intelligence_policy ?? DEFAULT_VPNGATE_INTELLIGENCE_POLICY}
-              proxycheckApiKeyConfigured={Boolean(
-                vpngate.data!.intelligence_credentials?.proxycheck_api_key_configured,
-              )}
+              intelligenceCredentials={vpngate.data!.intelligence_credentials}
+              globalEnabled={vpngate.data!.status.enabled}
               editable={editable}
             />
           </fieldset>
@@ -3672,8 +4028,12 @@ export function SettingsPane() {
                 </div>
               </Group>
             </Section>
+            {dataRetention.error ? (
+              <ErrorBox error={dataRetention.error} />
+            ) : (
+              <DataRetentionSection editable={editable} data={dataRetention.data!} />
+            )}
           </fieldset>
-          <TunnelProbeSettingsSection editable={can(who.role, 'edit')} />
         </div>
       </div>
     </div>

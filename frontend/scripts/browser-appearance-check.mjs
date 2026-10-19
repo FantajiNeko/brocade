@@ -14,6 +14,81 @@ const appearance = ts.transpileModule(
 const palettes = ['dailan', 'jinzi', 'songlv', 'oufen', 'xuanmo'];
 
 for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
+  test(`${engine}: background grid stays at the viewport while desktop, tablet and phone content scrolls`, async () => {
+    const browser = await launcher.launch();
+    try {
+      for (const device of [
+        { width: 1440, height: 900, touch: false },
+        { width: 1024, height: 768, touch: true },
+        { width: 768, height: 1024, touch: true },
+        { width: 390, height: 844, touch: true },
+        { width: 844, height: 390, touch: true },
+      ]) {
+        for (const theme of ['light', 'dark']) {
+          const page = await browser.newPage({
+            viewport: { width: device.width, height: device.height },
+            hasTouch: device.touch,
+            isMobile: device.touch,
+            reducedMotion: 'reduce',
+          });
+          await page.setContent(`<!doctype html><html data-theme="${theme}" data-palette="dailan"><head>
+            ${html.match(/<meta name="viewport"[^>]+>/)[0]}<style>${styles}</style></head><body>
+            <div class="forge${device.width <= 820 ? ' narrow' : ''}"><div class="fg-left"><div class="fg-desk">
+              <header class="fg-top"><button id="menu">Menu</button></header>
+              <main class="fg-view" style="min-height:2400px">
+                <section class="fg-sheet" style="margin-left:100px; margin-right:100px; height:1800px">
+                  <button id="content">Content</button>
+                </section>
+              </main>
+            </div></div></div></body></html>`);
+          await page.waitForTimeout(50);
+          const headerClip = { x: device.width - 76, y: 8, width: 64, height: 32 };
+          const clip = { x: 4, y: 128, width: 64, height: 64 };
+          const header = await page.screenshot({ clip: headerClip });
+          await page.locator('body').evaluate(el => el.style.setProperty('--grid-image', 'none'));
+          assert.ok((await page.screenshot({ clip: headerClip })).equals(header), 'grid never paints over the header');
+          const blank = await page.screenshot({ clip });
+          await page.locator('body').evaluate(el => el.style.removeProperty('--grid-image'));
+          const before = await page.screenshot({ clip });
+          assert.ok(!before.equals(blank), 'grid is actually visible');
+          const contentTop = await page.locator('#content').evaluate(el => el.getBoundingClientRect().top);
+          for (const offset of [73, 513, 1379, 0]) {
+            await page.evaluate(
+              ({ touch, offset }) => {
+                if (touch) window.scrollTo(0, offset);
+                else document.querySelector('.fg-desk').scrollTop = offset;
+              },
+              { touch: device.touch, offset },
+            );
+            assert.equal(
+              await page.locator('#content').evaluate(el => el.getBoundingClientRect().top),
+              contentTop - offset,
+            );
+            assert.ok(
+              (await page.screenshot({ clip })).equals(before),
+              `${theme} ${device.width}px grid shifted at ${offset}px`,
+            );
+          }
+          await page.locator('#content').evaluate(el => {
+            window.contentClicked = false;
+            el.onclick = () => {
+              window.contentClicked = true;
+            };
+          });
+          await page.locator('#content').click();
+          assert.equal(
+            await page.evaluate(() => window.contentClicked),
+            true,
+            'decorative layer does not intercept input',
+          );
+          await page.close();
+        }
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
   test(`${engine}: button, disclosure and link controls share one box and text center`, async () => {
     const browser = await launcher.launch();
     try {
@@ -64,24 +139,21 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
         `<span class="ui-icon"><svg width="${size}" height="${size}" viewBox="0 0 16 16"><path d="M2 8h12" /></svg></span>`;
       await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body>
         <span class="fg-who-plate">${icon(13)}</span>
-        <button class="sub-dialog-close" type="button">${icon(14)}</button>
         <button class="user-fcopy" type="button">${icon(11)}</button>
         <button class="fg-ico" type="button">${icon(13)}</button>
       </body></html>`);
 
-      const offsets = await page
-        .locator('.fg-who-plate, .sub-dialog-close, .user-fcopy, .fg-ico')
-        .evaluateAll(controls =>
-          controls.map(control => {
-            const box = control.getBoundingClientRect();
-            const svg = control.querySelector('svg').getBoundingClientRect();
-            return {
-              name: control.className,
-              x: svg.x + svg.width / 2 - box.x - box.width / 2,
-              y: svg.y + svg.height / 2 - box.y - box.height / 2,
-            };
-          }),
-        );
+      const offsets = await page.locator('.fg-who-plate, .user-fcopy, .fg-ico').evaluateAll(controls =>
+        controls.map(control => {
+          const box = control.getBoundingClientRect();
+          const svg = control.querySelector('svg').getBoundingClientRect();
+          return {
+            name: control.className,
+            x: svg.x + svg.width / 2 - box.x - box.width / 2,
+            y: svg.y + svg.height / 2 - box.y - box.height / 2,
+          };
+        }),
+      );
       for (const offset of offsets) {
         assert.ok(Math.abs(offset.x) <= 0.5, `${offset.name}: horizontal offset ${offset.x}px`);
         assert.ok(Math.abs(offset.y) <= 0.5, `${offset.name}: vertical offset ${offset.y}px`);
@@ -187,6 +259,52 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
           }
         }
         await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test(`${engine}: observation panel titles retain the shared background in every theme`, async () => {
+    const browser = await launcher.launch();
+    try {
+      for (const width of [390, 1440]) {
+        for (const theme of ['light', 'dark']) {
+          for (const palette of palettes) {
+            const page = await browser.newPage({ viewport: { width, height: 900 }, reducedMotion: 'reduce' });
+            await page.setContent(`<!doctype html><html data-theme="${theme}" data-palette="${palette}">
+              <head><style>${styles}</style></head><body>
+                <main class="nd-sheet"><div class="nd-paper">
+                  <section class="nd-tab-observed nd-tab-panel">
+                    <div class="panel nd-runtime"><header><h4 class="panel-title">运行状态</h4></header>
+                      <div class="nd-rt-band">AGENT / HOST / CONFIG</div>
+                    </div>
+                    <section class="panel config-panel"><header><h4>观测面板</h4></header>读数</section>
+                  </section>
+                  <div class="nd-tab-pair"><section class="panel"><header><h4>状态面板</h4></header>读数</section></div>
+                </div></main>
+                <section class="panel config-panel" id="reference"><header><h4>公共标题栏</h4></header></section>
+              </body></html>`);
+            const { expected, headers } = await page.evaluate(() => ({
+              expected: getComputedStyle(document.querySelector('#reference > header')).backgroundColor,
+              headers: [...document.querySelectorAll('.nd-sheet .panel > header')].map(element => ({
+                title: element.textContent,
+                background: getComputedStyle(element).backgroundColor,
+                cardBackground: getComputedStyle(element.parentElement).backgroundColor,
+                height: element.getBoundingClientRect().height,
+              })),
+            }));
+            assert.equal(headers.length, 3);
+            assert.notEqual(expected, 'rgba(0, 0, 0, 0)');
+            for (const header of headers) {
+              const context = `${theme}/${palette} ${width}px ${header.title}`;
+              assert.equal(header.background, expected, `${context}: retain the shared title band`);
+              assert.notEqual(header.background, header.cardBackground, `${context}: distinguish title from content`);
+              assert.equal(header.height, 36, `${context}: retain the content-panel title height`);
+            }
+            await page.close();
+          }
+        }
       }
     } finally {
       await browser.close();

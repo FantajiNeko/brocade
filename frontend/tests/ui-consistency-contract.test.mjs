@@ -49,13 +49,7 @@ test('状态语义不再使用无效修饰符，按钮不保留无效果的 ghos
 });
 
 test('用户页桌面按钮沿用全站控件高度', () => {
-  for (const selector of [
-    'user-roster-head-actions \\.btn',
-    'user-dacts \\.btn',
-    'user-account-type \\.segsw',
-    'grant-probe-actions \\.btn',
-    'grant-probe-one',
-  ]) {
+  for (const selector of ['user-roster-head-actions \\.btn', 'user-dacts \\.btn']) {
     assert.match(styles, new RegExp(`\\.${selector}\\s*\\{[^}]*min-height:\\s*var\\(--ctl-h\\)`, 's'));
   }
 });

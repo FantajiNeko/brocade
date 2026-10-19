@@ -1529,6 +1529,72 @@ fn a_change_the_running_xray_can_absorb_is_not_disruptive() {
 }
 
 #[test]
+fn inbound_changes_are_not_promised_as_in_process_updates() {
+    let before = snapshot(
+        vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],
+        vec![direct_app("direct", "hk", "i-hk", 8443, true, any_egress())],
+    );
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    let mut after = before.clone();
+    after.apps[0].ingresses[0].port = 9443;
+    let plan = plan_deployment(&after, &applied).unwrap();
+    let hk = target(&plan, "hk");
+    assert!(hk.actions.contains(&PlannedAction::ApplyXray));
+    assert!(
+        hk.disruptive,
+        "inbound replacement requires generation handoff"
+    );
+}
+
+#[test]
+fn a_public_v4_to_v6_hop_change_hot_updates_the_dialer_and_hands_off_the_listener() {
+    let mut app = relay_app("dual-stack", "hk", "sg", HopPool::None);
+    let Action::Forward { dial, .. } = &mut app.steps[0].rules[0].action else {
+        panic!("relay fixture must forward");
+    };
+    *dial = HopDial::Addr("192.0.2.2:20000".to_owned());
+    let mut before = relay_snapshot(vec![app]);
+    before
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "sg")
+        .unwrap()
+        .public_ipv4 = Some("192.0.2.2".to_owned());
+    before
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "sg")
+        .unwrap()
+        .public_ipv6 = Some("2001:db8::2".to_owned());
+    let first = plan_deployment(&before, &[]).unwrap();
+    let applied = applied_with_running_xray(&first);
+    let mut after = before.clone();
+    let Action::Forward { dial, .. } = &mut after.apps[0].steps[0].rules[0].action else {
+        unreachable!();
+    };
+    *dial = HopDial::Addr("[2001:db8::2]:20000".to_owned());
+    let plan = plan_deployment(&after, &applied).unwrap();
+    assert_eq!(plan.summary.changed_targets, 2);
+    assert_eq!(plan.summary.disruptive_targets, 1);
+    assert_eq!(target(&plan, "hk").actions, vec![PlannedAction::ApplyXray]);
+    assert!(!target(&plan, "hk").disruptive);
+    assert_eq!(target(&plan, "sg").actions, vec![PlannedAction::ApplyXray]);
+    assert!(target(&plan, "sg").disruptive);
+    let DesiredArtifact::Present { content, .. } = &target(&plan, "sg").desired.xray else {
+        panic!("receiver config must remain present");
+    };
+    let config: serde_json::Value = serde_json::from_str(content).unwrap();
+    let relay = config["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|inbound| inbound["tag"] == "in:hop:dual-stack/c-dual-stack")
+        .unwrap();
+    assert_eq!(relay["listen"], "::");
+}
+
+#[test]
 fn adding_a_managed_masque_outbound_can_hot_swap() {
     let mut before = snapshot(
         vec![node("hk", "hk.example.net", [10, 66, 0, 1], Dns::System)],

@@ -11,7 +11,7 @@ afterEach(() => {
 });
 
 const recoveredFleetEvent: MachineEventList = {
-  retention_days: 90,
+  retention_days: 7,
   latest_event_id: 6,
   last_seen_event_id: 0,
   cleared_through_event_id: 0,
@@ -88,7 +88,7 @@ const recoveredFleetEvent: MachineEventList = {
 };
 
 const activeStealEvent: MachineEventList = {
-  retention_days: 90,
+  retention_days: 7,
   latest_event_id: 8,
   last_seen_event_id: 7,
   cleared_through_event_id: 0,
@@ -126,7 +126,7 @@ const activeStealEvent: MachineEventList = {
 };
 
 const activeControlObservationIncident: MachineEventList = {
-  retention_days: 90,
+  retention_days: 7,
   latest_event_id: 7,
   last_seen_event_id: 6,
   cleared_through_event_id: 0,

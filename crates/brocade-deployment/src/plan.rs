@@ -654,7 +654,7 @@ fn desired_state(plan: &brocade_core::physical::node::NodePlan) -> NodeDesiredSt
     let phantun = desired_phantun(plan);
     let wireguard = desired_wireguard(plan);
     let xray = desired_xray(plan);
-    let grants = desired_grants(plan, &xray);
+    let grants = desired_grants(plan.xray.as_ref().map(|_| &plan.grant_sync));
 
     NodeDesiredState {
         phantun,
@@ -705,17 +705,15 @@ fn desired_xray(plan: &brocade_core::physical::node::NodePlan) -> DesiredArtifac
     }
 }
 
-fn desired_grants(
-    plan: &brocade_core::physical::node::NodePlan,
-    desired_xray: &DesiredArtifact,
-) -> DesiredGrants {
-    if !matches!(desired_xray, DesiredArtifact::Present { .. }) {
+/// Convert a grants-only projection using the same ordering and disabled state as a full plan.
+pub fn desired_grants(plan: Option<&brocade_core::physical::node::GrantSyncPlan>) -> DesiredGrants {
+    let Some(plan) = plan else {
         return DesiredGrants::Disabled {
             reason: "xray is disabled on this node".to_owned(),
         };
-    }
+    };
 
-    let batch = grants::build(plan);
+    let batch = grants::build_sync(plan);
     DesiredGrants::Present {
         inbounds: grant_inbounds(batch.inbounds),
     }

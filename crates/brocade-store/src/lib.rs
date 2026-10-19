@@ -12,6 +12,7 @@ mod distribution;
 mod draft;
 mod egress_dns;
 mod forwarding;
+mod forwarding_quota;
 mod grant_automation;
 mod grant_probe;
 mod host_tuning;
@@ -21,7 +22,10 @@ mod load;
 mod load_rollup;
 mod log_policy;
 mod materialize;
+mod node_inflow_usage;
 mod notifications;
+mod onboarding;
+mod other_domain;
 mod pg;
 mod ping_probe;
 mod probe;
@@ -29,13 +33,16 @@ mod provision;
 mod public_ip;
 mod quota;
 mod realtime;
+mod retention;
 pub mod secrets;
 mod serving;
 mod settings;
+mod site_usage;
 mod subscription_client;
 mod traffic;
 mod tunnel_probe;
 mod usage;
+mod user_machine_usage;
 mod user_presence;
 mod vpngate;
 mod xray_release;
@@ -108,18 +115,18 @@ pub use console::{
     CreateRealityIngressRequest, CreateTenantRequest, CreateUserRequest, DeleteFrontRequest,
     DeleteFrontResult, DeleteStepResult, DeploymentVerification, DynamicClashSubscription,
     DynamicSubscriptionFormat, FrontClientConfigState, FrontRouteAnalysisView, HopInRequest,
-    HopWireRequest, ModelWriteResult, NodeAgentStateItem, NodeAgentStateList, PruneChainResult,
-    PutStepRequest, RedactedModelSnapshot, RedactedSecret, RegisterWarpBindingRequest,
-    RegisterWarpBindingResult, RemoveRetiredNodesRequest, RemoveRetiredNodesResult,
-    RemoveWarpBindingRequest, RemoveWarpBindingResult, RevisionList, RevisionListItem,
-    RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult, StepAcceptRequest,
-    TenantList, TenantListItem, TransportRequest, UpdateNodeRequest, UpdateNodeResult,
-    UpdateNodeStatusRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
-    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
-    UpsertChainResult, UpsertExternalOutboundRequest, UpsertFrontResult, UpsertGrantResult,
-    UpsertIngressResult, UpsertTenantResult, UpsertUserResult, UserAccountType, UserAppQuota,
-    UserAppQuotaList, UserList, UserListItem, VerifyDeploymentRequest, WarpBindingRemoval,
-    WiresRequest,
+    HopWireRequest, ModelWriteResult, NodeAgentStateItem, NodeAgentStateList, NodeRegionOverride,
+    PruneChainResult, PutStepRequest, RedactedModelSnapshot, RedactedSecret,
+    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
+    RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult, RevisionList,
+    RevisionListItem, RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult,
+    StepAcceptRequest, TenantList, TenantListItem, TransportRequest, UpdateNodeRegionRequest,
+    UpdateNodeRequest, UpdateNodeResult, UpdateNodeStatusRequest, UpdateUserProfileRequest,
+    UpdateUserStatusRequest, UpdateUserStatusResult, UpdateWarpBindingRequest,
+    UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult, UpsertExternalOutboundRequest,
+    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
+    UpsertUserResult, UserAccountType, UserAppQuota, UserAppQuotaList, UserList, UserListItem,
+    UserTrafficAccountingMode, VerifyDeploymentRequest, WarpBindingRemoval, WiresRequest,
 };
 pub use credentials::{
     admin_session_token_hash, admin_token_display_prefix, admin_token_hash,
@@ -142,6 +149,9 @@ pub use forwarding::{
     ForwardingRuleWrite, DEFAULT_FORWARDING_MAX_RULES, DEFAULT_FORWARDING_PORT_END,
     DEFAULT_FORWARDING_PORT_START,
 };
+pub use forwarding_quota::{
+    ForwardingQuotaJob, ForwardingQuotaJobPage, ForwardingQuotaOutcome, ForwardingQuotaWrite,
+};
 pub use grant_automation::{
     GrantAutomationOutcome, GrantAutomationStatus, GRANTS_AUTOMATION_ACTOR,
 };
@@ -162,9 +172,13 @@ pub use log_policy::{
     DEFAULT_PHANTUN_LOG_MAX_MIB, DEFAULT_XRAY_LOG_MAX_MIB, MAX_AGENT_LOG_MAX_MIB,
     MIN_AGENT_LOG_MAX_MIB,
 };
+pub use node_inflow_usage::{NodeInflowRow, NodeInflowSource, NodeInflowUsage, NodeInflowUser};
 pub use notifications::{
     ActiveMachineIncidentView, ClaimedNotificationDelivery, MachineEventList, MachineEventView,
     MACHINE_EVENT_RETENTION_DAYS,
+};
+pub use onboarding::{
+    OnboardingCheckpointRequest, OnboardingProbeEvidence, OnboardingState, OnboardingStatus,
 };
 pub use pg::PgStore;
 pub use ping_probe::{
@@ -182,13 +196,18 @@ pub use public_ip::{
     RecordPublicIpObservationResult, PUBLIC_IP_EVENT_RETENTION_DAYS,
 };
 pub use quota::{QuotaEnforcementOutcome, QuotaEnforcementPlan, QuotaGrantChange, QUOTA_ACTOR};
+pub use retention::{
+    DataRetentionCategory, DataRetentionPolicyView, DataRetentionView, RetentionSchedule,
+    UpdateDataRetentionPolicy, MAX_RETENTION_HOURS,
+};
 pub use settings::{SettingsSnapshot, UpdateSettingsResult};
+pub use site_usage::{NodeSiteUsage, NodeSiteUser, NodeSiteUsers};
 pub use subscription_client::{ClientConfigCommitResult, ClientConfigCommitStatus};
 pub use traffic::{
     MachineTrafficAccuracy, MachineTrafficBand, MachineTrafficBandBasis, MachineTrafficConfidence,
     MachineTrafficDay, MachineTrafficModelNode, MachineTrafficModelView, MachineTrafficUser,
-    NodeTrafficCycleKind, NodeTrafficItem, NodeTrafficView, UpdateNodeTrafficRequest,
-    MACHINE_TRAFFIC_FORECAST_RETENTION_DAYS,
+    NodeTrafficAccountingMode, NodeTrafficCycleKind, NodeTrafficItem, NodeTrafficView,
+    UpdateNodeTrafficRequest, MACHINE_TRAFFIC_FORECAST_RETENTION_DAYS,
 };
 pub use tunnel_probe::{
     ClaimedTunnelProbe, TunnelProbeCompletion, TunnelProbeHealth, TunnelProbeHealthReason,
@@ -197,16 +216,20 @@ pub use tunnel_probe::{
     TunnelProbeSummary, TunnelProbeTrigger, TunnelProbeView, UpdateTunnelProbePolicy,
     TUNNEL_PROBE_RETENTION_DAYS,
 };
-pub use usage::{UserRealtimeTarget, UserTrafficHistoryScope};
+pub use usage::{
+    FleetRealtimeTarget, FleetRealtimeUser, UserRealtimeTarget, UserTrafficHistoryScope,
+};
+pub use user_machine_usage::UserMachineUsage;
 pub use user_presence::{
-    UserOnlineSourceAccess, UserOnlineSourceHistory, UserOnlineSourceView, UserPresenceList,
-    UserPresenceState, UserPresenceView, USER_ONLINE_SOURCE_HISTORY_LIMIT,
+    MissingPresenceNode, UserOnlineSourceAccess, UserOnlineSourceHistory, UserOnlineSourceView,
+    UserPresenceList, UserPresenceState, UserPresenceView, USER_ONLINE_SOURCE_HISTORY_LIMIT,
     USER_ONLINE_SOURCE_RETENTION_DAYS,
 };
 pub use vpngate::{
-    RequestVpngatePoolSwitch, UpdateVpngateCatalogSettings, UpdateVpngateIntelligenceCredentials,
-    UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode, UpdateVpngateProbeSettings,
-    VpngateCatalogStatus, VpngateCountrySummary, VpngateDirectoryFilter, VpngateDirectorySort,
+    RequestVpngatePoolSwitch, UpdateVpngateCatalogNode, UpdateVpngateCatalogSettings,
+    UpdateVpngateIntelligenceCredentials, UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode,
+    UpdateVpngateProbeSettings, VpngateCatalogNodeSelection, VpngateCatalogStatus,
+    VpngateCountrySummary, VpngateDirectoryFilter, VpngateDirectorySort,
     VpngateIntelligenceCredentialUpdateMode, VpngateIntelligenceCredentials,
     VpngateIntelligenceNodeSelection, VpngateIntelligencePolicy, VpngateIntelligenceRefreshMode,
     VpngateIntelligenceRefreshResult, VpngateIpIntelligenceClaim, VpngateOverview,

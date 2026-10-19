@@ -26,8 +26,10 @@ use brocade_deployment::protocol::{
     LoadReportRequest, LoadSample, LocalReconcileReport, NetworkDetailSample,
     NodePublicIpObservation, NodeRuntimeReport, NodeTrafficReading, NodeVersions, OnlineSource,
     PublicIpFamily, SpoolBacklog, UserOnlineSources, WireGuardHealth, WireGuardPeerHealth,
-    WireGuardPeerStatus,
+    WireGuardPeerStatus, XrayReleaseStrategy, XrayUpgradePhase, XrayUpgradeProcess,
+    XrayUpgradeRuntime,
 };
+use brocade_deployment::site_usage::SiteUsagePeriod;
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
     AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentLogLimits, ApplyDraftResult,
@@ -39,19 +41,20 @@ use brocade_store::{
     HopInRequest, HopWireRequest, HostNetworkTuning, IsolateDeploymentTargetRequest,
     IsolateNodeRequest, IssuedCertificate, LinkProbe, LinkProbeRequest, LinkProbeStatus,
     LoadSeriesQuery, MachineTrafficAccuracy, MachineTrafficBandBasis, MachineTrafficConfidence,
-    ModelOp, NodeDesiredDeployment, NodeTrafficCycleKind, PgStore, PingProbeFamily, PingProbeKind,
-    PingProbeReportRequest, PingProbeSample, PingProbeSettings, PingProbeSkipReason,
-    PingProbeTarget, ProbeTransport, ProvisionNodeRequest, PublicIpObservationOutcome,
-    PutStepRequest, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
-    RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest, SetUserPasswordRequest,
-    StepAcceptRequest, StoreError, TargetApplyResult, TargetConvergenceReport, TransportRequest,
-    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
-    UpdateNodeTrafficRequest, UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest,
-    UpdateUserStatusRequest, UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter,
-    UsageReportRequest, UserAccountType, UserDirectLoginRequest, UserPresenceState,
-    VerifyDeploymentRequest, WiresRequest, XrayBuildInfo, XrayReleaseArtifact, XrayReleaseOutcome,
-    XrayReleaseReport, XrayReleaseStatus, XrayReleaseTargetStatus, ENROLLMENT_TOKEN_PREFIX,
-    NODE_TOKEN_PREFIX,
+    ModelOp, NodeDesiredDeployment, NodeInflowSource, NodeTrafficAccountingMode,
+    NodeTrafficCycleKind, PgStore, PingProbeFamily, PingProbeKind, PingProbeReportRequest,
+    PingProbeSample, PingProbeSettings, PingProbeSkipReason, PingProbeTarget, ProbeTransport,
+    ProvisionNodeRequest, PublicIpObservationOutcome, PutStepRequest, RegisterWarpBindingRequest,
+    RemoveRetiredNodesRequest, RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest,
+    SetUserPasswordRequest, StepAcceptRequest, StoreError, TargetApplyResult,
+    TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
+    UpdateDataRetentionPolicy, UpdateNodeLogPolicyRequest, UpdateNodeRegionRequest,
+    UpdateNodeRequest, UpdateNodeTrafficRequest, UpdateRealtimeTelemetryPolicyRequest,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateWarpBindingRequest,
+    UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest, UserAccountType,
+    UserDirectLoginRequest, UserPresenceState, UserTrafficAccountingMode, VerifyDeploymentRequest,
+    WiresRequest, XrayBuildInfo, XrayReleaseArtifact, XrayReleaseOutcome, XrayReleaseReport,
+    XrayReleaseStatus, XrayReleaseTargetStatus, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -78,6 +81,9 @@ struct TestPg {
     /// on the same server without paying for a second container.
     url: String,
 }
+
+#[path = "cases/forwarding_quota.rs"]
+mod forwarding_quota_tests;
 
 impl TestPg {
     async fn start_if_enabled() -> Option<Self> {
@@ -2404,6 +2410,98 @@ async fn agent_log_policy_resolves_global_node_override_and_clear_without_a_revi
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn data_retention_is_allowlisted_live_policy_and_excludes_core_tables() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query(
+        "INSERT INTO admin_operators (id, display_name, role, password_hash)
+         VALUES ('retention-admin', 'Retention admin', 'system-admin', 'test-only')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let admin = AdminContext::system_admin("retention-admin");
+
+    let initial = db.store.data_retention().await.unwrap();
+    for table in ["node_public_ip_events", "machine_events"] {
+        let policy = initial
+            .policies
+            .iter()
+            .find(|item| item.table_name == table)
+            .unwrap();
+        assert_eq!(policy.ttl_hours, 7 * 24);
+        assert_eq!(policy.default_ttl_hours, 7 * 24);
+        assert!(!policy.customized);
+        assert_eq!(
+            db.store
+                .retention_schedule()
+                .await
+                .unwrap()
+                .ttl_hours(table),
+            7 * 24
+        );
+    }
+    assert!(initial
+        .policies
+        .iter()
+        .any(|policy| policy.table_name == "node_ping_probe_samples" && policy.ttl_hours == 168));
+    for core in [
+        "users",
+        "nodes",
+        "revisions",
+        "model_snapshots",
+        "usage_rollups",
+    ] {
+        assert!(!initial
+            .policies
+            .iter()
+            .any(|policy| policy.table_name == core));
+    }
+
+    let updated = db
+        .store
+        .update_data_retention(
+            &admin,
+            "node_ping_probe_samples",
+            UpdateDataRetentionPolicy { ttl_hours: 72 },
+        )
+        .await
+        .unwrap();
+    assert!(updated.policies.iter().any(|policy| {
+        policy.table_name == "node_ping_probe_samples"
+            && policy.ttl_hours == 72
+            && policy.customized
+    }));
+    assert_eq!(
+        db.store
+            .retention_schedule()
+            .await
+            .unwrap()
+            .ttl_hours("node_ping_probe_samples"),
+        72
+    );
+    assert!(matches!(
+        db.store
+            .update_data_retention(&admin, "users", UpdateDataRetentionPolicy { ttl_hours: 24 },)
+            .await,
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        db.store
+            .update_data_retention(
+                &tenant_admin("platform"),
+                "node_ping_probe_samples",
+                UpdateDataRetentionPolicy { ttl_hours: 24 },
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn host_network_tuning_is_live_validated_and_does_not_create_a_revision() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -2686,6 +2784,52 @@ async fn deployment_schema_matches_convergence_design() {
         grant_snapshot.is_err(),
         "grant-sync must not be a historical artifact kind"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn ping_probe_target_limit_preserves_saved_settings_and_readable_legacy_lists() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let mut settings = PingProbeSettings {
+        targets: (1..=6)
+            .map(|index| PingProbeTarget {
+                name: format!("target {index}"),
+                kind: PingProbeKind::Icmp,
+                ipv4: Some(format!("192.0.2.{index}")),
+                ipv6: None,
+            })
+            .collect(),
+        interval_secs: 60,
+        timeout_ms: 420,
+    };
+    let saved = db
+        .store
+        .update_ping_probe_settings(&system_admin(), settings.clone())
+        .await
+        .unwrap();
+    assert_eq!(db.store.ping_probe_settings().await.unwrap(), saved);
+    settings.targets.push(PingProbeTarget {
+        name: "seventh".to_owned(),
+        kind: PingProbeKind::Icmp,
+        ipv4: Some("192.0.2.7".to_owned()),
+        ipv6: None,
+    });
+    assert!(matches!(
+        db.store
+            .update_ping_probe_settings(&system_admin(), settings.clone())
+            .await,
+        Err(StoreError::InvalidData(_))
+    ));
+    assert_eq!(db.store.ping_probe_settings().await.unwrap(), saved);
+    sqlx::query("UPDATE control_state SET ping_probe_targets = $1 WHERE id = TRUE")
+        .bind(serde_json::to_value(&settings.targets).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(db.store.ping_probe_settings().await.unwrap(), settings);
 }
 
 #[tokio::test]
@@ -4299,6 +4443,21 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     assert!(first.usage.reset_at.ends_with("+08:00"));
     assert!(first.content.contains("name: \"Main Chain\""));
     assert!(first.content.contains("# Brocade · SubBoost 标准版"));
+
+    sqlx::query(
+        "UPDATE users
+            SET traffic_accounting_mode = 'double'
+          WHERE tenant_id = 'platform.acme' AND id = 'alice'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let doubled = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert_eq!(doubled.usage.upload_bytes, 2_400);
+    assert_eq!(doubled.usage.download_bytes, 1_600);
+    assert_eq!(doubled.usage.total_bytes, Some(10_000));
+    assert_eq!(doubled.usage.remaining_bytes, Some(6_000));
+
     let native = db
         .store
         .shadowrocket_subscription_by_uuid_filtered(
@@ -4311,7 +4470,7 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
         native.format,
         brocade_store::DynamicSubscriptionFormat::Shadowrocket
     );
-    assert_eq!(native.usage, first.usage);
+    assert_eq!(native.usage, doubled.usage);
     assert_eq!(native.revision, first.revision);
     assert_eq!(native.uuid, first.uuid);
     assert!(native.content.contains("vless://"));
@@ -4738,6 +4897,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
         xray: Some("Xray 26.3.27 (Xray, Penetrates Everything.)".to_owned()),
         xray_installed_sha256: Some("a".repeat(64)),
         xray_running_sha256: Some("a".repeat(64)),
+        xray_handoff: None,
         kernel_tls_module: Some(true),
         phantun: Some("phantun 0.7.0".to_owned()),
         openvpn: Some("OpenVPN 2.6.12 x86_64-pc-linux-gnu".to_owned()),
@@ -4773,6 +4933,33 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
             detail: Some("overlay 探不通".to_owned()),
         }],
     };
+    let xray_upgrade = XrayUpgradeRuntime {
+        source: brocade_deployment::protocol::XrayUpgradeSource::BinaryRelease,
+        release_id: 17,
+        attempt: 1,
+        strategy: XrayReleaseStrategy::Handoff,
+        phase: XrayUpgradePhase::Draining,
+        old: XrayUpgradeProcess {
+            pid: 101,
+            pid_start_ticks: 1_001,
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            sha256: "a".repeat(64),
+            alive: true,
+            accepting: Some(false),
+            active_connections: Some(2),
+        },
+        candidate: Some(XrayUpgradeProcess {
+            pid: 202,
+            pid_start_ticks: 1_002,
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            sha256: "b".repeat(64),
+            alive: true,
+            accepting: Some(true),
+            active_connections: Some(1),
+        }),
+        drain_deadline_unix_secs: Some(1_800_000_000),
+        blocked_reason: None,
+    };
 
     db.store
         .record_node_runtime(
@@ -4786,6 +4973,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 wireguard_health: Some(wireguard_health.clone()),
                 traffic: None,
                 online_sources: None,
+                xray_upgrade: Some(xray_upgrade.clone()),
                 spool: SpoolBacklog {
                     observation: 3,
                     usage: 41,
@@ -4802,7 +4990,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
 
     let row = sqlx::query(
         "SELECT agent_version, runtime_versions, spool_backlog, last_local_reconcile,
-                wireguard_health, geodata_observed,
+                wireguard_health, geodata_observed, xray_upgrade,
                 runtime_reported_at IS NOT NULL AS stamped
          FROM node_agent_state WHERE node_id = 'n1'",
     )
@@ -4843,6 +5031,9 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     let dat: GeodataObservation =
         serde_json::from_value(row.try_get("geodata_observed").unwrap()).unwrap();
     assert_eq!(dat, geodata);
+    let stored_upgrade: XrayUpgradeRuntime =
+        serde_json::from_value(row.try_get("xray_upgrade").unwrap()).unwrap();
+    assert_eq!(stored_upgrade, xray_upgrade);
 
     // The second round carries no local reconcile because the agent did not run one while the
     // control plane had work. The previous result must survive.
@@ -4866,6 +5057,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 wireguard_health: None,
                 traffic: None,
                 online_sources: None,
+                xray_upgrade: None,
                 spool: SpoolBacklog {
                     observation: 0,
                     usage: 0,
@@ -4882,7 +5074,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
 
     let row = sqlx::query(
         "SELECT runtime_versions, spool_backlog, last_local_reconcile, wireguard_health,
-                geodata_observed
+                geodata_observed, xray_upgrade
          FROM node_agent_state WHERE node_id = 'n1'",
     )
     .fetch_one(db.pool())
@@ -4910,6 +5102,12 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     let spool: SpoolBacklog =
         serde_json::from_value(row.try_get("spool_backlog").unwrap()).unwrap();
     assert_eq!(spool.observation, 0, "积压没跟着更新");
+    assert_eq!(
+        row.try_get::<Option<serde_json::Value>, _>("xray_upgrade")
+            .unwrap(),
+        None,
+        "终态运行报告必须清掉发布期双进程视图"
+    );
     assert_eq!(
         row.try_get::<serde_json::Value, _>("geodata_observed")
             .unwrap(),
@@ -4982,6 +5180,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
         release_id: build_id.clone(),
         nodes: vec!["n1".to_owned(), "n2".to_owned()],
         note: Some("replace the embedded Xray".to_owned()),
+        xray_strategy: XrayReleaseStrategy::Restart,
+        xray_drain_timeout_secs: None,
     };
     let build = XrayBuildInfo {
         release_id: &build_id,
@@ -4999,8 +5199,9 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
     sqlx::query(
         "UPDATE node_agent_state
             SET last_poll_at = now() - interval '2 minutes'
-          WHERE node_id = 'n1'",
+          WHERE node_id = $1",
     )
+    .bind("n1")
     .execute(db.pool())
     .await
     .unwrap();
@@ -5105,6 +5306,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 1,
                 outcome: XrayReleaseOutcome::Succeeded,
                 performed_update: true,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some(desired.clone()),
                 running_sha256: Some(desired.clone()),
@@ -5123,6 +5326,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 1,
                 outcome: XrayReleaseOutcome::FailedRecovered,
                 performed_update: false,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some(desired.clone()),
                 running_sha256: Some(old_n1.clone()),
@@ -5141,6 +5346,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 1,
                 outcome: XrayReleaseOutcome::FailedRecovered,
                 performed_update: false,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some(old_n1.clone()),
                 running_sha256: Some(desired.clone()),
@@ -5162,6 +5369,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 1,
                 outcome: XrayReleaseOutcome::FailedRecovered,
                 performed_update: false,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some(old_n1.clone()),
                 running_sha256: Some(old_n1.clone()),
@@ -5213,6 +5422,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 1,
                 outcome: XrayReleaseOutcome::Succeeded,
                 performed_update: true,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some(desired.clone()),
                 running_sha256: Some(desired.clone()),
@@ -5234,6 +5445,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 2,
                 outcome: XrayReleaseOutcome::Succeeded,
                 performed_update: true,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some(desired.clone()),
                 running_sha256: Some(desired.clone()),
@@ -5283,6 +5496,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 release_id: build_id.clone(),
                 nodes: vec!["n2".to_owned()],
                 note: None,
+                xray_strategy: XrayReleaseStrategy::Restart,
+                xray_drain_timeout_secs: None,
             },
             build,
         )
@@ -5299,6 +5514,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 release_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
                 note: None,
+                xray_strategy: XrayReleaseStrategy::Restart,
+                xray_drain_timeout_secs: None,
             },
             build,
         )
@@ -5322,6 +5539,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 1,
                 outcome: XrayReleaseOutcome::Succeeded,
                 performed_update: true,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some("b".repeat(64)),
                 running_sha256: Some("b".repeat(64)),
@@ -5356,6 +5575,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 release_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
                 note: None,
+                xray_strategy: XrayReleaseStrategy::Restart,
+                xray_drain_timeout_secs: None,
             },
             build,
         )
@@ -5402,6 +5623,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 2,
                 outcome: XrayReleaseOutcome::Succeeded,
                 performed_update: false,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: true,
                 installed_sha256: Some("b".repeat(64)),
                 running_sha256: Some("b".repeat(64)),
@@ -5436,6 +5659,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 attempt: 3,
                 outcome: XrayReleaseOutcome::Succeeded,
                 performed_update: true,
+                strategy: XrayReleaseStrategy::Restart,
+                forced_retirement: false,
                 xray_enabled: false,
                 installed_sha256: Some("b".repeat(64)),
                 running_sha256: None,
@@ -5467,6 +5692,8 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
                 release_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
                 note: None,
+                xray_strategy: XrayReleaseStrategy::Restart,
+                xray_drain_timeout_secs: None,
             },
             build,
         )
@@ -5505,6 +5732,321 @@ async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports(
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn xray_handoff_release_requires_live_readiness_and_freezes_its_strategy() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO admin_operators (id, display_name, role, password_hash)
+         VALUES ('test-system', 'Test System', 'system-admin', 'test-only')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let before = "1".repeat(64);
+    let wanted = "2".repeat(64);
+    let build_id = "3".repeat(64);
+    sqlx::query(
+        "INSERT INTO node_agent_state (
+             node_id, agent_protocol_version, last_poll_at, runtime_reported_at, runtime_versions
+         ) VALUES ('n1', 29, now(), now(), $1)",
+    )
+    .bind(json!({
+        "agent": "old-agent",
+        "xray_installed_sha256": before,
+        "xray_running_sha256": before,
+        "xray_handoff": {"state": "blocked", "reason": "not managed"}
+    }))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let artifacts = [XrayReleaseArtifact {
+        arch: "x86_64".to_owned(),
+        sha256: wanted.clone(),
+    }];
+    let build = XrayBuildInfo {
+        release_id: &build_id,
+        version: "26.9.1",
+        artifacts: &artifacts,
+    };
+    let mut request = CreateXrayReleaseRequest {
+        idempotency_key: "handoff-gate-old-protocol".to_owned(),
+        release_id: build_id.clone(),
+        nodes: vec!["n1".to_owned()],
+        note: None,
+        xray_strategy: XrayReleaseStrategy::Handoff,
+        xray_drain_timeout_secs: Some(300),
+    };
+
+    assert!(matches!(
+        db.store
+            .create_xray_release(&system_admin(), request.clone(), build)
+            .await,
+        Err(StoreError::InvalidData(_))
+    ));
+    sqlx::query("UPDATE node_agent_state SET agent_protocol_version = 30 WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    request.idempotency_key = "handoff-gate-blocked-runtime".to_owned();
+    assert!(matches!(
+        db.store
+            .create_xray_release(&system_admin(), request.clone(), build)
+            .await,
+        Err(StoreError::InvalidData(_))
+    ));
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_versions = jsonb_set(
+                runtime_versions, '{xray_handoff}', '{\"state\":\"ready\"}'::jsonb
+            )
+          WHERE node_id = $1",
+    )
+    .bind("n1")
+    .execute(db.pool())
+    .await
+    .unwrap();
+    request.idempotency_key = "handoff-gate-ready".to_owned();
+    let release = db
+        .store
+        .create_xray_release(&system_admin(), request, build)
+        .await
+        .unwrap();
+    assert_eq!(release.xray_strategy, Some(XrayReleaseStrategy::Handoff));
+    assert_eq!(release.xray_drain_timeout_secs, Some(300));
+    let offer = db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(offer.strategy, XrayReleaseStrategy::Handoff);
+    assert_eq!(offer.drain_timeout_secs, Some(300));
+
+    sqlx::query(
+        "UPDATE binary_release_targets
+            SET dispatched_at = now() - interval '59 minutes'
+          WHERE release_id = $1 AND node_id = 'n1'",
+    )
+    .bind(release.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let before_deadline = db.store.xray_release(release.id).await.unwrap();
+    assert!(before_deadline.targets[0].execution_deadline_at.is_some());
+    assert!(!before_deadline.targets[0].execution_timed_out);
+    assert!(!before_deadline.targets[0].retryable);
+
+    sqlx::query(
+        "UPDATE binary_release_targets
+            SET dispatched_at = now() - interval '61 minutes'
+          WHERE release_id = $1 AND node_id = 'n1'",
+    )
+    .bind(release.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let after_deadline = db.store.xray_release(release.id).await.unwrap();
+    assert!(after_deadline.targets[0].execution_timed_out);
+    assert!(after_deadline.targets[0].retryable);
+
+    sqlx::query("UPDATE node_agent_state SET xray_upgrade = $1 WHERE node_id = 'n1'")
+        .bind(json!({
+            "release_id": release.id,
+            "attempt": offer.attempt,
+            "phase": "draining"
+        }))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let still_draining = db.store.xray_release(release.id).await.unwrap();
+    assert!(still_draining.targets[0].execution_timed_out);
+    assert!(!still_draining.targets[0].retryable);
+    assert!(matches!(
+        db.store
+            .retry_xray_release_target(&system_admin(), release.id, "n1", &build_id)
+            .await,
+        Err(StoreError::Conflict(message)) if message.contains("still reports the active handoff attempt")
+    ));
+    sqlx::query("UPDATE node_agent_state SET xray_upgrade = NULL WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db.store.xray_release(release.id).await.unwrap().targets[0].retryable);
+
+    let mut report = XrayReleaseReport {
+        release_id: release.id,
+        attempt: offer.attempt,
+        outcome: XrayReleaseOutcome::Succeeded,
+        performed_update: true,
+        strategy: XrayReleaseStrategy::Restart,
+        forced_retirement: false,
+        xray_enabled: true,
+        installed_sha256: Some(wanted.clone()),
+        running_sha256: Some(wanted.clone()),
+        error: None,
+    };
+    assert!(matches!(
+        db.store.report_xray_release("n1", &report).await,
+        Err(StoreError::InvalidData(_))
+    ));
+    report.strategy = XrayReleaseStrategy::Handoff;
+    report.forced_retirement = true;
+    assert!(matches!(
+        db.store.report_xray_release("n1", &report).await,
+        Err(StoreError::InvalidData(_))
+    ));
+    report.forced_retirement = false;
+    // The timeout is a control-plane observation, not a terminal state. A late report for the
+    // same attempt remains authoritative until an operator explicitly supersedes that attempt.
+    assert!(db.store.report_xray_release("n1", &report).await.unwrap());
+    assert_eq!(
+        db.store.xray_release(release.id).await.unwrap().status,
+        XrayReleaseStatus::Succeeded
+    );
+
+    let recovery_release = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "handoff-dirty-recovery".to_owned(),
+                release_id: build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                note: None,
+                xray_strategy: XrayReleaseStrategy::Handoff,
+                xray_drain_timeout_secs: Some(300),
+            },
+            build,
+        )
+        .await
+        .unwrap();
+    let recovery_offer = db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut recovery_report = XrayReleaseReport {
+        release_id: recovery_release.id,
+        attempt: recovery_offer.attempt,
+        outcome: XrayReleaseOutcome::FailedDirty,
+        performed_update: true,
+        strategy: XrayReleaseStrategy::Handoff,
+        forced_retirement: false,
+        xray_enabled: true,
+        installed_sha256: Some(wanted.clone()),
+        running_sha256: Some(wanted.clone()),
+        error: Some("dynamic forwarding restore is still retrying".to_owned()),
+    };
+    assert!(db
+        .store
+        .report_xray_release("n1", &recovery_report)
+        .await
+        .unwrap());
+    let dirty = db.store.xray_release(recovery_release.id).await.unwrap();
+    assert_eq!(dirty.status, XrayReleaseStatus::Halted);
+    assert_eq!(
+        dirty.targets[0].status,
+        XrayReleaseTargetStatus::FailedDirty
+    );
+
+    recovery_report.outcome = XrayReleaseOutcome::Succeeded;
+    recovery_report.error = None;
+    recovery_report.performed_update = false;
+    assert!(matches!(
+        db.store
+            .report_xray_release("n1", &recovery_report)
+            .await,
+        Err(StoreError::InvalidData(message))
+            if message.contains("did not prove the approved running bytes")
+    ));
+    let still_dirty = db.store.xray_release(recovery_release.id).await.unwrap();
+    assert_eq!(
+        still_dirty.targets[0].status,
+        XrayReleaseTargetStatus::FailedDirty
+    );
+    assert!(!still_dirty.targets[0].recovered_after_dirty);
+
+    recovery_report.performed_update = true;
+    assert!(db
+        .store
+        .report_xray_release("n1", &recovery_report)
+        .await
+        .unwrap());
+    let recovered = db.store.xray_release(recovery_release.id).await.unwrap();
+    assert_eq!(recovered.status, XrayReleaseStatus::Succeeded);
+    assert_eq!(
+        recovered.targets[0].status,
+        XrayReleaseTargetStatus::Succeeded
+    );
+    assert!(recovered.targets[0].recovered_after_dirty);
+    assert!(recovered.halted_at.is_none());
+    let recovery_event = recovered
+        .events
+        .iter()
+        .find(|event| event.kind == "target-recovered-after-dirty")
+        .unwrap();
+    assert_eq!(
+        recovery_event.detail["previous_error"],
+        "dynamic forwarding restore is still retrying"
+    );
+    assert_eq!(
+        recovery_event.detail["previous_evidence"]["report"]["outcome"],
+        "failed-dirty"
+    );
+
+    let forced_release = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "handoff-force-success".to_owned(),
+                release_id: build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                note: None,
+                xray_strategy: XrayReleaseStrategy::HandoffForce,
+                xray_drain_timeout_secs: Some(300),
+            },
+            build,
+        )
+        .await
+        .unwrap();
+    let forced_offer = db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db
+        .store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: forced_release.id,
+                attempt: forced_offer.attempt,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: true,
+                strategy: XrayReleaseStrategy::HandoffForce,
+                forced_retirement: true,
+                xray_enabled: true,
+                installed_sha256: Some(wanted.clone()),
+                running_sha256: Some(wanted),
+                error: None,
+            },
+        )
+        .await
+        .unwrap());
+    let forced = db.store.xray_release(forced_release.id).await.unwrap();
+    assert_eq!(forced.status, XrayReleaseStatus::Succeeded);
+    assert_eq!(forced.targets[0].reported_forced_retirement, Some(true));
+    assert!(!forced.targets[0].recovered_after_dirty);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attempts() {
     use brocade_deployment::protocol::{AgentReleaseOutcome, AgentReleaseReport};
     use brocade_store::{
@@ -5526,8 +6068,10 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
     let before = "1".repeat(64);
     let wanted = "2".repeat(64);
     let build_id = "3".repeat(64);
-    sqlx::query("INSERT INTO node_agent_state (node_id, agent_version, agent_protocol_version, last_poll_at, runtime_reported_at, runtime_versions)
-        VALUES ('n1', $1, 24, now(), now(), $2)")
+    // An Xray generation may be draining for much longer than the desired-poll freshness window.
+    // Agent release remains safe because authenticated contact and runtime identity continue.
+    sqlx::query("INSERT INTO node_agent_state (node_id, token_last_used_at, agent_version, agent_protocol_version, last_poll_at, runtime_reported_at, runtime_versions)
+        VALUES ('n1', now(), $1, 24, now() - interval '10 minutes', now(), $2)")
         .bind(format!("brocade-agent/{before}")).bind(json!({"agent": before})).execute(db.pool()).await.unwrap();
     let artifacts = [BinaryReleaseArtifact {
         arch: "x86_64".to_owned(),
@@ -5544,6 +6088,8 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
         build_id: build_id.clone(),
         nodes: vec!["n1".to_owned()],
         note: Some("canary".to_owned()),
+        xray_strategy: None,
+        xray_drain_timeout_secs: None,
     };
     assert!(matches!(
         db.store
@@ -5610,8 +6156,8 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
     ));
     // Replacing a file and then disappearing must not count as success.
     sqlx::query(
-        "UPDATE node_agent_state SET agent_version = $1, runtime_versions = $2,
-        last_poll_at = now(), runtime_reported_at = now() WHERE node_id = 'n1'",
+        "UPDATE node_agent_state SET token_last_used_at = now(), agent_version = $1,
+        runtime_versions = $2, runtime_reported_at = now() WHERE node_id = 'n1'",
     )
     .bind(format!("brocade-agent/{wanted}"))
     .bind(json!({"agent": wanted}))
@@ -5657,6 +6203,8 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
                 build_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
                 note: None,
+                xray_strategy: None,
+                xray_drain_timeout_secs: None,
             },
             build,
         )
@@ -5676,8 +6224,8 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
     report.release_id = order2.id;
     report.performed_update = false;
     sqlx::query(
-        "UPDATE node_agent_state SET agent_version = $1, runtime_versions = $2,
-        last_poll_at = now(), runtime_reported_at = now() WHERE node_id = 'n1'",
+        "UPDATE node_agent_state SET token_last_used_at = now(), agent_version = $1,
+        runtime_versions = $2, runtime_reported_at = now() WHERE node_id = 'n1'",
     )
     .bind(format!("brocade-agent/{wanted}"))
     .bind(json!({"agent": wanted}))
@@ -5708,6 +6256,8 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
                 build_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
                 note: None,
+                xray_strategy: None,
+                xray_drain_timeout_secs: None,
             },
             build,
         )
@@ -5863,6 +6413,72 @@ async fn binary_release_compatibility_preserves_history_and_schema_identity() {
         .fetch_one(db.pool()).await.unwrap(), "s");
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn xray_handoff_release_compatibility_is_additive_and_enforces_shapes() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO admin_operators (id, display_name, role, password_hash)
+         VALUES ('test-system', 'Test System', 'system-admin', 'test-only')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE binary_releases
+             DROP COLUMN xray_strategy,
+             DROP COLUMN xray_drain_timeout_seconds;
+         ALTER TABLE binary_release_targets DROP COLUMN reported_forced_retirement;
+         ALTER TABLE node_agent_state DROP COLUMN xray_upgrade;",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let compatibility = include_str!("../../../scripts/compat-xray-handoff-release.sql")
+        .replace("\\set ON_ERROR_STOP on", "");
+    sqlx::raw_sql(&compatibility)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND (table_name, column_name) IN (
+                ('binary_releases', 'xray_strategy'),
+                ('binary_releases', 'xray_drain_timeout_seconds'),
+                ('binary_release_targets', 'reported_forced_retirement'),
+                ('node_agent_state', 'xray_upgrade')
+            )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(columns, 4);
+    assert!(sqlx::query(
+        "INSERT INTO binary_releases
+             (component, idempotency_key, build_id, version, artifacts, created_by,
+              xray_strategy, xray_drain_timeout_seconds)
+         VALUES ('agent', 'invalid-agent-policy', repeat('a', 64), 'test',
+                 '{\"x86_64\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}'::jsonb,
+                 'test-system', 'handoff', 300)",
+    )
+    .execute(db.pool())
+    .await
+    .is_err());
+    assert!(sqlx::query(
+        "INSERT INTO node_agent_state (node_id, xray_upgrade) VALUES ('n1', '[]'::jsonb)"
+    )
+    .execute(db.pool())
+    .await
+    .is_err());
+}
+
 /// Delivery is asynchronous, so an earlier snapshot may finish its POST after a newer one. The
 /// server must acknowledge that retry without moving the current runtime state backwards.
 #[tokio::test]
@@ -5886,6 +6502,7 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
             xray: None,
             xray_installed_sha256: None,
             xray_running_sha256: None,
+            xray_handoff: None,
             kernel_tls_module: None,
             phantun: None,
             openvpn: None,
@@ -5898,6 +6515,7 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
         wireguard_health: None,
         traffic: None,
         online_sources: None,
+        xray_upgrade: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
@@ -5928,6 +6546,282 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn config_xray_force_retirement_is_exact_idempotent_and_settled_by_runtime() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    db.store.issue_node_token("n1").await.unwrap();
+
+    let revision_id: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let deployment_id: i64 = sqlx::query_scalar(
+        "INSERT INTO deployments (
+             revision_id, status, active, kind, activation_status, settlement_status
+         ) VALUES ($1, 'succeeded', NULL, 'config', 'activated', 'converged')
+         RETURNING id",
+    )
+    .bind(revision_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_targets (deployment_id, node_id, status)
+         VALUES ($1, 'n1', 'succeeded')",
+    )
+    .bind(deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_target_state (
+             deployment_id, node_id, wave, disruptive, desired_structure,
+             desired_grants, claim_generation
+         ) VALUES ($1, 'n1', 0, TRUE, '{}'::jsonb, '{}'::jsonb, 7)",
+    )
+    .bind(deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let runtime = XrayUpgradeRuntime {
+        source: brocade_deployment::protocol::XrayUpgradeSource::ConfigDeployment {
+            deployment_id,
+            claim_generation: 7,
+        },
+        release_id: deployment_id.saturating_neg(),
+        attempt: 0,
+        strategy: XrayReleaseStrategy::Handoff,
+        phase: XrayUpgradePhase::Blocked,
+        old: XrayUpgradeProcess {
+            pid: 101,
+            pid_start_ticks: 1_001,
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            sha256: "a".repeat(64),
+            alive: true,
+            accepting: Some(false),
+            active_connections: Some(14),
+        },
+        candidate: Some(XrayUpgradeProcess {
+            pid: 202,
+            pid_start_ticks: 1_002,
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            sha256: "b".repeat(64),
+            alive: true,
+            accepting: Some(true),
+            active_connections: Some(2),
+        }),
+        drain_deadline_unix_secs: Some(1),
+        blocked_reason: Some("old generation still has 14 connections".to_owned()),
+    };
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET agent_protocol_version = $2,
+                runtime_reported_at = now(),
+                xray_upgrade = $3
+          WHERE node_id = $1",
+    )
+    .bind("n1")
+    .bind(
+        i32::try_from(brocade_deployment::protocol::CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION)
+            .unwrap(),
+    )
+    .bind(serde_json::to_value(&runtime).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.store
+            .force_config_xray_retirement(&publisher("platform.acme"), deployment_id, "n1")
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    let first = db
+        .store
+        .force_config_xray_retirement(&system_admin(), deployment_id, "n1")
+        .await
+        .unwrap();
+    assert_eq!(first.claim_generation, 7);
+    assert_eq!(first.active_connections, 14);
+    assert!(!first.reused);
+    let repeated = db
+        .store
+        .force_config_xray_retirement(&system_admin(), deployment_id, "n1")
+        .await
+        .unwrap();
+    assert!(repeated.reused);
+    assert_eq!(
+        db.store
+            .config_xray_force_retirement_command("n1")
+            .await
+            .unwrap()
+            .unwrap(),
+        brocade_deployment::protocol::ConfigXrayForceRetirementCommand {
+            deployment_id,
+            claim_generation: 7,
+        }
+    );
+
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    db.store
+        .record_node_runtime(
+            "n1",
+            &NodeRuntimeReport {
+                observed_at_unix_secs: now + 1,
+                certificate: Default::default(),
+                versions: NodeVersions {
+                    agent: "force-retirement-test".to_owned(),
+                    xray: None,
+                    xray_installed_sha256: None,
+                    xray_running_sha256: None,
+                    xray_handoff: None,
+                    kernel_tls_module: None,
+                    phantun: None,
+                    openvpn: None,
+                    vpngate_catalog_probe_workers: None,
+                    wg_tools: None,
+                    wg_backend: None,
+                },
+                geodata: None,
+                local_reconcile: None,
+                wireguard_health: None,
+                traffic: None,
+                online_sources: None,
+                xray_upgrade: None,
+                spool: SpoolBacklog {
+                    observation: 0,
+                    usage: 0,
+                    load: 0,
+                    dropped: 0,
+                    usage_dropped: Some(0),
+                    observation_dropped: Some(0),
+                    load_dropped: Some(0),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .config_xray_force_retirement_command("n1")
+        .await
+        .unwrap()
+        .is_none());
+    // The next block intentionally reuses the same synthetic handoff identity to isolate the
+    // automatic path. Production identities never reappear after their runtime reaches None.
+    sqlx::query("DELETE FROM config_xray_force_retirements WHERE node_id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // A later configuration release is itself authorization to clear the preceding generation.
+    // It must not wait for the preceding runtime's remaining grace window, and it must retain the
+    // preceding deployment/claim identity rather than copying the new release identity.
+    let next = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(
+                u64::try_from(revision_id).unwrap(),
+                "config-force-next-release",
+            ),
+        )
+        .await
+        .unwrap();
+    // The same revision is a no-op in this fixture. Turn its already compiled target into a
+    // synthetic eligible Xray work order so this test isolates the retirement-command boundary.
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'planned', active = TRUE, finished_at = NULL
+          WHERE id = $1",
+    )
+    .bind(next.deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE deployment_targets SET status = 'pending' WHERE deployment_id = $1 AND node_id = 'n1'",
+    )
+    .bind(next.deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE deployment_target_state
+            SET desired_structure = jsonb_set(
+                desired_structure, '{actions}', '[\"apply-xray\"]'::jsonb, TRUE
+            )
+          WHERE deployment_id = $1 AND node_id = 'n1'",
+    )
+    .bind(next.deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_wave_confirmations (deployment_id, wave, actor)
+         SELECT deployment_id, wave, 'test-system'
+           FROM deployment_target_state
+          WHERE deployment_id = $1 AND node_id = 'n1'
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(next.deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let due = db
+        .store
+        .load_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("synthetic next configuration is executable");
+    assert_eq!(due.deployment_id, next.deployment_id);
+    let mut draining = runtime;
+    draining.phase = XrayUpgradePhase::Draining;
+    draining.drain_deadline_unix_secs = Some(now + 300);
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET runtime_reported_at = now(), xray_upgrade = $2
+          WHERE node_id = $1",
+    )
+    .bind("n1")
+    .bind(serde_json::to_value(draining).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        db.store
+            .config_xray_force_retirement_command("n1")
+            .await
+            .unwrap()
+            .unwrap(),
+        brocade_deployment::protocol::ConfigXrayForceRetirementCommand {
+            deployment_id,
+            claim_generation: 7,
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT requested_by
+               FROM config_xray_force_retirements
+              WHERE node_id = 'n1' AND settled_at IS NULL",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        format!("deployment:{}", next.deployment_id)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -5948,6 +6842,7 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
                 xray: None,
                 xray_installed_sha256: None,
                 xray_running_sha256: None,
+                xray_handoff: None,
                 kernel_tls_module: None,
                 phantun: None,
                 openvpn: None,
@@ -5960,6 +6855,7 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
             wireguard_health: None,
             traffic: None,
             online_sources,
+            xray_upgrade: None,
             spool: SpoolBacklog {
                 observation: 0,
                 usage: 0,
@@ -5985,6 +6881,9 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
                 protocols: Some(vec![
                     brocade_deployment::protocol::OnlineSourceProtocol::Vless,
                 ]),
+                online_since_unix_secs: Some(now - 60),
+                session_uplink_bytes: Some(1_024),
+                session_downlink_bytes: Some(2_048),
             },
             OnlineSource {
                 ip: "1.1.1.1".to_owned(),
@@ -5992,16 +6891,25 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
                 protocols: Some(vec![
                     brocade_deployment::protocol::OnlineSourceProtocol::AnyTls,
                 ]),
+                online_since_unix_secs: Some(now - 60),
+                session_uplink_bytes: Some(1_024),
+                session_downlink_bytes: Some(2_048),
             },
             OnlineSource {
                 ip: "2606:4700:4700::1111".to_owned(),
                 last_seen_unix_secs: now,
                 protocols: None,
+                online_since_unix_secs: None,
+                session_uplink_bytes: None,
+                session_downlink_bytes: None,
             },
             OnlineSource {
                 ip: "192.168.1.20".to_owned(),
                 last_seen_unix_secs: now,
                 protocols: None,
+                online_since_unix_secs: None,
+                session_uplink_bytes: None,
+                session_downlink_bytes: None,
             },
         ],
     }];
@@ -6034,22 +6942,29 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
     assert_eq!(alice.state, UserPresenceState::Complete);
     assert_eq!(alice.expected_nodes, 1);
     assert_eq!(alice.reporting_nodes, 1);
+    assert!(alice.missing_nodes.is_empty());
     assert_eq!(alice.sources.len(), 2);
     let v4 = alice
         .sources
         .iter()
         .find(|source| source.ip == "1.1.1.1")
         .unwrap();
+    assert_eq!(v4.session_uplink_bytes, Some(1_024));
+    assert_eq!(v4.session_downlink_bytes, Some(2_048));
+    assert!(v4.online_since_at.is_some());
+    assert_eq!(v4.accesses.len(), 1);
+    assert_eq!(v4.accesses[0].node_id, "n1");
+    assert_eq!(v4.accesses[0].ingress_id, "ing-a1b2");
+    assert_eq!(v4.accesses[0].last_observed_at, v4.last_observed_at);
+    assert_eq!(v4.accesses[0].online_since_at, v4.online_since_at);
+    assert_eq!(v4.accesses[0].session_uplink_bytes, Some(1_024));
+    assert_eq!(v4.accesses[0].session_downlink_bytes, Some(2_048));
     assert_eq!(
-        v4.accesses,
-        vec![brocade_store::UserOnlineSourceAccess {
-            node_id: "n1".to_owned(),
-            ingress_id: "ing-a1b2".to_owned(),
-            protocols: Some(vec![
-                brocade_deployment::protocol::OnlineSourceProtocol::Vless,
-                brocade_deployment::protocol::OnlineSourceProtocol::AnyTls,
-            ]),
-        }]
+        v4.accesses[0].protocols,
+        Some(vec![
+            brocade_deployment::protocol::OnlineSourceProtocol::Vless,
+            brocade_deployment::protocol::OnlineSourceProtocol::AnyTls,
+        ])
     );
     let v4_accesses = v4.accesses.clone();
     assert_eq!(
@@ -6117,6 +7032,10 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
         .unwrap();
     assert_eq!(alice.state, UserPresenceState::Complete);
     assert!(
+        alice.missing_nodes.is_empty(),
+        "a successful empty report is fresh"
+    );
+    assert!(
         alice.sources.is_empty(),
         "an empty successful snapshot means zero online sources"
     );
@@ -6126,14 +7045,25 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
         .await
         .unwrap();
     assert_eq!(history.retention_days, 30);
+    let historical_v4 = history
+        .sources
+        .iter()
+        .find(|source| source.ip == "1.1.1.1")
+        .unwrap();
+    assert_eq!(historical_v4.accesses.len(), 1);
+    let historical_access = &historical_v4.accesses[0];
+    assert_eq!(historical_access.node_id, v4_accesses[0].node_id);
+    assert_eq!(historical_access.ingress_id, v4_accesses[0].ingress_id);
+    assert_eq!(historical_access.protocols, v4_accesses[0].protocols);
     assert_eq!(
-        history
-            .sources
-            .iter()
-            .find(|source| source.ip == "1.1.1.1")
-            .unwrap()
-            .accesses,
-        v4_accesses
+        historical_access.online_since_at,
+        v4_accesses[0].online_since_at
+    );
+    assert_eq!(historical_access.session_uplink_bytes, Some(1_024));
+    assert_eq!(historical_access.session_downlink_bytes, Some(2_048));
+    assert_eq!(
+        historical_access.last_observed_at,
+        historical_v4.last_observed_at
     );
     assert!(!history.truncated);
     assert_eq!(
@@ -6150,6 +7080,9 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
                 first_observed_at = now() - interval '31 days',
                 last_observed_at = now() - interval '31 days',
                 xray_last_seen_at = now() - interval '31 days',
+                online_since_at = NULL,
+                session_uplink_bytes = NULL,
+                session_downlink_bytes = NULL,
                 offline_at = NULL
           WHERE source_ip = '1.1.1.1'::inet",
     )
@@ -6176,6 +7109,9 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
             ip: "8.8.8.8".to_owned(),
             last_seen_unix_secs: now + 1,
             protocols: None,
+            online_since_unix_secs: None,
+            session_uplink_bytes: None,
+            session_downlink_bytes: None,
         }],
     }];
     db.store
@@ -6191,6 +7127,23 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
         active_after_stale, 0,
         "an older report must not reactivate a source"
     );
+    sqlx::query(
+        "UPDATE node_agent_state SET online_sources_reported_at = now() - interval '13 minutes'
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let expired = db.store.list_user_presence(&system_admin()).await.unwrap();
+    let alice = expired
+        .users
+        .iter()
+        .find(|user| user.user_id == "alice")
+        .unwrap();
+    assert_eq!(alice.state, UserPresenceState::Unavailable);
+    assert_eq!(alice.missing_nodes.len(), 1);
+    assert_eq!(alice.missing_nodes[0].node_id, "n1");
+    assert!(alice.missing_nodes[0].last_reported_at.is_some());
 }
 
 #[tokio::test]
@@ -6234,6 +7187,30 @@ async fn online_sources_protocols_replace_per_node_and_ingress_without_inflating
     for node in ["n1", "n2"] {
         db.store.issue_node_token(node).await.unwrap();
     }
+    let initial = db.store.list_user_presence(&system_admin()).await.unwrap();
+    let alice = initial
+        .users
+        .iter()
+        .find(|user| user.user_id == "alice")
+        .unwrap();
+    assert_eq!(
+        alice.expected_nodes, 2,
+        "count machines, not their three ingresses"
+    );
+    assert_eq!(alice.missing_nodes.len(), 2);
+    assert_eq!(alice.missing_nodes[0].node_id, "n1");
+    assert_eq!(alice.missing_nodes[1].node_id, "n2");
+    assert!(alice
+        .missing_nodes
+        .iter()
+        .all(|node| node.last_reported_at.is_none()));
+    assert!(db
+        .store
+        .list_user_presence(&tenant_admin("other"))
+        .await
+        .unwrap()
+        .users
+        .is_empty());
     let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(db.pool())
         .await
@@ -6265,6 +7242,20 @@ async fn online_sources_protocols_replace_per_node_and_ingress_without_inflating
         )
         .await
         .unwrap();
+    let partial = db
+        .store
+        .list_user_presence(&tenant_admin("platform.acme"))
+        .await
+        .unwrap();
+    let alice = partial
+        .users
+        .iter()
+        .find(|user| user.user_id == "alice")
+        .unwrap();
+    assert_eq!(alice.state, UserPresenceState::Partial);
+    assert_eq!(alice.reporting_nodes, 1);
+    assert_eq!(alice.missing_nodes.len(), 1);
+    assert_eq!(alice.missing_nodes[0].node_id, "n2");
     db.store
         .record_node_runtime("n2", &snapshot(now, &[("ing-e5f6", json!(["anytls"]))]))
         .await
@@ -6276,9 +7267,22 @@ async fn online_sources_protocols_replace_per_node_and_ingress_without_inflating
         .find(|user| user.user_id == "alice")
         .unwrap();
     assert_eq!(alice.sources.len(), 1);
+    assert!(alice.missing_nodes.is_empty());
     assert_eq!(alice.sources[0].node_ids, ["n1", "n2"]);
+    let compact_accesses = |accesses: &[brocade_store::UserOnlineSourceAccess]| {
+        accesses
+            .iter()
+            .map(|access| {
+                json!({
+                    "node_id": access.node_id,
+                    "ingress_id": access.ingress_id,
+                    "protocols": access.protocols,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        serde_json::to_value(&alice.sources[0].accesses).unwrap(),
+        serde_json::Value::Array(compact_accesses(&alice.sources[0].accesses)),
         json!([
             {"node_id": "n1", "ingress_id": "ing-a1b2", "protocols": ["vless", "anytls"]},
             {"node_id": "n1", "ingress_id": "ing-c3d4", "protocols": ["hysteria2"]},
@@ -6305,7 +7309,7 @@ async fn online_sources_protocols_replace_per_node_and_ingress_without_inflating
         .find(|user| user.user_id == "alice")
         .unwrap();
     assert_eq!(
-        serde_json::to_value(&alice.sources[0].accesses).unwrap(),
+        serde_json::Value::Array(compact_accesses(&alice.sources[0].accesses)),
         json!([
             {"node_id": "n1", "ingress_id": "ing-a1b2", "protocols": ["vless"]},
             {"node_id": "n2", "ingress_id": "ing-e5f6", "protocols": null},
@@ -6400,6 +7404,133 @@ async fn online_sources_documented_compatibility_preserves_legacy_rows_and_is_re
     );
 }
 
+async fn assert_online_source_session_constraint(pool: &PgPool) {
+    for mask in 0_u8..8 {
+        let result = sqlx::query(
+            "UPDATE user_online_sources
+                SET online_since_at = CASE WHEN $1 THEN last_observed_at ELSE NULL END,
+                    session_uplink_bytes = $2,
+                    session_downlink_bytes = $3",
+        )
+        .bind(mask & 1 != 0)
+        .bind((mask & 2 != 0).then_some(0_i64))
+        .bind((mask & 4 != 0).then_some(0_i64))
+        .execute(pool)
+        .await;
+        if mask == 0 || mask == 7 {
+            assert!(
+                result.is_ok(),
+                "complete or legacy metrics: {mask}: {result:?}"
+            );
+        } else {
+            let error = result.expect_err("partial session metrics must be rejected");
+            let database = error.as_database_error().unwrap();
+            assert_eq!(database.code().as_deref(), Some("23514"));
+            assert_eq!(
+                database.constraint(),
+                Some("user_online_sources_session_shape")
+            );
+        }
+    }
+    for invalid in [
+        "UPDATE user_online_sources SET session_uplink_bytes = -1",
+        "UPDATE user_online_sources SET session_downlink_bytes = -1",
+        "UPDATE user_online_sources
+            SET online_since_at = last_observed_at + interval '1 second'",
+    ] {
+        let error = sqlx::query(invalid).execute(pool).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().constraint(),
+            Some("user_online_sources_session_shape")
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn online_source_session_schema_rejects_partial_metrics() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO user_online_sources
+             (node_id, tenant_id, user_id, ingress_id, source_ip, first_observed_at,
+              last_observed_at, xray_last_seen_at)
+         VALUES ('n1', 'platform.acme', 'alice', 'ing-a1b2', '1.1.1.1', now(), now(), now())",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_online_source_session_constraint(db.pool()).await;
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn online_source_session_compatibility_preserves_legacy_rows() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO user_online_sources
+             (node_id, tenant_id, user_id, ingress_id, source_ip, first_observed_at,
+              last_observed_at, xray_last_seen_at)
+         VALUES ('n1', 'platform.acme', 'alice', 'ing-a1b2', '1.1.1.1', now(), now(), now())",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let definition_sql = "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                          WHERE conrelid = 'user_online_sources'::regclass
+                            AND conname = 'user_online_sources_session_shape'";
+    let expected: String = sqlx::query_scalar(definition_sql)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE user_online_sources
+             DROP CONSTRAINT user_online_sources_session_shape,
+             DROP COLUMN online_since_at,
+             DROP COLUMN session_uplink_bytes,
+             DROP COLUMN session_downlink_bytes",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let compatibility = include_str!("../../../scripts/compat-user-online-session.sql")
+        .replace("\\set ON_ERROR_STOP on", "")
+        .replace("SET LOCAL ROLE :\"app_role\";", "SET LOCAL ROLE postgres;");
+    sqlx::raw_sql(&compatibility)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let actual: String = sqlx::query_scalar(definition_sql)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    let preserved: bool = sqlx::query_scalar(
+        "SELECT online_since_at IS NULL
+                AND session_uplink_bytes IS NULL
+                AND session_downlink_bytes IS NULL
+           FROM user_online_sources
+          WHERE source_ip = '1.1.1.1'::inet",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        preserved,
+        "compatibility SQL must not invent legacy session data"
+    );
+    assert_online_source_session_constraint(db.pool()).await;
+}
+
 /// A machine with no valid token may not write runtime state. The same gate as
 /// `record_node_poll` — both endpoints are called unattended from the agent side, and one gate
 /// missing is as good as none.
@@ -6420,6 +7551,7 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
             xray: None,
             xray_installed_sha256: None,
             xray_running_sha256: None,
+            xray_handoff: None,
             kernel_tls_module: None,
             phantun: None,
             openvpn: None,
@@ -6432,6 +7564,7 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         wireguard_health: None,
         traffic: None,
         online_sources: None,
+        xray_upgrade: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
@@ -7231,6 +8364,75 @@ async fn node_mtu_overrides_the_global_default() {
             .find(|n| n.id == "narrow-01")
             .unwrap()
             .mtu,
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_region_override_normalizes_persists_and_restores_automatic_detection() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.acme', 'Platform Acme')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store
+        .provision_node(&system_admin(), provision_node_request("region-01"))
+        .await
+        .unwrap();
+
+    let saved = db
+        .store
+        .update_node_region_override(
+            &system_admin(),
+            "region-01",
+            UpdateNodeRegionRequest {
+                country_code: Some(" tw ".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.country_code.as_deref(), Some("TW"));
+
+    let nodes = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    let node = nodes
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "region-01")
+        .unwrap();
+    assert_eq!(node.public_ipv4_country_override.as_deref(), Some("TW"));
+    assert_eq!(
+        node.public_ipv4_country, None,
+        "GeoIP decoration belongs to Console"
+    );
+
+    db.store
+        .update_node_region_override(
+            &system_admin(),
+            "region-01",
+            UpdateNodeRegionRequest { country_code: None },
+        )
+        .await
+        .unwrap();
+    let nodes = db
+        .store
+        .list_node_agent_states(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(
+        nodes
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "region-01")
+            .unwrap()
+            .public_ipv4_country_override,
         None
     );
 }
@@ -8552,6 +9754,7 @@ async fn user_login_is_bound_to_one_user_and_resets_in_place() {
             "alice",
             UpdateUserProfileRequest {
                 account_type: UserAccountType::Test,
+                traffic_accounting_mode: None,
             },
         )
         .await
@@ -10134,6 +11337,8 @@ async fn retired_node_removal_is_atomic_and_cleans_chains_and_operational_state(
                 release_id: xray_build_id.clone(),
                 nodes: vec!["n1".to_owned()],
                 note: None,
+                xray_strategy: XrayReleaseStrategy::Restart,
+                xray_drain_timeout_secs: None,
             },
             XrayBuildInfo {
                 release_id: &xray_build_id,
@@ -10999,6 +12204,88 @@ async fn load_desired_for_node_keeps_the_grants_snapshot_from_deployment_creatio
             .any(|(email, _)| *email == "bob@platform.acme#ing-a1b2"),
         "a permission added after work-order creation must not be folded into that order"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn draft_submit_queues_only_account_changes_and_rolls_back_failed_edits() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    let mut settings = db.store.settings().await.unwrap();
+    settings.connection.conn_idle_secs += 1;
+    let config = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpdateSettings { settings }],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .grant_automation_status()
+            .await
+            .unwrap()
+            .pending_jobs,
+        0,
+        "configuration-only changes must not queue an account release"
+    );
+
+    let grant = |user: &str, enabled| ModelOp::UpsertGrant {
+        grant: CreateGrantRequest {
+            app_id: "app-main".to_owned(),
+            tenant_id: "platform.acme".to_owned(),
+            user_id: user.to_owned(),
+            ingress_id: "ing-a1b2".to_owned(),
+            enabled,
+            note: None,
+        },
+    };
+    let revoked = db
+        .store
+        .apply_draft(&system_admin(), vec![grant("alice", false)], None)
+        .await
+        .unwrap();
+    assert!(revoked.revision_id > config.revision_id);
+    let status = db.store.grant_automation_status().await.unwrap();
+    assert_eq!(status.pending_jobs, 1);
+    assert_eq!(status.latest_revision_id, Some(revoked.revision_id));
+    let frozen = db
+        .store
+        .materialize_snapshot(Some(revoked.revision_id))
+        .await
+        .unwrap();
+    assert!(frozen.apps[0].grants.is_empty());
+
+    let unchanged = db
+        .store
+        .apply_draft(&system_admin(), vec![grant("alice", false)], None)
+        .await
+        .unwrap();
+    assert_eq!(unchanged.revision_id, revoked.revision_id);
+    assert!(db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![grant("alice", true), grant("missing-user", true)],
+            None,
+        )
+        .await
+        .is_err());
+    let after_failure = db.store.materialize_snapshot(None).await.unwrap();
+    assert_eq!(
+        after_failure, frozen,
+        "a failed draft must roll back its grant"
+    );
+    let status = db.store.grant_automation_status().await.unwrap();
+    assert_eq!(status.pending_jobs, 1, "no-op and failed edits add no jobs");
+    assert_eq!(status.latest_revision_id, Some(revoked.revision_id));
 }
 
 // Permission edits are operational: one click commits the revision and a durable outbox row in
@@ -12720,6 +14007,7 @@ fn current_usage(
     downlink_bytes: u64,
 ) -> UsageReportRequest {
     UsageReportRequest {
+        site_usage: None,
         agent_instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
         zero_windows: Vec::new(),
         sequence,
@@ -12734,6 +14022,874 @@ fn current_usage(
             downlink_bytes,
         }],
     }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn sniffing_failed_usage_is_bounded_idempotent_and_admin_only() {
+    use brocade_deployment::sniffing_failed::{
+        SniffingFailedCounter, SniffingFailedPolicy, SniffingFailedReport,
+    };
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let policy = db.store.sniffing_failed_policy().await.unwrap();
+    assert!(!db.store.other_domain_policy().await.unwrap().enabled);
+    assert_eq!(policy, SniffingFailedPolicy::default());
+    assert!(matches!(
+        db.store
+            .update_sniffing_failed_policy(
+                &tenant_admin("platform"),
+                SniffingFailedPolicy {
+                    enabled: true,
+                    ..policy
+                }
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    assert!(db
+        .store
+        .update_sniffing_failed_policy(
+            &system_admin(),
+            SniffingFailedPolicy {
+                top_n: 513,
+                ..policy
+            }
+        )
+        .await
+        .is_err());
+    db.store
+        .update_sniffing_failed_policy(
+            &system_admin(),
+            SniffingFailedPolicy {
+                enabled: true,
+                top_n: 2,
+                ..policy
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !db.store.site_usage_policy().await.unwrap().enabled,
+        "independent switches"
+    );
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let base = now - 90;
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    let row = |domain: &str, up, down| SniffingFailedCounter {
+        bucket: base / 3600 * 3600,
+        label: "alice@platform.acme#ing-a1b2".into(),
+        target: domain.into(),
+        uplink_bytes: up,
+        downlink_bytes: down,
+    };
+    let mut report = SniffingFailedReport {
+        version: 1,
+        epoch: "a".repeat(32),
+        activation_unix_secs: base - 10,
+        read_at_unix_secs: base,
+        usage_generation_id: generation,
+        limited: false,
+        counters: vec![
+            row("tcp://192.0.2.1:443", 10, 20),
+            row("udp://[2001:db8::1]:53", 40, 50),
+            row("tcp://192.0.2.1:8443", 50, 50),
+        ],
+    };
+    let (a, b) = tokio::join!(
+        db.store.record_sniffing_failed_report("n1", report.clone()),
+        db.store.record_sniffing_failed_report("n1", report.clone())
+    );
+    assert!(a.is_ok() || b.is_ok()); // A busy optional report can explicitly retry.
+    db.store
+        .record_sniffing_failed_report("n1", report.clone())
+        .await
+        .unwrap();
+    let result = db
+        .store
+        .user_sniffing_failed_targets(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result
+            .rows
+            .iter()
+            .map(|r| r.target.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tcp://192.0.2.1:8443", "udp://[2001:db8::1]:53"]
+    );
+    assert_eq!(result.rows[0].uplink_bytes, 50);
+    let bills: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_samples")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(bills, 0);
+    for actor in [
+        AdminContext::new("public", AdminRole::Readonly, None),
+        AdminContext::new("alice", AdminRole::User, Some("platform.acme".into())),
+        publisher("platform.acme"),
+        tenant_admin("platform.other"),
+    ] {
+        assert!(matches!(
+            db.store
+                .user_sniffing_failed_targets(
+                    &actor,
+                    "platform.acme",
+                    "alice",
+                    SiteUsagePeriod::Month
+                )
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+    }
+    assert!(db
+        .store
+        .user_sniffing_failed_targets(
+            &tenant_admin("platform"),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month
+        )
+        .await
+        .is_ok());
+    report.read_at_unix_secs += 30;
+    report.counters = vec![row("tcp://192.0.2.1:8443", 55, 75)]; // Delta-only report; omitted heads must remain.
+    db.store
+        .record_sniffing_failed_report("n1", report.clone())
+        .await
+        .unwrap();
+    db.store
+        .record_sniffing_failed_report("n1", report.clone())
+        .await
+        .unwrap();
+    let result = db
+        .store
+        .user_sniffing_failed_targets(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (result.rows[0].uplink_bytes, result.rows[0].downlink_bytes),
+        (55, 75)
+    );
+    report.epoch = "b".repeat(32);
+    report.activation_unix_secs = base + 31;
+    report.read_at_unix_secs = base + 60;
+    report.counters = vec![row("tcp://192.0.2.1:8443", 3, 4)];
+    db.store
+        .record_sniffing_failed_report("n1", report.clone())
+        .await
+        .unwrap();
+    let result = db
+        .store
+        .user_sniffing_failed_targets(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (result.rows[0].uplink_bytes, result.rows[0].downlink_bytes),
+        (58, 79),
+        "RAM epochs add new bytes without replacing history"
+    );
+    report.read_at_unix_secs += 1;
+    report.counters[0].target = "https://secret.example/path".into();
+    assert!(db
+        .store
+        .record_sniffing_failed_report("n1", report.clone())
+        .await
+        .is_err());
+    db.store
+        .update_sniffing_failed_policy(&system_admin(), policy)
+        .await
+        .unwrap();
+    report.counters.clear();
+    assert!(matches!(
+        db.store.record_sniffing_failed_report("n1", report).await,
+        Err(StoreError::Forbidden(_))
+    ));
+    let result = db
+        .store
+        .user_sniffing_failed_targets(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert!(!result.collection_enabled);
+    assert!(!result.rows.is_empty());
+    sqlx::query("UPDATE user_sniffing_failed_hourly SET bucket=bucket-48*3600")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.prune_usage_samples(31).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM user_sniffing_failed_hourly")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn sniffing_failed_compatibility_script_preserves_default_off_and_ownership() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::raw_sql("DROP TABLE user_sniffing_failed_hourly, sniffing_failed_counter_heads, node_sniffing_failed_state;
+        ALTER TABLE control_state DROP COLUMN sniffing_failed_policy;
+        CREATE ROLE observation_app;
+        ALTER TABLE control_state OWNER TO observation_app;
+        GRANT USAGE,CREATE ON SCHEMA public TO observation_app;
+        GRANT REFERENCES ON ALL TABLES IN SCHEMA public TO observation_app;")
+        .execute(db.pool()).await.unwrap();
+    let script = include_str!("../../../scripts/compat-sniffing-failed-usage.sql")
+        .lines()
+        .filter(|line| !line.starts_with('\\'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(
+            "SET LOCAL ROLE :\"app_role\";",
+            "SET LOCAL ROLE observation_app;",
+        );
+    sqlx::raw_sql(&script).execute(db.pool()).await.unwrap();
+    assert!(!db.store.sniffing_failed_policy().await.unwrap().enabled);
+    let owners:Vec<String>=sqlx::query_scalar("SELECT tableowner FROM pg_tables WHERE schemaname='public' AND tablename IN ('user_sniffing_failed_hourly','sniffing_failed_counter_heads','node_sniffing_failed_state')")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(owners, vec!["observation_app"; 3]);
+    assert!(!db.store.other_domain_policy().await.unwrap().enabled);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn other_domain_usage_is_bounded_idempotent_and_admin_only() {
+    use brocade_deployment::other_domain::{
+        OtherDomainCounter, OtherDomainPolicy, OtherDomainReport,
+    };
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let policy = db.store.other_domain_policy().await.unwrap();
+    assert_eq!(policy, OtherDomainPolicy::default());
+    assert!(matches!(
+        db.store
+            .update_other_domain_policy(
+                &tenant_admin("platform"),
+                OtherDomainPolicy {
+                    enabled: true,
+                    ..policy
+                }
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    assert!(db
+        .store
+        .update_other_domain_policy(
+            &system_admin(),
+            OtherDomainPolicy {
+                top_n: 513,
+                ..policy
+            }
+        )
+        .await
+        .is_err());
+    db.store
+        .update_other_domain_policy(
+            &system_admin(),
+            OtherDomainPolicy {
+                enabled: true,
+                top_n: 2,
+                ..policy
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !db.store.site_usage_policy().await.unwrap().enabled,
+        "independent switches"
+    );
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let base = now - 90;
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    let row = |domain: &str, up, down| OtherDomainCounter {
+        bucket: base / 3600 * 3600,
+        label: "alice@platform.acme#ing-a1b2".into(),
+        domain: domain.into(),
+        uplink_bytes: up,
+        downlink_bytes: down,
+    };
+    let mut report = OtherDomainReport {
+        version: 1,
+        epoch: "a".repeat(32),
+        activation_unix_secs: base - 10,
+        read_at_unix_secs: base,
+        usage_generation_id: generation,
+        limited: false,
+        counters: vec![
+            row("a.example", 10, 20),
+            row("b.example", 40, 50),
+            row("c.example", 50, 50),
+        ],
+    };
+    let (a, b) = tokio::join!(
+        db.store.record_other_domain_report("n1", report.clone()),
+        db.store.record_other_domain_report("n1", report.clone())
+    );
+    assert!(a.is_ok() || b.is_ok()); // A busy optional report can explicitly retry.
+    db.store
+        .record_other_domain_report("n1", report.clone())
+        .await
+        .unwrap();
+    let result = db
+        .store
+        .user_other_domains(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    for period in [SiteUsagePeriod::Day, SiteUsagePeriod::Month] {
+        let detail = db
+            .store
+            .user_other_domains(&system_admin(), "platform.acme", "alice", period)
+            .await
+            .unwrap();
+        let sites = db
+            .store
+            .user_site_usage(&system_admin(), "platform.acme", "alice", period)
+            .await
+            .unwrap();
+        assert!(detail.range_start_unix_secs >= sites.range_start_unix_secs);
+        assert!(detail.range_end_unix_secs - detail.range_start_unix_secs <= 24 * 3600);
+    }
+    assert_eq!(
+        result
+            .rows
+            .iter()
+            .map(|r| r.domain.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c.example", "b.example"]
+    );
+    assert_eq!(result.rows[0].uplink_bytes, 50);
+    let bills: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_samples")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(bills, 0);
+    for actor in [
+        AdminContext::new("public", AdminRole::Readonly, None),
+        AdminContext::new("alice", AdminRole::User, Some("platform.acme".into())),
+        publisher("platform.acme"),
+        tenant_admin("platform.other"),
+    ] {
+        assert!(matches!(
+            db.store
+                .user_other_domains(&actor, "platform.acme", "alice", SiteUsagePeriod::Month)
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+    }
+    assert!(db
+        .store
+        .user_other_domains(
+            &tenant_admin("platform"),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month
+        )
+        .await
+        .is_ok());
+    report.read_at_unix_secs += 30;
+    report.counters = vec![row("c.example", 55, 75)]; // Delta-only report; omitted heads must remain.
+    db.store
+        .record_other_domain_report("n1", report.clone())
+        .await
+        .unwrap();
+    db.store
+        .record_other_domain_report("n1", report.clone())
+        .await
+        .unwrap();
+    let result = db
+        .store
+        .user_other_domains(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (result.rows[0].uplink_bytes, result.rows[0].downlink_bytes),
+        (55, 75)
+    );
+    report.epoch = "b".repeat(32);
+    report.activation_unix_secs = base + 31;
+    report.read_at_unix_secs = base + 60;
+    report.counters = vec![row("c.example", 3, 4)];
+    db.store
+        .record_other_domain_report("n1", report.clone())
+        .await
+        .unwrap();
+    let result = db
+        .store
+        .user_other_domains(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (result.rows[0].uplink_bytes, result.rows[0].downlink_bytes),
+        (58, 79),
+        "RAM epochs add new bytes without replacing history"
+    );
+    report.read_at_unix_secs += 1;
+    report.counters[0].domain = "https://secret.example/path".into();
+    assert!(db
+        .store
+        .record_other_domain_report("n1", report.clone())
+        .await
+        .is_err());
+    db.store
+        .update_other_domain_policy(&system_admin(), policy)
+        .await
+        .unwrap();
+    report.counters.clear();
+    assert!(matches!(
+        db.store.record_other_domain_report("n1", report).await,
+        Err(StoreError::Forbidden(_))
+    ));
+    let result = db
+        .store
+        .user_other_domains(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert!(!result.collection_enabled);
+    assert!(!result.rows.is_empty());
+    sqlx::query("UPDATE user_other_domain_hourly SET bucket=bucket-48*3600")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.prune_usage_samples(31).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM user_other_domain_hourly")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_site_usage_is_idempotent_non_billable_and_admin_scoped() {
+    use brocade_deployment::site_usage::{SiteUsageCounter, SiteUsageReport};
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    assert!(!db.store.site_usage_policy().await.unwrap().enabled);
+    assert!(matches!(
+        db.store
+            .update_site_usage_policy(
+                &tenant_admin("platform"),
+                brocade_deployment::site_usage::SiteUsagePolicy { enabled: true },
+            )
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    db.store
+        .update_site_usage_policy(
+            &system_admin(),
+            brocade_deployment::site_usage::SiteUsagePolicy { enabled: true },
+        )
+        .await
+        .unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    let site = |id: &str, up, down| SiteUsageCounter {
+        label: "alice@platform.acme#ing-a1b2".into(),
+        site_id: id.into(),
+        uplink_bytes: up,
+        downlink_bytes: down,
+    };
+    let mut first = current_usage(generation, 1, base, "boot-a:100", 10, 20);
+    first.site_usage = Some(SiteUsageReport {
+        activation_id: None,
+        version: 1,
+        epoch: "a".repeat(32),
+        limited: false,
+        counters: vec![site("youtube", 10, 20), site("sniffing-failed", 5, 15)],
+    });
+    db.store.record_usage_report("n1", first).await.unwrap();
+    let empty = db
+        .store
+        .user_site_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert!(
+        empty.rows.is_empty(),
+        "first reading establishes baseline, not current traffic"
+    );
+    let mut second = current_usage(generation, 2, base + 30, "boot-a:100", 20, 40);
+    second.site_usage = Some(SiteUsageReport {
+        activation_id: None,
+        version: 1,
+        epoch: "a".repeat(32),
+        limited: false,
+        counters: vec![
+            site("youtube", 110, 220),
+            site("sniffing-failed", 15, 135),
+            site("unidentified", 7, 20),
+            SiteUsageCounter {
+                label: "relay@n2".into(),
+                ..site("youtube", 9999, 9999)
+            },
+        ],
+    });
+    db.store
+        .record_usage_report("n1", second.clone())
+        .await
+        .unwrap();
+    let mut old_console_view = second.clone();
+    old_console_view.site_usage = None;
+    use sha2::Digest;
+    let old_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&old_console_view).unwrap())
+    );
+    let persisted_hash: String = sqlx::query_scalar(
+        "SELECT payload_sha256 FROM usage_report_receipts WHERE node_id='n1' AND sequence=2",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted_hash, old_hash,
+        "rollback must preserve lost-ACK billing retry identity"
+    );
+    assert!(
+        db.store
+            .record_usage_report("n1", old_console_view)
+            .await
+            .unwrap()
+            .duplicate
+    );
+    assert!(
+        db.store
+            .record_usage_report("n1", second)
+            .await
+            .unwrap()
+            .duplicate
+    );
+    let result = db
+        .store
+        .user_site_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.rows.iter().map(|row| row.uplink_bytes).sum::<u64>(),
+        117
+    );
+    assert_eq!(
+        result
+            .rows
+            .iter()
+            .map(|row| row.downlink_bytes)
+            .sum::<u64>(),
+        340
+    );
+    let failed = result
+        .rows
+        .iter()
+        .find(|row| row.site_id == "sniffing-failed")
+        .unwrap();
+    assert_eq!((failed.uplink_bytes, failed.downlink_bytes), (10, 120));
+    // Calendar periods at +08 and a series that adds up to the category totals.
+    for period in [
+        SiteUsagePeriod::Day,
+        SiteUsagePeriod::Week,
+        SiteUsagePeriod::Month,
+    ] {
+        let view = db
+            .store
+            .user_site_usage(&system_admin(), "platform.acme", "alice", period)
+            .await
+            .unwrap();
+        let start = view.range_start_unix_secs;
+        let length = view.period_end_unix_secs - start;
+        assert_eq!(view.period, period);
+        assert_eq!(
+            (start + 8 * 3600) % 86_400,
+            0,
+            "{period:?} starts at +08 midnight"
+        );
+        assert!(
+            start <= view.range_end_unix_secs
+                && view.range_end_unix_secs < view.period_end_unix_secs
+        );
+        match period {
+            SiteUsagePeriod::Day => assert_eq!(length, 86_400),
+            SiteUsagePeriod::Week => {
+                assert_eq!(length, 7 * 86_400);
+                // 1970-01-01 was a Thursday; ISO weeks start on Monday.
+                assert_eq!(((start + 8 * 3600) / 86_400 + 3) % 7, 0);
+            }
+            SiteUsagePeriod::Month => assert!((28 * 86_400..=31 * 86_400).contains(&length)),
+        }
+        assert_eq!(view.bucket_secs, period.bucket_secs());
+        for row in &view.rows {
+            let series = view
+                .series
+                .iter()
+                .find(|series| series.site_id == row.site_id)
+                .unwrap();
+            assert!(series
+                .points
+                .iter()
+                .all(|point| point.0 >= start
+                    && (point.0 - start) % i64::from(view.bucket_secs) == 0));
+            let up: u64 = series.points.iter().map(|point| point.1).sum();
+            let down: u64 = series.points.iter().map(|point| point.2).sum();
+            assert_eq!((up, down), (row.uplink_bytes, row.downlink_bytes));
+        }
+        assert_eq!(view.series.len(), view.rows.len());
+    }
+    let billable: (i64,i64) = sqlx::query_as("SELECT sum(uplink_bytes)::bigint,sum(downlink_bytes)::bigint FROM usage_samples WHERE user_id='alice'").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(billable, (10, 20), "site counters must not be billed again");
+    for actor in [
+        AdminContext::new("public", AdminRole::Readonly, None),
+        tenant_admin("platform.other"),
+        publisher("platform.acme"),
+    ] {
+        assert!(matches!(
+            db.store
+                .user_site_usage(&actor, "platform.acme", "alice", SiteUsagePeriod::Month)
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+    }
+    assert!(db
+        .store
+        .user_site_usage(
+            &tenant_admin("platform"),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month
+        )
+        .await
+        .is_ok());
+    // Replacing the site journal resets only its baseline, not billing or old category rows.
+    let mut reset = current_usage(generation, 3, base + 60, "boot-a:100", 30, 60);
+    reset.site_usage = Some(SiteUsageReport {
+        activation_id: None,
+        version: 1,
+        epoch: "b".repeat(32),
+        limited: false,
+        counters: vec![site("youtube", 9, 9)],
+    });
+    db.store.record_usage_report("n1", reset).await.unwrap();
+    let after = db
+        .store
+        .user_site_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after.rows.iter().map(|row| row.uplink_bytes).sum::<u64>(),
+        117
+    );
+    let mut invalid = current_usage(generation, 4, base + 90, "boot-a:100", 40, 80);
+    invalid.site_usage = Some(SiteUsageReport {
+        activation_id: None,
+        version: 1,
+        epoch: "b".repeat(32),
+        limited: false,
+        counters: vec![site("unknown-domain.example", 10, 10)],
+    });
+    assert!(db.store.record_usage_report("n1", invalid).await.is_err());
+    let legacy = current_usage(generation, 4, base + 90, "boot-a:100", 40, 80);
+    db.store
+        .record_usage_report("n1", legacy.clone())
+        .await
+        .unwrap();
+    let mut lost_ack = legacy;
+    lost_ack.site_usage = Some(SiteUsageReport {
+        activation_id: None,
+        version: 1,
+        epoch: "b".repeat(32),
+        limited: false,
+        counters: vec![site("youtube", 100, 100)],
+    });
+    assert!(
+        db.store
+            .record_usage_report("n1", lost_ack)
+            .await
+            .unwrap()
+            .duplicate
+    );
+    let after_legacy = db
+        .store
+        .user_site_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after_legacy
+            .rows
+            .iter()
+            .map(|row| row.uplink_bytes)
+            .sum::<u64>(),
+        117,
+        "legacy receipts are not retroactively enriched"
+    );
+    assert_eq!(after_legacy.reporting_nodes, 0);
+    let mut restored = current_usage(generation, 5, base + 120, "boot-a:100", 50, 100);
+    restored.site_usage = Some(SiteUsageReport {
+        activation_id: None,
+        version: 1,
+        epoch: "b".repeat(32),
+        limited: false,
+        counters: vec![site("youtube", 200, 200)],
+    });
+    db.store.record_usage_report("n1", restored).await.unwrap();
+    let after_gap = db
+        .store
+        .user_site_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_gap.observed_since_unix_secs, Some(base + 120));
+    assert_eq!(
+        after_gap
+            .rows
+            .iter()
+            .map(|row| row.uplink_bytes)
+            .sum::<u64>(),
+        117,
+        "unknown gaps establish a new observation baseline"
+    );
+    // A rapid off/on cycle changes activation even without an intervening report.
+    let mut reactivated = current_usage(generation, 6, base + 150, "boot-a:100", 60, 120);
+    reactivated.site_usage = Some(SiteUsageReport {
+        activation_id: Some(123),
+        version: 1,
+        epoch: "b".repeat(32),
+        limited: false,
+        counters: vec![site("youtube", 300, 300)],
+    });
+    db.store
+        .record_usage_report("n1", reactivated.clone())
+        .await
+        .unwrap();
+    let after_activation = db
+        .store
+        .user_site_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after_activation
+            .rows
+            .iter()
+            .map(|row| row.uplink_bytes)
+            .sum::<u64>(),
+        117
+    );
+    assert_eq!(after_activation.observed_since_unix_secs, Some(base + 150));
+    db.store
+        .update_site_usage_policy(
+            &system_admin(),
+            brocade_deployment::site_usage::SiteUsagePolicy { enabled: false },
+        )
+        .await
+        .unwrap();
+    let mut off = current_usage(generation, 7, base + 180, "boot-a:100", 70, 140);
+    off.site_usage = reactivated.site_usage.take();
+    off.site_usage.as_mut().unwrap().counters = vec![site("youtube", 500, 500)];
+    db.store.record_usage_report("n1", off).await.unwrap();
+    let stopped = db
+        .store
+        .user_site_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert!(!stopped.collection_enabled);
+    assert_eq!(stopped.reporting_nodes, 0);
+    assert_eq!(
+        stopped.rows.iter().map(|row| row.uplink_bytes).sum::<u64>(),
+        117,
+        "closed policy ignores late observations but retains history"
+    );
 }
 
 #[tokio::test]
@@ -13188,6 +15344,80 @@ async fn usage_report_receipt_is_exactly_once_under_retry_and_concurrency() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn journal_handoff_fallback_preserves_baseline_and_real_legacy_restart() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    for (seq, at, epoch, up, down) in [
+        (1, base, "journal:stable", 1_000_000, 2_000_000),
+        (2, base + 30, "journal:stable", 1_000_010, 2_000_020),
+        (3, base + 31, "boot-a:100", 1_000_015, 2_000_025),
+        (4, base + 45, "journal:stable", 1_000_025, 2_000_045),
+    ] {
+        let mut request = current_usage(generation, seq, at, epoch, up, down);
+        request.xray_started_at_unix_secs = base - 120;
+        let result = db
+            .store
+            .record_usage_report("n1", request.clone())
+            .await
+            .unwrap();
+        if seq == 3 {
+            assert_eq!(result.rejected_counters, 1);
+            assert_eq!(result.accepted_readings, 0);
+            assert_eq!(result.inserted_samples, 0);
+            assert!(
+                db.store
+                    .record_usage_report("n1", request)
+                    .await
+                    .unwrap()
+                    .duplicate
+            );
+            let head: String =
+                sqlx::query_scalar("SELECT xray_epoch FROM usage_counter_heads WHERE node_id='n1'")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(head, "journal:stable");
+        }
+    }
+    let totals: (i64, i64) = sqlx::query_as(
+        "SELECT sum(uplink_bytes)::bigint,sum(downlink_bytes)::bigint FROM usage_rollups",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        totals,
+        (25, 45),
+        "only real growth, including the rejected interval, is billed"
+    );
+    let node: (i64,i64) = sqlx::query_as("SELECT sum(user_uplink_bytes)::bigint,sum(user_downlink_bytes)::bigint FROM usage_node_rollups").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(node, totals);
+    let mut legacy = current_usage(generation, 5, base + 90, "boot-a:900", 7, 11);
+    legacy.xray_started_at_unix_secs = base + 60;
+    let result = db.store.record_usage_report("n1", legacy).await.unwrap();
+    assert_eq!(result.rejected_counters, 0);
+    assert_eq!(result.gap_samples, 1);
+    let totals: (i64, i64) = sqlx::query_as(
+        "SELECT sum(uplink_bytes)::bigint,sum(downlink_bytes)::bigint FROM usage_rollups",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        totals,
+        (32, 56),
+        "an actual legacy restart still records its new counters"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn exact_xray_epoch_rejects_counter_regression_and_new_epoch_marks_a_gap() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -13555,6 +15785,7 @@ async fn first_report_after_new_authorization_counts_the_complete_counter() {
         .record_usage_report(
             "n1",
             UsageReportRequest {
+                site_usage: None,
                 agent_instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
                 zero_windows: Vec::new(),
                 sequence: 1,
@@ -14460,6 +16691,48 @@ async fn quota_enforcement_leaves_users_under_the_limit_alone() {
     let outcome = db.store.enforce_quotas().await.unwrap();
     assert_eq!(outcome.suspended, 1);
     assert_eq!(live_grants(db.pool()).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_double_accounting_reuses_raw_usage_and_crosses_the_quota_at_twice_the_bytes() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    set_quota(&db, Some(1_500)).await;
+    insert_month_sample(db.pool(), "ing-a1b2", "app-main", 1, 400, 400).await;
+    assert_eq!(db.store.enforce_quotas().await.unwrap().suspended, 0);
+
+    let profile = db
+        .store
+        .update_user_profile(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            UpdateUserProfileRequest {
+                account_type: UserAccountType::Formal,
+                traffic_accounting_mode: Some(UserTrafficAccountingMode::Double),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        profile.traffic_accounting_mode,
+        UserTrafficAccountingMode::Double
+    );
+    assert_eq!(db.store.enforce_quotas().await.unwrap().suspended, 1);
+
+    let raw: i64 = sqlx::query_scalar(
+        "SELECT sum(uplink_bytes + downlink_bytes)::bigint FROM usage_rollups
+         WHERE tenant_id='platform.acme' AND user_id='alice'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(raw, 800, "changing accounting must not rewrite raw usage");
 }
 
 // When a grants deployment lands on a machine, the desired state the agent receives must carry no
@@ -16265,7 +18538,7 @@ async fn rollback_deployment_restores_target_snapshot_then_force_syncs_when_acti
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn discard_pending_changes_restores_machine_settings_but_keeps_immediate_fields() {
+async fn discard_pending_changes_keeps_immediate_fields_and_chain_latency() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -16341,6 +18614,38 @@ async fn discard_pending_changes_restores_machine_settings_but_keeps_immediate_f
     assert_eq!(
         deployment_status(db.pool(), published.deployment_id).await,
         "succeeded"
+    );
+
+    let now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::BIGINT")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for (offset, ttfb_ms) in [(-1, 21), (0, 34)] {
+        db.store
+            .record_e2e_probe(
+                "n1",
+                E2eProbeRequest {
+                    probed_at_unix_secs: now + offset,
+                    chains: vec![E2eProbe {
+                        app_id: None,
+                        chain_id: "chn-a1b2-c3d4".to_owned(),
+                        status: E2eProbeStatus::Ok,
+                        ttfb_ms: Some(ttfb_ms),
+                        exit_ip: Some("192.0.2.10".to_owned()),
+                        exit_loc: Some("test-region".to_owned()),
+                        exit_verdict: E2eExitVerdict::Match,
+                        detail: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let probes_before_discard = db.store.e2e_probes(&system_admin()).await.unwrap();
+    assert_eq!(probes_before_discard.len(), 1);
+    assert_eq!(
+        probes_before_discard[0].samples.ttfb_ms,
+        [Some(21), Some(34)]
     );
 
     let reordered_apps = db
@@ -16456,6 +18761,11 @@ async fn discard_pending_changes_restores_machine_settings_but_keeps_immediate_f
         .map(|chain| chain.id.as_str())
         .collect();
     assert_eq!(restored_chain_order, ["c-secondary", "chn-a1b2-c3d4"]);
+    assert_eq!(
+        db.store.e2e_probes(&system_admin()).await.unwrap(),
+        probes_before_discard,
+        "discarding an unpublished plan must not erase the surviving chain's current latency or history"
+    );
 }
 
 #[tokio::test]
@@ -18529,7 +20839,8 @@ async fn an_entrance_requires_a_guard_and_changing_it_stamps_a_revision() {
             "no_bittorrent": true,
             "no_mail": true,
             "no_udp_amplification": true,
-            "tcp_and_quic_only": false
+            "tcp_and_quic_only": false,
+            "cn_source_block": "ipv4-and-ipv6"
         }
     });
     let mut missing_guard = current.clone();
@@ -18543,15 +20854,19 @@ async fn an_entrance_requires_a_guard_and_changing_it_stamps_a_revision() {
         .await
         .unwrap();
 
-    let stored: (bool, bool, bool, bool, bool) = sqlx::query_as(
+    let stored: (bool, bool, bool, bool, bool, String) = sqlx::query_as(
         "SELECT guard_no_private, guard_no_bittorrent, guard_no_mail,
-                guard_no_udp_amplification, guard_tcp_and_quic_only
+                guard_no_udp_amplification, guard_tcp_and_quic_only,
+                guard_cn_source_block
            FROM ingresses WHERE id = 'ing-b2c3'",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(stored, (true, true, true, true, false));
+    assert_eq!(
+        stored,
+        (true, true, true, true, false, "ipv4-and-ipv6".to_owned())
+    );
 
     // Re-sending the identical request burns no revision — the guard columns join the row
     // comparison rather than sitting outside it, which would have made every save look like a
@@ -18593,6 +20908,11 @@ async fn an_entrance_requires_a_guard_and_changing_it_stamps_a_revision() {
         .expect("ing-b2c3 在快照里");
     assert!(!ingress.guard.no_bittorrent);
     assert!(ingress.guard.no_private, "没动的那几条要原样留着");
+    assert_eq!(
+        ingress.guard.cn_source_block,
+        brocade_core::model::CnSourceBlock::Off,
+        "来源阻断的三态值也要跟随整张策略保存"
+    );
 }
 
 /// The column takes an https URL and nothing else.
@@ -22216,7 +24536,7 @@ async fn public_ip_observations_are_separate_from_config_and_changes_are_debounc
         .node_public_ip_history(&system_admin(), "n1", 14)
         .await
         .unwrap();
-    assert_eq!(history.retention_days, 90);
+    assert_eq!(history.retention_days, 7);
     assert_eq!(history.events.len(), 2);
     assert_eq!(
         history.events[0].previous_ip.as_deref(),
@@ -22224,7 +24544,7 @@ async fn public_ip_observations_are_separate_from_config_and_changes_are_debounc
     );
     assert_eq!(history.events[0].current_ip, "8.8.8.8");
     let notification = db.store.machine_events(&system_admin(), 10).await.unwrap();
-    assert_eq!(notification.retention_days, 90);
+    assert_eq!(notification.retention_days, 7);
     assert_eq!(notification.events.len(), 1);
     assert_eq!(notification.events[0].event_kind, "public_ip_changed");
     assert_eq!(notification.events[0].family, Some(4));
@@ -22267,7 +24587,7 @@ async fn machine_presence_transitions_are_deduplicated_and_deliverable() {
     .await
     .unwrap();
 
-    db.store.issue_node_token("n1").await.unwrap();
+    let issued = db.store.issue_node_token("n1").await.unwrap();
     let waiting: String =
         sqlx::query_scalar("SELECT status FROM node_presence_state WHERE node_id = 'n1'")
             .fetch_one(db.pool())
@@ -22277,6 +24597,11 @@ async fn machine_presence_transitions_are_deduplicated_and_deliverable() {
 
     db.store.record_node_poll("n1", None).await.unwrap();
     db.store.record_node_poll("n1", None).await.unwrap();
+    db.store
+        .authenticate_node_token(&issued.token)
+        .await
+        .unwrap()
+        .expect("an authenticated report is machine contact");
     let online_events: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM machine_events
           WHERE node_id = 'n1' AND event_kind = 'node_online'",
@@ -22297,8 +24622,21 @@ async fn machine_presence_transitions_are_deduplicated_and_deliverable() {
     .execute(db.pool())
     .await
     .unwrap();
-    assert_eq!(db.store.reconcile_node_presence().await.unwrap(), 1);
-    assert_eq!(db.store.reconcile_node_presence().await.unwrap(), 0);
+    assert_eq!(
+        db.store.reconcile_node_presence().await.unwrap(),
+        (0, 0),
+        "fresh authenticated traffic keeps a handoff from looking offline"
+    );
+    sqlx::query(
+        "UPDATE node_agent_state
+            SET token_last_used_at = now() - interval '2 minutes'
+          WHERE node_id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(db.store.reconcile_node_presence().await.unwrap(), (0, 1));
+    assert_eq!(db.store.reconcile_node_presence().await.unwrap(), (0, 0));
     let offline: String =
         sqlx::query_scalar("SELECT status FROM node_presence_state WHERE node_id = 'n1'")
             .fetch_one(db.pool())
@@ -22311,7 +24649,12 @@ async fn machine_presence_transitions_are_deduplicated_and_deliverable() {
     assert_eq!(active.active[0].incident_kind, "control_plane_offline");
     assert!(active.active[0].started_at < active.active[0].detected_at);
 
-    db.store.record_node_poll("n1", None).await.unwrap();
+    db.store
+        .authenticate_node_token(&issued.token)
+        .await
+        .unwrap()
+        .expect("a later authenticated report recovers presence");
+    assert_eq!(db.store.reconcile_node_presence().await.unwrap(), (1, 0));
     let events = db.store.machine_events(&system_admin(), 10).await.unwrap();
     assert!(events.active.is_empty());
     assert_eq!(events.events.len(), 3);
@@ -25293,6 +27636,90 @@ async fn reverse_health_settings_round_trip_and_validate() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn traffic_accounting_mode_compatibility_preserves_legacy_rows_and_defaults() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::raw_sql(
+        "INSERT INTO node_traffic_policy (node_id, updated_by)
+         VALUES ('n1', 'legacy');
+         INSERT INTO node_traffic_calibrations (
+             node_id, target_total_bytes, accounted_total_bytes, calibrated_by
+         ) VALUES ('n1', 100, 80, 'legacy');
+         INSERT INTO node_traffic_forecasts (
+             node_id, day, taken_at, period_start, period_end,
+             used_bytes, p50_bytes, p90_bytes
+         ) VALUES ('n1', current_date, now(), current_date, current_date + 1,
+                   10, 20, 30);
+         ALTER TABLE users DROP COLUMN traffic_accounting_mode;
+         ALTER TABLE node_traffic_policy DROP COLUMN accounting_mode;
+         ALTER TABLE node_traffic_calibrations
+             DROP COLUMN accounting_mode,
+             DROP COLUMN accounted_rx_bytes,
+             DROP COLUMN accounted_tx_bytes;
+         ALTER TABLE node_traffic_forecasts DROP COLUMN accounting_mode;",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let script = include_str!("../../../scripts/compat-traffic-accounting-modes.sql")
+        .lines()
+        .filter(|line| !line.starts_with('\\'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(":\"app_role\"", "postgres");
+    sqlx::raw_sql(&script).execute(db.pool()).await.unwrap();
+
+    let user_mode: String = sqlx::query_scalar(
+        "SELECT traffic_accounting_mode FROM users
+         WHERE tenant_id = 'platform.acme' AND id = 'alice'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(user_mode, "single");
+    let modes: (String, String, String) = sqlx::query_as(
+        "SELECT policy.accounting_mode, calibration.accounting_mode, forecast.accounting_mode
+           FROM node_traffic_policy policy
+           JOIN node_traffic_calibrations calibration USING (node_id)
+           JOIN node_traffic_forecasts forecast USING (node_id)
+          WHERE policy.node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        modes,
+        (
+            "bidirectional_sum".to_owned(),
+            "bidirectional_sum".to_owned(),
+            "bidirectional_sum".to_owned(),
+        )
+    );
+    let directions: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT accounted_rx_bytes::text, accounted_tx_bytes::text
+           FROM node_traffic_calibrations WHERE node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(directions, (None, None));
+    assert!(sqlx::query(
+        "INSERT INTO node_traffic_calibrations (
+             node_id, target_total_bytes, accounted_total_bytes, accounting_mode,
+             accounted_rx_bytes, accounted_tx_bytes, calibrated_by
+         ) VALUES ('n1', 100, 80, 'bidirectional_max', 40, NULL, 'invalid')",
+    )
+    .execute(db.pool())
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -25351,6 +27778,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
             "n1",
             UpdateNodeTrafficRequest {
                 cycle_kind: NodeTrafficCycleKind::Monthly,
+                accounting_mode: Some(brocade_store::NodeTrafficAccountingMode::BidirectionalSum),
                 reset_month: None,
                 reset_day: 1,
                 quota_bytes: Some("10995116277760".to_owned()),
@@ -25443,6 +27871,93 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .unwrap();
     assert!(!capacity.needs_calibration);
     assert_eq!(capacity.gap_reason, None);
+
+    // A mode switch never reuses a calibration made under a different formula. Max is taken over
+    // the whole period's direction totals: max(160, 260), not the sum of daily maxima.
+    db.store
+        .update_node_traffic(
+            &system_admin(),
+            "n1",
+            UpdateNodeTrafficRequest {
+                cycle_kind: NodeTrafficCycleKind::Monthly,
+                accounting_mode: Some(NodeTrafficAccountingMode::BidirectionalMax),
+                reset_month: None,
+                reset_day: 1,
+                quota_bytes: Some("10995116277760".to_owned()),
+                calibrated_total_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    let switched = db.store.node_traffic(&system_admin()).await.unwrap();
+    let switched = switched
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(
+        switched.accounting_mode,
+        NodeTrafficAccountingMode::BidirectionalMax
+    );
+    assert_eq!(switched.total_bytes, "260");
+    assert_eq!(switched.calibrated_at_unix_secs, None);
+
+    db.store
+        .update_node_traffic(
+            &system_admin(),
+            "n1",
+            UpdateNodeTrafficRequest {
+                cycle_kind: NodeTrafficCycleKind::Monthly,
+                accounting_mode: Some(NodeTrafficAccountingMode::BidirectionalMax),
+                reset_month: None,
+                reset_day: 1,
+                quota_bytes: Some("10995116277760".to_owned()),
+                calibrated_total_bytes: Some("1000".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    db.store
+        .record_node_traffic("n1", now + 3, &reading(5, 190, 280, 1))
+        .await
+        .unwrap();
+    let recalibrated = db.store.node_traffic(&system_admin()).await.unwrap();
+    let recalibrated = recalibrated
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(recalibrated.total_bytes, "1030");
+
+    // An older already-open UI has no mode field. Its quota edit must preserve the selected mode
+    // and that mode's calibration instead of silently resetting both to the legacy default.
+    db.store
+        .update_node_traffic(
+            &system_admin(),
+            "n1",
+            UpdateNodeTrafficRequest {
+                cycle_kind: NodeTrafficCycleKind::Monthly,
+                accounting_mode: None,
+                reset_month: None,
+                reset_day: 1,
+                quota_bytes: Some("12345".to_owned()),
+                calibrated_total_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    let legacy_write = db.store.node_traffic(&system_admin()).await.unwrap();
+    let legacy_write = legacy_write
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "n1")
+        .unwrap();
+    assert_eq!(
+        legacy_write.accounting_mode,
+        NodeTrafficAccountingMode::BidirectionalMax
+    );
+    assert_eq!(legacy_write.total_bytes, "1030");
+    assert_eq!(legacy_write.quota_bytes.as_deref(), Some("12345"));
 }
 
 #[tokio::test]
@@ -26077,4 +28592,752 @@ async fn regrant_waits_for_an_unsettled_revoke_order() {
         .items
         .len();
     assert_eq!(probe_items_after, probe_items_before);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_machine_usage_preserves_accounting_history_and_admin_scope() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    db.store
+        .record_usage_report("n1", current_usage(generation, 1, base, "epoch", 10, 20))
+        .await
+        .unwrap();
+    let report = current_usage(generation, 2, base + 30, "epoch", 110, 220);
+    db.store
+        .record_usage_report("n1", report.clone())
+        .await
+        .unwrap();
+    assert!(
+        db.store
+            .record_usage_report("n1", report)
+            .await
+            .unwrap()
+            .duplicate
+    );
+    db.store
+        .record_usage_report(
+            "n1",
+            current_usage(generation, 3, base + 60, "epoch", 110, 220),
+        )
+        .await
+        .unwrap();
+    // Forwarding already has durable user/machine daily attribution, including first readings
+    // with no measured interval. This query must add it once and expose that uncertainty.
+    let rule:i64=sqlx::query_scalar("INSERT INTO forwarding_rules(tenant_id,user_id,node_id,name,protocol,listen_port,target_host,target_port) VALUES('platform.acme','alice','n1','Test','tcp',20042,'192.0.2.1',443) RETURNING id").fetch_one(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO forwarding_usage_rollups(period_start,node_id,tenant_id,user_id,rule_id,uplink_bytes,downlink_bytes,has_gap) VALUES(date_trunc('day',to_timestamp($1) AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong','n1','platform.acme','alice',$2,30,70,false)").bind(base as f64).bind(rule).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO forwarding_usage_samples(node_id,rule_id,tenant_id,user_id,read_at,uplink_bytes,downlink_bytes) VALUES('n1',$1,'platform.acme','alice',to_timestamp($2),30,70)").bind(rule).bind(base as f64).execute(db.pool()).await.unwrap();
+    for period in [
+        SiteUsagePeriod::Day,
+        SiteUsagePeriod::Week,
+        SiteUsagePeriod::Month,
+    ] {
+        let view = db
+            .store
+            .user_machine_usage(&system_admin(), "platform.acme", "alice", period)
+            .await
+            .unwrap();
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("n1"))
+            .unwrap();
+        assert_eq!(
+            (row.uplink_bytes, row.downlink_bytes, row.forwarding_bytes),
+            (130, 270, 100)
+        );
+        assert_eq!(row.points.iter().map(|p| p.1 + p.2).sum::<u64>(), 400);
+        assert!(row.points.iter().any(|p| p.5));
+        if period != SiteUsagePeriod::Month {
+            assert!(
+                row.points.iter().any(|p| p.4),
+                "unknown forwarding interval"
+            );
+        }
+        assert_eq!((view.range_start_unix_secs + 8 * 3600) % 86400, 0);
+        assert_eq!(view.bucket_secs, period.bucket_secs());
+    }
+    // Historic attribution is not a join to today's grants.
+    sqlx::query("DELETE FROM grants WHERE user_id='alice'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let historical = db
+        .store
+        .user_machine_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.rows[0].uplink_bytes, 130);
+    assert!(!historical.rows[0].expected);
+    // Data older than retained detail remains in the ledger, but cannot be assigned to a node.
+    sqlx::query("UPDATE usage_rollups SET uplink_bytes=uplink_bytes+11,downlink_bytes=downlink_bytes+22 WHERE user_id='alice'").execute(db.pool()).await.unwrap();
+    let legacy = db
+        .store
+        .user_machine_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    let unknown = legacy
+        .rows
+        .iter()
+        .find(|row| row.node_id.is_none())
+        .unwrap();
+    assert_eq!((unknown.uplink_bytes, unknown.downlink_bytes), (11, 22));
+    assert_eq!(unknown.points.iter().map(|p| p.1 + p.2).sum::<u64>(), 33);
+    let day = db
+        .store
+        .user_machine_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Day,
+        )
+        .await
+        .unwrap();
+    assert!(
+        day.rows
+            .iter()
+            .find(|row| row.node_id.is_none())
+            .unwrap()
+            .points
+            .is_empty(),
+        "do not invent hourly placement"
+    );
+    sqlx::query("DELETE FROM usage_samples")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let retained = db
+        .store
+        .user_machine_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.rows[0].uplink_bytes, 130,
+        "month survives raw retention"
+    );
+    for actor in [
+        AdminContext::new("public", AdminRole::Readonly, None),
+        tenant_admin("platform.other"),
+        publisher("platform.acme"),
+    ] {
+        assert!(matches!(
+            db.store
+                .user_machine_usage(&actor, "platform.acme", "alice", SiteUsagePeriod::Month)
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+    }
+    assert!(db
+        .store
+        .user_machine_usage(
+            &tenant_admin("platform"),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Week
+        )
+        .await
+        .is_ok());
+    assert!(matches!(
+        db.store
+            .user_machine_usage(
+                &system_admin(),
+                "platform.acme",
+                "missing",
+                SiteUsagePeriod::Day
+            )
+            .await,
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_machine_usage_backfill_and_write_failure_are_atomic() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    db.store
+        .record_usage_report("n1", current_usage(generation, 1, base, "epoch", 10, 20))
+        .await
+        .unwrap();
+    let report = current_usage(generation, 2, base + 30, "epoch", 110, 220);
+    sqlx::query(
+        "ALTER TABLE usage_user_node_rollups ADD CONSTRAINT test_reject CHECK (uplink_bytes=0)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(db
+        .store
+        .record_usage_report("n1", report.clone())
+        .await
+        .is_err());
+    let charged: i64 =
+        sqlx::query_scalar("SELECT coalesce(sum(uplink_bytes),0)::bigint FROM usage_rollups")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        charged, 0,
+        "projection failure rolls back ledger and receipt"
+    );
+    sqlx::query("ALTER TABLE usage_user_node_rollups DROP CONSTRAINT test_reject")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store
+        .record_usage_report("n1", report.clone())
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE usage_user_node_rollups")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let script = include_str!("../../../scripts/compat-user-machine-usage.sql")
+        .lines()
+        .filter(|line| !line.starts_with('\\'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(":\"app_role\"", "postgres");
+    sqlx::raw_sql(&script).execute(db.pool()).await.unwrap();
+    assert!(
+        db.store
+            .record_usage_report("n1", report)
+            .await
+            .unwrap()
+            .duplicate
+    );
+    let view = db
+        .store
+        .user_machine_usage(
+            &system_admin(),
+            "platform.acme",
+            "alice",
+            SiteUsagePeriod::Month,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (view.rows[0].uplink_bytes, view.rows[0].downlink_bytes),
+        (100, 200)
+    );
+    let zero = current_usage(generation, 3, base + 60, "epoch", 110, 220);
+    db.store.record_usage_report("n1", zero).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_samples")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "sparse zero windows remain sparse");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_inflow_usage_attributes_chains_forwarding_history_and_scope() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    db.store
+        .record_usage_report("n1", current_usage(generation, 1, base, "epoch", 10, 20))
+        .await
+        .unwrap();
+    let report = current_usage(generation, 2, base + 30, "epoch", 110, 220);
+    db.store
+        .record_usage_report("n1", report.clone())
+        .await
+        .unwrap();
+    assert!(
+        db.store
+            .record_usage_report("n1", report)
+            .await
+            .unwrap()
+            .duplicate,
+        "a retried report must not count twice"
+    );
+    let rule:i64=sqlx::query_scalar("INSERT INTO forwarding_rules(tenant_id,user_id,node_id,name,protocol,listen_port,target_host,target_port) VALUES('platform.acme','alice','n1','Test','tcp',20042,'192.0.2.1',443) RETURNING id").fetch_one(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO forwarding_usage_rollups(period_start,node_id,tenant_id,user_id,rule_id,uplink_bytes,downlink_bytes,has_gap) VALUES(date_trunc('day',to_timestamp($1) AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong','n1','platform.acme','alice',$2,30,70,false)").bind(base as f64).bind(rule).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO users (tenant_id, id, uuid) VALUES ('platform.acme', 'bob', 'f6a8d5bb-3a5f-4f61-9b0e-2b7f0d8c4e11')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO grants (app_id, tenant_id, user_id, ingress_id) VALUES ('app-main', 'platform.acme', 'bob', 'ing-a1b2')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let totals = |view: &brocade_store::NodeInflowUsage, source: NodeInflowSource| {
+        view.rows
+            .iter()
+            .filter(|row| row.source == source)
+            .map(|row| (row.uplink_bytes, row.downlink_bytes))
+            .fold((0, 0), |sum, row| (sum.0 + row.0, sum.1 + row.1))
+    };
+    for period in [
+        SiteUsagePeriod::Day,
+        SiteUsagePeriod::Week,
+        SiteUsagePeriod::Month,
+    ] {
+        let view = db
+            .store
+            .node_inflow_usage(&system_admin(), "n1", period)
+            .await
+            .unwrap();
+        assert_eq!(view.period, period);
+        assert_eq!((view.range_start_unix_secs + 8 * 3600) % 86_400, 0);
+        let chain = view
+            .rows
+            .iter()
+            .find(|row| row.source == NodeInflowSource::Chain)
+            .unwrap();
+        assert_eq!(
+            (
+                chain.user_id.as_str(),
+                chain.app_id.as_deref(),
+                chain.chain_id.as_deref(),
+                chain.ingress_id.as_deref(),
+            ),
+            ("alice", Some("app-main"), Some("chn-a1b2-c3d4"), None)
+        );
+        assert_eq!((chain.uplink_bytes, chain.downlink_bytes), (100, 200));
+        assert_eq!(totals(&view, NodeInflowSource::Forwarding), (30, 70));
+        assert_eq!(totals(&view, NodeInflowSource::Unattributed), (0, 0));
+        assert_eq!(
+            view.idle_users
+                .iter()
+                .map(|user| user.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bob"],
+            "granted without inflow is idle, not zero rows"
+        );
+        assert!(view.latest_report_unix_secs.is_some());
+    }
+
+    // The chain was frozen at insert: moving the ingress later does not move its history.
+    sqlx::query("INSERT INTO chains (id, app_id, tenant_id, name, position) VALUES ('chn-later', 'app-main', 'platform.acme', 'Later', 1)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ingresses SET chain_id='chn-later' WHERE id='ing-a1b2'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let frozen = db
+        .store
+        .node_inflow_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+        .await
+        .unwrap();
+    assert!(frozen
+        .rows
+        .iter()
+        .any(|row| row.chain_id.as_deref() == Some("chn-a1b2-c3d4")));
+
+    // An ingress already gone at insert keeps only its id; the bytes are not dropped.
+    sqlx::query("UPDATE usage_user_ingress_rollups SET chain_id=NULL, ingress_id='ing-gone'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let orphan = db
+        .store
+        .node_inflow_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+        .await
+        .unwrap();
+    let row = orphan
+        .rows
+        .iter()
+        .find(|row| row.source == NodeInflowSource::Chain)
+        .unwrap();
+    assert_eq!(
+        (row.chain_id.as_deref(), row.ingress_id.as_deref()),
+        (None, Some("ing-gone"))
+    );
+    assert_eq!((row.uplink_bytes, row.downlink_bytes), (100, 200));
+
+    // Reusing a previously missing ingress id must not assign its old traffic to a new chain.
+    sqlx::query("UPDATE usage_user_ingress_rollups SET ingress_id='ing-a1b2'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let reused = db
+        .store
+        .node_inflow_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+        .await
+        .unwrap();
+    let reused = reused
+        .rows
+        .iter()
+        .find(|row| row.source == NodeInflowSource::Chain)
+        .unwrap();
+    assert_eq!(
+        (reused.chain_id.as_deref(), reused.ingress_id.as_deref()),
+        (None, Some("ing-a1b2"))
+    );
+
+    // Days before per-chain accounting stay whole as the unattributed remainder.
+    sqlx::query("DELETE FROM usage_user_ingress_rollups")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE usage_user_node_rollups SET has_gap=true WHERE node_id='n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let legacy = db
+        .store
+        .node_inflow_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+        .await
+        .unwrap();
+    assert_eq!(totals(&legacy, NodeInflowSource::Chain), (0, 0));
+    assert_eq!(totals(&legacy, NodeInflowSource::Unattributed), (100, 200));
+
+    assert!(legacy
+        .rows
+        .iter()
+        .filter(|row| row.source == NodeInflowSource::Unattributed)
+        .all(|row| row.has_gap));
+
+    // A chain projection larger than the machine projection is reported, never clamped.
+    sqlx::query("INSERT INTO usage_user_ingress_rollups (node_id,period_start,tenant_id,user_id,ingress_id,app_id,chain_id,uplink_bytes,downlink_bytes) SELECT node_id,period_start,tenant_id,user_id,'ing-a1b2','app-main','chn-a1b2-c3d4',uplink_bytes+1,downlink_bytes FROM usage_user_node_rollups")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.store
+            .node_inflow_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+            .await,
+        Err(StoreError::InvalidData(_))
+    ));
+    sqlx::query("UPDATE usage_user_ingress_rollups SET uplink_bytes=uplink_bytes-1")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // Tenant administrators read their own subtree only; other roles are refused.
+    let outside = db
+        .store
+        .node_inflow_usage(&tenant_admin("platform.other"), "n1", SiteUsagePeriod::Day)
+        .await
+        .unwrap();
+    assert!(outside.rows.is_empty() && outside.idle_users.is_empty());
+    let inside = db
+        .store
+        .node_inflow_usage(&tenant_admin("platform"), "n1", SiteUsagePeriod::Day)
+        .await
+        .unwrap();
+    assert!(!inside.rows.is_empty());
+    for actor in [
+        AdminContext::new("public", AdminRole::Readonly, None),
+        publisher("platform.acme"),
+    ] {
+        assert!(matches!(
+            db.store
+                .node_inflow_usage(&actor, "n1", SiteUsagePeriod::Day)
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_inflow_usage_backfill_matches_retained_detail_once() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let base = usage_report_base_unix();
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
+    db.store
+        .record_usage_report("n1", current_usage(generation, 1, base, "epoch", 10, 20))
+        .await
+        .unwrap();
+    let report = current_usage(generation, 2, base + 30, "epoch", 110, 220);
+    db.store
+        .record_usage_report("n1", report.clone())
+        .await
+        .unwrap();
+    // A failed projection rolls back the whole accepted window, including its receipt.
+    sqlx::query("DROP TABLE usage_user_ingress_rollups")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX user_site_usage_hourly_by_node")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .record_usage_report(
+            "n1",
+            current_usage(generation, 3, base + 60, "epoch", 150, 260)
+        )
+        .await
+        .is_err());
+    let script = include_str!("../../../scripts/compat-user-ingress-usage.sql")
+        .lines()
+        .filter(|line| !line.starts_with('\\'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(":\"app_role\"", "postgres");
+    sqlx::raw_sql(&script).execute(db.pool()).await.unwrap();
+    let view = db
+        .store
+        .node_inflow_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+        .await
+        .unwrap();
+    let chain = view
+        .rows
+        .iter()
+        .find(|row| row.source == NodeInflowSource::Chain)
+        .unwrap();
+    assert_eq!(
+        (
+            chain.chain_id.as_deref(),
+            chain.uplink_bytes,
+            chain.downlink_bytes
+        ),
+        (Some("chn-a1b2-c3d4"), 100, 200),
+        "backfill equals the retained detail"
+    );
+    assert!(view
+        .rows
+        .iter()
+        .all(|row| row.source != NodeInflowSource::Unattributed));
+    // psql stops on the error and ends the session; a pooled connection must roll back itself.
+    let mut connection = db.pool().acquire().await.unwrap();
+    assert!(
+        sqlx::raw_sql(&script)
+            .execute(&mut *connection)
+            .await
+            .is_err(),
+        "a second run must fail instead of double counting"
+    );
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    assert!(
+        db.store
+            .record_usage_report("n1", report)
+            .await
+            .unwrap()
+            .duplicate
+    );
+    db.store
+        .record_usage_report(
+            "n1",
+            current_usage(generation, 3, base + 60, "epoch", 150, 260),
+        )
+        .await
+        .unwrap();
+    let after = db
+        .store
+        .node_inflow_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+        .await
+        .unwrap();
+    let chain = after
+        .rows
+        .iter()
+        .find(|row| row.source == NodeInflowSource::Chain)
+        .unwrap();
+    assert_eq!((chain.uplink_bytes, chain.downlink_bytes), (140, 240));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_site_usage_reads_one_machine_across_users_in_scope() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO nodes (
+            id, tenant_id, name, public_ipv4, overlay_addr,
+            wg_private_key, wg_public_key, wg_listen_port,
+            api_port, overlay, egress_allowed,
+            dns_kind, dns_servers
+         ) VALUES (
+            'n2', 'platform.acme', 'Node 2', 'n2.example.net', '10.66.0.2',
+            'wg-private-2', 'wg-public-2', 51820,
+            10085, TRUE, TRUE,
+            'servers', '[\"1.1.1.1\"]'::jsonb
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.other', 'Other')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for (tenant, user, uuid) in [
+        (
+            "platform.acme",
+            "bob",
+            "f6a8d5bb-3a5f-4f61-9b0e-2b7f0d8c4e11",
+        ),
+        (
+            "platform.other",
+            "carol",
+            "0b9c3a39-6c3e-4f5d-8d6c-0c8f3a4d2e77",
+        ),
+    ] {
+        sqlx::query("INSERT INTO users (tenant_id, id, uuid) VALUES ($1, $2, $3::uuid)")
+            .bind(tenant)
+            .bind(user)
+            .bind(uuid)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    let hour: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint / 3600 * 3600")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for (node, tenant, user, site, up, down) in [
+        ("n1", "platform.acme", "alice", "youtube", 10_i64, 90_i64),
+        ("n1", "platform.acme", "bob", "youtube", 5, 5),
+        ("n1", "platform.other", "carol", "youtube", 1, 1),
+        ("n1", "platform.acme", "bob", "netflix", 7, 3),
+        ("n2", "platform.acme", "alice", "youtube", 1000, 1000),
+    ] {
+        sqlx::query("INSERT INTO user_site_usage_hourly (bucket,node_id,tenant_id,user_id,site_id,uplink_bytes,downlink_bytes) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            .bind(hour).bind(node).bind(tenant).bind(user).bind(site).bind(up).bind(down)
+            .execute(db.pool()).await.unwrap();
+    }
+    for (tenant, user, domain, up, down) in [
+        ("platform.acme", "alice", "video.example", 3_i64, 4_i64),
+        ("platform.acme", "bob", "video.example", 1, 2),
+        ("platform.other", "carol", "video.example", 50, 50),
+    ] {
+        sqlx::query("INSERT INTO user_other_domain_hourly (bucket,node_id,tenant_id,user_id,domain,uplink_bytes,downlink_bytes) VALUES ($1,'n1',$2,$3,$4,$5,$6)")
+            .bind(hour).bind(tenant).bind(user).bind(domain).bind(up).bind(down)
+            .execute(db.pool()).await.unwrap();
+    }
+    let view = db
+        .store
+        .node_site_usage(&tenant_admin("platform.acme"), "n1", SiteUsagePeriod::Day)
+        .await
+        .unwrap();
+    assert_eq!(
+        view.usage.expected_nodes, 1,
+        "n1 has an authenticated ingress"
+    );
+    let youtube = view
+        .usage
+        .rows
+        .iter()
+        .find(|row| row.site_id == "youtube")
+        .unwrap();
+    assert_eq!(
+        (youtube.uplink_bytes, youtube.downlink_bytes),
+        (15, 95),
+        "one machine, every user in scope, no other machine and no other tenant"
+    );
+    let carriers = view
+        .top_users
+        .iter()
+        .find(|site| site.site_id == "youtube")
+        .unwrap();
+    assert_eq!(
+        carriers
+            .users
+            .iter()
+            .map(|user| user.user_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alice", "bob"]
+    );
+    assert_eq!(carriers.other_users, 0);
+    let series_total: u64 = view
+        .usage
+        .series
+        .iter()
+        .flat_map(|series| series.points.iter())
+        .map(|point| point.1 + point.2)
+        .sum();
+    assert_eq!(series_total, 15 + 95 + 10);
+    let all = db
+        .store
+        .node_site_usage(&system_admin(), "n1", SiteUsagePeriod::Month)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.usage
+            .rows
+            .iter()
+            .find(|row| row.site_id == "youtube")
+            .map(|row| row.uplink_bytes + row.downlink_bytes),
+        Some(112)
+    );
+    let no_ingress = db
+        .store
+        .node_site_usage(&system_admin(), "n2", SiteUsagePeriod::Day)
+        .await
+        .unwrap();
+    assert_eq!(
+        no_ingress.usage.expected_nodes, 0,
+        "a machine without an authenticated ingress expects no site report"
+    );
+    let domains = db
+        .store
+        .node_other_domains(&tenant_admin("platform.acme"), "n1", SiteUsagePeriod::Day)
+        .await
+        .unwrap();
+    assert_eq!(
+        domains
+            .rows
+            .iter()
+            .map(|row| (row.domain.as_str(), row.uplink_bytes, row.downlink_bytes))
+            .collect::<Vec<_>>(),
+        vec![("video.example", 4, 6)]
+    );
+    for actor in [
+        AdminContext::new("public", AdminRole::Readonly, None),
+        publisher("platform.acme"),
+    ] {
+        assert!(matches!(
+            db.store
+                .node_site_usage(&actor, "n1", SiteUsagePeriod::Day)
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+        assert!(matches!(
+            db.store
+                .node_sniffing_failed_targets(&actor, "n1", SiteUsagePeriod::Day)
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+    }
 }

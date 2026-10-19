@@ -29,6 +29,17 @@ test('订阅弹窗：节点地址是复制按钮，长 IPv6 只截主机、端�
   assert.doesNotMatch(styles, /\.node-insecure/, '「允许 insecure」开关已移进说明行');
 });
 
+test('订阅弹窗：拨测状态灯沿用 .cg-lamp，失败原因写在地址下方，进度铺在按钮底色上', () => {
+  // 状态灯的颜色只来自共享的 .cg-lamp；这里只留同宽的位置，让同列地址对齐。
+  assert.match(desktop, /\.node-copy-lamp\s*\{[^}]*width:\s*7px;[^}]*flex:\s*none;/);
+  assert.doesNotMatch(desktop, /\.node-copy-lamp[^{]*\{[^}]*background/);
+  assert.match(desktop, /\.node-copy\.is-failed\s*\{[^}]*background:[^;]*var\(--err\)/);
+  assert.match(desktop, /\.node-copy-note\s*\{[^}]*color:\s*var\(--err\);[^}]*white-space:\s*normal;/);
+  assert.match(desktop, /\.node-copy\.has-note\s*\{[^}]*height:\s*auto;/);
+  assert.match(desktop, /\.btn\.node-probe-progress\s*\{[^}]*background-size:\s*var\(--progress, 0%\) 100%;/);
+  assert.match(desktop, /\.sub-dialog-foot > span\.node-probe-tally::before\s*\{[^}]*content:\s*none;/);
+});
+
 test('订阅弹窗：窄屏与 useNarrow 同一断点，贴底成为面板，触屏目标放大', () => {
   assert.ok(narrowMax, 'ui/viewport.ts 定义 NARROW_MAX');
   assert.ok(narrow, `窄屏规则写在 @media (max-width: ${narrowMax}px)`);
@@ -41,6 +52,8 @@ test('订阅弹窗：窄屏与 useNarrow 同一断点，贴底成为面板，触
   assert.match(narrow, /\.sub-dialog-foot\s*\{[^}]*var\(--safe-bottom\)/);
   assert.match(narrow, /\.sub-url > button,\s*\.sub-url > \.sub-url-copy\s*\{[^}]*height:\s*44px;/);
   assert.match(narrow, /\.node-copy\s*\{[^}]*height:\s*40px;/);
+  assert.match(narrow, /\.node-copy-all,\s*\.node-probe-all,\s*\.node-probe-retry\s*\{[^}]*height:\s*44px;/);
+  assert.match(narrow, /\.btn\.node-group-run\s*\{[^}]*min-height:\s*40px;/);
   // iOS 聚焦字号小于 16px 的表单控件会放大页面。
   assert.match(dialog, /\.sub-pick > select\s*\{[^}]*font-size:\s*16px;/);
 });

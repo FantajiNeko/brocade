@@ -2,35 +2,14 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::Router;
 use brocade_console::http::{
-    admin_router_with_services, agent_router_with_origin_realtime_and_shutdown,
-    merged_router_with_wakes_and_realtime, with_console_branding, with_console_static,
-    with_console_static_dir, BootstrapCredential, ConsoleServices,
+    admin_router_with_services, merged_router_with_wakes_and_realtime, with_console_branding,
+    with_console_static, with_console_static_dir, BootstrapCredential, ConsoleServices,
 };
 use brocade_console::lifecycle::{
     serve_http_surfaces, ShutdownOutcome, ShutdownSignal, DEFAULT_SHUTDOWN_GRACE,
 };
 use brocade_store::PgStore;
 use tokio::sync::Notify;
-
-/// Raw cumulative history is short-lived diagnostic evidence; billing uses durable counter heads.
-const USAGE_READING_RETAIN_DAYS: u32 = 1;
-/// Retry responses have an independent lifetime, not the raw diagnostic history's cutoff.
-const USAGE_RECEIPT_RETAIN_DAYS: u32 = 7;
-const USAGE_SAMPLE_RETAIN_DAYS: u32 = 7;
-
-/// How long telemetry is retained: a week lets operators look back at an incident after a weekend.
-/// These finished observations are independent of the shorter raw accounting diagnostic history.
-///
-/// This is the first knob to turn if the tables get heavy. Shortening it costs history; shortening
-/// the sampling interval instead would cost the resolution that makes a CPU spike visible at all,
-/// which is the one thing this data is for.
-const LOAD_SAMPLE_RETAIN_DAYS: u32 = 7;
-const PING_PROBE_RETAIN_DAYS: u32 = 7;
-// Serving and directory reads use `vpngate_candidate_probe_latest`; the append-only copy is only
-// for short incident reconstruction. Keeping one day gives an operator the complete lead-up to a
-// problem without making current selection pay for a week of high-cardinality probe history.
-const VPNGATE_CANDIDATE_RETAIN_DAYS: u32 = 1;
-const VPNGATE_OBSERVATION_RETAIN_DAYS: u32 = 2;
 
 /// How often quotas are checked. Usage reports in 30-second windows, so anything denser has no new
 /// data to look at; with the agent's 15-second fetch interval, going over to being cut off takes
@@ -202,8 +181,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
+            let schedule = match readings_pruner.retention_schedule().await {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    eprintln!("retention: 读取保留策略失败：{error}");
+                    continue;
+                }
+            };
             match readings_pruner
-                .prune_usage_readings(USAGE_READING_RETAIN_DAYS)
+                .prune_configured_usage_readings(&schedule)
                 .await
             {
                 Ok(0) => {}
@@ -222,73 +208,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
-            match pruner
-                .prune_usage_report_receipts(USAGE_RECEIPT_RETAIN_DAYS)
-                .await
-            {
+            let schedule = match pruner.retention_schedule().await {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    eprintln!("retention: 读取保留策略失败：{error}");
+                    continue;
+                }
+            };
+            match pruner.prune_configured_usage_receipts(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("usage: 清掉 {rows} 条过期回执"),
                 Err(error) => eprintln!("usage: 清理回执失败：{error}"),
             }
-            match pruner.prune_usage_samples(USAGE_SAMPLE_RETAIN_DAYS).await {
+            match pruner.prune_configured_usage_history(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("usage: 清掉 {rows} 条已汇总明细"),
                 Err(error) => eprintln!("usage: 清理明细失败：{error}"),
             }
-            match pruner.prune_load_samples(LOAD_SAMPLE_RETAIN_DAYS).await {
+            match pruner.prune_configured_load_history(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("load: 清掉 {rows} 条过期遥测"),
                 Err(error) => eprintln!("load: 清理遥测失败：{error}"),
             }
-            match pruner
-                .prune_node_ping_probe_samples(PING_PROBE_RETAIN_DAYS)
-                .await
-            {
+            match pruner.prune_configured_ping_history(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("ping: 清掉 {rows} 条过期探测"),
                 Err(error) => eprintln!("ping: 清理探测失败：{error}"),
             }
-            match pruner
-                .prune_vpngate_history(
-                    VPNGATE_CANDIDATE_RETAIN_DAYS,
-                    VPNGATE_OBSERVATION_RETAIN_DAYS,
-                )
-                .await
-            {
+            match pruner.prune_configured_e2e_history(&schedule).await {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("probe: 清掉 {rows} 条过期端到端探测"),
+                Err(error) => eprintln!("probe: 清理端到端探测失败：{error}"),
+            }
+            match pruner.prune_configured_vpngate_history(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("vpngate: 清掉 {rows} 条过期观测"),
                 Err(error) => eprintln!("vpngate: 清理观测失败：{error}"),
             }
-            match pruner
-                .prune_node_public_ip_events(brocade_store::PUBLIC_IP_EVENT_RETENTION_DAYS)
-                .await
-            {
+            match pruner.prune_configured_public_ip_history(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("public-ip: 清掉 {rows} 条过期变更事件"),
                 Err(error) => eprintln!("public-ip: 清理变更事件失败：{error}"),
             }
-            match pruner
-                .prune_machine_events(brocade_store::MACHINE_EVENT_RETENTION_DAYS)
-                .await
-            {
+            match pruner.prune_configured_machine_events(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("notifications: 清掉 {rows} 条过期机器事件"),
                 Err(error) => eprintln!("notifications: 清理机器事件失败：{error}"),
             }
-            match pruner
-                .prune_user_online_sources(brocade_store::USER_ONLINE_SOURCE_RETENTION_DAYS)
-                .await
-            {
+            match pruner.prune_configured_online_sources(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("presence: 清掉 {rows} 条过期来源"),
                 Err(error) => eprintln!("presence: 清理来源失败：{error}"),
             }
-            match pruner
-                .prune_machine_traffic_forecasts(
-                    brocade_store::MACHINE_TRAFFIC_FORECAST_RETENTION_DAYS,
-                )
-                .await
-            {
+            match pruner.prune_configured_traffic_forecasts(&schedule).await {
                 Ok(0) => {}
                 Ok(rows) => eprintln!("traffic: 清掉 {rows} 条过期流量预测"),
                 Err(error) => eprintln!("traffic: 清理流量预测失败：{error}"),
@@ -374,6 +346,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(error) => eprintln!("quota: 这一轮失败：{error}"),
             }
+            match quota_store.enforce_forwarding_quotas().await {
+                Ok(outcome) if outcome.suspended > 0 || outcome.restored > 0 => eprintln!(
+                    "forwarding quota: 暂停 {}、恢复 {} 个用户/机器配额，已创建自动化工单",
+                    outcome.suspended, outcome.restored
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!("forwarding quota: 自动化评估失败：{error}"),
+            }
         }
     });
 
@@ -434,13 +414,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let outcome = match agent_listener {
         // Split: the console keeps the static fallback, the agent face is on its own.
         Some(agent_listener) => {
+            let agent = admin_services
+                .clone()
+                .agent_router(store.clone(), agent_origin);
             let admin = with_console(admin_router_with_services(store.clone(), admin_services));
-            let agent = agent_router_with_origin_realtime_and_shutdown(
-                store,
-                agent_origin,
-                realtime,
-                shutdown.clone(),
-            );
             serve_http_surfaces(
                 (admin_listener, admin),
                 Some((agent_listener, agent)),

@@ -67,8 +67,6 @@ const RUNS_SHOWN = 5;
 
 const isActive = (run: TunnelProbeRun | null | undefined) => run?.status === 'queued' || run?.status === 'running';
 const intervalText = (seconds: number) => INTERVALS.find(option => option.value === seconds)?.label ?? `${seconds} 秒`;
-const dateText = (seconds: number | null) =>
-  seconds === null ? '—' : new Date(seconds * 1000).toLocaleString('zh-CN', { hour12: false });
 
 const two = (value: number) => String(value).padStart(2, '0');
 /** HH:MM for today, MM-DD HH:MM otherwise; probe records span at most the retention week. */
@@ -93,10 +91,6 @@ function sinceText(seconds: number, nowMs = Date.now()): string {
   if (elapsed < 3_600) return `${Math.round(elapsed / 60)} 分钟前`;
   if (elapsed < 86_400) return `${Math.round(elapsed / 3_600)} 小时前`;
   return `${Math.round(elapsed / 86_400)} 天前`;
-}
-
-function HealthBadge({ health }: { health: TunnelProbeHealth }) {
-  return <span className={`tunnel-probe-health ${health}`}>{healthText[health]}</span>;
 }
 
 export const tunnelProbeQueryKey = (tenantId: string, outboundId: string, windowSecs: number) =>
@@ -800,105 +794,6 @@ export function TunnelProbePanel({
         onEdit={() => setPolicyOpen(true)}
       />
       {policyOpen && view && <TunnelProbePolicyDialog item={view.item} onClose={() => setPolicyOpen(false)} />}
-    </section>
-  );
-}
-
-export function TunnelProbeSettingsSection({ editable }: { editable: boolean }) {
-  const qc = useQueryClient();
-  const [editing, setEditing] = useState<TunnelProbeListItem | null>(null);
-  const probes = useQuery({
-    queryKey: ['tunnel-probes'],
-    queryFn: fetchTunnelProbes,
-    staleTime: 30_000,
-    refetchInterval: 30_000,
-  });
-  const capability = useQuery({
-    queryKey: ['tunnel-probe-capability'],
-    queryFn: fetchTunnelProbeCapability,
-    staleTime: 60_000,
-  });
-  const toggle = useMutation({
-    mutationFn: ({ item, enabled }: { item: TunnelProbeListItem; enabled: boolean }) =>
-      updateTunnelProbePolicy(item.tenant_id, item.outbound_id, {
-        enabled,
-        interval_secs: item.policy?.interval_secs ?? 300,
-        timeout_secs: item.policy?.timeout_secs ?? 10,
-      }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['tunnel-probes'] }),
-  });
-
-  // Both reads are required to describe this section. On the initial mount, extend the settings
-  // page's existing loading boundary instead of replacing this one section with a second skeleton.
-  if (probes.isPending || capability.isPending) return <Loading variant="settings" />;
-  const items = probes.data?.items.filter(item => item.supported) ?? [];
-
-  return (
-    <section className="panel config-panel tunnel-probe-settings" id="set-tunnel-probes">
-      <header>
-        <PanelTitle of="tunnels">隧道定时监测</PanelTitle>
-        <span className="tunnel-probe-setting-count">{items.length} 条隧道</span>
-      </header>
-      <p className="cardsub">由 Console 定时验证隧道可用性</p>
-      {probes.error || capability.error ? (
-        <ErrorBox error={probes.error ?? capability.error} />
-      ) : (
-        <div className="setgrp settings-block tunnel-probe-setting-content">
-          <p className="eyebrow">执行环境</p>
-          <div className="tunnel-probe-setting-facts">
-            <span>Console</span>
-            <code>{probes.data!.endpoint_url}</code>
-            <b>{capability.data?.available ? `Xray ${capability.data.version ?? ''}` : '不可用'}</b>
-          </div>
-          {capability.data && !capability.data.available && (
-            <p className="tunnel-probe-warning">{capability.data.reason ?? 'Console 拨测组件不可用'}</p>
-          )}
-          {toggle.error && <ErrorBox error={toggle.error} />}
-          <p className="eyebrow tunnel-probe-setting-list-title">监测隧道</p>
-          <div className="tunnel-probe-setting-list">
-            {items.map(item => {
-              const busy = toggle.isPending && toggle.variables.item.outbound_id === item.outbound_id;
-              return (
-                <article className="tunnel-probe-setting-row" key={`${item.tenant_id}/${item.outbound_id}`}>
-                  <span className="tunnel-probe-setting-name">
-                    <b>{item.name}</b>
-                    <small>
-                      {item.tenant_id} · {item.protocol}
-                    </small>
-                  </span>
-                  <HealthBadge health={item.health} />
-                  <span className="tunnel-probe-setting-schedule">
-                    <b>{item.policy?.enabled ? intervalText(item.policy.interval_secs) : '未启用'}</b>
-                    <small>
-                      {item.policy?.enabled
-                        ? `下次 ${dateText(item.policy.next_run_at_unix_secs)}`
-                        : (item.unsupported_reason ?? '可随时手动拨测')}
-                    </small>
-                  </span>
-                  <label className={`switch${!item.supported || !editable ? ' disabled' : ''}`}>
-                    <input
-                      type="checkbox"
-                      checked={item.policy?.enabled ?? false}
-                      disabled={!item.supported || !editable || busy}
-                      aria-label={`${item.name} 定时监测`}
-                      onChange={event => toggle.mutate({ item, enabled: event.target.checked })}
-                    />
-                    <span className="switch-ui">
-                      <span />
-                    </span>
-                    <span className="switch-label">{busy ? '保存中' : item.policy?.enabled ? '已启用' : '已暂停'}</span>
-                  </label>
-                  <button className="btn" disabled={!item.supported || !editable} onClick={() => setEditing(item)}>
-                    设置
-                  </button>
-                </article>
-              );
-            })}
-            {items.length === 0 && <p className="tunnel-probe-inline-empty">还没有可监测的隧道。</p>}
-          </div>
-        </div>
-      )}
-      {editing && <TunnelProbePolicyDialog item={editing} onClose={() => setEditing(null)} />}
     </section>
   );
 }

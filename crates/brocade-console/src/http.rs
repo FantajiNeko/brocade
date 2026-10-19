@@ -52,19 +52,21 @@ use brocade_store::{
     CreateXrayReleaseRequest, DeleteFrontRequest, DistributionSettings, E2eProbeItem,
     E2eProbeRequest, ForwardingEntitlementWrite, ForwardingRuleWrite, HostNetworkTuning,
     IsolateDeploymentTargetRequest, IsolateNodeRequest, LinkHealthRequest, LinkProbeRequest,
-    LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, PgStore, PhantunBinaries,
-    PingProbeReportRequest, PingProbeSettings, ProvisionNodeRequest, ProvisionNodeResult,
-    ProvisionedNode, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
-    RemoveWarpBindingRequest, RequestVpngatePoolSwitch, SetUserAppQuotaRequest,
-    SetUserPasswordRequest, StoreError, SystemInitRequest, TunnelProbeSource,
-    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
+    LoadReportRequest, LoadSeriesQuery, ModelOp, NodeLifecyclePhase, OnboardingCheckpointRequest,
+    OnboardingProbeEvidence, PgStore, PhantunBinaries, PingProbeReportRequest, PingProbeSettings,
+    ProvisionNodeRequest, ProvisionNodeResult, ProvisionedNode, RegisterWarpBindingRequest,
+    RemoveRetiredNodesRequest, RemoveWarpBindingRequest, RequestVpngatePoolSwitch,
+    SetUserAppQuotaRequest, SetUserPasswordRequest, StoreError, SystemInitRequest,
+    TunnelProbeSource, UpdateAgentLogDefaultRequest, UpdateDataRetentionPolicy,
+    UpdateNodeLogPolicyRequest, UpdateNodeRegionRequest, UpdateNodeRequest,
     UpdateNodeStatusRequest, UpdateNodeTrafficRequest, UpdateTunnelProbePolicy,
-    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateVpngateCatalogSettings,
-    UpdateVpngateIntelligenceCredentials, UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode,
-    UpdateVpngateProbeSettings, UpdateWarpBindingRequest, UserDirectLoginRequest,
-    UserTrafficHistoryScope, VerifyDeploymentRequest, VpngateAdmissionPolicy,
-    VpngateIntelligencePolicy, VpngateProbeNodeOrigin, VpngateServerPageRequest, VpngateSyncClaim,
-    XrayBuildInfo, XrayReleaseArtifact, XrayReleaseSummary, PUBLIC_OPERATOR_ID,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateVpngateCatalogNode,
+    UpdateVpngateCatalogSettings, UpdateVpngateIntelligenceCredentials,
+    UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode, UpdateVpngateProbeSettings,
+    UpdateWarpBindingRequest, UserDirectLoginRequest, UserTrafficHistoryScope,
+    VerifyDeploymentRequest, VpngateAdmissionPolicy, VpngateIntelligencePolicy,
+    VpngateProbeNodeOrigin, VpngateServerPageRequest, VpngateSyncClaim, XrayBuildInfo,
+    XrayReleaseArtifact, XrayReleaseSummary, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -311,6 +313,7 @@ pub struct AppState {
     // On-demand authorization verification. Jobs and their latest results are intentionally
     // process-local: this is an operator action, not durable health telemetry.
     grant_probes: crate::grant_probe::GrantProbeService,
+    forwarding_probes: crate::forwarding_probe::Service,
     // One process-local live channel shared by the admin and Agent route trees. It contains no
     // durable samples; persistence is limited to the policy stored by PgStore.
     realtime: crate::realtime::RealtimeService,
@@ -330,12 +333,14 @@ struct SubscriptionRateWindow {
 ///
 /// Grouping them keeps router construction explicit without making every new service another
 /// positional argument. Durable state remains in [`PgStore`], which is passed separately.
+#[derive(Clone)]
 pub struct ConsoleServices {
     quota_wake: Arc<Notify>,
     grants_wake: Arc<Notify>,
     cert_wake: Arc<Notify>,
     geoip: crate::geoip::GeoIpLookup,
     realtime: crate::realtime::RealtimeService,
+    forwarding_probes: crate::forwarding_probe::Service,
     bootstrap_credential: Option<BootstrapCredential>,
     shutdown: crate::lifecycle::ShutdownSignal,
 }
@@ -354,6 +359,7 @@ impl ConsoleServices {
             cert_wake,
             geoip,
             realtime,
+            forwarding_probes: Default::default(),
             bootstrap_credential: None,
             shutdown: crate::lifecycle::ShutdownSignal::new(),
         }
@@ -367,6 +373,17 @@ impl ConsoleServices {
     pub fn and_shutdown(mut self, shutdown: crate::lifecycle::ShutdownSignal) -> Self {
         self.shutdown = shutdown;
         self
+    }
+
+    /// Split listeners must share process-local diagnostics, just as they share realtime state.
+    pub fn agent_router(self, store: PgStore, agent_origin: String) -> Router {
+        let mut state = AppState::with_agent_origin(store, Arc::new(Notify::new()), agent_origin)
+            .and_realtime(self.realtime)
+            .and_shutdown(self.shutdown);
+        state.forwarding_probes = self.forwarding_probes;
+        agent_routes()
+            .route("/healthz", get(healthz))
+            .with_state(state)
     }
 }
 
@@ -509,6 +526,7 @@ impl AppState {
             // route instead of failing to construct.
             cert_wake: Arc::new(Notify::new()),
             grant_probes: crate::grant_probe::GrantProbeService::from_env(),
+            forwarding_probes: crate::forwarding_probe::Service::default(),
             realtime: crate::realtime::RealtimeService::new(Default::default()),
             shutdown: crate::lifecycle::ShutdownSignal::new(),
             dist: AgentDistribution {
@@ -701,15 +719,16 @@ pub fn admin_router_with_bootstrap_credential(
 
 /// Build the administrative face with every process-local worker service.
 pub fn admin_router_with_services(store: PgStore, services: ConsoleServices) -> Router {
-    admin_router_with_state(
-        AppState::with_quota_wake(store, services.quota_wake)
-            .and_grants_wake(services.grants_wake)
-            .and_cert_wake(services.cert_wake)
-            .and_geoip(services.geoip)
-            .and_realtime(services.realtime)
-            .and_shutdown(services.shutdown)
-            .and_bootstrap_credential(services.bootstrap_credential),
-    )
+    let forwarding_probes = services.forwarding_probes.clone();
+    let mut state = AppState::with_quota_wake(store, services.quota_wake)
+        .and_grants_wake(services.grants_wake)
+        .and_cert_wake(services.cert_wake)
+        .and_geoip(services.geoip)
+        .and_realtime(services.realtime)
+        .and_shutdown(services.shutdown)
+        .and_bootstrap_credential(services.bootstrap_credential);
+    state.forwarding_probes = forwarding_probes;
+    admin_router_with_state(state)
 }
 
 pub fn merged_router_with_wakes(
@@ -732,13 +751,14 @@ pub fn merged_router_with_wakes_and_realtime(
     agent_origin: String,
     services: ConsoleServices,
 ) -> Router {
-    let state = AppState::with_agent_origin(store, services.quota_wake, agent_origin)
+    let mut state = AppState::with_agent_origin(store, services.quota_wake, agent_origin)
         .and_grants_wake(services.grants_wake)
         .and_cert_wake(services.cert_wake)
         .and_geoip(services.geoip)
         .and_realtime(services.realtime)
         .and_shutdown(services.shutdown)
         .and_bootstrap_credential(services.bootstrap_credential);
+    state.forwarding_probes = services.forwarding_probes;
     admin_router_with_state(state.clone()).merge(agent_routes().with_state(state))
 }
 
@@ -872,6 +892,8 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/usage/samples",
         "/usage/monthly-summary",
         "/realtime/nodes/events",
+        "/realtime/fleet-traffic/events",
+        "/realtime/fleet-traffic/snapshot",
         "/vpngate",
         "/vpngate/runtimes",
     ];
@@ -937,6 +959,10 @@ fn is_user_forwarding_path(method: &axum::http::Method, path: &str) -> bool {
         return false;
     }
     match parts.as_slice() {
+        [_, _, "forwarding", "tcp-pings"] => method == axum::http::Method::GET,
+        [_, _, "forwarding", rule_id, "tcp-ping"] => {
+            rule_id.parse::<i64>().is_ok_and(|id| id > 0) && method == axum::http::Method::POST
+        }
         [_, _, "forwarding"] => {
             method == axum::http::Method::GET || method == axum::http::Method::POST
         }
@@ -1120,6 +1146,11 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/auth/logout", post(auth_logout))
         .route("/visitor-access", put(set_visitor_access))
         .route("/bootstrap", get(bootstrap))
+        .route(
+            "/onboarding",
+            get(get_onboarding).put(checkpoint_onboarding),
+        )
+        .route("/onboarding/complete", post(complete_onboarding))
         .route("/whoami", get(whoami))
         // Public read: the login page must know its name and mark before a session exists. Writes
         // still require a system administrator in the handler below.
@@ -1131,7 +1162,27 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/realtime/settings",
             get(get_realtime_settings).put(update_realtime_settings),
         )
+        .route(
+            "/site-usage/settings",
+            get(get_site_usage_policy).put(update_site_usage_policy),
+        )
+        .route(
+            "/other-domain/settings",
+            get(get_other_domain_policy).put(update_other_domain_policy),
+        )
+        .route(
+            "/sniffing-failed/settings",
+            get(get_sniffing_failed_policy).put(update_sniffing_failed_policy),
+        )
         .route("/realtime/nodes/events", get(realtime_fleet_events))
+        .route(
+            "/realtime/fleet-traffic/events",
+            get(realtime_fleet_traffic_events),
+        )
+        .route(
+            "/realtime/fleet-traffic/snapshot",
+            get(realtime_fleet_traffic_snapshot),
+        )
         .route(
             "/realtime/nodes/{node_id}/events",
             get(realtime_node_events),
@@ -1167,6 +1218,10 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/agent-log-policy/nodes/{node_id}",
             put(update_node_log_policy),
         )
+        // Database retention is live operational policy. The Store exposes only its compiled
+        // bounded-data allow-list, never arbitrary relation names supplied by the browser.
+        .route("/data-retention", get(get_data_retention))
+        .route("/data-retention/{table_name}", put(update_data_retention))
         // Kernel NIC/NAPI coalescing is live operational state. Agents persist and reconcile it
         // from every desired-state response; saving here creates no model revision or Xray restart.
         .route(
@@ -1263,6 +1318,15 @@ fn admin_router_with_state(state: AppState) -> Router {
             "/nodes/{node_id}/public-ip-history",
             get(node_public_ip_history),
         )
+        // Machine detail traffic statistics: signed-in operators only, never cached, never in the
+        // visitor or ordinary-user allowlists.
+        .route("/nodes/{node_id}/inflow-usage", get(node_inflow_usage))
+        .route("/nodes/{node_id}/site-usage", get(node_site_usage))
+        .route("/nodes/{node_id}/other-domains", get(node_other_domains))
+        .route(
+            "/nodes/{node_id}/sniffing-failed-targets",
+            get(node_sniffing_failed_targets),
+        )
         .route("/artifacts/index", get(artifact_index))
         .route(
             "/artifacts/content/{target_kind}/{target_id}/{artifact_kind}",
@@ -1295,12 +1359,17 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(retry_target),
         )
         .route(
+            "/deployments/{deployment_id}/targets/{node_id}/xray-handoff/force",
+            post(force_config_xray_retirement),
+        )
+        .route(
             "/deployments/{deployment_id}/targets/{node_id}/isolate",
             post(isolate_deployment_target),
         )
         .route("/nodes/provision", post(provision_node))
         .route("/nodes", delete(remove_retired_nodes))
         .route("/nodes/{node_id}", put(update_node))
+        .route("/nodes/{node_id}/region", put(update_node_region))
         .route("/nodes/{node_id}/status", put(update_node_status))
         .route("/nodes/{node_id}/isolate", post(isolate_node))
         .route("/nodes/{node_id}/lifecycle/abandon", post(abandon_node))
@@ -1324,6 +1393,22 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/users/{tenant_id}/{user_id}/realtime/history",
             get(realtime_user_history),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/machine-usage",
+            get(user_machine_usage),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/site-usage",
+            get(user_site_usage),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/other-domains",
+            get(user_other_domains),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/sniffing-failed-targets",
+            get(user_sniffing_failed_targets),
         )
         .route(
             "/users/{tenant_id}/{user_id}/presence-history",
@@ -1362,12 +1447,28 @@ fn admin_router_with_state(state: AppState) -> Router {
             get(user_forwarding_overview).post(create_user_forwarding_rule),
         )
         .route(
+            "/users/{tenant_id}/{user_id}/forwarding/tcp-pings",
+            get(user_forwarding_probes),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/forwarding/{rule_id}/tcp-ping",
+            post(start_user_forwarding_probe),
+        )
+        .route(
             "/users/{tenant_id}/{user_id}/forwarding/{rule_id}",
             put(update_user_forwarding_rule).delete(delete_user_forwarding_rule),
         )
         .route(
             "/users/{tenant_id}/{user_id}/forwarding-nodes/{node_id}",
             put(set_user_forwarding_entitlement).delete(delete_user_forwarding_entitlement),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/forwarding-nodes/{node_id}/quota",
+            put(set_user_forwarding_quota),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/forwarding-nodes/{node_id}/quota/jobs",
+            get(user_forwarding_quota_jobs),
         )
         .route(
             "/users/{tenant_id}/{user_id}/grant-probes",
@@ -1432,6 +1533,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/vpngate/probe-nodes/{node_id}",
             put(update_vpngate_probe_node),
+        )
+        .route(
+            "/vpngate/catalog-nodes/{node_id}",
+            put(update_vpngate_catalog_node),
         )
         .route(
             "/vpngate/intelligence-nodes/{node_id}",
@@ -1642,6 +1747,10 @@ fn agent_routes() -> Router<AppState> {
         )
         .route("/agent/v1/observation", post(agent_observation))
         .route("/agent/v1/runtime", post(agent_runtime))
+        .route(
+            "/agent/v1/xray-handoff/force",
+            post(agent_config_xray_force_retirement),
+        )
         .route("/agent/v1/agent-release", get(agent_release))
         .route("/agent/v1/agent-release/report", post(agent_release_report))
         .route("/agent/v1/xray-release", get(agent_xray_release))
@@ -1649,7 +1758,18 @@ fn agent_routes() -> Router<AppState> {
             "/agent/v1/xray-release/report",
             post(agent_xray_release_report),
         )
-        .route("/agent/v1/usage", post(agent_usage))
+        .route(
+            "/agent/v1/usage",
+            post(agent_usage).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/agent/v1/other-domain-usage",
+            post(agent_other_domain_usage).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/agent/v1/sniffing-failed-usage",
+            post(agent_sniffing_failed_usage).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route(
             "/agent/v1/forwarding/desired",
             get(agent_forwarding_desired),
@@ -1659,6 +1779,14 @@ fn agent_routes() -> Router<AppState> {
             post(agent_forwarding_reconcile),
         )
         .route("/agent/v1/forwarding/usage", post(agent_forwarding_usage))
+        .route(
+            "/agent/v1/forwarding/tcp-ping-target",
+            get(agent_forwarding_probe_target),
+        )
+        .route(
+            "/agent/v1/forwarding/tcp-ping-report",
+            post(agent_forwarding_probe_report),
+        )
         .route("/agent/v1/load", post(agent_load))
         .route("/agent/v1/realtime", get(agent_realtime))
         .route(
@@ -2228,6 +2356,96 @@ async fn bootstrap(State(state): State<AppState>, headers: HeaderMap) -> ApiResu
     Ok(response)
 }
 
+async fn get_onboarding(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(state.store.onboarding(&actor).await?).into_response())
+}
+
+async fn checkpoint_onboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<OnboardingCheckpointRequest>,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(state.store.checkpoint_onboarding(&actor, request).await?).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompleteOnboardingRequest {
+    probe_id: String,
+    item_id: String,
+}
+
+async fn complete_onboarding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CompleteOnboardingRequest>,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let onboarding = state.store.onboarding(&actor).await?;
+    let tenant_id = onboarding.user_tenant_id.ok_or_else(|| {
+        ApiError::Store(StoreError::Conflict(
+            "onboarding has no committed first user".to_owned(),
+        ))
+    })?;
+    let user_id = onboarding.user_id.ok_or_else(|| {
+        ApiError::Store(StoreError::Conflict(
+            "onboarding has no committed first user".to_owned(),
+        ))
+    })?;
+    let job = state
+        .grant_probes
+        .snapshot_for(&request.probe_id)
+        .ok_or_else(|| {
+            ApiError::Store(StoreError::NotFound(format!(
+                "grant probe {}",
+                request.probe_id
+            )))
+        })?;
+    if job.kind != "grant" || job.tenant_id != tenant_id || job.user_id != user_id {
+        return Err(ApiError::Store(StoreError::Conflict(
+            "probe does not belong to the onboarding user".to_owned(),
+        )));
+    }
+    if !state
+        .store
+        .user_grant_probe_generation_matches(job.serving_generation)
+        .await?
+    {
+        return Err(ApiError::Store(StoreError::Conflict(
+            "Serving authorization changed after this probe; run it again".to_owned(),
+        )));
+    }
+    let item = job
+        .items
+        .iter()
+        .find(|item| item.id == request.item_id)
+        .ok_or_else(|| {
+            ApiError::Store(StoreError::NotFound(format!(
+                "grant probe item {}",
+                request.item_id
+            )))
+        })?;
+    if item.status != "passed"
+        || onboarding.app_id.as_deref() != Some(&item.app_id)
+        || onboarding.chain_id.as_deref() != Some(&item.chain_id)
+        || onboarding.ingress_id.as_deref() != Some(&item.ingress_id)
+    {
+        return Err(ApiError::Store(StoreError::Conflict(
+            "probe item is not a successful result for the onboarding ingress".to_owned(),
+        )));
+    }
+    let evidence = OnboardingProbeEvidence {
+        probe_id: job.id,
+        item_id: item.id.clone(),
+        serving_generation: job.serving_generation,
+        protocol: item.protocol.to_owned(),
+        family: item.family.to_owned(),
+    };
+    Ok(Json(state.store.complete_onboarding(&actor, evidence).await?).into_response())
+}
+
 #[derive(Debug, Deserialize)]
 struct RevisionQuery {
     revision: Option<u64>,
@@ -2381,11 +2599,13 @@ async fn node_agent_state(
             .countries(&settings.geodata.geoip_url, &addresses)
             .await;
         for node in &mut result.nodes {
-            node.public_ipv4_country = node
+            let detected = node
                 .public_ipv4
                 .as_ref()
                 .and_then(|address| countries.get(address))
                 .cloned();
+            node.public_ipv4_country_detected = detected.clone();
+            node.public_ipv4_country = node.public_ipv4_country_override.clone().or(detected);
         }
     }
     Ok(Json(result).into_response())
@@ -2473,6 +2693,68 @@ async fn get_realtime_settings(
 ) -> ApiResult<Response> {
     let _admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(Json(state.store.realtime_telemetry_policy().await?).into_response())
+}
+
+async fn get_other_domain_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let _admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(state.store.other_domain_policy().await?))
+}
+
+async fn get_sniffing_failed_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let _admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(state.store.sniffing_failed_policy().await?))
+}
+async fn update_sniffing_failed_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<brocade_deployment::sniffing_failed::SniffingFailedPolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .update_sniffing_failed_policy(&admin, policy)
+            .await?,
+    ))
+}
+
+async fn update_other_domain_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<brocade_deployment::other_domain::OtherDomainPolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .update_other_domain_policy(&admin, policy)
+            .await?,
+    ))
+}
+
+async fn get_site_usage_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let _admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(state.store.site_usage_policy().await?))
+}
+
+async fn update_site_usage_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(policy): Json<brocade_deployment::site_usage::SiteUsagePolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(no_store_json(
+        state.store.update_site_usage_policy(&admin, policy).await?,
+    ))
 }
 
 async fn update_realtime_settings(
@@ -2671,12 +2953,7 @@ async fn realtime_node_user_history(
     Query(query): Query<UserTrafficHistoryQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    let visible = state.store.list_node_agent_states(&admin).await?;
-    if !visible.nodes.iter().any(|node| node.node_id == node_id) {
-        return Err(ApiError::Store(StoreError::NotFound(format!(
-            "node {node_id}"
-        ))));
-    }
+    require_visible_node(&state, &admin, &node_id).await?;
     let history = state
         .store
         .list_user_traffic_history(
@@ -2713,6 +2990,154 @@ async fn realtime_user_history(
     Ok(no_store_json(history))
 }
 
+/// `period=day|week|month` (default day); an unknown value is rejected with 400.
+#[derive(Deserialize)]
+struct UserSiteUsageQuery {
+    #[serde(default)]
+    period: brocade_deployment::site_usage::SiteUsagePeriod,
+}
+
+async fn user_other_domains(
+    State(state): State<AppState>,
+    Path((tenant, user)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .user_other_domains(&admin, &tenant, &user, query.period)
+            .await?,
+    ))
+}
+
+async fn user_sniffing_failed_targets(
+    State(state): State<AppState>,
+    Path((tenant, user)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .user_sniffing_failed_targets(&admin, &tenant, &user, query.period)
+            .await?,
+    ))
+}
+
+async fn user_machine_usage(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .user_machine_usage(&admin, &tenant_id, &user_id, query.period)
+            .await?,
+    ))
+}
+
+async fn user_site_usage(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .user_site_usage(&admin, &tenant_id, &user_id, query.period)
+            .await?,
+    ))
+}
+
+/// Machine-scoped user statistics read the same machine list as the machine page: a machine the
+/// caller cannot see does not exist for them.
+async fn require_visible_node(
+    state: &AppState,
+    admin: &AdminContext,
+    node_id: &str,
+) -> ApiResult<()> {
+    let visible = state.store.list_node_agent_states(admin).await?;
+    if visible.nodes.iter().any(|node| node.node_id == node_id) {
+        Ok(())
+    } else {
+        Err(ApiError::Store(StoreError::NotFound(format!(
+            "node {node_id}"
+        ))))
+    }
+}
+
+async fn node_inflow_usage(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    require_visible_node(&state, &admin, &node_id).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .node_inflow_usage(&admin, &node_id, query.period)
+            .await?,
+    ))
+}
+
+async fn node_site_usage(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    require_visible_node(&state, &admin, &node_id).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .node_site_usage(&admin, &node_id, query.period)
+            .await?,
+    ))
+}
+
+async fn node_other_domains(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    require_visible_node(&state, &admin, &node_id).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .node_other_domains(&admin, &node_id, query.period)
+            .await?,
+    ))
+}
+
+async fn node_sniffing_failed_targets(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<UserSiteUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    require_visible_node(&state, &admin, &node_id).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .node_sniffing_failed_targets(&admin, &node_id, query.period)
+            .await?,
+    ))
+}
+
 /// Recent history changes every 30 seconds; a cached copy would hide the newest window.
 fn no_store_json(value: impl Serialize) -> Response {
     let mut response = Json(value).into_response();
@@ -2736,6 +3161,87 @@ async fn realtime_fleet_events(
         .map(|node| node.node_id)
         .collect::<Vec<_>>();
     realtime_events_response(&state, nodes, role_masks_assets(admin.role())).await
+}
+
+async fn realtime_fleet_traffic_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let (subscription, mode, _) = realtime_fleet_traffic_subscription(&state, &headers).await?;
+    Ok(realtime_stream_response(
+        subscription,
+        state.shutdown,
+        role_masks_assets(admin.role()),
+        mode,
+    ))
+}
+
+async fn realtime_fleet_traffic_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let (subscription, mode, expected) =
+        realtime_fleet_traffic_subscription(&state, &headers).await?;
+    let mut payload = json!({
+        "policy": subscription.policy,
+        "nodes": subscription.snapshots,
+        "expected": expected,
+    });
+    omit_snapshot_diagnostics(&mut payload);
+    filter_realtime_user_traffic(&mut payload, &mode);
+    Ok(no_store_json(payload))
+}
+
+async fn realtime_fleet_traffic_subscription(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<(
+    crate::realtime::RealtimeSubscription,
+    RealtimeStreamMode,
+    Value,
+)> {
+    let admin = require_admin_context(state, headers, AdminPermission::Read).await?;
+    let visible = state.store.list_node_agent_states(&admin).await?;
+    let nodes = visible
+        .nodes
+        .into_iter()
+        .filter(|node| node.lifecycle_phase == "active")
+        .map(|node| node.node_id)
+        .collect::<Vec<_>>();
+    let visible_nodes = nodes.iter().cloned().collect::<HashSet<_>>();
+    let targets = state.store.fleet_realtime_targets(&admin).await?;
+    let forwarding = targets
+        .iter()
+        .filter(|target| visible_nodes.contains(&target.node_id))
+        .filter(|target| !target.forwarding.is_empty())
+        .map(|target| (target.node_id.clone(), target.forwarding.clone()))
+        .collect::<HashMap<_, _>>();
+    let forwarding_nodes = forwarding.keys().cloned().collect();
+    let expected = Value::Array(
+        targets
+            .into_iter()
+            .filter(|target| visible_nodes.contains(&target.node_id))
+            .map(|target| {
+                json!({
+                    "node_id": target.node_id,
+                    "users": target.users.into_iter().map(|user| json!({
+                        "tenant_id": user.tenant_id,
+                        "user_id": user.user_id,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect(),
+    );
+    let mode = RealtimeStreamMode::FleetTraffic {
+        tenant_scope: admin.tenant_scope().map(str::to_owned),
+        forwarding_nodes,
+    };
+    let subscription = state
+        .realtime
+        .subscribe_fleet_traffic(nodes, forwarding)
+        .await;
+    Ok((subscription, mode, expected))
 }
 
 async fn realtime_events_response(
@@ -2765,6 +3271,12 @@ enum RealtimeStreamMode {
     /// The global header consumes only NIC rates. Worker snapshots can be hundreds of kilobytes
     /// and are never useful to that consumer.
     Fleet,
+    /// A dedicated on-demand surface. Unlike the global header, this lease deliberately asks each
+    /// visible machine for all active user rates while still omitting worker diagnostics.
+    FleetTraffic {
+        tenant_scope: Option<String>,
+        forwarding_nodes: HashSet<String>,
+    },
     User {
         tenant_id: String,
         user_id: String,
@@ -2826,6 +3338,33 @@ fn filter_realtime_user_traffic(value: &mut Value, mode: &RealtimeStreamMode) {
                             .and_then(Value::as_str)
                             .is_some_and(|tenant| brocade_store::tenant_in_scope(tenant, scope))
                     });
+                }
+            }
+        }
+        RealtimeStreamMode::FleetTraffic {
+            tenant_scope,
+            forwarding_nodes,
+        } => {
+            if let Some(report) = sample
+                .get_mut("user_traffic")
+                .and_then(Value::as_object_mut)
+            {
+                report.insert(
+                    "forwarding_expected".to_owned(),
+                    Value::Bool(
+                        node_id
+                            .as_ref()
+                            .is_some_and(|node_id| forwarding_nodes.contains(node_id)),
+                    ),
+                );
+                if let Some(scope) = tenant_scope {
+                    if let Some(users) = report.get_mut("users").and_then(Value::as_array_mut) {
+                        users.retain(|user| {
+                            user.get("tenant_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|tenant| brocade_store::tenant_in_scope(tenant, scope))
+                        });
+                    }
                 }
             }
         }
@@ -2909,6 +3448,24 @@ fn omit_snapshot_diagnostics(value: &mut Value) {
     }
 }
 
+/// The browser treats an SSE snapshot as current state and reads only `samples.at(-1)`. Keep the
+/// process-local ring for gap handling and internal consumers, but do not replay its full two
+/// minutes every time the stream performs its bounded authorization refresh.
+fn retain_latest_snapshot_samples(value: &mut Value) {
+    let Some(nodes) = value.get_mut("nodes").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for node in nodes {
+        let Some(samples) = node.get_mut("samples").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        if let Some(latest) = samples.pop() {
+            samples.clear();
+            samples.push(latest);
+        }
+    }
+}
+
 fn diagnostics_due(last_sent: &mut HashMap<String, i64>, node_id: &str, received_at: i64) -> bool {
     if last_sent.get(node_id).is_some_and(|previous| {
         received_at >= *previous
@@ -2938,12 +3495,16 @@ fn realtime_stream_response(
     }
     let mut initial_value =
         json!({ "policy": subscription.policy, "nodes": subscription.snapshots });
-    if mode == RealtimeStreamMode::Fleet {
+    retain_latest_snapshot_samples(&mut initial_value);
+    if matches!(
+        mode,
+        RealtimeStreamMode::Fleet | RealtimeStreamMode::FleetTraffic { .. }
+    ) {
         omit_snapshot_diagnostics(&mut initial_value);
     }
     filter_realtime_user_traffic(&mut initial_value, &mode);
     if mask_assets {
-        mask_realtime_vpngate(&mut initial_value);
+        mask_realtime_assets(&mut initial_value, &mode);
     }
     let initial = Event::default()
         .event("snapshot")
@@ -3000,7 +3561,7 @@ fn realtime_stream_response(
                     };
                     filter_realtime_user_traffic(&mut value, &mode);
                     if mask_assets {
-                        mask_realtime_vpngate(&mut value);
+                        mask_realtime_assets(&mut value, &mode);
                     }
                     let event = Event::default()
                         .event(name)
@@ -3033,6 +3594,17 @@ fn realtime_stream_response(
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
+}
+
+fn mask_realtime_assets(value: &mut Value, mode: &RealtimeStreamMode) {
+    if matches!(mode, RealtimeStreamMode::FleetTraffic { .. }) {
+        // The public fleet stream must match the ordinary masked JSON snapshot, including
+        // identifiers which themselves look like addresses. Diagnostic node streams retain
+        // their existing VPN Gate-specific projection.
+        crate::mask::mask_json(value);
+    } else {
+        mask_realtime_vpngate(value);
+    }
 }
 
 fn mask_realtime_vpngate(value: &mut serde_json::Value) {
@@ -3254,6 +3826,29 @@ async fn update_node_log_policy(
         .update_node_log_policy(&admin, &node_id, request)
         .await?;
     Ok(Json(state.store.agent_log_policy(&admin).await?).into_response())
+}
+
+async fn get_data_retention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(no_store_json(state.store.data_retention().await?))
+}
+
+async fn update_data_retention(
+    State(state): State<AppState>,
+    Path(table_name): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateDataRetentionPolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .update_data_retention(&admin, &table_name, request)
+            .await?,
+    ))
 }
 
 async fn get_host_network_tuning(
@@ -4439,6 +5034,19 @@ async fn retry_target(
     Ok(Json(result).into_response())
 }
 
+async fn force_config_xray_retirement(
+    State(state): State<AppState>,
+    Path((deployment_id, node_id)): Path<(i64, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let result = state
+        .store
+        .force_config_xray_retirement(&admin, deployment_id, &node_id)
+        .await?;
+    Ok(Json(result).into_response())
+}
+
 async fn isolate_deployment_target(
     State(state): State<AppState>,
     Path((deployment_id, node_id)): Path<(i64, String)>,
@@ -4505,6 +5113,22 @@ async fn update_node(
     let result = state.store.update_node(&admin, &node_id, request).await?;
     state.grants_wake.notify_one();
     Ok(Json(result).into_response())
+}
+
+async fn update_node_region(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateNodeRegionRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(
+        state
+            .store
+            .update_node_region_override(&admin, &node_id, request)
+            .await?,
+    )
+    .into_response())
 }
 
 /// Re-signing invalidates the token on the machine immediately and marks its last reported runtime
@@ -4649,6 +5273,87 @@ async fn set_user_forwarding_entitlement(
         .set_forwarding_entitlement(&admin, &tenant_id, &user_id, &node_id, request)
         .await?;
     Ok(Json(result).into_response())
+}
+
+async fn user_forwarding_probes(
+    State(state): State<AppState>,
+    Path((tenant, user)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let overview = state
+        .store
+        .forwarding_overview(&admin, &tenant, &user)
+        .await?;
+    Ok(no_store_json(state.forwarding_probes.list(&overview)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TcpPingRequest {}
+
+async fn start_user_forwarding_probe(
+    State(state): State<AppState>,
+    Path((tenant, user, rule_id)): Path<(String, String, i64)>,
+    headers: HeaderMap,
+    Json(_request): Json<TcpPingRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let overview = state
+        .store
+        .forwarding_probe_overview(&admin, &tenant, &user)
+        .await?;
+    let rule = overview
+        .rules
+        .iter()
+        .find(|rule| rule.id == rule_id)
+        .ok_or_else(|| StoreError::NotFound("forwarding rule".to_owned()))?;
+    let protocol = state.store.forwarding_probe_protocol(&rule.node_id).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        no_store_json(
+            state
+                .forwarding_probes
+                .enqueue(&overview, rule_id, protocol)?,
+        ),
+    )
+        .into_response())
+}
+
+async fn set_user_forwarding_quota(
+    State(state): State<AppState>,
+    Path((tenant, user, node)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<brocade_store::ForwardingQuotaWrite>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let result = state
+        .store
+        .set_forwarding_quota(&admin, &tenant, &user, &node, request)
+        .await?;
+    state.quota_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct ForwardingQuotaJobsQuery {
+    before_id: Option<i64>,
+}
+
+async fn user_forwarding_quota_jobs(
+    State(state): State<AppState>,
+    Path((tenant, user, node)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<ForwardingQuotaJobsQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(
+        state
+            .store
+            .forwarding_quota_jobs(&admin, &tenant, &user, &node, query.before_id)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn delete_user_forwarding_entitlement(
@@ -4824,6 +5529,8 @@ async fn update_user_profile(
         .store
         .update_user_profile(&admin, &tenant_id, &user_id, request)
         .await?;
+    // Switching single/double accounting can cross both access and forwarding quotas immediately.
+    state.quota_wake.notify_one();
     Ok(Json(result).into_response())
 }
 
@@ -5584,8 +6291,13 @@ async fn vpngate_overview(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let _admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    Ok(Json(state.store.vpngate_overview().await?).into_response())
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let mut overview = state.store.vpngate_overview().await?;
+    // The catalogue is also visitor-readable; credential fragments belong only to its owner.
+    if admin.role() != AdminRole::SystemAdmin {
+        overview.intelligence_credentials.proxycheck_api_keys_masked = None;
+    }
+    Ok(Json(overview).into_response())
 }
 
 async fn vpngate_country_servers(
@@ -5767,6 +6479,22 @@ async fn update_vpngate_intelligence_node(
         state
             .store
             .update_vpngate_intelligence_node(&admin, &node_id, request)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn update_vpngate_catalog_node(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateVpngateCatalogNode>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_catalog_node(&admin, &node_id, request)
             .await?,
     )
     .into_response())
@@ -6226,6 +6954,15 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
     // otherwise converged and the body is 204. This changes retention without inventing a fake
     // deployment or restarting Xray.
     let log_limits = state.store.effective_node_log_limits(&node.node_id).await?;
+    let site_usage_policy = state.store.site_usage_policy().await?;
+    let domain_policy = serde_json::to_string(&state.store.other_domain_policy().await?)
+        .map_err(StoreError::from)?;
+    let domain_policy = HeaderValue::from_str(&domain_policy)
+        .map_err(|_| StoreError::InvalidData("invalid domain collection header".into()))?;
+    let failed_policy = serde_json::to_string(&state.store.sniffing_failed_policy().await?)
+        .map_err(StoreError::from)?;
+    let failed_policy = HeaderValue::from_str(&failed_policy)
+        .map_err(|_| StoreError::InvalidData("invalid failed-target collection header".into()))?;
     let host_tuning = state.store.host_network_tuning().await?;
     let agent_version = user_agent(&headers).map(str::to_owned);
     let protocol_version = agent_protocol_version(&headers);
@@ -6245,17 +6982,21 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             .await?;
     }
 
-    if protocol_version
-        .is_none_or(|version| version < brocade_deployment::protocol::MIN_AGENT_PROTOCOL_VERSION)
-    {
+    if protocol_version.is_none_or(|version| {
+        version < brocade_deployment::protocol::CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION
+    }) {
         let mut response = StatusCode::NO_CONTENT.into_response();
         response.headers_mut().insert(
             "x-brocade-agent-upgrade-required",
             HeaderValue::from_static("1"),
         );
-        return Ok(with_host_network_tuning(
-            with_agent_log_policy(response, log_limits),
-            host_tuning,
+        return Ok(with_detail_policies(
+            with_site_usage_policy(
+                with_host_network_tuning(with_agent_log_policy(response, log_limits), host_tuning),
+                site_usage_policy.enabled,
+            ),
+            domain_policy,
+            failed_policy,
         ));
     }
 
@@ -6300,10 +7041,38 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             true => StatusCode::NO_CONTENT.into_response(),
         },
     };
-    Ok(with_host_network_tuning(
-        with_agent_log_policy(response, log_limits),
-        host_tuning,
+    Ok(with_detail_policies(
+        with_site_usage_policy(
+            with_host_network_tuning(with_agent_log_policy(response, log_limits), host_tuning),
+            site_usage_policy.enabled,
+        ),
+        domain_policy,
+        failed_policy,
     ))
+}
+
+fn with_detail_policies(
+    mut response: Response,
+    policy: HeaderValue,
+    failed: HeaderValue,
+) -> Response {
+    response.headers_mut().insert(
+        brocade_deployment::other_domain::OTHER_DOMAIN_POLICY_HEADER,
+        policy,
+    );
+    response.headers_mut().insert(
+        brocade_deployment::sniffing_failed::SNIFFING_FAILED_POLICY_HEADER,
+        failed,
+    );
+    response
+}
+
+fn with_site_usage_policy(mut response: Response, enabled: bool) -> Response {
+    response.headers_mut().insert(
+        brocade_deployment::site_usage::SITE_USAGE_ENABLED_HEADER,
+        HeaderValue::from_static(if enabled { "1" } else { "0" }),
+    );
+    response
 }
 
 async fn agent_public_ip_observation(
@@ -6498,6 +7267,8 @@ fn xray_release_offer(
         ),
         sha256: assignment.sha256,
         previous_sha256: assignment.previous_sha256,
+        strategy: assignment.strategy,
+        drain_timeout_secs: assignment.drain_timeout_secs,
     }
 }
 
@@ -6824,6 +7595,27 @@ async fn agent_runtime(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+async fn agent_config_xray_force_retirement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if agent_protocol_version(&headers).is_none_or(|version| {
+        version < brocade_deployment::protocol::CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION
+    }) {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    match state
+        .store
+        .config_xray_force_retirement_command(&node.node_id)
+        .await?
+    {
+        Some(command) => Ok(Json(command).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
 async fn agent_observation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6924,6 +7716,34 @@ async fn cleanup_retired_warp_bindings(state: &AppState, node_id: &str) {
     }
 }
 
+async fn agent_other_domain_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<brocade_deployment::other_domain::OtherDomainReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    state
+        .store
+        .record_other_domain_report(&node.node_id, report)
+        .await?;
+    Ok(no_store_json(json!({"accepted":true})))
+}
+
+async fn agent_sniffing_failed_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<brocade_deployment::sniffing_failed::SniffingFailedReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    state
+        .store
+        .record_sniffing_failed_report(&node.node_id, report)
+        .await?;
+    Ok(no_store_json(json!({"accepted":true})))
+}
+
 async fn agent_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6996,6 +7816,42 @@ async fn agent_forwarding_usage(
         .record_forwarding_usage(&node.node_id, report)
         .await?;
     Ok(Json(result).into_response())
+}
+
+async fn agent_forwarding_probe_target(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    if agent_protocol_version(&headers).is_none_or(|version| {
+        version < brocade_deployment::protocol::FORWARDING_PROBE_PROTOCOL_VERSION
+    }) {
+        return Err(StoreError::Unsupported(
+            "agent does not support forwarding TCP ping".to_owned(),
+        )
+        .into());
+    }
+    Ok(no_store_json(
+        state
+            .forwarding_probes
+            .claim(&state.store, &node.node_id)
+            .await?,
+    ))
+}
+
+async fn agent_forwarding_probe_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<brocade_deployment::forwarding_probe::ForwardingProbeReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    state
+        .forwarding_probes
+        .report(&state.store, &node.node_id, report)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Host load and per-hop link quality. As with usage, `node_id` comes from the token rather than
@@ -8247,6 +9103,8 @@ mod tests {
                 version: "fork-source-revision-dirty".to_owned(),
                 sha256: "a".repeat(64),
                 previous_sha256: "b".repeat(64),
+                strategy: brocade_deployment::protocol::XrayReleaseStrategy::Restart,
+                drain_timeout_secs: None,
             },
             "https://console.example",
             "aarch64",
@@ -8506,6 +9364,86 @@ mod tests {
     }
 
     #[test]
+    fn realtime_snapshot_projection_keeps_only_each_nodes_latest_sample() {
+        let mut payload = serde_json::json!({
+            "nodes": [
+                {"node_id": "n1", "samples": [
+                    {"sample": {"sequence": 1}},
+                    {"sample": {"sequence": 2}},
+                    {"sample": {"sequence": 3}}
+                ]},
+                {"node_id": "n2", "samples": []},
+                {"node_id": "n3", "samples": [{"sample": {"sequence": 4}}]}
+            ]
+        });
+
+        super::retain_latest_snapshot_samples(&mut payload);
+
+        assert_eq!(
+            payload["nodes"][0]["samples"],
+            serde_json::json!([{"sample": {"sequence": 3}}])
+        );
+        assert_eq!(payload["nodes"][1]["samples"], serde_json::json!([]));
+        assert_eq!(
+            payload["nodes"][2]["samples"],
+            serde_json::json!([{"sample": {"sequence": 4}}])
+        );
+    }
+
+    #[tokio::test]
+    async fn live_stream_initial_snapshot_sends_only_the_latest_ring_sample() {
+        let realtime = crate::realtime::RealtimeService::new(Default::default());
+        let _demand = realtime.subscribe_nic(["n1".to_owned()]).await;
+        let agent = realtime.register_agent("n1".to_owned()).await;
+        let sampled_at_unix_millis = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        for sequence in [1, 2] {
+            let sample = serde_json::from_value(serde_json::json!({
+                "sequence": sequence,
+                "sampled_at_unix_millis": sampled_at_unix_millis,
+                "elapsed_millis": 1000,
+                "interface": "eth0",
+                "rx_bytes_per_sec": sequence * 100,
+                "tx_bytes_per_sec": sequence * 200,
+                "has_gap": false
+            }))
+            .unwrap();
+            realtime
+                .record_sample("n1", agent.session, sample)
+                .await
+                .unwrap();
+        }
+
+        let response = super::realtime_stream_response(
+            realtime.subscribe_nic(["n1".to_owned()]).await,
+            crate::lifecycle::ShutdownSignal::new(),
+            false,
+            super::RealtimeStreamMode::Fleet,
+        );
+        let mut body = response.into_body().into_data_stream();
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .expect("the stream should send its initial snapshot")
+            .expect("the stream should contain its initial snapshot")
+            .unwrap();
+        let initial = String::from_utf8(initial.to_vec()).unwrap();
+        let data = initial
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("the initial SSE event should contain JSON data");
+        let payload: serde_json::Value = serde_json::from_str(data).unwrap();
+        let samples = payload["nodes"][0]["samples"].as_array().unwrap();
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0]["sample"]["sequence"], 2);
+    }
+
+    #[test]
     fn node_realtime_projection_caps_complete_diagnostics_without_clock_lockout() {
         let mut sent = std::collections::HashMap::new();
         assert!(super::diagnostics_due(&mut sent, "n1", 10_000));
@@ -8690,6 +9628,71 @@ mod tests {
         assert_eq!(user["sample"]["user_traffic"]["all_users"], false);
         assert!(user["sample"].get("rx_bytes_per_sec").is_none());
         assert!(user["sample"].get("mux").is_none());
+    }
+
+    #[test]
+    fn public_fleet_stream_masking_matches_json_snapshots_without_changing_rates() {
+        let mut event = serde_json::json!({
+            "node_id": "n1",
+            "sample": {
+                "rx_bytes_per_sec": 9000,
+                "user_traffic": { "state": "ready", "users": [{
+                    "tenant_id": "platform.acme",
+                    "user_id": "198.51.100.10",
+                    "uplink_bytes_per_sec": 10,
+                    "downlink_bytes_per_sec": 20
+                }] }
+            }
+        });
+        let mut snapshot = serde_json::json!({ "nodes": [{ "samples": [event.clone()] }] });
+        crate::mask::mask_json(&mut snapshot);
+        super::mask_realtime_assets(
+            &mut event,
+            &super::RealtimeStreamMode::FleetTraffic {
+                tenant_scope: None,
+                forwarding_nodes: Default::default(),
+            },
+        );
+        assert_eq!(event, snapshot["nodes"][0]["samples"][0]);
+        assert_eq!(
+            event["sample"]["user_traffic"]["users"][0]["user_id"],
+            "198.51.***.***"
+        );
+        assert_eq!(
+            event["sample"]["user_traffic"]["users"][0]["uplink_bytes_per_sec"],
+            10
+        );
+        assert_eq!(event["sample"]["rx_bytes_per_sec"], 9000);
+    }
+
+    #[test]
+    fn fleet_traffic_projection_keeps_rates_inside_the_tenant_scope() {
+        let mut event = serde_json::json!({
+            "node_id": "entry-node",
+            "sample": {
+                "rx_bytes_per_sec": 9000,
+                "reverse_health": { "workers": [1] },
+                "user_traffic": { "state": "ready", "all_users": true, "users": [
+                    { "tenant_id": "platform.acme", "user_id": "alice", "uplink_bytes_per_sec": 10 },
+                    { "tenant_id": "platform.acme.team", "user_id": "bob", "uplink_bytes_per_sec": 20 },
+                    { "tenant_id": "platform.other", "user_id": "mallory", "uplink_bytes_per_sec": 30 }
+                ] }
+            }
+        });
+        super::filter_realtime_user_traffic(
+            &mut event,
+            &super::RealtimeStreamMode::FleetTraffic {
+                tenant_scope: Some("platform.acme".to_owned()),
+                forwarding_nodes: std::collections::HashSet::from(["entry-node".to_owned()]),
+            },
+        );
+
+        let users = event["sample"]["user_traffic"]["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(event["sample"]["user_traffic"]["forwarding_expected"], true);
+        // Filtering is an authorization projection; the stream's diagnostic stripping remains a
+        // separate pass so it is applied identically to snapshots and live events.
+        assert_eq!(event["sample"]["rx_bytes_per_sec"], 9000);
     }
 
     #[test]
@@ -9069,6 +10072,8 @@ mod tests {
             "/usage/monthly-summary",
             "/users/platform.acme/alice/grant-probes",
             "/realtime/nodes/events",
+            "/realtime/fleet-traffic/events",
+            "/realtime/fleet-traffic/snapshot",
             "/realtime/nodes/hk-01/events",
             "/realtime/nodes/hk-01/snapshot",
             "/nodes/hk-01/public-ip-history",
@@ -9084,6 +10089,7 @@ mod tests {
             "/ping-probe/settings",
             "/realtime/settings",
             "/distribution",
+            "/data-retention",
             "/admin/operators",
             "/artifacts/index",
             "/users/presence",
@@ -9093,7 +10099,15 @@ mod tests {
             "/nodes/hk-01/public-ip-history/extra",
             "/usage/machine-model",
             "/realtime/nodes/hk-01/user-history",
+            "/realtime/fleet-traffic/settings",
+            "/realtime/fleet-traffic/snapshot/extra",
+            "/realtime/fleet-traffic/events/extra",
             "/users/platform.acme/alice/realtime/history",
+            "/users/platform.acme/alice/site-usage",
+            "/nodes/hk-01/inflow-usage",
+            "/nodes/hk-01/site-usage",
+            "/nodes/hk-01/other-domains",
+            "/nodes/hk-01/sniffing-failed-targets",
         ] {
             assert!(!public_may(&Method::GET, path), "should refuse GET {path}");
         }
@@ -9105,6 +10119,9 @@ mod tests {
         assert!(!public_may(&Method::POST, "/notifications/clear"));
         assert!(!public_may(&Method::PUT, "/branding"));
         assert!(!public_may(&Method::PUT, "/agent-log-policy"));
+        assert!(!public_may(&Method::PUT, "/data-retention/usage_samples"));
+        assert!(!public_may(&Method::GET, "/site-usage/settings"));
+        assert!(!public_may(&Method::PUT, "/site-usage/settings"));
         assert!(!public_may(&Method::PUT, "/node-traffic/nodes/hk-01"));
         assert!(!public_may(&Method::PUT, "/nodes/hk-01"));
         assert!(!public_may(&Method::PUT, "/vpngate/settings"));
@@ -9114,6 +10131,7 @@ mod tests {
         assert!(!public_may(&Method::POST, "/vpngate/intelligence-refresh"));
         assert!(!public_may(&Method::POST, "/vpngate/sync"));
         assert!(!public_may(&Method::PUT, "/vpngate/probe-nodes/hk-01"));
+        assert!(!public_may(&Method::PUT, "/vpngate/catalog-nodes/hk-01"));
         assert!(!public_may(
             &Method::PUT,
             "/vpngate/intelligence-nodes/hk-01"
@@ -9132,6 +10150,14 @@ mod tests {
         assert!(!public_may(&Method::GET, "/tunnel-probes"));
         assert!(!public_may(&Method::GET, "/tunnel-probes/capability"));
         assert!(!public_may(
+            &Method::GET,
+            "/users/platform.acme/alice/forwarding/tcp-pings"
+        ));
+        assert!(!public_may(
+            &Method::POST,
+            "/users/platform.acme/alice/forwarding/42/tcp-ping"
+        ));
+        assert!(!public_may(
             &Method::POST,
             "/users/platform.acme/alice/grant-probes"
         ));
@@ -9149,6 +10175,20 @@ mod tests {
             &Method::GET,
             "/tenants/platform.acme/tunnels/custom-1111-1111/probe/extra"
         ));
+    }
+
+    #[test]
+    fn site_collection_policy_is_explicit_even_on_empty_desired_responses() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        for enabled in [false, true] {
+            let response =
+                super::with_site_usage_policy(StatusCode::NO_CONTENT.into_response(), enabled);
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                response.headers()[brocade_deployment::site_usage::SITE_USAGE_ENABLED_HEADER],
+                if enabled { "1" } else { "0" }
+            );
+        }
     }
 
     #[test]
@@ -9209,6 +10249,26 @@ mod tests {
             &Method::DELETE,
             "/users/platform.acme/alice/forwarding/42"
         ));
+        assert!(user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/forwarding/tcp-pings"
+        ));
+        assert!(user_may(
+            &Method::POST,
+            "/users/platform.acme/alice/forwarding/42/tcp-ping"
+        ));
+        assert!(!user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/forwarding/42/tcp-ping"
+        ));
+        assert!(!user_may(
+            &Method::POST,
+            "/users/platform.acme/alice/forwarding/tcp-pings"
+        ));
+        assert!(!user_may(
+            &Method::POST,
+            "/users/platform.acme/alice/forwarding/no-id/tcp-ping"
+        ));
         assert!(user_may(&Method::GET, "/grant-probes/p1"));
         assert!(user_may(&Method::DELETE, "/grant-probes/p1"));
         assert!(user_may(&Method::GET, "/grant-probes/p1/events"));
@@ -9228,6 +10288,15 @@ mod tests {
         ));
         assert!(!user_may(&Method::GET, "/admin/operators"));
         assert!(!user_may(&Method::GET, "/artifacts/index"));
+        // Machine statistics name every user on the machine.
+        for path in [
+            "/nodes/n1/inflow-usage",
+            "/nodes/n1/site-usage",
+            "/nodes/n1/other-domains",
+            "/nodes/n1/sniffing-failed-targets",
+        ] {
+            assert!(!user_may(&Method::GET, path), "should refuse GET {path}");
+        }
         assert!(!user_may(&Method::POST, "/grant-probes/capability"));
         assert!(!user_may(&Method::DELETE, "/grant-probes/p1/events"));
         assert!(!user_may(&Method::GET, "/grant-probes/p1/extra"));

@@ -1,3 +1,4 @@
+import { useMetricQuery } from '../ui/metric-cadence';
 import { draft } from '../draft';
 import {
   Fragment,
@@ -37,6 +38,7 @@ import {
   fetchNodePublicIpHistory,
   fetchNodePingProbe,
   fetchNodePingProbeRange,
+  forceConfigXrayRetirement,
   isolateNode,
   monthBytes,
   issueNodeToken,
@@ -44,6 +46,7 @@ import {
   removeRetiredNodes,
   restoreNodeService,
   saveNodeLogPolicy,
+  saveNodeRegion,
   saveNodeTraffic,
   setNodeCertGroup,
   setNodeStatus,
@@ -73,16 +76,17 @@ import {
   type PingProbePoint,
   type PingProbeTargetSeries,
   type NodePublicIpEvent,
+  type NodeTrafficAccountingMode,
   type NodeTrafficCycleKind,
   type NodeTrafficItem,
   type NodeTrafficView,
   type ProvisionNodeResult,
   type UsageNodeSeries,
 } from '../api';
+import { configHandoffForceCandidate } from '../xray-handoff';
 import { fetchPreviewStatus } from '../preview/api';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
-import { can, canViewUserRealtimeTraffic, isVisitor, useSession } from '../session';
-import { NodeUserTrafficCard } from '../user-traffic-realtime';
+import { can, isVisitor, useSession } from '../session';
 import { Ago, Confirm, Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
@@ -111,6 +115,7 @@ import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { RegionFlag } from '../ui/region-flag';
 import { trafficGapReason } from '../ui/traffic-gap';
+import { machineQuotaBytes, machineQuotaTiB } from '../ui/machine-traffic-quota';
 import {
   navigate,
   navigateInPlace,
@@ -145,6 +150,7 @@ import { isForwardTargetInChain } from './rule-graph';
 import { chainSpine, fetchSnapshot, type SnapshotChain, type SnapshotIngress, type SnapshotStep } from '../api';
 import { MuxObservationCard } from '../mux-observation';
 import { VpngateObservationCard } from '../vpngate-observation';
+import { NodeRegionEditor } from './node-region-editor';
 import { NodeRealtimeProvider } from '../node-realtime';
 import { ReverseHealthCard } from '../reverse-health';
 import type { AppIr } from '../topo/model';
@@ -653,7 +659,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   });
   // 卡片底部只显示物理网卡累计。XRAY 业务累计仍可在用量页和机器详情的
   // XRAY 曲线中查看，不在这张用于扫视机器状态的卡片上建立第二个并列数字。
-  const traffic = useQuery({
+  const traffic = useMetricQuery({
     queryKey: ['node-traffic'],
     queryFn: fetchNodeTraffic,
     enabled: nodes.isSuccess,
@@ -662,7 +668,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   });
   // 各机器的近期负载。列表用它绘制 NIC 曲线，并决定状态灯的颜色与 title。
   // 与上面的查询一样独立：查询失败时列表正常显示，状态点回退为只反映活性。
-  const load = useQuery({
+  const load = useMetricQuery({
     queryKey: ['node-nic-list', 'windows', LIST_NIC_WINDOWS],
     queryFn: () => fetchNodeNicListWindows(LIST_NIC_WINDOWS),
     enabled: nodes.isSuccess,
@@ -670,7 +676,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     retry: false,
   });
   const loadOf = useMemo(() => new Map((load.data?.nodes ?? []).map(n => [n.node_id, n])), [load.data]);
-  const pingProbe = useQuery({
+  const pingProbe = useMetricQuery({
     queryKey: ['ping-probe-nodes', 'latest'],
     queryFn: () => fetchLatestNodePingProbes(),
     enabled: nodes.isSuccess,
@@ -881,7 +887,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   if (sheeted) {
     return (
       <div className="cardpage node-cardpage">
-        <section className="panel titled node-list-panel">
+        <section className="panel titled node-list-panel" data-page-title="true">
           {renderHeader()}
           {retireAll.error && <ErrorBox error={retireAll.error} />}
           {removalNotice && <div className="callout">{removalNotice}</div>}
@@ -969,10 +975,11 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   );
 }
 
-// 状态点只表示一项：agent 是否仍在拉取配置。
-// 判定依据与纳管向导一致——使用 last_poll_at 而非 usage 上报，60s = agent 15s 轮询
-// 加 systemd RestartSec=5 加时钟误差。灰色表示从未上报，与掉线是两种状态。
+// 状态点表示 Agent 是否在线，而不是是否正在领取新配置。正常情况下 last_poll_at 是最密集
+// 的证据；Xray 代际交接排空期间 Agent 会有意暂停 desired poll，但运行时上报仍持续。此时
+// 把机器标成「失联」会把健康排空误报成故障。灰色表示从未上报，与掉线是两种状态。
 function pollTone(node: NodeAgentStateItem): 'ok' | 'bad' | 'idle' {
+  if (node.runtime_report_fresh) return 'ok';
   if (!node.last_poll_at) return 'idle';
   const raw = node.last_poll_at;
   const t = Date.parse(raw.endsWith('Z') || raw.includes('+') ? raw : `${raw}Z`);
@@ -987,7 +994,7 @@ type NodeLampState = {
 
 /** 节点列表和详情书签共用的状态灯。在线状态优先，失联后不再用旧上报里的
  * finding 推断当前状态；detailOnly 只是详情说明，不改变灯色。 */
-function nodeLampState(
+export function nodeLampState(
   node: NodeAgentStateItem,
   wireguardEnabled?: boolean,
   isolatedNodeIds?: ReadonlySet<string>,
@@ -2044,11 +2051,11 @@ export function ThroughputPanel({
   linked: boolean;
   observationModules?: NodeObservationModules;
 }) {
-  const load = useQuery({
+  const load = useMetricQuery({
     ...nodeLoadRangeQuery(nodeId, range),
     refetchInterval: fixedLoadRange(range) ? false : range.seconds <= 60 * 60 ? 10_000 : 30_000,
   });
-  const usage = useQuery({
+  const usage = useMetricQuery({
     ...nodeUsageRangeQuery(nodeId, range),
     refetchInterval: fixedLoadRange(range) ? false : 30_000,
   });
@@ -2966,8 +2973,8 @@ export function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; can
   );
 }
 
-// DNS 卡位于身份和 WIREGUARD 之间：身份表示外部如何访问该机器，本卡表示该机器如何
-// 解析外部地址，WIREGUARD 表示骨干网连接——按此顺序构成一条完整的路径。
+// DNS 卡位于右栏证书组上方：解析策略与证书都决定这台机器如何连接外部服务；左栏则
+// 保留身份、物理流量和 WIREGUARD，避免将运行用量夹在外部关系配置之间。
 //
 // 此前这两个字段只出现在建机器向导中，更新接口一直接收 dns 但没有对应界面，
 // 导致创建后无法修改。形态与 EgressRow 一致：未修改时为灰色说明，修改后显示工具条。
@@ -3281,8 +3288,10 @@ function ConnectionCard({
 type TrafficCalibrationUnit = 'GiB' | 'TiB';
 type TrafficForm = {
   cycle_kind: NodeTrafficCycleKind;
+  accounting_mode: NodeTrafficAccountingMode;
   reset_month: string;
   reset_day: string;
+  quota: string;
   calibration: string;
   calibration_unit: TrafficCalibrationUnit;
 };
@@ -3304,141 +3313,137 @@ export function trafficCalibrationBytes(raw: string, unit: TrafficCalibrationUni
   return bytesValue <= U64_MAX ? bytesValue.toString() : null;
 }
 
+const TRAFFIC_ACCOUNTING_MODES: ReadonlyArray<{ value: NodeTrafficAccountingMode; label: string; note: string }> = [
+  { value: 'bidirectional_sum', label: '双向合计', note: '接收与发送相加。' },
+  { value: 'bidirectional_max', label: '双向取大', note: '整个账期累计后取较大的方向，不按天取大。' },
+  { value: 'outbound_only', label: '单向出站', note: '只计发送。' },
+  { value: 'inbound_only', label: '单向入站', note: '只计接收。' },
+];
+const TRAFFIC_DAY_SECS = 86_400;
+
 /** Physical default-route traffic. Policy/calibration are immediate and do not create a revision. */
 export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
   const qc = useQueryClient();
-  const traffic = useQuery({ queryKey: ['node-traffic'], queryFn: fetchNodeTraffic, retry: false });
+  const traffic = useMetricQuery({ queryKey: ['node-traffic'], queryFn: fetchNodeTraffic, retry: false });
   const mine = traffic.data?.nodes.find(item => item.node_id === node.node_id) ?? null;
   const base: TrafficForm = {
     cycle_kind: mine?.cycle_kind ?? 'monthly',
+    accounting_mode: mine?.accounting_mode ?? 'bidirectional_sum',
     reset_month: String(mine?.reset_month ?? 1),
     reset_day: String(mine?.reset_day ?? 1),
+    quota: machineQuotaTiB(mine?.quota_bytes ?? null),
     calibration: '',
     calibration_unit: 'GiB',
   };
-  const source = JSON.stringify([node.node_id, mine?.cycle_kind, mine?.reset_month, mine?.reset_day]);
+  const source = JSON.stringify([
+    node.node_id,
+    mine?.cycle_kind,
+    mine?.accounting_mode,
+    mine?.reset_month,
+    mine?.reset_day,
+    mine?.quota_bytes,
+  ]);
   const [syncedFrom, setSyncedFrom] = useState(source);
   const [form, setForm] = useState<TrafficForm | null>(null);
+  const [calibrating, setCalibrating] = useState(false);
   if (source !== syncedFrom) {
     setSyncedFrom(source);
     setForm(null);
+    setCalibrating(false);
   }
 
   const shown = form ?? base;
   const resetDay = Number(shown.reset_day);
   const resetMonth = Number(shown.reset_month);
+  const quota = machineQuotaBytes(shown.quota);
   const calibration = shown.calibration.trim()
     ? trafficCalibrationBytes(shown.calibration, shown.calibration_unit)
     : null;
+  const calibrationInvalid = shown.calibration.trim() !== '' && calibration === null;
   const invalid =
     !Number.isInteger(resetDay) ||
     resetDay < 1 ||
     resetDay > 31 ||
     (shown.cycle_kind === 'yearly' && (!Number.isInteger(resetMonth) || resetMonth < 1 || resetMonth > 12)) ||
-    (shown.calibration.trim() !== '' && calibration === null);
+    quota === undefined ||
+    calibrationInvalid;
   const policyDirty =
     shown.cycle_kind !== base.cycle_kind ||
+    shown.accounting_mode !== base.accounting_mode ||
     shown.reset_day !== base.reset_day ||
     (shown.cycle_kind === 'yearly' && shown.reset_month !== base.reset_month);
-  const dirty = policyDirty || shown.calibration.trim() !== '';
+  const dirty = policyDirty || shown.quota !== base.quota || shown.calibration.trim() !== '';
   useUnsavedChanges(dirty, `${node.name || node.node_id} 的流量统计`, `node-tab:${node.node_id}:config`);
   const set = (patch: Partial<TrafficForm>) => setForm({ ...shown, ...patch });
+  const revert = () => {
+    setForm(null);
+    setCalibrating(false);
+  };
   const save = useMutation({
     mutationFn: () =>
       saveNodeTraffic(node.node_id, {
         cycle_kind: shown.cycle_kind,
+        accounting_mode: shown.accounting_mode,
         reset_month: shown.cycle_kind === 'yearly' ? resetMonth : null,
         reset_day: resetDay,
-        quota_bytes: mine?.quota_bytes ?? null,
+        quota_bytes: quota ?? null,
         calibrated_total_bytes: calibration,
       }),
-    onSuccess: view => {
-      setForm(null);
+    onSuccess: async view => {
+      revert();
       qc.setQueryData<NodeTrafficView>(['node-traffic'], view);
+      await qc.invalidateQueries({ queryKey: ['usage-machine-model'] });
     },
   });
 
   if (!mine) return null;
 
   const reported = mine.last_reported_at_unix_secs;
-  const tracked = mine.tracking_started_at_unix_secs !== null || mine.calibrated_at_unix_secs !== null;
-  const periodStart = new Date(mine.period_start_unix_secs * 1000).toISOString().slice(0, 10);
-  const nextReset = new Date(mine.period_end_unix_secs * 1000).toISOString().slice(0, 10);
   return (
-    <details className="panel config-panel node-traffic-accounting">
-      <summary>
+    <div className="panel config-panel node-traffic-accounting">
+      <header>
         <PanelTitle of="usage">流量统计</PanelTitle>
         <span className="sp" />
-        {mine.has_gap && <span className="node-traffic-summary-gap">缺口</span>}
-        <span className="node-traffic-summary-total mono">{tracked ? exactBytes(mine.total_bytes) : '待上报'}</span>
         <span className="node-traffic-source" title={reported === null ? undefined : `上报于 ${iso(reported)}`}>
           <span className="mono">{mine.interface ?? '待上报'}</span>
         </span>
-      </summary>
-      <div className="node-traffic-overview">
-        <div className="node-traffic-total">
-          <span>本期总量</span>
-          <span className="node-traffic-value mono">{tracked ? exactBytes(mine.total_bytes) : '—'}</span>
-          <span className="node-traffic-meta">
-            <span className="node-traffic-period mono">
-              {periodStart} → {nextReset} <small>UTC</small>
-            </span>
-            {mine.calibrated_at_unix_secs !== null && (
-              <span className="node-traffic-calibrated">
-                校准 · <Ago at={iso(mine.calibrated_at_unix_secs)} />
-              </span>
-            )}
-          </span>
-        </div>
-        <dl className="node-traffic-directions" aria-label="接收与发送流量">
-          <div>
-            <dt>
-              <i className="rx" aria-hidden="true">
-                ↓
-              </i>
-              接收
-            </dt>
-            <dd className="mono">{tracked ? exactBytes(mine.rx_bytes) : '—'}</dd>
-          </div>
-          <div>
-            <dt>
-              <i className="tx" aria-hidden="true">
-                ↑
-              </i>
-              发送
-            </dt>
-            <dd className="mono">{tracked ? exactBytes(mine.tx_bytes) : '—'}</dd>
-          </div>
-        </dl>
-      </div>
-      {mine.has_gap && (
-        <div
-          className="node-traffic-gap"
-          role="status"
-          title={mine.last_gap_at_unix_secs === null ? undefined : iso(mine.last_gap_at_unix_secs)}
-        >
-          <span aria-hidden="true">!</span>
-          缺口 · {trafficGapReason(mine.last_gap_reason)}
-        </div>
-      )}
+      </header>
+      <TrafficPeriodSummary traffic={mine} />
       <div className="fgrid one node-traffic-settings">
-        <Row k="周期">
-          <SegmentedControl
-            value={shown.cycle_kind}
-            options={[
-              { value: 'monthly' as const, label: '每月' },
-              { value: 'yearly' as const, label: '每年' },
-            ]}
+        <Row k="计量口径">
+          <select
+            className="f words"
+            style={{ width: 128 }}
+            value={shown.accounting_mode}
             disabled={!canEdit}
-            ariaLabel="流量重置周期"
-            onChange={cycle_kind => set({ cycle_kind })}
-          />
+            aria-label="机器流量计量口径"
+            onChange={event => set({ accounting_mode: event.target.value as NodeTrafficAccountingMode })}
+          >
+            {TRAFFIC_ACCOUNTING_MODES.map(mode => (
+              <option key={mode.value} value={mode.value}>
+                {mode.label}
+              </option>
+            ))}
+          </select>
+          <span className="sub">
+            {TRAFFIC_ACCOUNTING_MODES.find(mode => mode.value === shown.accounting_mode)?.note}
+          </span>
         </Row>
-        <Row k="重置日">
+        <Row k="重置">
           <span className="nd-ctl-line">
+            <SegmentedControl
+              value={shown.cycle_kind}
+              options={[
+                { value: 'monthly' as const, label: '每月' },
+                { value: 'yearly' as const, label: '每年' },
+              ]}
+              disabled={!canEdit}
+              ariaLabel="流量重置周期"
+              onChange={cycle_kind => set({ cycle_kind })}
+            />
             {shown.cycle_kind === 'yearly' && (
               <select
-                className="f"
+                className="f words"
                 style={{ width: 82 }}
                 value={shown.reset_month}
                 disabled={!canEdit}
@@ -3454,7 +3459,7 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
             )}
             <input
               className="f mono"
-              style={{ width: 72 }}
+              style={{ width: 64 }}
               type="number"
               min={1}
               max={31}
@@ -3463,35 +3468,84 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
               aria-label="重置日"
               onChange={event => set({ reset_day: event.target.value })}
             />
+            <span>日</span>
           </span>
         </Row>
-        <Row k="校准总量">
+        <Row k="流量额度">
           <span className="nd-ctl-line">
             <input
               className="f mono"
               style={{ width: 128 }}
               inputMode="decimal"
-              placeholder="留空不变"
-              value={shown.calibration}
+              placeholder="不限"
+              value={shown.quota}
               disabled={!canEdit}
-              aria-label="当前流量校准值"
-              onChange={event => set({ calibration: event.target.value })}
+              aria-label="机器流量额度"
+              aria-invalid={quota === undefined || undefined}
+              onChange={event => set({ quota: event.target.value })}
             />
-            <select
-              className="f"
-              style={{ width: 76 }}
-              value={shown.calibration_unit}
-              disabled={!canEdit}
-              aria-label="校准单位"
-              onChange={event => set({ calibration_unit: event.target.value as TrafficCalibrationUnit })}
-            >
-              <option value="GiB">GiB</option>
-              <option value="TiB">TiB</option>
-            </select>
+            <span>TiB</span>
           </span>
         </Row>
+        <Row k="校准">
+          {calibrating ? (
+            <span className="nd-ctl-line">
+              <input
+                className="f mono"
+                style={{ width: 128 }}
+                inputMode="decimal"
+                placeholder="服务商读数"
+                autoFocus
+                value={shown.calibration}
+                aria-label="当前流量校准值"
+                aria-invalid={calibrationInvalid || undefined}
+                onChange={event => set({ calibration: event.target.value })}
+              />
+              <SegmentedControl
+                value={shown.calibration_unit}
+                options={[
+                  { value: 'GiB' as const, label: 'GiB' },
+                  { value: 'TiB' as const, label: 'TiB' },
+                ]}
+                ariaLabel="校准单位"
+                onChange={calibration_unit => set({ calibration_unit })}
+              />
+              <button
+                type="button"
+                className="btn"
+                onClick={() => {
+                  set({ calibration: '' });
+                  setCalibrating(false);
+                }}
+              >
+                取消
+              </button>
+            </span>
+          ) : (
+            <span className="nd-ctl-line">
+              <span>
+                {mine.calibrated_at_unix_secs === null ? (
+                  '本期未校准'
+                ) : (
+                  <>
+                    已校准 · <Ago at={iso(mine.calibrated_at_unix_secs)} />
+                  </>
+                )}
+              </span>
+              {canEdit && (
+                <button type="button" className="btn" onClick={() => setCalibrating(true)}>
+                  校准
+                </button>
+              )}
+            </span>
+          )}
+        </Row>
       </div>
-      {invalid && <div className="callout err">日期需为 1–31；校准值需为非负数字，最多保留 6 位小数。</div>}
+      {invalid && (
+        <div className="callout err">
+          日期需为 1–31；流量额度需为大于 0 的数字、最多两位小数，留空表示不限；校准值需为非负数字、最多保留 6 位小数。
+        </div>
+      )}
       {save.error && <ErrorBox error={save.error} />}
       {dirty && (
         <div className="toolbar config-panel-savebar">
@@ -3503,12 +3557,107 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
           >
             {save.isPending ? '保存中…' : '保存'}
           </button>
-          <button className="btn" disabled={save.isPending} onClick={() => setForm(null)}>
+          <button className="btn" disabled={save.isPending} onClick={revert}>
             还原
           </button>
         </div>
       )}
-    </details>
+    </div>
+  );
+}
+
+/** 本期一行读数、额度条与接收/发送。倒计时与时间进度用共享的一秒节拍，只让这一块随之重绘。 */
+function TrafficPeriodSummary({ traffic }: { traffic: NodeTrafficItem }) {
+  const now = useNow() / 1000;
+  const tracked = traffic.tracking_started_at_unix_secs !== null || traffic.calibrated_at_unix_secs !== null;
+  const start = traffic.period_start_unix_secs;
+  const end = traffic.period_end_unix_secs;
+  const left = Math.max(end - now, 0);
+  const used = Number(traffic.total_bytes);
+  const quota = traffic.quota_bytes === null ? null : Number(traffic.quota_bytes);
+  const counted = countedTrafficDirections(traffic);
+  return (
+    <div className="node-traffic-summary">
+      <div className="node-traffic-line">
+        <span className="node-traffic-used">
+          本期
+          <b>{tracked ? exactBytes(traffic.total_bytes) : '—'}</b>
+          {traffic.quota_bytes !== null && <span>/ {machineQuotaTiB(traffic.quota_bytes)} TiB</span>}
+          {quota !== null && tracked && (
+            <span className={used > quota ? 'over' : undefined}>{Math.round((used / quota) * 100)}%</span>
+          )}
+        </span>
+        <span className="node-traffic-reset">
+          {left < TRAFFIC_DAY_SECS
+            ? `${Math.max(1, Math.round(left / 3600))} 小时`
+            : `${Math.round(left / TRAFFIC_DAY_SECS)} 天`}
+          后重置 · {new Date(end * 1000).toISOString().slice(5, 10)} UTC
+        </span>
+      </div>
+      {quota !== null && tracked && (
+        <TrafficQuotaMeter used={used} quota={quota} elapsed={(now - start) / (end - start)} />
+      )}
+      {tracked && (
+        <dl className="node-traffic-directions" aria-label="接收与发送流量">
+          <div className={counted.rx ? 'rx' : 'rx off'}>
+            <dt>
+              <i aria-hidden="true" />
+              接收
+            </dt>
+            <dd>{exactBytes(traffic.rx_bytes)}</dd>
+          </div>
+          <div className={counted.tx ? 'tx' : 'tx off'}>
+            <dt>
+              <i aria-hidden="true" />
+              发送
+            </dt>
+            <dd>{exactBytes(traffic.tx_bytes)}</dd>
+          </div>
+        </dl>
+      )}
+    </div>
+  );
+}
+
+/** 计入本期总量的方向；取大时是整个账期累计较大的一方。 */
+function countedTrafficDirections(traffic: NodeTrafficItem): { rx: boolean; tx: boolean } {
+  switch (traffic.accounting_mode) {
+    case 'bidirectional_sum':
+      return { rx: true, tx: true };
+    case 'inbound_only':
+      return { rx: true, tx: false };
+    case 'outbound_only':
+      return { rx: false, tx: true };
+    case 'bidirectional_max': {
+      const rxLarger = Number(traffic.rx_bytes) >= Number(traffic.tx_bytes);
+      return { rx: rxLarger, tx: !rxLarger };
+    }
+  }
+}
+
+/** 额度条沿用流量预测页的跑道：满格为额度与已用中较大者，超出额度的部分用错误色。
+ *  未超额时竖线是本期时间进度，与已用长度对照即看出快慢；超额后竖线改标额度位置。 */
+function TrafficQuotaMeter({ used, quota, elapsed }: { used: number; quota: number; elapsed: number }) {
+  const full = Math.max(quota, used);
+  const at = (value: number) => (full > 0 ? (Math.min(Math.max(value, 0), full) / full) * 100 : 0);
+  const progress = Math.min(Math.max(elapsed, 0), 1);
+  const over = used > quota;
+  return (
+    <span
+      className="node-traffic-meter"
+      aria-hidden="true"
+      title={over ? undefined : `本期时间已过 ${Math.round(progress * 100)}%`}
+    >
+      <span className="cap-bar">
+        <i className="u" style={{ left: 0, width: `${at(Math.min(used, quota))}%` }} />
+        {over && <i className="u x" style={{ left: `${at(quota)}%`, width: `${at(used) - at(quota)}%` }} />}
+      </span>
+      {over ? (
+        <i className="cap-q" style={{ left: `${at(quota)}%` }} />
+      ) : (
+        <i className="node-traffic-pace" style={{ left: `${progress * 100}%` }} />
+      )}
+    </span>
   );
 }
 
@@ -3823,7 +3972,7 @@ function WgDisabledLinksRow({
 // 而不是只标记为异常。
 
 type Finding = {
-  tone: 'warn' | 'bad';
+  tone: 'info' | 'warn' | 'bad';
   chip: string;
   text: ReactNode;
   /** 只在详情页显示，不进入列表。列表用于定位存在问题的机器，而部分条目是说明而非问题——
@@ -3841,18 +3990,6 @@ function xrayVer(raw: string | null | undefined): [number, number] | null {
 
 /** `geodata` 自动更新合入主线的版本。低于该版本的 xray 会忽略该段配置且不报错。 */
 const XRAY_GEODATA_MIN: [number, number] = [26, 4];
-
-function spoolDropCounts(spool: NonNullable<NodeAgentStateItem['spool_backlog']>) {
-  const usage = Math.max(0, spool.usage_dropped ?? 0);
-  const observation = Math.max(0, spool.observation_dropped ?? 0);
-  const load = Math.max(0, spool.load_dropped ?? 0);
-  return {
-    usage,
-    observation,
-    load,
-    unclassified: Math.max(0, spool.dropped - usage - observation - load),
-  };
-}
 
 export function runtimeFindings(
   node: NodeAgentStateItem,
@@ -3952,39 +4089,40 @@ export function runtimeFindings(
     }
   }
 
+  const upgrade = node.xray_upgrade;
+  if (upgrade?.phase === 'blocked') {
+    const oldConnections = upgrade.old.active_connections;
+    const candidateServing = upgrade.candidate?.alive === true && upgrade.candidate.accepting === true;
+    out.push({
+      tone: candidateServing ? 'info' : 'bad',
+      detailOnly: candidateServing,
+      chip: oldConnections == null ? 'Xray 交接阻塞' : `Xray 待排空 ${oldConnections.toLocaleString()} 条`,
+      text: candidateServing ? (
+        <>
+          新 Xray 实例已接管新连接；
+          {oldConnections == null
+            ? '上一代实例仍未满足安全退役条件'
+            : `上一代实例仍承载 ${oldConnections.toLocaleString()} 条存量连接`}
+          。排空时限已经到达，Agent 将在下一次收敛中终止上一代；这些存量连接会中断，新连接不受影响。
+        </>
+      ) : (
+        <>Xray 交接被阻塞，候选代尚未确认接管：{upgrade.blocked_reason || '未上报具体原因'}。</>
+      ),
+    });
+  }
+
   const spool = node.spool_backlog;
   if (spool) {
-    const dropped = spoolDropCounts(spool);
-    if (dropped.usage > 0) {
+    const usageDropped = Math.max(0, spool.usage_dropped ?? 0);
+    if (usageDropped > 0) {
       out.push({
         tone: 'bad',
-        chip: `丢了 ${dropped.usage.toLocaleString()} 条用量`,
+        chip: `丢了 ${usageDropped.toLocaleString()} 条用量`,
         text: (
           <>
             用量上报已被永久丢弃，对应时段的流量明细<b>找不回来</b>。先检查控制面连通性和用量接口错误。
           </>
         ),
-      });
-    }
-    if (dropped.observation > 0) {
-      out.push({
-        tone: 'warn',
-        chip: `丢了 ${dropped.observation.toLocaleString()} 条收敛结果`,
-        text: <>Agent 已执行但结果被控制面永久拒绝；发布可能缺少执行证据，但这不代表流量丢失。</>,
-      });
-    }
-    if (dropped.load > 0) {
-      out.push({
-        tone: 'warn',
-        chip: `丢了 ${dropped.load.toLocaleString()} 个指标窗口`,
-        text: <>Console 不可达超过本机一小时队列，较早的 CPU、内存、磁盘和网卡速率窗口无法补回。</>,
-      });
-    }
-    if (dropped.unclassified > 0) {
-      out.push({
-        tone: 'warn',
-        chip: `丢了 ${dropped.unclassified.toLocaleString()} 条未分类上报`,
-        text: <>旧 Agent 只记录总数，无法还原是用量还是收敛结果；升级后新丢弃会分类记录。</>,
       });
     }
   }
@@ -4019,7 +4157,7 @@ export function runtimeFindings(
   /* 该条需要最后添加：它说明上面各项显示为「—」的原因。 */
   if (!node.runtime_versions && node.agent_version) {
     out.push({
-      tone: 'warn',
+      tone: 'info',
       detailOnly: true,
       // 构建号截断显示：完整 sha 有 64 位，完整显示会导致该行超出宽度。
       chip: `agent ${node.agent_version.replace(/^brocade-agent\//, '').slice(0, 12)}`,
@@ -4041,13 +4179,17 @@ export function runtimeFindings(
   return out;
 }
 
+export function runtimeFindingAttentionCount(findings: readonly Finding[], unreachableHops = 0): number {
+  return findings.filter(finding => finding.tone !== 'info').length + unreachableHops;
+}
+
 /** 成因说明。位置和语气与 USAGE 卡下方的采集缺口说明一致。 */
 function Findings({ list }: { list: Finding[] }) {
   if (list.length === 0) return null;
   return (
     <>
       {list.map((f, i) => (
-        <p key={i} className={`rt-dx${f.tone === 'bad' ? ' bad' : ''}`}>
+        <p key={i} className={`rt-dx ${f.tone}`}>
           {f.text}
         </p>
       ))}
@@ -4201,7 +4343,7 @@ function LoadCardFor({
      按 10s 拉，窗口一关最多 10 秒就被取到——这一段是纯等待，缩掉不损失任何东西。
      真正的分辨率仍是 30 秒，那要改 agent 的窗口，且用量窗口得一起动（两者故意对齐，
      遥测页把流量柱和 CPU 线叠在同一根时间轴上就靠这个）。 */
-  const load = useQuery({
+  const load = useMetricQuery({
     ...nodeLoadRangeQuery(nodeId, range),
     // 长范围通常有约 2,880 个深度窗口，而原数据本身每 30 秒才增加一点。
     // 30m/1h 保留 10s 的低延迟；6h 以上按数据分辨率拉取，避免重复传输同一大段历史。
@@ -4533,7 +4675,7 @@ export function PingProbePanel({
   linked: boolean;
   observationModules: NodeObservationModules;
 }) {
-  const probe = useQuery({
+  const probe = useMetricQuery({
     ...nodePingRangeQuery(nodeId, range),
   });
   const [chosenFamily, setChosenFamily] = useState<PingProbeFamily>('ipv4');
@@ -4768,11 +4910,7 @@ function AgentCard({
                 {node.spool_backlog.observation + node.spool_backlog.usage + (node.spool_backlog.load ?? 0)}
                 <span className="nd-rt-u">条</span>
                 <span className="dim"> · 丢弃 </span>
-                {node.spool_backlog.dropped > 0 ? (
-                  <Hot>{node.spool_backlog.dropped.toLocaleString()}</Hot>
-                ) : (
-                  node.spool_backlog.dropped.toLocaleString()
-                )}
+                {node.spool_backlog.dropped.toLocaleString()}
               </>
             ) : (
               <span className="dim">—</span>
@@ -5181,19 +5319,19 @@ function NodeChainsSection({
 
 const IDENT_FIELD = { width: 220 };
 
-/** 详情页的三页。观测和配置是原来的两栏，规则原先是页面最下方的一块通栏。 */
+/** 机器详情保留运行观测、机器配置与规则关系；用户流量在用量页查看。 */
 type NodeTab = 'observed' | 'config' | 'chains';
 
 function NodeDetailLayout({
   sheeted,
   node,
-  lamp,
+  identityMark,
   toolbar,
   children,
 }: {
   sheeted: boolean;
   node: NodeAgentStateItem;
-  lamp: NodeLampState;
+  identityMark: ReactNode;
   toolbar: ReactNode;
   children: ReactNode;
 }) {
@@ -5202,21 +5340,7 @@ function NodeDetailLayout({
   const pageHeader = (
     <header className="nd-page-head">
       <div className="nd-page-identity">
-        {/* 区域旗装进带框圆角板，状态灯落在右下角，合成一个紧凑的 identity 对象。
-            无区域（geoip 无国别）时回退为裸灯，底板没有内容就不画。 */}
-        {node.public_ipv4_country ? (
-          <span className="nd-idplate">
-            {/* clip 层裁切铺满的旗；角灯放在 clip 外，探出板角不被裁。 */}
-            <span className="nd-idplate-clip">
-              <RegionFlag code={node.public_ipv4_country} square />
-            </span>
-            <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
-          </span>
-        ) : (
-          <span className="nd-status-slot">
-            <i className={`node-lamp ${lamp.tone}`} title={lamp.why} aria-label={lamp.why} />
-          </span>
-        )}
+        {identityMark}
         <div className="nd-ident-text">
           <div className="nd-ident-row">
             <h1 className={node.name ? 'nd-id nd-name' : 'nd-id'}>{node.name || node.node_id}</h1>
@@ -5320,6 +5444,7 @@ function NodeDetail({
   /* 签发的 node token 同样只显示一次 */
   const [issued, setIssued] = useState<{ token: string; install_command: string } | null>(null);
   const [confirmIsolationFor, setConfirmIsolationFor] = useState<string | null>(null);
+  const [confirmForceRetirement, setConfirmForceRetirement] = useState(false);
 
   // 身份表单始终可编辑，不再设置「改名称 / 公网 IP」开关。
   // 取消编辑模式不会导致误改：不保存则不生效，且「保存到草稿」只在有修改时出现。
@@ -5412,6 +5537,14 @@ function NodeDetail({
       qc.invalidateQueries({ queryKey: ['deployments'] });
     },
   });
+  const forceRetirement = useMutation({
+    mutationFn: (deploymentId: number) => forceConfigXrayRetirement(deploymentId, id),
+    onSuccess: () => {
+      setConfirmForceRetirement(false);
+      refresh();
+      qc.invalidateQueries({ queryKey: ['deployments'] });
+    },
+  });
 
   /* 验证接入：执行一次不做任何修改的空收敛，确认该机器是否已与当前模型一致 */
   const verify = useMutation({ mutationFn: () => verifyDeployment({ node_id: id }) });
@@ -5424,17 +5557,17 @@ function NodeDetail({
      不会让 HOST 因为 24 小时查询而延迟刷新；
      跳的存活同理，与下面的 HopHealth 共用 useHopStats。 */
   const initialRange = DEFAULT_LOAD_RANGE;
-  const load = useQuery({
+  const load = useMetricQuery({
     ...nodeLoadRangeQuery(id, initialRange),
     refetchInterval: 10_000,
   });
   /* 首屏观测和图表分包与基础详情并行。详情框架不再等待这三个查询或图表模块：机器清单
      已经足够画出真实页头与页签，各观测卡先在自己的最终位置显示统一的图表加载态，完成后各自
      替换。这样最慢的 Ping 或图表包不会把已经可用的机器身份一起藏起来。 */
-  const initialUsage = useQuery({
+  const initialUsage = useMetricQuery({
     ...nodeUsageRangeQuery(id, initialRange),
   });
-  const initialPing = useQuery({
+  const initialPing = useMetricQuery({
     ...nodePingRangeQuery(id, initialRange),
   });
   const observationModules = useNodeObservationModules();
@@ -5519,6 +5652,8 @@ function NodeDetail({
      按钮上放不下的解释（旧 token 立即失效、打标记不删行）落在菜单里。
      开合机制与顶栏更多菜单相同（shell.tsx）：document 级点击与 Escape 关闭。 */
   const [actsOpen, setActsOpen] = useState(false);
+  const actsTriggerRef = useRef<HTMLButtonElement>(null);
+  const actsMenuRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!actsOpen) return;
     const close = () => setActsOpen(false);
@@ -5530,6 +5665,34 @@ function NodeDetail({
     return () => {
       document.removeEventListener('click', close);
       document.removeEventListener('keydown', esc);
+    };
+  }, [actsOpen]);
+  useLayoutEffect(() => {
+    if (!actsOpen) return;
+    const position = () => {
+      const trigger = actsTriggerRef.current?.getBoundingClientRect();
+      const menu = actsMenuRef.current;
+      if (!trigger || !menu) return;
+      const margin = 10;
+      const gap = 6;
+      const left = Math.min(
+        window.innerWidth - menu.offsetWidth - margin,
+        Math.max(margin, trigger.right - menu.offsetWidth),
+      );
+      const below = trigger.bottom + gap;
+      const top =
+        below + menu.offsetHeight <= window.innerHeight - margin
+          ? below
+          : Math.max(margin, trigger.top - menu.offsetHeight - gap);
+      menu.style.top = `${top}px`;
+      menu.style.left = `${left}px`;
+    };
+    position();
+    window.addEventListener('resize', position);
+    window.addEventListener('scroll', position, true);
+    return () => {
+      window.removeEventListener('resize', position);
+      window.removeEventListener('scroll', position, true);
     };
   }, [actsOpen]);
 
@@ -5551,6 +5714,7 @@ function NodeDetail({
   if (nodes.isPending) return <Loading variant="detail" sheeted={sheeted} />;
   if (nodes.error) return <ErrorBox error={nodes.error} />;
   if (!n) return <ErrorBox error={new Error(`没有这台机器：${id}`)} />;
+  const forceCandidate = configHandoffForceCandidate(n);
 
   const lifecycleOrder = n.lifecycle_deployment_id
     ? deployments.data?.deployments.find(deployment => deployment.id === n.lifecycle_deployment_id)
@@ -5658,10 +5822,10 @@ function NodeDetail({
   /* 同一观测页里的图表始终共享时间位置与 Tooltip，不再把页面级一致行为做成用户开关。 */
   const chartsLinked = true;
 
-  /* 观测页的角标数。此处不按 `detailOnly` 过滤：那个标记的含义是「列表里不占标记位，
-     进详情页才读」，而这里就是详情页——角标指向的正是它下面那几张卡里会展开的说明。
-     跳不通与 finding 合计成一个数：两者在这一页上是同一件事，「有几处要看」。 */
-  const findingCount = runtimeFindings(n, wireguardEnabled, isolatedNodeIds).length + dead.length;
+  /* 观测页的角标只计需要关注的当前问题。detailOnly 仍可进入角标，例如旧 Xray；info
+     是正常过渡或数据说明，只在卡内呈现。跳不通与 finding 合计成一个数：两者在这一页
+     上是同一件事，「有几处要看」。 */
+  const findingCount = runtimeFindingAttentionCount(runtimeFindings(n, wireguardEnabled, isolatedNodeIds), dead.length);
   const lamp = nodeLampState(n, wireguardEnabled, isolatedNodeIds);
 
   /* A1 页头：身份、页签与操作共用 sheet 内的一条横梁，当前页由满宽底部刻度标记。 */
@@ -5735,6 +5899,7 @@ function NodeDetail({
                 而打开菜单的这次点击绑定发生后仍会冒泡到 document——不拦下，
                 菜单开同一瞬间又被自己关掉（shell.tsx 的两个菜单同样拦）。 */}
                 <button
+                  ref={actsTriggerRef}
                   type="button"
                   className="btn fg-more"
                   aria-label="更多操作"
@@ -5747,107 +5912,129 @@ function NodeDetail({
                 >
                   <Icon of="more" size={14} className="nd-tool-icon" />
                 </button>
-                {actsOpen && (
-                  <div className="fg-menu action-menu" role="menu" onClick={() => setActsOpen(false)}>
-                    {tab === 'observed' && (
+                {actsOpen &&
+                  createPortal(
+                    <div
+                      ref={actsMenuRef}
+                      className="fg-menu action-menu"
+                      data-node-action-menu
+                      role="menu"
+                      onClick={() => setActsOpen(false)}
+                    >
+                      {tab === 'observed' && (
+                        <button
+                          role="menuitem"
+                          disabled={!verifyAllowed || verify.isPending}
+                          onClick={() => verify.mutate()}
+                        >
+                          <Icon of="check" size={14} className="action-menu-icon" />
+                          <span>
+                            {verify.isPending ? '验证中…' : '验证接入'}
+                            <small>空跑一次收敛，确认这台与当前模型一致，不改任何配置</small>
+                          </span>
+                        </button>
+                      )}
                       <button
                         role="menuitem"
-                        disabled={!verifyAllowed || verify.isPending}
-                        onClick={() => verify.mutate()}
+                        disabled={!system || issue.isPending || n.lifecycle_phase !== 'active'}
+                        onClick={() => issue.mutate()}
                       >
-                        <Icon of="check" size={14} className="action-menu-icon" />
+                        <Icon of="access" size={14} className="action-menu-icon" />
                         <span>
-                          {verify.isPending ? '验证中…' : '验证接入'}
-                          <small>空跑一次收敛，确认这台与当前模型一致，不改任何配置</small>
+                          {n.token_prefix && !n.token_revoked_at ? '重签 token' : '签发 token'}
+                          <small>凭据只显示一次；重签后旧 token 立即失效</small>
                         </span>
                       </button>
-                    )}
-                    <button
-                      role="menuitem"
-                      disabled={!system || issue.isPending || n.lifecycle_phase !== 'active'}
-                      onClick={() => issue.mutate()}
-                    >
-                      <Icon of="access" size={14} className="action-menu-icon" />
-                      <span>
-                        {n.token_prefix && !n.token_revoked_at ? '重签 token' : '签发 token'}
-                        <small>凭据只显示一次；重签后旧 token 立即失效</small>
-                      </span>
-                    </button>
-                    <hr />
-                    {!n.operationally_isolated && n.lifecycle_phase === 'active' && (
-                      <button
-                        role="menuitem"
-                        className="dg"
-                        disabled={!system || isolate.isPending}
-                        onClick={() => setConfirmIsolationFor(id)}
-                      >
-                        <Icon of="warn" size={14} className="action-menu-icon" />
-                        <span>
-                          隔离机器
-                          <small>立即停止承载流量；进行中的发布转为隔离待补偿</small>
-                        </span>
-                      </button>
-                    )}
-                    <button
-                      role="menuitem"
-                      className={n.lifecycle_phase === 'active' ? 'dg' : undefined}
-                      disabled={!system || retire.isPending}
-                      onClick={() => retire.mutate(n.lifecycle_phase === 'active' ? 'retired' : 'active')}
-                    >
-                      <Icon
-                        of={n.lifecycle_phase === 'active' ? 'dash' : 'check'}
-                        size={14}
-                        className="action-menu-icon"
-                      />
-                      <span>
-                        {retire.isPending ? '提交中…' : n.lifecycle_phase === 'active' ? '退役机器' : '恢复机器'}
-                        <small>
-                          {n.lifecycle_phase === 'active'
-                            ? '立即创建完整停用发布；不会删除机器记录'
-                            : '递增生命周期代次并创建恢复发布；需要重新签发 Token'}
-                        </small>
-                      </span>
-                    </button>
-                    {n.lifecycle_phase === 'retiring' && (
-                      <>
-                        {teardownNeedsRepair && (
-                          <button
-                            role="menuitem"
-                            disabled={!system || retire.isPending}
-                            onClick={() => retire.mutate('retired')}
-                          >
-                            <Icon of="deploy" size={14} className="action-menu-icon" />
-                            <span>
-                              重建停用发布
-                              <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
-                            </span>
-                          </button>
-                        )}
+                      <hr />
+                      {forceCandidate && (
                         <button
                           role="menuitem"
                           className="dg"
-                          disabled={!system || abandon.isPending}
-                          onClick={() => abandon.mutate()}
+                          disabled={!system || forceRetirement.isPending}
+                          onClick={() => setConfirmForceRetirement(true)}
                         >
                           <Icon of="warn" size={14} className="action-menu-icon" />
                           <span>
-                            {abandon.isPending ? '处理中…' : '强制退役'}
-                            <small>仅用于机器永久失联；结果会保留为警告状态</small>
+                            强制完成 Xray 交接
+                            <small>中断上一代仍承载的 {forceCandidate.activeConnections} 条存量 TCP 连接</small>
                           </span>
                         </button>
-                      </>
-                    )}
-                    {n.lifecycle_deployment_id && (
-                      <button role="menuitem" onClick={() => navigate('deploy')}>
-                        <Icon of="deploy" size={14} className="action-menu-icon" />
+                      )}
+                      {!n.operationally_isolated && n.lifecycle_phase === 'active' && (
+                        <button
+                          role="menuitem"
+                          className="dg"
+                          disabled={!system || isolate.isPending}
+                          onClick={() => setConfirmIsolationFor(id)}
+                        >
+                          <Icon of="warn" size={14} className="action-menu-icon" />
+                          <span>
+                            隔离机器
+                            <small>立即停止承载流量；进行中的发布转为隔离待补偿</small>
+                          </span>
+                        </button>
+                      )}
+                      <button
+                        role="menuitem"
+                        className={n.lifecycle_phase === 'active' ? 'dg' : undefined}
+                        disabled={!system || retire.isPending}
+                        onClick={() => retire.mutate(n.lifecycle_phase === 'active' ? 'retired' : 'active')}
+                      >
+                        <Icon
+                          of={n.lifecycle_phase === 'active' ? 'dash' : 'check'}
+                          size={14}
+                          className="action-menu-icon"
+                        />
                         <span>
-                          查看发布 #{n.lifecycle_deployment_id}
-                          <small>打开发布页查看停用动作与波次确认</small>
+                          {retire.isPending ? '提交中…' : n.lifecycle_phase === 'active' ? '退役机器' : '恢复机器'}
+                          <small>
+                            {n.lifecycle_phase === 'active'
+                              ? '立即创建完整停用发布；不会删除机器记录'
+                              : '递增生命周期代次并创建恢复发布；需要重新签发 Token'}
+                          </small>
                         </span>
                       </button>
-                    )}
-                  </div>
-                )}
+                      {n.lifecycle_phase === 'retiring' && (
+                        <>
+                          {teardownNeedsRepair && (
+                            <button
+                              role="menuitem"
+                              disabled={!system || retire.isPending}
+                              onClick={() => retire.mutate('retired')}
+                            >
+                              <Icon of="deploy" size={14} className="action-menu-icon" />
+                              <span>
+                                重建停用发布
+                                <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
+                              </span>
+                            </button>
+                          )}
+                          <button
+                            role="menuitem"
+                            className="dg"
+                            disabled={!system || abandon.isPending}
+                            onClick={() => abandon.mutate()}
+                          >
+                            <Icon of="warn" size={14} className="action-menu-icon" />
+                            <span>
+                              {abandon.isPending ? '处理中…' : '强制退役'}
+                              <small>仅用于机器永久失联；结果会保留为警告状态</small>
+                            </span>
+                          </button>
+                        </>
+                      )}
+                      {n.lifecycle_deployment_id && (
+                        <button role="menuitem" onClick={() => navigate('deploy')}>
+                          <Icon of="deploy" size={14} className="action-menu-icon" />
+                          <span>
+                            查看发布 #{n.lifecycle_deployment_id}
+                            <small>打开发布页查看停用动作与波次确认</small>
+                          </span>
+                        </button>
+                      )}
+                    </div>,
+                    document.body,
+                  )}
               </div>
             </div>
           )}
@@ -5857,7 +6044,24 @@ function NodeDetail({
   );
 
   return (
-    <NodeDetailLayout sheeted={sheeted} node={n} lamp={lamp} toolbar={detailToolbar}>
+    <NodeDetailLayout
+      sheeted={sheeted}
+      node={n}
+      identityMark={
+        <NodeRegionEditor
+          nodeName={n.name || id}
+          countryCode={n.public_ipv4_country}
+          detectedCountryCode={n.public_ipv4_country_detected}
+          overrideCountryCode={n.public_ipv4_country_override}
+          lampTone={lamp.tone}
+          lampWhy={lamp.why}
+          editable={system}
+          onSave={countryCode => saveNodeRegion(id, countryCode)}
+          onSaved={refresh}
+        />
+      }
+      toolbar={detailToolbar}
+    >
       {n.operationally_isolated && (
         <div className="callout warn node-isolation-banner">
           <div className="node-isolation-copy">
@@ -5918,9 +6122,23 @@ function NodeDetail({
         </div>
       )}
 
-      {(issue.error || verify.error || retire.error || abandon.error || isolate.error || serviceRestore.error) && (
+      {(issue.error ||
+        verify.error ||
+        retire.error ||
+        abandon.error ||
+        isolate.error ||
+        serviceRestore.error ||
+        forceRetirement.error) && (
         <ErrorBox
-          error={issue.error ?? verify.error ?? retire.error ?? abandon.error ?? isolate.error ?? serviceRestore.error}
+          error={
+            issue.error ??
+            verify.error ??
+            retire.error ??
+            abandon.error ??
+            isolate.error ??
+            serviceRestore.error ??
+            forceRetirement.error
+          }
         />
       )}
 
@@ -5996,7 +6214,6 @@ function NodeDetail({
           {/* Mux 与反向隧道来自同一条节点实时流，只建立一个 EventSource。两张卡都只在对应
               快照存在时渲染；计数基线留在浏览器内，不进入遥测历史或数据库。 */}
           <NodeRealtimeProvider nodeId={id}>
-            {canViewUserRealtimeTraffic(who) && <NodeUserTrafficCard nodeId={id} />}
             <VpngateObservationCard nodeId={id} />
             <MuxObservationCard nodeId={id} nodeName={nodeNameOf} chainName={chainNameOf} />
             <ReverseHealthCard nodeId={id} nodeName={nodeNameOf} chainName={chainNameOf} />
@@ -6027,8 +6244,8 @@ function NodeDetail({
       {/* ── 写入控制面模型的配置。 ──
             两列而不是铺满：表单行是一条标签栏加 220px 输入，整幅宽度只会让标签和值之间
             空出一大片。分栏依据是「改这一项影响谁」：
-              左栏 —— 只影响这台机器自己（它叫什么、地址是什么、如何解析、wg0 怎么起）；
-              右栏 —— 影响它与外部的关系，以及它与机队默认值的差异。
+              左栏 —— 这台机器自己的身份、物理流量与 wg0；
+              右栏 —— DNS、证书等外部关系，以及它与机队默认值的差异。
             右栏末尾的「本机覆盖」把设置页里按机器分列的两段（连接策略、日志保留）收在
             这台机器名下：那两段在设置页是一张机队表，逐台调一项要先在表里找到这一行。 */}
       {tab === 'config' && !snapshot.data && (
@@ -6119,7 +6336,7 @@ function NodeDetail({
               )}
             </div>
 
-            <DnsCard node={n} canEdit={system} onSaved={onSaved} />
+            <TrafficAccountingCard node={n} canEdit={system} />
             <WgCard
               node={n}
               listenPort={wgListenPort}
@@ -6132,11 +6349,11 @@ function NodeDetail({
           </div>
 
           <div>
+            <DnsCard node={n} canEdit={system} onSaved={onSaved} />
             {/* 证书组决定这台机器出示的 SNI，与身份里的公网地址一样是它的对外属性；
                 与它们不同的是改动不经过发布，所以卡里自己就保存了。 */}
             <CertGroupCard node={n} canEdit={system} />
             <ConnectionCard node={n} canEdit={system} onSaved={onSaved} />
-            <TrafficAccountingCard node={n} canEdit={system} />
             <LogRetentionCard node={n} canEdit={system} />
           </div>
         </section>
@@ -6188,6 +6405,22 @@ function NodeDetail({
           confirmDisabled={isolate.isPending}
           onConfirm={() => isolate.mutate()}
           onCancel={() => setConfirmIsolationFor(null)}
+        />
+      )}
+      {confirmForceRetirement && forceCandidate && (
+        <Confirm
+          title={`强制完成 ${n.name || id} 的 Xray 交接？`}
+          body={
+            <p>
+              当前配置发布 #{forceCandidate.deploymentId} 的新 Xray 已接管新连接；上一代仍承载{' '}
+              {forceCandidate.activeConnections} 条存量 TCP
+              连接。继续会只终止上一代并中断这些连接，新连接继续由当前实例接入。
+            </p>
+          }
+          confirmLabel="强制完成交接"
+          confirmDisabled={forceRetirement.isPending}
+          onConfirm={() => forceRetirement.mutate(forceCandidate.deploymentId)}
+          onCancel={() => setConfirmForceRetirement(false)}
         />
       )}
     </NodeDetailLayout>

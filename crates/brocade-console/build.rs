@@ -426,9 +426,10 @@ fn missing_prerequisites(
 
     if missing_go {
         let version = xray_build::GO_VERSION.trim();
+        let release_line = version.rsplit_once('.').map_or(version, |(line, _)| line);
         text.push_str(&format!(
-            "\n[{}] Go {version}（构建或验证仓库内的 {XRAY_SOURCE_DIR}）\n\n\
-             装好 Go {version} 后确保 `go version` 能运行，或者用 {GO_ENV_VAR} 指定完整路径。\n\
+            "\n[{}] Go {release_line}.x（构建或验证仓库内的 {XRAY_SOURCE_DIR}）\n\n\
+             装好 Go {release_line} 系列后确保 `go version` 能运行，或者用 {GO_ENV_VAR} 指定完整路径。\n\
              Xray 源码已经钉在仓库内，构建过程不会 clone 或切换上游仓库。\n",
             next(),
         ));

@@ -1,7 +1,7 @@
 import { ingressUpsertBody } from '../src/api';
 import { useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   CertificateTrack,
@@ -52,6 +52,7 @@ function ingress(
       no_mail: true,
       no_udp_amplification: true,
       tcp_and_quic_only: false,
+      cn_source_block: 'off',
     },
     identity: { public_key: 'public-key', short_ids: ['0123456789abcdef'] },
     wires: { vless },
@@ -415,7 +416,7 @@ describe('MTProxy machine eligibility', () => {
 
     expect(card?.querySelectorAll('.protocol-choice-icon path')).toHaveLength(2);
     expect(card?.querySelector('.protocol-choice-icon circle')).toBeNull();
-    expect(view.getByText('Telegram MTProto 代理；出口地址参与中继握手，要求网卡直配公网 IPv4。')).toBeTruthy();
+    expect(view.getByText('Telegram MTProto 代理。')).toBeTruthy();
   });
 
   it('allows creation on a network-card public IPv4 and still lets an invalid legacy instance be disabled', () => {
@@ -518,7 +519,7 @@ describe('接入协议面板折叠', () => {
     if (!(panel instanceof HTMLDetailsElement)) throw new Error('安全策略没有使用可折叠面板');
     expect(panel.open).toBe(false);
     expect(panel.classList.contains('config-disclosure')).toBe(true);
-    expect(panel.querySelector('.config-disclosure-summary')?.textContent).toBe('已启用 4 / 5 项');
+    expect(panel.querySelector('.config-disclosure-summary')?.textContent).toBe('已启用 4 / 6 项');
     expect(panel.querySelector('.config-disclosure-toggle')?.textContent).toBe('展开');
 
     const summary = panel.querySelector('summary');
@@ -526,6 +527,68 @@ describe('接入协议面板折叠', () => {
     fireEvent.click(summary);
     expect(panel.open).toBe(true);
     await waitFor(() => expect(panel.querySelector('.config-disclosure-toggle')?.textContent).toBe('收起'));
+    const family = view.getByRole('group', { name: '阻断 CN 来源 IP' });
+    expect(within(family).getByRole('button', { name: '不阻断', pressed: true })).toBeTruthy();
+    const ipv4 = within(family).getByRole('button', { name: '仅 IPv4', pressed: false });
+    const dualStack = within(family).getByRole('button', { name: 'IPv4 + IPv6', pressed: false });
+    const strict = view.getByText('只放行 TCP 与 UDP/443').closest('.guard-row');
+    expect(strict?.nextElementSibling).toBe(family.closest('.guard-row'));
+    fireEvent.click(ipv4);
+    expect(ipv4.getAttribute('aria-pressed')).toBe('true');
+    expect(within(family).getByRole('button', { name: '不阻断', pressed: false })).toBeTruthy();
+    fireEvent.click(dualStack);
+    expect(dualStack.getAttribute('aria-pressed')).toBe('true');
+    expect(panel.querySelector('.config-disclosure-summary')?.textContent).toBe('已启用 5 / 6 项');
+    const mail = view.getByRole('switch', { name: '禁止邮件端口', checked: true });
+    fireEvent.click(mail);
+    expect(view.getByRole('switch', { name: '禁止邮件端口', checked: false })).toBe(mail);
+    expect(panel.querySelector('.config-disclosure-summary')?.textContent).toBe('已启用 4 / 6 项');
+    fireEvent.click(view.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
+    const operation = draft.ops()[0];
+    if (operation?.op !== 'upsert_ingress') throw new Error('expected an ingress draft operation');
+    expect(operation.ingress.guard.cn_source_block).toBe('ipv4-and-ipv6');
+    expect(operation.ingress.guard.no_mail).toBe(false);
+  });
+
+  it('保留访客可见的策略状态，同时禁止修改开关和来源地址族', () => {
+    const client = new QueryClient();
+    const value = ingress('vless-reality');
+    value.guard.cn_source_block = 'ipv4';
+    const view = render(
+      <QueryClientProvider client={client}>
+        <IngressGuardBlock appId="app-1" ingress={value} editable={false} />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(view.getByText('安全策略'));
+
+    const switches = view.getAllByRole('switch') as HTMLInputElement[];
+    expect(switches).toHaveLength(5);
+    expect(switches.every(control => control.disabled)).toBe(true);
+    const family = within(view.getByRole('group', { name: '阻断 CN 来源 IP' }));
+    expect(family.getByRole('button', { name: '仅 IPv4', pressed: true })).toBeTruthy();
+    const modes = family.getAllByRole('button') as HTMLButtonElement[];
+    expect(modes.every(control => control.disabled)).toBe(true);
+    expect(view.queryByRole('button', { name: '保存' })).toBeNull();
+    expect(draft.ops()).toHaveLength(0);
+  });
+
+  it('兼容旧 Console 未返回 CN 策略的预览，不误算启用数或生成未保存修改', () => {
+    const client = new QueryClient();
+    const value = ingress('vless-reality');
+    Reflect.deleteProperty(value.guard, 'cn_source_block');
+    const view = render(
+      <QueryClientProvider client={client}>
+        <IngressGuardBlock appId="app-1" ingress={value} editable />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(view.getByText('安全策略'));
+
+    expect(view.getByText('已启用 4 / 6 项')).toBeTruthy();
+    const family = within(view.getByRole('group', { name: '阻断 CN 来源 IP' }));
+    expect(family.getByRole('button', { name: '不阻断', pressed: true })).toBeTruthy();
+    expect(view.queryByText('未保存')).toBeNull();
+    expect(view.queryByRole('button', { name: '保存' })).toBeNull();
   });
 });
 

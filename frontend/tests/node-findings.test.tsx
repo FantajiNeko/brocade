@@ -3,7 +3,9 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { NodeAgentStateItem } from '../src/api';
 
 let runtimeFindings: typeof import('../src/panes/nodes').runtimeFindings;
+let runtimeFindingAttentionCount: typeof import('../src/panes/nodes').runtimeFindingAttentionCount;
 let AppliedCard: typeof import('../src/panes/nodes').AppliedCard;
+let nodeLampState: typeof import('../src/panes/nodes').nodeLampState;
 
 beforeAll(async () => {
   vi.stubGlobal(
@@ -14,7 +16,7 @@ beforeAll(async () => {
       removeEventListener: vi.fn(),
     })),
   );
-  ({ AppliedCard, runtimeFindings } = await import('../src/panes/nodes'));
+  ({ AppliedCard, nodeLampState, runtimeFindingAttentionCount, runtimeFindings } = await import('../src/panes/nodes'));
 });
 
 afterEach(cleanup);
@@ -145,6 +147,51 @@ describe('usage runtime findings', () => {
   });
 });
 
+describe('handoff liveness findings', () => {
+  it('keeps a runtime-reporting node online while desired polling pauses for drain', () => {
+    const value = node(false);
+    value.last_poll_at = '2026-10-16T14:10:28Z';
+    value.runtime_reported_at = new Date().toISOString();
+    value.runtime_report_fresh = true;
+    value.desired_poll_fresh = false;
+    value.xray_upgrade = {
+      source: { kind: 'config-deployment', deployment_id: 604, claim_generation: 0 },
+      release_id: -604,
+      attempt: 0,
+      strategy: 'handoff',
+      phase: 'blocked',
+      old: {
+        pid: 49698,
+        pid_start_ticks: 1,
+        boot_id: 'boot',
+        sha256: 'old',
+        alive: true,
+        accepting: false,
+        active_connections: 3,
+      },
+      candidate: {
+        pid: 18801,
+        pid_start_ticks: 2,
+        boot_id: 'boot',
+        sha256: 'new',
+        alive: true,
+        accepting: true,
+        active_connections: 32,
+      },
+      blocked_reason: '旧代仍有 3 条连接，Agent 重启后继续等待自然排空',
+    };
+
+    const finding = runtimeFindings(value).find(item => item.chip === 'Xray 待排空 3 条');
+    expect(finding?.tone).toBe('info');
+    expect(finding?.detailOnly).toBe(true);
+    expect(runtimeFindingAttentionCount(runtimeFindings(value))).toBe(0);
+    expect(nodeLampState(value)).toEqual({ tone: 'ok', why: '没有要处理的' });
+    render(<div>{finding?.text}</div>);
+    expect(screen.getByText(/上一代实例仍承载 3 条存量连接/)).not.toBeNull();
+    expect(screen.queryByText(/49698|PID/)).toBeNull();
+  });
+});
+
 describe('durable spool-loss findings', () => {
   it('reserves the traffic-loss warning for classified usage reports', () => {
     const value = node(false);
@@ -162,7 +209,7 @@ describe('durable spool-loss findings', () => {
     expect(container.textContent).toContain('流量明细');
   });
 
-  it('reports rejected convergence evidence without claiming traffic was lost', () => {
+  it('keeps historical convergence loss out of current health attention', () => {
     const value = node(false);
     value.spool_backlog = {
       observation: 0,
@@ -172,13 +219,12 @@ describe('durable spool-loss findings', () => {
       observation_dropped: 1,
     };
 
-    const finding = runtimeFindings(value).find(item => item.chip === '丢了 1 条收敛结果');
-    expect(finding?.tone).toBe('warn');
-    const { container } = render(<>{finding?.text}</>);
-    expect(container.textContent).toContain('不代表流量丢失');
+    expect(runtimeFindings(value).some(item => item.chip.includes('收敛结果'))).toBe(false);
+    value.runtime_report_fresh = true;
+    expect(nodeLampState(value)).toEqual({ tone: 'ok', why: '没有要处理的' });
   });
 
-  it('classifies evicted load windows separately from traffic and convergence', () => {
+  it('keeps historical load-window loss out of current health attention', () => {
     const value = node(false);
     value.spool_backlog = {
       observation: 0,
@@ -191,18 +237,22 @@ describe('durable spool-loss findings', () => {
     };
 
     const findings = runtimeFindings(value);
-    expect(findings.find(item => item.chip === '丢了 4 个指标窗口')?.tone).toBe('warn');
+    expect(findings.some(item => item.chip.includes('指标窗口'))).toBe(false);
     expect(findings.some(item => item.chip.includes('未分类'))).toBe(false);
     expect(findings.some(item => item.chip.includes('条用量'))).toBe(false);
+    value.runtime_report_fresh = true;
+    expect(nodeLampState(value)).toEqual({ tone: 'ok', why: '没有要处理的' });
   });
 
-  it('keeps an old aggregate loss unclassified instead of inventing lost usage', () => {
+  it('keeps a legacy aggregate loss out of current health attention', () => {
     const value = node(false);
     value.spool_backlog = { observation: 0, usage: 0, dropped: 3 };
 
     const findings = runtimeFindings(value);
-    expect(findings.find(item => item.chip === '丢了 3 条未分类上报')?.tone).toBe('warn');
+    expect(findings.some(item => item.chip.includes('未分类'))).toBe(false);
     expect(findings.some(item => item.chip.includes('条用量'))).toBe(false);
+    value.runtime_report_fresh = true;
+    expect(nodeLampState(value)).toEqual({ tone: 'ok', why: '没有要处理的' });
   });
 });
 

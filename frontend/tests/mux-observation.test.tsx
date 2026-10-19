@@ -201,6 +201,8 @@ it('shows current capacity and derives reuse counters only from this browser obs
       demand_dials: 6,
     }),
   ]);
+  expect(screen.getByText('调度统计').parentElement?.textContent).toContain('活跃复用 0');
+  act(() => vi.advanceTimersByTime(1_000));
   const dispatchStats = screen.getByText('调度统计').parentElement?.textContent;
   expect(dispatchStats).toContain('活跃复用 2');
   expect(dispatchStats).toContain('空闲命中 1');

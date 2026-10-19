@@ -1,4 +1,8 @@
-use std::{str::FromStr, sync::Arc};
+use std::{
+    borrow::Cow,
+    str::FromStr,
+    sync::{Arc, LazyLock},
+};
 
 use brocade_core::{
     model::{IpFamily, ModelSettings, ModelSnapshot},
@@ -22,6 +26,7 @@ use crate::grant_probe;
 use crate::host_tuning;
 use crate::load;
 use crate::notifications;
+use crate::onboarding;
 use crate::ping_probe;
 use crate::probe;
 use crate::provision;
@@ -43,29 +48,30 @@ use crate::{
     CreateRollbackRequest, CreateTenantRequest, CreateUserRequest, DeleteFrontRequest,
     DeleteFrontResult, DeleteStepResult, DeploymentCommandResult, DeploymentDetail, DeploymentList,
     DeploymentVerification, DeploymentWaveConfirmationResult, DynamicClashSubscription,
-    E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, ForwardingDesiredState,
-    ForwardingEntitlementWrite, ForwardingOverview, ForwardingReconcileReport, ForwardingRuleWrite,
-    ForwardingUsageReportRequest, ForwardingUsageReportResult, FrontClientConfigState,
-    FrontRouteAnalysisView, HopLinkList, IssuedAdminToken, IssuedNodeToken, IssuedUserDirectLogin,
-    IssuedUserLogin, LinkHealthItem, LinkHealthRequest, LinkHealthResult, LinkMtuView,
-    LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult, LoadSeriesQuery,
-    ModelWriteResult, NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView,
-    NodePingProbeLatestList, NodePingProbeList, NodePingProbeView, PingProbeReportRequest,
-    PingProbeReportResult, PingProbeSettings, ProbeTargetList, ProvisionNodeRequest,
-    ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan,
-    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
-    RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
-    ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
-    SetUserAppQuotaRequest, SetUserAppQuotaResult, SetUserPasswordRequest, SetUserPasswordResult,
-    StoreError, SystemInitRequest, SystemInitResult, TargetConvergenceReport, TenantList,
-    UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest,
-    UpdateUserStatusRequest, UpdateUserStatusResult, UpdateWarpBindingRequest,
-    UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult, UpsertFrontResult,
-    UpsertGrantResult, UpsertIngressResult, UpsertTenantResult, UpsertUserResult,
-    UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest, UsageReportResult,
-    UsageSampleList, UserAppQuotaList, UserDirectLoginRequest, UserGrantProbePlan, UserList,
-    UserRealtimeTarget, UserTrafficHistory, UserTrafficHistoryScope, VerifyDeploymentRequest,
-    WarpBindingRemoval,
+    E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, FleetRealtimeTarget,
+    ForwardingDesiredState, ForwardingEntitlementWrite, ForwardingOverview,
+    ForwardingReconcileReport, ForwardingRuleWrite, ForwardingUsageReportRequest,
+    ForwardingUsageReportResult, FrontClientConfigState, FrontRouteAnalysisView, HopLinkList,
+    IssuedAdminToken, IssuedNodeToken, IssuedUserDirectLogin, IssuedUserLogin, LinkHealthItem,
+    LinkHealthRequest, LinkHealthResult, LinkMtuView, LinkProbeRequest, LinkProbeResult,
+    LoadReportRequest, LoadReportResult, LoadSeriesQuery, ModelWriteResult, NodeAgentStateList,
+    NodeDesiredDeployment, NodeLoadList, NodeLoadView, NodePingProbeLatestList, NodePingProbeList,
+    NodePingProbeView, OnboardingCheckpointRequest, OnboardingProbeEvidence, OnboardingState,
+    PingProbeReportRequest, PingProbeReportResult, PingProbeSettings, ProbeTargetList,
+    ProvisionNodeRequest, ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome,
+    QuotaEnforcementPlan, RegisterWarpBindingRequest, RegisterWarpBindingResult,
+    RemoveRetiredNodesRequest, RemoveRetiredNodesResult, RemoveWarpBindingRequest,
+    RemoveWarpBindingResult, ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList,
+    RotateUserUuidResult, SetUserAppQuotaRequest, SetUserAppQuotaResult, SetUserPasswordRequest,
+    SetUserPasswordResult, StoreError, SystemInitRequest, SystemInitResult,
+    TargetConvergenceReport, TenantList, UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult,
+    UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateUserStatusResult,
+    UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult,
+    UpsertFrontResult, UpsertGrantResult, UpsertIngressResult, UpsertTenantResult,
+    UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest,
+    UsageReportResult, UsageSampleList, UserAppQuotaList, UserDirectLoginRequest,
+    UserGrantProbePlan, UserList, UserRealtimeTarget, UserTrafficHistory, UserTrafficHistoryScope,
+    VerifyDeploymentRequest, WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -85,7 +91,21 @@ const DUPLICATE_DATABASE: &str = "42P04";
 /// `template1` cannot be dropped at all, so the pair covers servers that have been tidied up.
 const MAINTENANCE_DATABASES: &[&str] = &["postgres", "template1"];
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+// This repository deliberately has one squashed fresh-install schema (enforced by
+// schema_source_is_a_single_fresh_install_definition). Build the same embedded migration without
+// SQLx's proc-macro feature: that feature also compiles unused MySQL/RSA tooling into the host-side
+// build dependency graph.
+static MIGRATOR: LazyLock<sqlx::migrate::Migrator> = LazyLock::new(|| {
+    let mut migrator = sqlx::migrate::Migrator::DEFAULT;
+    migrator.migrations = Cow::Owned(vec![sqlx::migrate::Migration::new(
+        1,
+        Cow::Borrowed("init"),
+        sqlx::migrate::MigrationType::Simple,
+        Cow::Borrowed(include_str!("../migrations/0001_init.sql")),
+        false,
+    )]);
+    migrator
+});
 
 /// The SQLSTATE a failure carries, where it came from the server at all.
 fn sqlstate(error: &sqlx::Error) -> Option<String> {
@@ -879,6 +899,26 @@ impl PgStore {
         console::console_initial_data(&self.pool, actor).await
     }
 
+    pub async fn onboarding(&self, actor: &AdminContext) -> Result<OnboardingState> {
+        onboarding::get(&self.pool, actor).await
+    }
+
+    pub async fn checkpoint_onboarding(
+        &self,
+        actor: &AdminContext,
+        request: OnboardingCheckpointRequest,
+    ) -> Result<OnboardingState> {
+        onboarding::checkpoint(&self.pool, actor, request).await
+    }
+
+    pub async fn complete_onboarding(
+        &self,
+        actor: &AdminContext,
+        evidence: OnboardingProbeEvidence,
+    ) -> Result<OnboardingState> {
+        onboarding::complete(&self.pool, actor, evidence).await
+    }
+
     pub async fn list_node_agent_states(&self, actor: &AdminContext) -> Result<NodeAgentStateList> {
         let mut result = console::list_node_agent_states(&self.pool, actor).await?;
         for node in &mut result.nodes {
@@ -1343,8 +1383,8 @@ impl PgStore {
         public_ip::history(&self.pool, actor, node_id, visible_days).await
     }
 
-    pub async fn reconcile_node_presence(&self) -> Result<u64> {
-        notifications::reconcile_offline(&self.pool).await
+    pub async fn reconcile_node_presence(&self) -> Result<(u64, u64)> {
+        notifications::reconcile_presence(&self.pool).await
     }
 
     pub async fn claim_notification_delivery(
@@ -1448,6 +1488,15 @@ impl PgStore {
         deployment::retry_target(&self.pool, actor, deployment_id, node_id).await
     }
 
+    pub async fn force_config_xray_retirement(
+        &self,
+        actor: &AdminContext,
+        deployment_id: i64,
+        node_id: &str,
+    ) -> Result<brocade_deployment::protocol::ConfigXrayForceRetirementResult> {
+        deployment::force_config_xray_retirement(&self.pool, actor, deployment_id, node_id).await
+    }
+
     pub async fn isolate_deployment_target(
         &self,
         actor: &AdminContext,
@@ -1542,6 +1591,15 @@ impl PgStore {
         console::update_node(&self.pool, actor, node_id, request).await
     }
 
+    pub async fn update_node_region_override(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: crate::UpdateNodeRegionRequest,
+    ) -> Result<crate::NodeRegionOverride> {
+        console::update_node_region_override(&self.pool, actor, node_id, request).await
+    }
+
     pub async fn create_user(
         &self,
         actor: &AdminContext,
@@ -1566,6 +1624,53 @@ impl PgStore {
         user_id: &str,
     ) -> Result<ForwardingOverview> {
         forwarding::overview(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    /// Diagnostic traffic requires the same ownership and write permission as the rule itself.
+    pub async fn forwarding_probe_overview(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<ForwardingOverview> {
+        forwarding::require_rule_write_access(actor, tenant_id, user_id)?;
+        forwarding::overview(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn forwarding_probe_protocol(&self, node_id: &str) -> Result<Option<i32>> {
+        Ok(sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT agent_protocol_version FROM node_agent_state WHERE node_id=$1",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    pub async fn set_forwarding_quota(
+        &self,
+        actor: &AdminContext,
+        tenant: &str,
+        user: &str,
+        node: &str,
+        request: crate::ForwardingQuotaWrite,
+    ) -> Result<ForwardingOverview> {
+        crate::forwarding_quota::set_quota(&self.pool, actor, tenant, user, node, request).await
+    }
+
+    pub async fn enforce_forwarding_quotas(&self) -> Result<crate::ForwardingQuotaOutcome> {
+        crate::forwarding_quota::enforce(&self.pool).await
+    }
+
+    pub async fn forwarding_quota_jobs(
+        &self,
+        actor: &AdminContext,
+        tenant: &str,
+        user: &str,
+        node: &str,
+        before: Option<i64>,
+    ) -> Result<crate::ForwardingQuotaJobPage> {
+        crate::forwarding_quota::jobs(&self.pool, actor, tenant, user, node, before).await
     }
 
     pub async fn set_forwarding_entitlement(
@@ -1922,6 +2027,13 @@ impl PgStore {
         agent::record_node_runtime(&self.pool, node_id, report).await
     }
 
+    pub async fn config_xray_force_retirement_command(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<brocade_deployment::protocol::ConfigXrayForceRetirementCommand>> {
+        agent::config_xray_force_retirement_command(&self.pool, node_id).await
+    }
+
     pub async fn record_node_traffic(
         &self,
         node_id: &str,
@@ -2158,6 +2270,13 @@ impl PgStore {
         usage::user_realtime_targets(&self.pool, actor, tenant_id, user_id).await
     }
 
+    pub async fn fleet_realtime_targets(
+        &self,
+        actor: &AdminContext,
+    ) -> Result<Vec<FleetRealtimeTarget>> {
+        usage::fleet_realtime_targets(&self.pool, actor).await
+    }
+
     pub async fn node_forwarding_realtime_targets(
         &self,
         actor: &AdminContext,
@@ -2179,6 +2298,140 @@ impl PgStore {
         window_secs: u32,
     ) -> Result<UserTrafficHistory> {
         usage::list_user_traffic_history(&self.pool, actor, scope, window_secs).await
+    }
+
+    pub async fn user_machine_usage(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<crate::UserMachineUsage> {
+        crate::user_machine_usage::query(&self.pool, actor, tenant_id, user_id, period).await
+    }
+
+    pub async fn user_site_usage(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<brocade_deployment::site_usage::UserSiteUsage> {
+        crate::site_usage::query(&self.pool, actor, tenant_id, user_id, period).await
+    }
+
+    /// One machine's inflow by user and access chain (machine detail). The caller must already
+    /// have resolved that the machine is visible to `actor`.
+    pub async fn node_inflow_usage(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<crate::NodeInflowUsage> {
+        crate::node_inflow_usage::query(&self.pool, actor, node_id, period).await
+    }
+
+    /// One machine's outflow by destination category, with the users behind each category.
+    pub async fn node_site_usage(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<crate::NodeSiteUsage> {
+        crate::site_usage::query_node(&self.pool, actor, node_id, period).await
+    }
+
+    pub async fn node_other_domains(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<brocade_deployment::other_domain::UserOtherDomains> {
+        crate::other_domain::query_node(&self.pool, actor, node_id, period).await
+    }
+
+    pub async fn node_sniffing_failed_targets(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<brocade_deployment::sniffing_failed::UserSniffingFailedTargets> {
+        crate::other_domain::query_failed_node(&self.pool, actor, node_id, period).await
+    }
+
+    pub async fn site_usage_policy(
+        &self,
+    ) -> Result<brocade_deployment::site_usage::SiteUsagePolicy> {
+        crate::site_usage::load_policy(&self.pool).await
+    }
+
+    pub async fn other_domain_policy(
+        &self,
+    ) -> Result<brocade_deployment::other_domain::OtherDomainPolicy> {
+        crate::other_domain::policy(&self.pool).await
+    }
+
+    pub async fn sniffing_failed_policy(
+        &self,
+    ) -> Result<brocade_deployment::sniffing_failed::SniffingFailedPolicy> {
+        crate::other_domain::failed_policy(&self.pool).await
+    }
+    pub async fn update_sniffing_failed_policy(
+        &self,
+        actor: &AdminContext,
+        policy: brocade_deployment::sniffing_failed::SniffingFailedPolicy,
+    ) -> Result<brocade_deployment::sniffing_failed::SniffingFailedPolicy> {
+        crate::other_domain::update_failed_policy(&self.pool, actor, policy).await
+    }
+    pub async fn record_sniffing_failed_report(
+        &self,
+        node_id: &str,
+        report: brocade_deployment::sniffing_failed::SniffingFailedReport,
+    ) -> Result<()> {
+        crate::other_domain::record_failed(&self.pool, node_id, report).await
+    }
+    pub async fn user_sniffing_failed_targets(
+        &self,
+        actor: &AdminContext,
+        tenant: &str,
+        user: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<brocade_deployment::sniffing_failed::UserSniffingFailedTargets> {
+        crate::other_domain::query_failed(&self.pool, actor, tenant, user, period).await
+    }
+
+    pub async fn update_other_domain_policy(
+        &self,
+        actor: &AdminContext,
+        policy: brocade_deployment::other_domain::OtherDomainPolicy,
+    ) -> Result<brocade_deployment::other_domain::OtherDomainPolicy> {
+        crate::other_domain::update_policy(&self.pool, actor, policy).await
+    }
+
+    pub async fn record_other_domain_report(
+        &self,
+        node_id: &str,
+        report: brocade_deployment::other_domain::OtherDomainReport,
+    ) -> Result<()> {
+        crate::other_domain::record(&self.pool, node_id, report).await
+    }
+
+    pub async fn user_other_domains(
+        &self,
+        actor: &AdminContext,
+        tenant: &str,
+        user: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+    ) -> Result<brocade_deployment::other_domain::UserOtherDomains> {
+        crate::other_domain::query(&self.pool, actor, tenant, user, period).await
+    }
+
+    pub async fn update_site_usage_policy(
+        &self,
+        actor: &AdminContext,
+        policy: brocade_deployment::site_usage::SiteUsagePolicy,
+    ) -> Result<brocade_deployment::site_usage::SiteUsagePolicy> {
+        crate::site_usage::update_policy(&self.pool, actor, policy).await
     }
 
     pub async fn list_monthly_usage_summary(
@@ -2209,6 +2462,8 @@ impl PgStore {
     }
 
     pub async fn prune_usage_samples(&self, retain_days: u32) -> Result<u64> {
+        crate::other_domain::prune(&self.pool).await?;
+        crate::site_usage::prune(&self.pool).await?;
         let ordinary = usage::prune_usage_samples(&self.pool, retain_days).await?;
         let forwarding = forwarding::prune_usage_samples(&self.pool, retain_days).await?;
         ordinary

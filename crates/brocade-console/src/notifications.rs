@@ -37,8 +37,15 @@ pub async fn spawn(store: PgStore) {
         loop {
             tick.tick().await;
             match presence_store.reconcile_node_presence().await {
-                Ok(0) => {}
-                Ok(count) => eprintln!("notifications: {count} 台机器转为离线"),
+                Ok((0, 0)) => {}
+                Ok((recovered, offline)) => {
+                    if recovered != 0 {
+                        eprintln!("notifications: {recovered} 台机器恢复在线");
+                    }
+                    if offline != 0 {
+                        eprintln!("notifications: {offline} 台机器转为离线");
+                    }
+                }
                 Err(error) => eprintln!("notifications: 检查机器在线状态失败：{error}"),
             }
         }

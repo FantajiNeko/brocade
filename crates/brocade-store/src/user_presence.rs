@@ -38,6 +38,14 @@ pub struct UserOnlineSourceView {
     pub first_observed_at: String,
     pub last_observed_at: String,
     pub xray_last_seen_at: String,
+    /// Start and byte counters for the current (or most recently ended) continuous online epoch.
+    /// Missing means the reporting Agent/Xray predates source-session accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_since_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_uplink_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_downlink_bytes: Option<u64>,
     pub node_ids: Vec<String>,
     pub ingress_ids: Vec<String>,
     /// Associations must stay together: a protocol observed on one node is not evidence for another.
@@ -49,8 +57,23 @@ pub struct UserOnlineSourceView {
 pub struct UserOnlineSourceAccess {
     pub node_id: String,
     pub ingress_id: String,
+    pub last_observed_at: String,
+    pub xray_last_seen_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_since_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_uplink_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_downlink_bytes: Option<u64>,
     /// NULL means the last accepted snapshot predates protocol-aware reporting.
     pub protocols: Option<Vec<OnlineSourceProtocol>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingPresenceNode {
+    pub node_id: String,
+    /// NULL distinguishes never receiving a successful snapshot from an expired snapshot.
+    pub last_reported_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +83,8 @@ pub struct UserPresenceView {
     pub state: UserPresenceState,
     pub expected_nodes: u64,
     pub reporting_nodes: u64,
+    #[serde(default)]
+    pub missing_nodes: Vec<MissingPresenceNode>,
     pub sources: Vec<UserOnlineSourceView>,
 }
 
@@ -86,6 +111,16 @@ struct NormalizedSource {
     ip: String,
     xray_last_seen_unix_secs: i64,
     protocols: Option<Vec<OnlineSourceProtocol>>,
+    online_since_unix_secs: Option<i64>,
+    session_uplink_bytes: Option<i64>,
+    session_downlink_bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedObservation {
+    xray_last_seen_unix_secs: i64,
+    protocols: BTreeSet<OnlineSourceProtocol>,
+    session: Option<(i64, i64, i64)>,
 }
 
 fn presence_state(expected_nodes: u64, reporting_nodes: u64) -> UserPresenceState {
@@ -120,8 +155,7 @@ fn normalize_snapshot(
 
     // Xray maps are already unique per label/IP, but normalizing here makes retries stable and
     // prevents a malformed Agent from producing duplicate upsert work.
-    let mut normalized =
-        BTreeMap::<(String, String, String, String), (i64, BTreeSet<OnlineSourceProtocol>)>::new();
+    let mut normalized = BTreeMap::<(String, String, String, String), NormalizedObservation>::new();
     for user in users {
         let Some((user_id, tenant_id, ingress_id)) = parse_grant_label(&user.label) else {
             // Probe credentials and labels from extensions outside the grant namespace do not
@@ -148,6 +182,39 @@ fn normalize_snapshot(
                     "online source last_seen is outside the accepted clock window".to_owned(),
                 ));
             }
+            let session = match (
+                source.online_since_unix_secs,
+                source.session_uplink_bytes,
+                source.session_downlink_bytes,
+            ) {
+                (None, None, None) => None,
+                (Some(online_since), Some(uplink), Some(downlink))
+                    if online_since > 0
+                        && online_since <= source.last_seen_unix_secs
+                        && online_since <= observed_at_unix_secs =>
+                {
+                    Some((
+                        online_since,
+                        i64::try_from(uplink).map_err(|_| {
+                            StoreError::InvalidData(
+                                "online source session uplink exceeds PostgreSQL BIGINT".to_owned(),
+                            )
+                        })?,
+                        i64::try_from(downlink).map_err(|_| {
+                            StoreError::InvalidData(
+                                "online source session downlink exceeds PostgreSQL BIGINT"
+                                    .to_owned(),
+                            )
+                        })?,
+                    ))
+                }
+                _ => {
+                    return Err(StoreError::InvalidData(
+                        "online source session metrics are incomplete or outside the accepted clock window"
+                            .to_owned(),
+                    ));
+                }
+            };
             let protocols = if protocols.is_empty() {
                 BTreeSet::from([OnlineSourceProtocol::Unknown])
             } else {
@@ -160,27 +227,47 @@ fn normalize_snapshot(
                     ingress_id.to_owned(),
                     ip.to_string(),
                 ))
-                .or_insert_with(|| (source.last_seen_unix_secs, BTreeSet::new()));
-            entry.0 = entry.0.max(source.last_seen_unix_secs);
-            entry.1.extend(protocols);
+                .or_insert_with(|| NormalizedObservation {
+                    xray_last_seen_unix_secs: source.last_seen_unix_secs,
+                    protocols: BTreeSet::new(),
+                    session,
+                });
+            if entry.session != session {
+                return Err(StoreError::InvalidData(
+                    "duplicate online source entries disagree on session metrics".to_owned(),
+                ));
+            }
+            entry.xray_last_seen_unix_secs = entry
+                .xray_last_seen_unix_secs
+                .max(source.last_seen_unix_secs);
+            entry.protocols.extend(protocols);
         }
     }
 
     Ok(normalized
         .into_iter()
-        .map(
-            |((tenant_id, user_id, ingress_id, ip), (xray_last_seen_unix_secs, protocols))| {
-                NormalizedSource {
-                    tenant_id,
-                    user_id,
-                    ingress_id,
-                    ip,
-                    xray_last_seen_unix_secs,
-                    protocols: (protocols != BTreeSet::from([OnlineSourceProtocol::Unknown]))
-                        .then(|| protocols.into_iter().collect()),
-                }
-            },
-        )
+        .map(|((tenant_id, user_id, ingress_id, ip), observation)| {
+            let (online_since_unix_secs, session_uplink_bytes, session_downlink_bytes) =
+                observation.session.map_or(
+                    (None, None, None),
+                    |(online_since, uplink, downlink)| {
+                        (Some(online_since), Some(uplink), Some(downlink))
+                    },
+                );
+            NormalizedSource {
+                tenant_id,
+                user_id,
+                ingress_id,
+                ip,
+                xray_last_seen_unix_secs: observation.xray_last_seen_unix_secs,
+                protocols: (observation.protocols
+                    != BTreeSet::from([OnlineSourceProtocol::Unknown]))
+                .then(|| observation.protocols.into_iter().collect()),
+                online_since_unix_secs,
+                session_uplink_bytes,
+                session_downlink_bytes,
+            }
+        })
         .collect())
 }
 
@@ -235,6 +322,18 @@ pub(crate) async fn replace_node_snapshot(
         .iter()
         .map(|source| serde_json::to_value(&source.protocols))
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let online_since = sources
+        .iter()
+        .map(|source| source.online_since_unix_secs)
+        .collect::<Vec<_>>();
+    let session_uplink = sources
+        .iter()
+        .map(|source| source.session_uplink_bytes)
+        .collect::<Vec<_>>();
+    let session_downlink = sources
+        .iter()
+        .map(|source| source.session_downlink_bytes)
+        .collect::<Vec<_>>();
 
     // Joining current grants and ingress ownership drops probe labels, stale credentials and a
     // compromised node attempting to attribute an address to another node's listener.
@@ -242,18 +341,23 @@ pub(crate) async fn replace_node_snapshot(
         "WITH incoming AS (
             SELECT *
               FROM unnest(
-                    $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::jsonb[]
-              ) AS value(tenant_id, user_id, ingress_id, source_ip, xray_last_seen, protocols)
+                    $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::jsonb[],
+                    $9::bigint[], $10::bigint[], $11::bigint[]
+              ) AS value(tenant_id, user_id, ingress_id, source_ip, xray_last_seen, protocols,
+                         online_since, session_uplink, session_downlink)
          )
          INSERT INTO user_online_sources (
             node_id, tenant_id, user_id, ingress_id, source_ip, active,
-            first_observed_at, last_observed_at, xray_last_seen_at, offline_at, protocols
+            first_observed_at, last_observed_at, xray_last_seen_at, offline_at, protocols,
+            online_since_at, session_uplink_bytes, session_downlink_bytes
          )
          SELECT $1, value.tenant_id, value.user_id, value.ingress_id,
                 value.source_ip::inet, TRUE,
                 to_timestamp($2), to_timestamp($2),
                 to_timestamp(value.xray_last_seen::double precision), NULL,
-                NULLIF(value.protocols, 'null'::jsonb)
+                NULLIF(value.protocols, 'null'::jsonb),
+                to_timestamp(value.online_since::double precision),
+                value.session_uplink, value.session_downlink
            FROM incoming value
            JOIN grants grant_row
              ON grant_row.tenant_id = value.tenant_id
@@ -268,6 +372,9 @@ pub(crate) async fn replace_node_snapshot(
             last_observed_at = EXCLUDED.last_observed_at,
             xray_last_seen_at = EXCLUDED.xray_last_seen_at,
             protocols = EXCLUDED.protocols,
+            online_since_at = EXCLUDED.online_since_at,
+            session_uplink_bytes = EXCLUDED.session_uplink_bytes,
+            session_downlink_bytes = EXCLUDED.session_downlink_bytes,
             offline_at = NULL",
     )
     .bind(node_id)
@@ -278,6 +385,9 @@ pub(crate) async fn replace_node_snapshot(
     .bind(ips)
     .bind(xray_last_seen)
     .bind(protocols)
+    .bind(online_since)
+    .bind(session_uplink)
+    .bind(session_downlink)
     .execute(&mut **tx)
     .await?;
 
@@ -310,36 +420,61 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<UserPresenceLis
             .push_bind(scope.to_owned())
             .push(" OR tenant_id LIKE ")
             .push_bind(pattern)
-            .push(" ESCAPE '\\\\')");
+            .push(" ESCAPE E'\\\\')");
     }
     query.push(
-        "), expected AS (
-            SELECT visible.tenant_id, visible.user_id,
-                   count(DISTINCT ingress.node_id)::bigint AS expected_nodes,
-                   count(DISTINCT ingress.node_id) FILTER (
-                       WHERE agent.online_sources_reported_at >=
-                             now() - make_interval(secs => ",
+        "), entry_nodes AS (
+            SELECT DISTINCT visible.tenant_id, visible.user_id, ingress.node_id,
+                   agent.online_sources_reported_at,
+                   agent.online_sources_reported_at >=
+                       now() - make_interval(secs => ",
     );
     query.push_bind(ONLINE_SOURCE_FRESH_SECS as i32);
     query.push(
-        "))::bigint AS reporting_nodes
+        ") AS fresh
               FROM visible_users visible
               LEFT JOIN grants grant_row
                 ON grant_row.tenant_id = visible.tenant_id
                AND grant_row.user_id = visible.user_id
               LEFT JOIN ingresses ingress ON ingress.id = grant_row.ingress_id
               LEFT JOIN node_agent_state agent ON agent.node_id = ingress.node_id
-             GROUP BY visible.tenant_id, visible.user_id
+         ), expected AS (
+            SELECT tenant_id, user_id,
+                   count(node_id)::bigint AS expected_nodes,
+                   count(node_id) FILTER (WHERE fresh)::bigint AS reporting_nodes,
+                   COALESCE(jsonb_agg(jsonb_build_object(
+                       'node_id', node_id,
+                       'last_reported_at', online_sources_reported_at::text
+                   ) ORDER BY node_id) FILTER (
+                       WHERE node_id IS NOT NULL AND fresh IS NOT TRUE
+                   ), '[]'::jsonb) AS missing_nodes
+              FROM entry_nodes
+             GROUP BY tenant_id, user_id
          ), source_rows AS (
             SELECT source.tenant_id, source.user_id, host(source.source_ip) AS ip,
                    min(source.first_observed_at)::text AS first_observed_at,
                    max(source.last_observed_at)::text AS last_observed_at,
                    max(source.xray_last_seen_at)::text AS xray_last_seen_at,
+                   CASE WHEN count(*) FILTER (WHERE source.online_since_at IS NULL) = 0
+                        THEN min(source.online_since_at)::text END AS online_since_at,
+                   CASE WHEN count(*) FILTER (WHERE source.session_uplink_bytes IS NULL) = 0
+                        THEN LEAST(sum(source.session_uplink_bytes),
+                                   9223372036854775807::numeric)::bigint END
+                        AS session_uplink_bytes,
+                   CASE WHEN count(*) FILTER (WHERE source.session_downlink_bytes IS NULL) = 0
+                        THEN LEAST(sum(source.session_downlink_bytes),
+                                   9223372036854775807::numeric)::bigint END
+                        AS session_downlink_bytes,
                    array_agg(DISTINCT source.node_id ORDER BY source.node_id) AS node_ids,
                    array_agg(DISTINCT source.ingress_id ORDER BY source.ingress_id) AS ingress_ids,
                    jsonb_agg(jsonb_build_object(
                        'node_id', source.node_id, 'ingress_id', source.ingress_id,
-                       'protocols', source.protocols
+                       'protocols', source.protocols,
+                       'last_observed_at', source.last_observed_at::text,
+                       'xray_last_seen_at', source.xray_last_seen_at::text,
+                       'online_since_at', source.online_since_at::text,
+                       'session_uplink_bytes', source.session_uplink_bytes,
+                       'session_downlink_bytes', source.session_downlink_bytes
                    ) ORDER BY source.node_id, source.ingress_id) AS accesses
               FROM user_online_sources source
               JOIN visible_users visible
@@ -362,7 +497,7 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<UserPresenceLis
              GROUP BY source.tenant_id, source.user_id, source.source_ip
          )
          SELECT expected.tenant_id, expected.user_id,
-                expected.expected_nodes, expected.reporting_nodes,
+                expected.expected_nodes, expected.reporting_nodes, expected.missing_nodes,
                 COALESCE(
                     jsonb_agg(
                         jsonb_build_object(
@@ -370,6 +505,9 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<UserPresenceLis
                             'first_observed_at', source.first_observed_at,
                             'last_observed_at', source.last_observed_at,
                             'xray_last_seen_at', source.xray_last_seen_at,
+                            'online_since_at', source.online_since_at,
+                            'session_uplink_bytes', source.session_uplink_bytes,
+                            'session_downlink_bytes', source.session_downlink_bytes,
                             'node_ids', source.node_ids,
                             'ingress_ids', source.ingress_ids,
                             'accesses', source.accesses
@@ -382,7 +520,7 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<UserPresenceLis
              ON source.tenant_id = expected.tenant_id
             AND source.user_id = expected.user_id
           GROUP BY expected.tenant_id, expected.user_id,
-                   expected.expected_nodes, expected.reporting_nodes
+                   expected.expected_nodes, expected.reporting_nodes, expected.missing_nodes
           ORDER BY expected.tenant_id, expected.user_id",
     );
 
@@ -402,6 +540,7 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<UserPresenceLis
                 state,
                 expected_nodes,
                 reporting_nodes,
+                missing_nodes: serde_json::from_value(row.try_get("missing_nodes")?)?,
                 sources,
             })
         })
@@ -425,6 +564,9 @@ pub async fn history(
     tenant_id: &str,
     user_id: &str,
 ) -> Result<UserOnlineSourceHistory> {
+    let retention_days = crate::retention::ttl_hours(pool, "user_online_sources")
+        .await?
+        .div_ceil(24);
     let tenant_id = required_text(tenant_id, "tenant_id")?;
     let user_id = required_text(user_id, "user_id")?;
     if actor.role() == AdminRole::User || actor.operator_id() == PUBLIC_OPERATOR_ID {
@@ -453,11 +595,26 @@ pub async fn history(
                 min(source.first_observed_at)::text AS first_observed_at,
                 max(source.last_observed_at)::text AS last_observed_at,
                 max(source.xray_last_seen_at)::text AS xray_last_seen_at,
+                CASE WHEN count(*) FILTER (WHERE source.online_since_at IS NULL) = 0
+                     THEN min(source.online_since_at)::text END AS online_since_at,
+                CASE WHEN count(*) FILTER (WHERE source.session_uplink_bytes IS NULL) = 0
+                     THEN LEAST(sum(source.session_uplink_bytes),
+                                9223372036854775807::numeric)::bigint END
+                     AS session_uplink_bytes,
+                CASE WHEN count(*) FILTER (WHERE source.session_downlink_bytes IS NULL) = 0
+                     THEN LEAST(sum(source.session_downlink_bytes),
+                                9223372036854775807::numeric)::bigint END
+                     AS session_downlink_bytes,
                 array_agg(DISTINCT source.node_id ORDER BY source.node_id) AS node_ids,
                 array_agg(DISTINCT source.ingress_id ORDER BY source.ingress_id) AS ingress_ids,
                 jsonb_agg(jsonb_build_object(
                     'node_id', source.node_id, 'ingress_id', source.ingress_id,
-                    'protocols', source.protocols
+                    'protocols', source.protocols,
+                    'last_observed_at', source.last_observed_at::text,
+                    'xray_last_seen_at', source.xray_last_seen_at::text,
+                    'online_since_at', source.online_since_at::text,
+                    'session_uplink_bytes', source.session_uplink_bytes,
+                    'session_downlink_bytes', source.session_downlink_bytes
                 ) ORDER BY source.node_id, source.ingress_id) AS accesses
            FROM user_online_sources source
           WHERE source.tenant_id = $1
@@ -496,6 +653,25 @@ pub async fn history(
                 first_observed_at: row.try_get("first_observed_at")?,
                 last_observed_at: row.try_get("last_observed_at")?,
                 xray_last_seen_at: row.try_get("xray_last_seen_at")?,
+                online_since_at: row.try_get("online_since_at")?,
+                session_uplink_bytes: row
+                    .try_get::<Option<i64>, _>("session_uplink_bytes")?
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        StoreError::InvalidData(
+                            "negative online source session uplink bytes".to_owned(),
+                        )
+                    })?,
+                session_downlink_bytes: row
+                    .try_get::<Option<i64>, _>("session_downlink_bytes")?
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        StoreError::InvalidData(
+                            "negative online source session downlink bytes".to_owned(),
+                        )
+                    })?,
                 node_ids: row.try_get("node_ids")?,
                 ingress_ids: row.try_get("ingress_ids")?,
                 accesses: serde_json::from_value(row.try_get("accesses")?)?,
@@ -506,23 +682,26 @@ pub async fn history(
     Ok(UserOnlineSourceHistory {
         tenant_id,
         user_id,
-        retention_days: USER_ONLINE_SOURCE_RETENTION_DAYS,
+        retention_days,
         truncated,
         sources,
     })
 }
 
 pub async fn prune(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days =
-        i32::try_from(retain_days.clamp(1, 3650)).expect("online source retention fits i32");
+    prune_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     // Every accepted snapshot refreshes last_observed_at for active rows. An active row older
     // than the retention window therefore belongs to a node that stopped reporting; keeping it
     // forever would make the documented bounded history unbounded for offline nodes.
     let result = sqlx::query(
         "DELETE FROM user_online_sources
-          WHERE last_observed_at < now() - make_interval(days => $1)",
+          WHERE last_observed_at < now() - make_interval(secs => $1::double precision)",
     )
-    .bind(retain_days)
+    .bind(retain_secs)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -542,6 +721,9 @@ mod tests {
                     ip: "1.1.1.1".to_owned(),
                     last_seen_unix_secs: 90,
                     protocols: Some(vec![OnlineSourceProtocol::Vless]),
+                    online_since_unix_secs: None,
+                    session_uplink_bytes: None,
+                    session_downlink_bytes: None,
                 },
                 OnlineSource {
                     ip: "1.1.1.1".to_owned(),
@@ -550,11 +732,17 @@ mod tests {
                         OnlineSourceProtocol::AnyTls,
                         OnlineSourceProtocol::Vless,
                     ]),
+                    online_since_unix_secs: None,
+                    session_uplink_bytes: None,
+                    session_downlink_bytes: None,
                 },
                 OnlineSource {
                     ip: "192.168.1.2".to_owned(),
                     last_seen_unix_secs: 99,
                     protocols: None,
+                    online_since_unix_secs: None,
+                    session_uplink_bytes: None,
+                    session_downlink_bytes: None,
                 },
             ],
         }];
@@ -579,6 +767,9 @@ mod tests {
                 ip: "1.1.1.1".to_owned(),
                 last_seen_unix_secs: 90,
                 protocols: None,
+                online_since_unix_secs: None,
+                session_uplink_bytes: None,
+                session_downlink_bytes: None,
             }],
         }];
         assert!(normalize_snapshot(100, &users).unwrap().is_empty());
@@ -592,6 +783,9 @@ mod tests {
                 ip: "1.1.1.1".to_owned(),
                 last_seen_unix_secs: 90,
                 protocols: None,
+                online_since_unix_secs: None,
+                session_uplink_bytes: None,
+                session_downlink_bytes: None,
             }],
         }];
         assert_eq!(normalize_snapshot(100, &users).unwrap()[0].protocols, None);
@@ -599,6 +793,9 @@ mod tests {
             ip: "1.1.1.1".to_owned(),
             last_seen_unix_secs: 95,
             protocols: Some(vec![OnlineSourceProtocol::Hysteria2]),
+            online_since_unix_secs: None,
+            session_uplink_bytes: None,
+            session_downlink_bytes: None,
         });
         assert_eq!(
             normalize_snapshot(100, &users).unwrap()[0].protocols,
@@ -611,6 +808,28 @@ mod tests {
             OnlineSourceProtocol::Vless;
             MAX_ONLINE_SOURCE_PROTOCOLS + 1
         ]);
+        assert!(normalize_snapshot(100, &users).is_err());
+    }
+
+    #[test]
+    fn snapshot_session_metrics_stay_atomic_and_exact() {
+        let mut users = vec![UserOnlineSources {
+            label: "alice@platform#i-main".to_owned(),
+            sources: vec![OnlineSource {
+                ip: "1.1.1.1".to_owned(),
+                last_seen_unix_secs: 95,
+                protocols: Some(vec![OnlineSourceProtocol::Vless]),
+                online_since_unix_secs: Some(80),
+                session_uplink_bytes: Some(1_024),
+                session_downlink_bytes: Some(2_048),
+            }],
+        }];
+        let normalized = normalize_snapshot(100, &users).unwrap();
+        assert_eq!(normalized[0].online_since_unix_secs, Some(80));
+        assert_eq!(normalized[0].session_uplink_bytes, Some(1_024));
+        assert_eq!(normalized[0].session_downlink_bytes, Some(2_048));
+
+        users[0].sources[0].session_downlink_bytes = None;
         assert!(normalize_snapshot(100, &users).is_err());
     }
 

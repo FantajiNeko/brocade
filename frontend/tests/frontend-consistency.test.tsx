@@ -148,6 +148,14 @@ const committedSettings = () => ({
 });
 
 const ROUTES: Record<string, () => unknown> = {
+  '/other-domain/settings': () => ({
+    enabled: false,
+    top_n: 128,
+    max_domains_per_user: 1024,
+    node_capacity: 4096,
+    report_interval_secs: 30,
+  }),
+  '/site-usage/settings': () => ({ enabled: false }),
   '/settings': committedSettings,
   '/branding': () => ({ site_name: 'brocade', icon: null, accent: null }),
   '/auth/state': () => ({ public_open: false }),
@@ -160,6 +168,7 @@ const ROUTES: Record<string, () => unknown> = {
     global: { agent_journal_mib: 100, xray_mib: 100, phantun_mib: 100 },
     nodes: [],
   }),
+  '/data-retention': () => ({ policies: [] }),
   '/host-network-tuning': () => ({ gro_flush_timeout_ns: 20000, napi_defer_hard_irqs: 2 }),
   '/ping-probe/settings': () => ({ targets: [], interval_secs: 60, timeout_ms: 420 }),
   '/tunnel-probes': () => ({
@@ -200,6 +209,8 @@ it('branding save preserves further typing while the request is pending', async 
   draft.init('audit-branding');
   draft.clear();
   const qc = client();
+  qc.setQueryData(['other-domain-policy'], ROUTES['/other-domain/settings']());
+  qc.setQueryData(['sniffing-failed-policy'], ROUTES['/other-domain/settings']());
   const keys: Record<string, string> = {
     '/settings': 'settings',
     '/branding': 'branding',
@@ -207,7 +218,9 @@ it('branding save preserves further typing while the request is pending', async 
     '/certs': 'certs',
     '/distribution': 'distribution',
     '/agent-log-policy': 'agent-log-policy',
+    '/data-retention': 'data-retention',
     '/host-network-tuning': 'host-network-tuning',
+    '/site-usage/settings': 'site-usage-policy',
     '/ping-probe/settings': 'ping-probe-settings',
     '/tunnel-probes': 'tunnel-probes',
     '/tunnel-probes/capability': 'tunnel-probe-capability',
@@ -262,7 +275,9 @@ it('committing settings draft keeps the new baseline and refreshes settings', as
     '/certs': 'certs',
     '/distribution': 'distribution',
     '/agent-log-policy': 'agent-log-policy',
+    '/data-retention': 'data-retention',
     '/host-network-tuning': 'host-network-tuning',
+    '/site-usage/settings': 'site-usage-policy',
     '/ping-probe/settings': 'ping-probe-settings',
     '/tunnel-probes': 'tunnel-probes',
     '/tunnel-probes/capability': 'tunnel-probe-capability',
@@ -305,6 +320,9 @@ it('committing settings draft keeps the new baseline and refreshes settings', as
 
 function settingsClient() {
   const qc = client();
+  qc.setQueryData(['other-domain-policy'], ROUTES['/other-domain/settings']());
+  qc.setQueryData(['sniffing-failed-policy'], ROUTES['/other-domain/settings']());
+  qc.setQueryData(['site-usage-policy'], { enabled: false });
   const keys: Record<string, string> = {
     '/settings': 'settings',
     '/branding': 'branding',
@@ -312,7 +330,9 @@ function settingsClient() {
     '/certs': 'certs',
     '/distribution': 'distribution',
     '/agent-log-policy': 'agent-log-policy',
+    '/data-retention': 'data-retention',
     '/host-network-tuning': 'host-network-tuning',
+    '/site-usage/settings': 'site-usage-policy',
     '/ping-probe/settings': 'ping-probe-settings',
     '/tunnel-probes': 'tunnel-probes',
     '/tunnel-probes/capability': 'tunnel-probe-capability',

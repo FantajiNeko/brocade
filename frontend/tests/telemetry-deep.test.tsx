@@ -40,7 +40,7 @@ vi.mock('echarts/core', () => ({
     group: '',
   })),
 }));
-vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {} }));
+vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {}, BarChart: {} }));
 vi.mock('echarts/components', () => ({ GridComponent: {}, MarkLineComponent: {}, TooltipComponent: {} }));
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
@@ -743,6 +743,30 @@ describe('deep host telemetry', () => {
     expect(chartMock.connect).not.toHaveBeenCalled();
   });
 
+  it('renders time-based throughput bars with real gaps and preserves line charts for other callers', () => {
+    const props = {
+      timesUnixSecs: [100, 130, 160],
+      rangeStartUnixSecs: 70,
+      rangeEndUnixSecs: 160,
+      rx: [100, null, 300],
+      tx: [20, null, 50],
+      rxName: '下行',
+      txName: '上行',
+    };
+    const view = render(<ThroughputChart {...props} presentation="bar" />);
+    const bars = chartMock.setOption.mock.calls.at(-1)?.[0];
+    expect(bars.series.map((series: { type: string }) => series.type)).toEqual(['bar', 'bar']);
+    expect(bars.series[0].data).toEqual([
+      [100000, 100],
+      [130000, null],
+      [160000, 300],
+    ]);
+    expect(bars.series[1].name).toBe('上行');
+    expect(view.container.querySelector('.ndtp-bars')).toBeTruthy();
+    view.rerender(<ThroughputChart {...props} />);
+    expect(chartMock.setOption.mock.calls.at(-1)?.[0].series[0].type).toBe('line');
+  });
+
   it('connects throughput and expanded history charts only after linking is enabled', () => {
     const throughput = renderThroughput(report(), true);
 
@@ -982,6 +1006,7 @@ describe('deep host telemetry', () => {
   });
 
   it('anchors the live Ping axis to query refreshes, not parent renders or the wall clock', async () => {
+    vi.useFakeTimers();
     const now = vi.spyOn(Date, 'now').mockReturnValue(130_000);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const ping: NodePingProbeView = {
@@ -1017,7 +1042,10 @@ describe('deep host telemetry', () => {
     // Even an unchanged successful response must advance the rolling window at refresh time.
     now.mockReturnValue(140_000);
     act(() => client.setQueryData(queryKey, structuredClone(ping)));
-    await waitFor(() => expect(chartMock.setOption).toHaveBeenCalledTimes(2));
+    await act(() => vi.advanceTimersByTimeAsync(20));
+    expect(chartMock.setOption).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    expect(chartMock.setOption).toHaveBeenCalledTimes(2);
     expect(chartMock.setOption.mock.calls[1][0]).toMatchObject({
       animation: false,
       xAxis: [{ max: 140_000 }, { max: 140_000 }],
@@ -1029,6 +1057,7 @@ describe('deep host telemetry', () => {
     expect(chartMock.setOption.mock.calls[2][0].xAxis[0].max).toBe(125_000);
     view.unmount();
     client.clear();
+    vi.useRealTimers();
   });
 
   const pingSeries = (address: string, samples: PingProbePoint[]): PingProbeFamilySeries => ({ address, samples });

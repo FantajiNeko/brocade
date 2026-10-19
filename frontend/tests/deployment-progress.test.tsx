@@ -230,8 +230,9 @@ describe('执行进度', () => {
     const second = stepRow(view.container, '第 2 步');
     expect(second.classList.contains('warn')).toBe(true);
     expect(second.querySelector('.cgp-state')?.textContent).toBe('等待确认');
-    // 分组行已写过动作；等待确认时这一步再写一遍，「会中断连接」标金色
-    expect(second.querySelector('.cgp-facts em')?.classList.contains('warn')).toBe(true);
+    // 配置交接会先平滑接管，但排空超时会终止上一代，因此批准时必须明确显示最坏影响。
+    expect(second.querySelector('.cgp-facts')?.textContent).toBe('更新 Xray · 会中断连接');
+    expect(within(second).getByText('会中断连接')).toBeTruthy();
     expect(view.getByRole('button', { name: '更新这 2 台机器' })).toBeTruthy();
     expect(view.container.querySelector('.cg-plate .cg-lamp')?.classList.contains('warn')).toBe(true);
   });

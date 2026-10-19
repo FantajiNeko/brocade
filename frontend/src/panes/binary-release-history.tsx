@@ -22,6 +22,7 @@ const EVENTS: Record<string, string> = {
   succeeded: '发布完成',
   'target-retried': '重新尝试',
   'target-reported': '收到执行结果',
+  'target-recovered-after-dirty': '异常后自动恢复完成',
   'target-reported-after-cancel': '停止后收到执行结果',
   'target-unsupported': '目标不支持',
   'canceled-for-node-lifecycle': '机器生命周期变化，停止发布',
@@ -162,7 +163,7 @@ function TargetAttempts({
         onClick={() => setExpanded(value => !value)}
       >
         <span>
-          {names(target.node_id)} · {BINARY_TARGET_STATUS[target.status].text}
+          {names(target.node_id)} · {targetStatusText(target)}
         </span>
         <span className="mono">
           {target.before_sha256.slice(0, 8)} → {target.desired_sha256?.slice(0, 8) ?? '未领取'}
@@ -198,22 +199,38 @@ function TargetAttempts({
   );
 }
 
+function targetStatusText(target: BinaryReleaseTarget) {
+  if (target.status === 'succeeded' && target.reported_forced_retirement === true) return '强制退役完成';
+  if (target.status === 'succeeded' && target.recovered_after_dirty === true) return '自动恢复完成';
+  return BINARY_TARGET_STATUS[target.status].text;
+}
+
 function EventList({ events }: { events: BinaryReleaseEvent[] }) {
   return (
     <ol className="binary-attempts">
-      {events.map(event => (
-        <li key={event.id}>
-          <span>
-            {EVENTS[event.kind] ?? event.kind}
-            {event.node_id ? ` · ${event.node_id}` : ''}
-          </span>
-          <small>
-            {event.actor ?? 'Agent / 系统'} · {stamp(event.created_at)}
-          </small>
-        </li>
-      ))}
+      {events.map(event => {
+        const detail = recoveredEventDetail(event);
+        return (
+          <li key={event.id}>
+            <span>
+              {EVENTS[event.kind] ?? event.kind}
+              {event.node_id ? ` · ${event.node_id}` : ''}
+            </span>
+            <small>
+              {event.actor ?? 'Agent / 系统'} · {stamp(event.created_at)}
+            </small>
+            {detail && <p>{detail}</p>}
+          </li>
+        );
+      })}
     </ol>
   );
+}
+
+function recoveredEventDetail(event: BinaryReleaseEvent) {
+  if (event.kind !== 'target-recovered-after-dirty' || !event.detail || typeof event.detail !== 'object') return null;
+  const previousError = (event.detail as Record<string, unknown>).previous_error;
+  return typeof previousError === 'string' && previousError ? `恢复前异常：${previousError}` : null;
 }
 
 function EarlierEvents({ component, id, before }: { component: BinaryComponent; id: number; before: number }) {

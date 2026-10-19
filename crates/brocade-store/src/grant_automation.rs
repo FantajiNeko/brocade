@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use brocade_core::model::ModelSnapshot;
-use brocade_deployment::plan::{plan_deployment, DesiredGrants};
+use brocade_deployment::plan::{desired_grants, DesiredGrants};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -25,6 +25,10 @@ const RETRY_INTERVAL: &str = "5 seconds";
 // A stable, application-owned advisory-lock key.  It serializes workers across control-plane
 // instances; the per-kind deployment lock remains the final authority against manual releases.
 const WORKER_LOCK_KEY: i64 = 0x6272_6f63_6772_616e;
+
+#[cfg(test)]
+#[path = "grant_automation_tests.rs"]
+mod tests;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantAutomationOutcome {
@@ -142,9 +146,14 @@ pub(crate) async fn enqueue_if_changed_tx(
     previous_revision: u64,
     revision_id: u64,
 ) -> Result<()> {
-    let previous = crate::materialize::load_snapshot_tx(tx, Some(previous_revision)).await?;
-    let current = crate::materialize::load_snapshot_tx(tx, Some(revision_id)).await?;
-    let changed = match (compiled_grants(&previous), compiled_grants(&current)) {
+    // set_current_revision has already frozen the new snapshot; its predecessor is immutable.
+    // Rematerializing here repeats every application/table query while holding the write lock.
+    let previous = crate::materialize::load_immutable_snapshot_tx(tx, previous_revision).await?;
+    let current = crate::materialize::load_immutable_snapshot_tx(tx, revision_id).await?;
+    let changed = match (
+        compiled_grants(&previous).await?,
+        compiled_grants(&current).await?,
+    ) {
         (Some(previous), Some(current)) => previous != current,
         _ => true,
     };
@@ -163,13 +172,33 @@ pub(crate) async fn enqueue_if_changed_tx(
     enqueue_tx(tx, revision_id, &author, &note).await
 }
 
-fn compiled_grants(snapshot: &ModelSnapshot) -> Option<BTreeMap<String, DesiredGrants>> {
-    plan_deployment(snapshot, &[]).ok().map(|plan| {
-        plan.targets
+async fn compiled_grants(
+    snapshot: &ModelSnapshot,
+) -> Result<Option<BTreeMap<String, DesiredGrants>>> {
+    let output = crate::compile_cache::compile_snapshot(snapshot).await?;
+    if !output.can_publish() {
+        return Ok(None);
+    }
+    let node_ids = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    // The commit only needs account changes. Reuse the compiler IR, then project accounts
+    // directly: no node configuration rendering, hashing, action comparison or wave planning.
+    tokio::task::spawn_blocking(move || {
+        node_ids
             .into_iter()
-            .map(|target| (target.node_id, target.desired.grants))
+            .map(|node_id| {
+                output
+                    .project_grants(&node_id)
+                    .ok()
+                    .map(|grants| (node_id, desired_grants(grants.as_ref())))
+            })
             .collect()
     })
+    .await
+    .map_err(|error| StoreError::Unavailable(format!("grant projection task failed: {error}")))
 }
 
 /// Serialize an operation that invalidates queued revisions with the worker that may turn one of

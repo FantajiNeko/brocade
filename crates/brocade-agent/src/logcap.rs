@@ -228,6 +228,10 @@ pub(crate) fn command(
     state_dir: &Path,
     workload: WorkloadLog,
 ) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(command) = std::env::var_os("BROCADE_TEST_LOG_SINK") {
+        return Ok(command.to_string_lossy().into_owned());
+    }
     let executable = std::env::current_exe()
         .map_err(|error| format!("cannot locate agent binary for log sink: {error}"))?;
     Ok(format!(

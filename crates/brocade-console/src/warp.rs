@@ -679,32 +679,32 @@ mod tests {
             "out:external/warp-live-e2e"
         );
 
-        if let Some(binary) = xray_binary() {
-            // Geodata is part of the production node artifact, but unrelated to this WARP
-            // compiler check. Keep the unit test independent from local geoip/geosite assets.
-            let mut config = config;
-            config
-                .as_object_mut()
-                .expect("Xray config object")
-                .remove("geodata");
-            let dir = PrivateTempDir::create(
-                std::env::temp_dir().join(format!("brocade-warp-config-test-{socks_port}")),
-            )
-            .unwrap();
-            let config_path = dir.path().join("xray.json");
-            write_private_json(&config_path, &config).unwrap();
-            let checked = Command::new(binary)
-                .args(["-test", "-c"])
-                .arg(config_path)
-                .output()
-                .expect("跑得起 xray -test");
-            assert!(
-                checked.status.success(),
-                "注册身份生成的配置 Xray 不认：{}{}",
-                String::from_utf8_lossy(&checked.stdout),
-                String::from_utf8_lossy(&checked.stderr)
-            );
-        }
+        // Geodata is part of the production node artifact, but unrelated to this WARP compiler
+        // check. Keep the unit test independent from local geoip/geosite assets while executing
+        // the exact Xray bytes this Console build embeds and distributes to nodes.
+        let mut config = config;
+        config
+            .as_object_mut()
+            .expect("Xray config object")
+            .remove("geodata");
+        let dir = PrivateTempDir::create(
+            std::env::temp_dir().join(format!("brocade-warp-config-test-{socks_port}")),
+        )
+        .unwrap();
+        let binary = embedded_xray_binary(dir.path());
+        let config_path = dir.path().join("xray.json");
+        write_private_json(&config_path, &config).unwrap();
+        let checked = Command::new(binary)
+            .args(["-test", "-c"])
+            .arg(config_path)
+            .output()
+            .expect("跑得起内嵌 xray -test");
+        assert!(
+            checked.status.success(),
+            "注册身份生成的配置不被当前内嵌 Xray 接受：{}{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
     }
 
     /// Live acceptance for the complete provider/data-plane boundary.
@@ -734,8 +734,11 @@ mod tests {
             Ok("1"),
             "真实 WARP E2E 会提交 ToS 时间戳；确认后设置 BROCADE_ACCEPT_CLOUDFLARE_APPLICATION_TERMS=1"
         );
-        let binary = xray_binary()
-            .expect("真实 WARP E2E 需要 BROCADE_XRAY_BIN，或工作区根目录下可执行的 .tools/xray");
+        let binary_dir = PrivateTempDir::create(
+            std::env::temp_dir().join(format!("brocade-warp-live-xray-{}", std::process::id())),
+        )
+        .unwrap();
+        let binary = live_xray_binary(binary_dir.path());
         assert!(
             Command::new("curl").arg("--version").output().is_ok(),
             "真实 WARP E2E 需要 curl"
@@ -1027,15 +1030,22 @@ mod tests {
         }
     }
 
-    fn xray_binary() -> Option<PathBuf> {
-        let path = match std::env::var_os("BROCADE_XRAY_BIN") {
-            Some(value) => PathBuf::from(value),
-            None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()?
-                .parent()?
-                .join(".tools/xray"),
+    fn embedded_xray_binary(cache_root: &Path) -> PathBuf {
+        crate::embedded_xray::prepare(cache_root, std::env::consts::ARCH)
+            .expect("当前 Console 构建必须能发布并执行它内嵌的 Xray")
+    }
+
+    fn live_xray_binary(cache_root: &Path) -> PathBuf {
+        let Some(value) = std::env::var_os("BROCADE_XRAY_BIN") else {
+            return embedded_xray_binary(cache_root);
         };
-        path.is_file().then_some(path)
+        let path = PathBuf::from(value);
+        assert!(
+            path.is_file(),
+            "BROCADE_XRAY_BIN 必须显式指向普通 Xray 文件：{}",
+            path.display()
+        );
+        path
     }
 
     fn free_tcp_port() -> Result<u16, String> {

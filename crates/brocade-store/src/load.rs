@@ -2114,21 +2114,34 @@ pub async fn hop_link_list(
 /// Unlike `prune_usage_readings`, nothing here is derived from these rows before they go — they
 /// are the finished article, and once old, worthless.
 pub async fn prune_load_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let cutoff = format!("{retain_days} days");
+    let retain_hours = retain_days.saturating_mul(24);
+    prune_load_samples_hours(pool, retain_hours, retain_hours).await
+}
+
+pub(crate) async fn prune_load_samples_hours(
+    pool: &PgPool,
+    load_retain_hours: u32,
+    hop_retain_hours: u32,
+) -> Result<u64> {
+    let load_cutoff = format!(
+        "{} hours",
+        load_retain_hours.min(crate::MAX_RETENTION_HOURS)
+    );
+    let hop_cutoff = format!("{} hours", hop_retain_hours.min(crate::MAX_RETENTION_HOURS));
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(load_rollup::RETENTION_LOCK)
         .execute(&mut *tx)
         .await?;
     let load = sqlx::query("DELETE FROM node_load_samples WHERE window_end < now() - $1::interval")
-        .bind(&cutoff)
+        .bind(&load_cutoff)
         .execute(&mut *tx)
         .await?
         .rows_affected();
     tx.commit().await?;
     let hops =
         sqlx::query("DELETE FROM node_hop_link_samples WHERE window_end < now() - $1::interval")
-            .bind(&cutoff)
+            .bind(&hop_cutoff)
             .execute(pool)
             .await?
             .rows_affected();

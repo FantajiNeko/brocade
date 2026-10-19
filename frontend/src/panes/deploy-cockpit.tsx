@@ -113,7 +113,7 @@ export interface MachineGroup {
 }
 
 /** 逐台机器表：机器 │ 当前 │ 目标 │ 状态 │ 上次来拉，按状态分组。编辑升级范围时前面多一列勾选，
- *  工具条贴在列头之上，外框换成主题色细线。 */
+ *  工具条贴在列头之上，内容边缘与配置页签保持一致。 */
 export function MachineTable({
   label,
   groups,

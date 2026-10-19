@@ -25,7 +25,39 @@ export interface ConsoleInitialData {
   node_count: number;
   /** Each JSON tuple is `[group_id, member_count]`, in the same order as the chain page. */
   chain_group_count: [groupId: string, memberCount: number][];
+  /** Older Consoles omit this field; absence is equivalent to an established installation. */
+  onboarding?: OnboardingStatus;
 }
+
+export type OnboardingStatus = 'active' | 'complete' | 'not-applicable';
+
+export interface OnboardingState {
+  status: OnboardingStatus;
+  root_tenant_id: string | null;
+  started_at: string | null;
+  node_id: string | null;
+  app_id: string | null;
+  chain_id: string | null;
+  ingress_id: string | null;
+  user_tenant_id: string | null;
+  user_id: string | null;
+  target_revision_id: number | null;
+  deployment_id: number | null;
+  completed_at: string | null;
+}
+
+export type OnboardingCheckpoint =
+  | { step: 'node'; node_id: string }
+  | {
+      step: 'model';
+      app_id: string;
+      chain_id: string;
+      ingress_id: string;
+      user_tenant_id: string;
+      user_id: string;
+      target_revision_id: number;
+    }
+  | { step: 'deployment'; deployment_id: number };
 
 export interface ConsoleBootstrap {
   who: Whoami;
@@ -329,6 +361,11 @@ export const setVisitorAccess = (enabled: boolean) =>
   api<AuthState>('/visitor-access', '', { method: 'PUT', body: JSON.stringify({ enabled }) });
 export const fetchSessionWhoami = () => api<Whoami>('/whoami', '', { cache: 'no-store' });
 export const fetchConsoleBootstrap = () => api<ConsoleBootstrap>('/bootstrap');
+export const fetchOnboarding = () => api<OnboardingState>('/onboarding');
+export const checkpointOnboarding = (body: OnboardingCheckpoint) =>
+  api<OnboardingState>('/onboarding', '', { method: 'PUT', body: JSON.stringify(body) });
+export const completeOnboarding = (probeId: string, itemId: string) =>
+  post<OnboardingState>('/onboarding/complete', { probe_id: probeId, item_id: itemId });
 export const initAdmin = (
   bootstrapToken: string,
   body: { operator_id: string; display_name: string; password: string; root_tenant: string },
@@ -429,8 +466,10 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 29;
+export const AGENT_PROTOCOL_VERSION = 36;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
+export const XRAY_HANDOFF_PROTOCOL_VERSION = 30;
+export const CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION = 33;
 export const VPNGATE_MAX_CANDIDATES = 16;
 export const VPNGATE_CONNECT_THRESHOLD_MAX_MS = 35_000;
 export const VPNGATE_DEFAULT_PROBE_WORKERS = 16;
@@ -442,6 +481,10 @@ export interface NodeVersions {
   /** 受管路径上的 Xray 与实际服务进程分别取摘要；原子替换后、重启前两者会短暂不同。 */
   xray_installed_sha256?: string | null;
   xray_running_sha256?: string | null;
+  xray_handoff?: {
+    state: 'unsupported' | 'ready' | 'busy' | 'blocked';
+    reason?: string | null;
+  } | null;
   phantun: string | null;
   /** 可选能力；OpenVPN 或 /dev/net/tun 不可用时为 null，该机器不纳入 VPN Gate 接入节点。 */
   openvpn?: string | null;
@@ -463,7 +506,7 @@ export interface SpoolBacklog {
   usage_dropped?: number | null;
   /** 新 Agent 才有；非零表示发布收敛证据曾被永久丢弃。 */
   observation_dropped?: number | null;
-  /** 新 Agent 才有；非零表示超过一小时队列后永久丢失的主机指标窗口。 */
+  /** 新 Agent 才有；累计被本机队列淘汰或被 Console 永久拒收的主机指标窗口。 */
   load_dropped?: number | null;
 }
 export interface LocalReconcileReport {
@@ -502,6 +545,10 @@ export interface NodeAgentStateItem {
   name: string;
   public_ipv4: string | null;
   public_ipv4_country?: string | null;
+  /** GeoIP answer before an operator correction is applied. */
+  public_ipv4_country_detected?: string | null;
+  /** Durable operator correction; absent means the displayed country follows GeoIP. */
+  public_ipv4_country_override?: string | null;
   public_ipv6: string | null;
   public_ipv4_nat: boolean;
   public_ipv6_nat: boolean;
@@ -523,12 +570,16 @@ export interface NodeAgentStateItem {
   vpngate_probe_reported_at?: string | null;
   /** True after a selected machine has supplied no accepted catalogue-probe samples for thirty minutes. */
   vpngate_probe_data_stale?: boolean;
-  /** Selected to collect the upstream directory and query three-provider exit-IP intelligence; absent on older Consoles. */
+  /** Selected to collect the upstream VPN Gate directory; absent on older Consoles. */
+  vpngate_catalog_enabled?: boolean;
+  /** Selected to query three-provider exit-IP intelligence; absent on older Consoles. */
   vpngate_intelligence_enabled?: boolean;
   // 运行时对账。null 表示尚未上报（刚纳管尚未轮到，或协议尚未恢复），
   // 需要与上报值为零区分——界面显示为「—」而非 0，否则状态最差的机器
   // 会显示为状态最好的。
   runtime_versions: NodeVersions | null;
+  /** 仅在一次 Xray 发布执行期间存在；发布结束后由 Agent 明确清空。 */
+  xray_upgrade?: XrayUpgradeRuntime | null;
   spool_backlog: SpoolBacklog | null;
   last_local_reconcile: LocalReconcileReport | null;
   wireguard_health: WireGuardHealth | null;
@@ -701,6 +752,18 @@ export const abandonNode = (id: string, unregisterWarp = true) =>
   });
 
 export const fetchNodes = (token = '') => api<{ nodes: NodeAgentStateItem[] }>('/nodes/agent-state', token);
+
+export interface NodeRegionOverride {
+  node_id: string;
+  country_code: string | null;
+}
+
+/** Presentation metadata only: changing it does not create a model revision or deployment. */
+export const saveNodeRegion = (nodeId: string, countryCode: string | null) =>
+  api<NodeRegionOverride>(`/nodes/${encodeURIComponent(nodeId)}/region`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ country_code: countryCode }),
+  });
 
 export const fetchNodePublicIpHistory = (nodeId: string, days = 14) =>
   api<NodePublicIpHistory>(
@@ -935,6 +998,20 @@ export const fetchActiveDeployments = (token = '') =>
 export const fetchDeployment = (id: number, token = '', includeContent = false) =>
   api<DeploymentDetail>(`/deployments/${id}${includeContent ? '?include=content' : ''}`, token);
 
+export interface ConfigXrayForceRetirementResult {
+  deployment_id: number;
+  node_id: string;
+  claim_generation: number;
+  active_connections: number;
+  reused: boolean;
+}
+
+export const forceConfigXrayRetirement = (deploymentId: number, nodeId: string) =>
+  post<ConfigXrayForceRetirementResult>(
+    `/deployments/${deploymentId}/targets/${encodeURIComponent(nodeId)}/xray-handoff/force`,
+    {},
+  );
+
 export interface NodeIsolationCommandResult {
   node_id: string;
   isolated: boolean;
@@ -1032,11 +1109,15 @@ export interface UserListItem {
   uuid?: string;
   status: string;
   account_type?: 'formal' | 'test';
+  /** Missing only while a newer UI is rolling over an older local Console. */
+  traffic_accounting_mode?: UserTrafficAccountingMode;
   login_enabled?: boolean;
   direct_login_enabled?: boolean;
   created_at: string;
   created_revision: number | null;
 }
+
+export type UserTrafficAccountingMode = 'single' | 'double';
 
 export const fetchUsers = (includeDisabled = true) =>
   api<{ users: UserListItem[] }>(`/users?include_disabled=${includeDisabled}`);
@@ -1047,6 +1128,14 @@ export interface UserOnlineSourceAccess {
   node_id: string;
   ingress_id: string;
   protocols: OnlineSourceProtocol[] | null;
+  /** Agent report acceptance time for this exact ingress association. */
+  last_observed_at?: string;
+  /** Most recent connection creation time observed by Xray. */
+  xray_last_seen_at?: string;
+  /** Absent when the reporting Agent/Xray predates source-session accounting. */
+  online_since_at?: string | null;
+  session_uplink_bytes?: number | null;
+  session_downlink_bytes?: number | null;
 }
 
 export interface UserOnlineSource {
@@ -1054,6 +1143,9 @@ export interface UserOnlineSource {
   first_observed_at: string;
   last_observed_at: string;
   xray_last_seen_at: string;
+  online_since_at?: string | null;
+  session_uplink_bytes?: number | null;
+  session_downlink_bytes?: number | null;
   node_ids: string[];
   ingress_ids: string[];
   /** Absent on older Consoles; never infer protocols from configured listeners. */
@@ -1066,6 +1158,8 @@ export interface UserPresence {
   state: 'complete' | 'partial' | 'unavailable';
   expected_nodes: number;
   reporting_nodes: number;
+  /** Missing or expired source snapshots, scoped to this user's ingress nodes. Older Consoles omit it. */
+  missing_nodes?: { node_id: string; last_reported_at: string | null }[];
   sources: UserOnlineSource[];
 }
 
@@ -1105,7 +1199,7 @@ export const fetchUserOnlineSourceHistory = (tenantId: string, userId: string) =
   api<UserOnlineSourceHistory>(`/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}/presence-history`);
 
 export const createUser = (body: { tenant_id: string; id: string }) =>
-  immediateModelWrite(() => post<ModelWriteResult>('/users', body));
+  immediateModelWrite(() => post<{ revision_id: number; user: UserListItem }>('/users', body));
 
 // Permission changes bypass the browser draft.  The server commits a revision and a durable
 // automatic-grants job together; the worker creates the non-disruptive grants deployment.
@@ -1139,7 +1233,41 @@ export interface ForwardingEntitlement {
   applied_generation: number | null;
   reconcile_status: 'pending' | 'converged' | 'error';
   last_error: string | null;
+  monthly_limit_bytes?: number | null;
+  monthly_used_bytes?: number;
+  quota_suspended?: boolean;
+  quota_job_id?: number | null;
+  quota_job_status?: 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled' | null;
+  quota_job_error?: string | null;
 }
+
+export interface ForwardingQuotaJob {
+  id: number;
+  node_id: string;
+  suspended: boolean;
+  generation: number;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled';
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ForwardingQuotaJobPage {
+  jobs: ForwardingQuotaJob[];
+  next_before_id: number | null;
+}
+
+const forwardingQuotaPath = (tenant: string, user: string, node: string) =>
+  `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/forwarding-nodes/${encodeURIComponent(node)}/quota`;
+export const setForwardingQuota = (tenant: string, user: string, node: string, limit: number | null) =>
+  api<ForwardingOverview>(forwardingQuotaPath(tenant, user, node), '', {
+    method: 'PUT',
+    body: JSON.stringify({ limit_bytes: limit }),
+  });
+export const fetchForwardingQuotaJobs = (tenant: string, user: string, node: string, before?: number) =>
+  api<ForwardingQuotaJobPage>(
+    `${forwardingQuotaPath(tenant, user, node)}/jobs${before === undefined ? '' : `?before_id=${before}`}`,
+  );
 
 export interface ForwardingRule {
   id: number;
@@ -1152,7 +1280,7 @@ export interface ForwardingRule {
   target_host: string;
   target_port: number;
   enabled: boolean;
-  runtime_status: 'active' | 'pending' | 'error' | 'disabled';
+  runtime_status: 'active' | 'pending' | 'error' | 'disabled' | 'quota-paused';
   uplink_bytes: number;
   downlink_bytes: number;
   created_at: string;
@@ -1165,6 +1293,37 @@ export interface ForwardingOverview {
   entitlements: ForwardingEntitlement[];
   rules: ForwardingRule[];
 }
+
+export interface ForwardingTcpPingResult {
+  status: 'reachable' | 'failed' | 'not_run';
+  code:
+    | 'connected'
+    | 'invalid-target'
+    | 'dns-failed'
+    | 'dns-busy'
+    | 'dns-empty'
+    | 'address-blocked'
+    | 'connect-failed'
+    | 'timeout'
+    | 'agent-upgrade-required';
+  dns_ms: number | null;
+  connect_ms: number | null;
+  resolved_ip: string | null;
+}
+export interface ForwardingProbe {
+  id: string;
+  rule_id: number;
+  rule_updated_at: string;
+  generation: number;
+  state: 'queued' | 'running' | 'complete' | 'obsolete' | 'expired';
+  created_at: number;
+  result: ForwardingTcpPingResult | null;
+}
+
+export const fetchForwardingProbes = (tenant: string, user: string) =>
+  api<ForwardingProbe[]>(`${forwardingPath(tenant, user)}/tcp-pings`);
+export const startForwardingProbe = (tenant: string, user: string, ruleId: number) =>
+  post<ForwardingProbe>(`${forwardingPath(tenant, user)}/${ruleId}/tcp-ping`, {});
 
 export interface ForwardingEntitlementWrite {
   enabled: boolean;
@@ -1223,7 +1382,11 @@ export const updateForwardingRule = (tenant: string, user: string, ruleId: numbe
 export const deleteForwardingRule = (tenant: string, user: string, ruleId: number) =>
   api<ForwardingOverview>(`${forwardingPath(tenant, user)}/${ruleId}`, '', { method: 'DELETE' });
 
-export const updateUserProfile = (tenant: string, user: string, body: { account_type: 'formal' | 'test' }) =>
+export const updateUserProfile = (
+  tenant: string,
+  user: string,
+  body: { account_type: 'formal' | 'test'; traffic_accounting_mode?: UserTrafficAccountingMode },
+) =>
   api<UserListItem>(`/users/${tenant}/${user}/profile`, '', {
     method: 'PUT',
     body: JSON.stringify(body),
@@ -1492,8 +1655,9 @@ export interface ClashHaitunSubscriptionInfo {
   revoked_at: string | null;
 }
 
-// The URL is a bearer credential, so it is fetched only when the operator opens the Clash
-// dialog. It must not ride along in the ordinary user-list response or initial page DOM.
+// The URL is a bearer credential: it is fetched only by the subscription card on the user's
+// access tab, never with the ordinary user-list response. The card renders it with the token
+// masked; the full URL stays in memory until the operator reveals or copies it.
 export const fetchClashSubscription = (tenant: string, user: string, signal?: AbortSignal) =>
   api<ClashSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription`, '', { signal });
 
@@ -1870,7 +2034,11 @@ export interface IngressGuard {
   no_udp_amplification: boolean;
   /** 除 443 外的全部 UDP。限制范围最大的一档，会影响游戏和语音，默认关闭。 */
   tcp_and_quic_only: boolean;
+  /** 是否阻断 CN GeoIP 来源，以及覆盖的地址族。 */
+  cn_source_block: CnSourceBlock;
 }
+
+export type CnSourceBlock = 'off' | 'ipv4' | 'ipv4-and-ipv6';
 
 // 对外投影：订阅中写入的地址。两个地址族相互独立，某一族缺省（或为 null）表示该族不投影。
 //
@@ -2534,6 +2702,8 @@ export interface VpngateIntelligencePolicy {
 
 export interface VpngateIntelligenceCredentials {
   proxycheck_api_key_configured: boolean;
+  /** 仅系统管理员可见，每条保留首尾各 6 位；旧 Console 不返回此字段。 */
+  proxycheck_api_keys_masked?: string[];
 }
 
 export interface VpngateIpNetwork {
@@ -2560,6 +2730,14 @@ export interface VpngateIntelligenceNodeSelection {
   enabled: boolean;
   selected_at_unix_secs: number | null;
 }
+
+export type VpngateCatalogNodeSelection = VpngateIntelligenceNodeSelection;
+
+export const updateVpngateCatalogNode = (nodeId: string, enabled: boolean) =>
+  api<VpngateCatalogNodeSelection>(`/vpngate/catalog-nodes/${encodeURIComponent(nodeId)}`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ enabled }),
+  });
 
 export const updateVpngateIntelligenceNode = (nodeId: string, enabled: boolean) =>
   api<VpngateIntelligenceNodeSelection>(`/vpngate/intelligence-nodes/${encodeURIComponent(nodeId)}`, '', {
@@ -3298,6 +3476,143 @@ export const fetchNodeUserTrafficHistory = (nodeId: string) =>
 export const fetchUserTrafficHistory = (tenantId: string, userId: string) =>
   api<UserTrafficHistory>(`/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}/realtime/history`);
 
+/** 站点流量的统计范围：UTC+8 自然日、周一起的自然周、自然月（与额度的自然月相同）。 */
+export type SiteUsagePeriod = 'day' | 'week' | 'month';
+
+export interface UserSiteUsage {
+  collection_enabled: boolean;
+  catalog_version: number;
+  period: SiteUsagePeriod;
+  /** 周期起点；合计与时间分布覆盖 [range_start, range_end]。 */
+  range_start_unix_secs: number;
+  /** 查询时刻。 */
+  range_end_unix_secs: number;
+  /** 周期终点，图表据此排出尚未到的小时或日子。 */
+  period_end_unix_secs: number;
+  /** 时间分布每格的宽度：当天、当周 3600，当月 86400（UTC+8 自然日）。 */
+  bucket_secs: number;
+  reporting_nodes: number;
+  expected_nodes: number;
+  limited: boolean;
+  latest_report_unix_secs: number | null;
+  observed_since_unix_secs: number | null;
+  rows: { site_id: string; name: string; uplink_bytes: number; downlink_bytes: number }[];
+  /** 各类别的时间分布，points 为 [格起点, 上行, 下行]；没有流量的格不列出。 */
+  series: { site_id: string; points: [number, number, number][] }[];
+}
+
+const userPath = (tenantId: string, userId: string) =>
+  `/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}`;
+
+export interface UserMachineUsageRow {
+  node_id: string | null;
+  uplink_bytes: number;
+  downlink_bytes: number;
+  forwarding_bytes: number;
+  has_gap: boolean;
+  expected: boolean;
+  latest_report_unix_secs: number | null;
+  /** Bucket, up, down, forwarding, explicit gap, observation evidence. */
+  points: [number, number, number, number, boolean, boolean][];
+}
+export interface UserMachineUsage {
+  period: SiteUsagePeriod;
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
+  period_end_unix_secs: number;
+  bucket_secs: number;
+  reporting_nodes: number;
+  expected_nodes: number;
+  rows: UserMachineUsageRow[];
+}
+export const fetchUserMachineUsage = (tenantId: string, userId: string, period: SiteUsagePeriod) =>
+  api<UserMachineUsage>(`${userPath(tenantId, userId)}/machine-usage?period=${period}`);
+
+export const fetchUserSiteUsage = (tenantId: string, userId: string, period: SiteUsagePeriod) =>
+  api<UserSiteUsage>(`${userPath(tenantId, userId)}/site-usage?period=${period}`);
+
+export interface NodeInflowRow {
+  tenant_id: string;
+  user_id: string;
+  source: 'chain' | 'forwarding' | 'unattributed';
+  app_id: string | null;
+  chain_id: string | null;
+  ingress_id: string | null;
+  uplink_bytes: number;
+  downlink_bytes: number;
+  has_gap: boolean;
+}
+export interface NodeInflowUsage {
+  period: SiteUsagePeriod;
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
+  period_end_unix_secs: number;
+  latest_report_unix_secs: number | null;
+  rows: NodeInflowRow[];
+  idle_users: { tenant_id: string; user_id: string }[];
+}
+export interface NodeSiteUsage extends UserSiteUsage {
+  top_users: {
+    site_id: string;
+    users: { tenant_id: string; user_id: string; uplink_bytes: number; downlink_bytes: number }[];
+    other_users: number;
+    other_uplink_bytes: number;
+    other_downlink_bytes: number;
+  }[];
+}
+const nodeUsagePath = (nodeId: string, kind: string, period: SiteUsagePeriod) =>
+  `/nodes/${encodeURIComponent(nodeId)}/${kind}?period=${period}`;
+export const fetchNodeInflowUsage = (nodeId: string, period: SiteUsagePeriod) =>
+  api<NodeInflowUsage>(nodeUsagePath(nodeId, 'inflow-usage', period));
+export const fetchNodeSiteUsage = (nodeId: string, period: SiteUsagePeriod) =>
+  api<NodeSiteUsage>(nodeUsagePath(nodeId, 'site-usage', period));
+export const fetchNodeOtherDomains = (nodeId: string, period: SiteUsagePeriod) =>
+  api<UserOtherDomains>(nodeUsagePath(nodeId, 'other-domains', period));
+export const fetchNodeSniffingFailedTargets = (nodeId: string, period: SiteUsagePeriod) =>
+  api<UserSniffingFailedTargets>(nodeUsagePath(nodeId, 'sniffing-failed-targets', period));
+
+export const fetchSiteUsagePolicy = () => api<{ enabled: boolean }>('/site-usage/settings');
+export const saveSiteUsagePolicy = (enabled: boolean) =>
+  api<{ enabled: boolean }>('/site-usage/settings', '', { method: 'PUT', body: JSON.stringify({ enabled }) });
+
+export interface OtherDomainPolicy {
+  enabled: boolean;
+  top_n: number;
+  max_domains_per_user: number;
+  node_capacity: number;
+  report_interval_secs: number;
+}
+export interface UserOtherDomains {
+  collection_enabled: boolean;
+  top_n: number;
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
+  reporting_nodes: number;
+  expected_nodes: number;
+  limited: boolean;
+  observed_since_unix_secs: number | null;
+  latest_report_unix_secs: number | null;
+  rows: { domain: string; uplink_bytes: number; downlink_bytes: number }[];
+}
+export const fetchOtherDomainPolicy = () => api<OtherDomainPolicy>('/other-domain/settings');
+export const saveOtherDomainPolicy = (policy: OtherDomainPolicy) =>
+  api<OtherDomainPolicy>('/other-domain/settings', '', { method: 'PUT', body: JSON.stringify(policy) });
+/** 明细只保留近 24 小时：当周、当月的 range_start 晚于周期起点。 */
+export const fetchUserOtherDomains = (tenant: string, user: string, period: SiteUsagePeriod) =>
+  api<UserOtherDomains>(`${userPath(tenant, user)}/other-domains?period=${period}`);
+
+export interface SniffingFailedPolicy extends Omit<OtherDomainPolicy, 'max_domains_per_user'> {
+  max_targets_per_user: number;
+}
+export interface UserSniffingFailedTargets extends Omit<UserOtherDomains, 'rows'> {
+  rows: { target: string; uplink_bytes: number; downlink_bytes: number }[];
+}
+export const fetchSniffingFailedPolicy = () => api<SniffingFailedPolicy>('/sniffing-failed/settings');
+export const saveSniffingFailedPolicy = (policy: SniffingFailedPolicy) =>
+  api<SniffingFailedPolicy>('/sniffing-failed/settings', '', { method: 'PUT', body: JSON.stringify(policy) });
+export const fetchUserSniffingFailedTargets = (tenant: string, user: string, period: SiteUsagePeriod) =>
+  api<UserSniffingFailedTargets>(`${userPath(tenant, user)}/sniffing-failed-targets?period=${period}`);
+
 /* ── 设置 ── */
 
 export interface BrandingSettings {
@@ -3519,6 +3834,35 @@ export const saveNodeLogPolicy = (nodeId: string, overrides: AgentLogLimitOverri
     body: JSON.stringify(overrides),
   });
 
+/* ── PostgreSQL 历史/临时数据保留：即时运行策略，不进入模型修订 ── */
+export type DataRetentionCategory = 'history' | 'temporary';
+
+export interface DataRetentionPolicy {
+  table_name: string;
+  title: string;
+  description: string;
+  category: DataRetentionCategory;
+  ttl_hours: number;
+  default_ttl_hours: number;
+  min_ttl_hours: number;
+  max_ttl_hours: number;
+  customized: boolean;
+  /** PostgreSQL 统计估值，不是会锁表的精确 COUNT。 */
+  estimated_rows: number;
+  total_bytes: number;
+}
+
+export interface DataRetentionView {
+  policies: DataRetentionPolicy[];
+}
+
+export const fetchDataRetention = () => api<DataRetentionView>('/data-retention', '', { cache: 'no-store' });
+export const saveDataRetention = (tableName: string, ttlHours: number) =>
+  api<DataRetentionView>(`/data-retention/${encodeURIComponent(tableName)}`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ ttl_hours: ttlHours }),
+  });
+
 /* ── 主网卡 NAPI/GRO：即时运行态配置，不进入模型修订，也不重启 XRAY ── */
 export interface HostNetworkTuning {
   gro_flush_timeout_ns: number;
@@ -3534,12 +3878,14 @@ export const saveHostNetworkTuning = (body: HostNetworkTuning) =>
 
 /* ── 机器物理网卡累计：UTC 重置周期与总量校准，均为即时运行态配置 ── */
 export type NodeTrafficCycleKind = 'monthly' | 'yearly';
+export type NodeTrafficAccountingMode = 'bidirectional_sum' | 'bidirectional_max' | 'outbound_only' | 'inbound_only';
 
 export interface NodeTrafficItem {
   node_id: string;
   tenant_id: string;
   name: string;
   cycle_kind: NodeTrafficCycleKind;
+  accounting_mode: NodeTrafficAccountingMode;
   reset_month: number | null;
   reset_day: number;
   quota_bytes: string | null;
@@ -3564,6 +3910,7 @@ export interface NodeTrafficView {
 
 export interface UpdateNodeTrafficRequest {
   cycle_kind: NodeTrafficCycleKind;
+  accounting_mode: NodeTrafficAccountingMode;
   reset_month: number | null;
   reset_day: number;
   quota_bytes: string | null;
@@ -3622,6 +3969,7 @@ export interface MachineTrafficModelNode {
   tenant_id: string;
   name: string;
   cycle_kind: NodeTrafficCycleKind;
+  accounting_mode: NodeTrafficAccountingMode;
   reset_month: number | null;
   reset_day: number;
   period_start_unix_secs: number;
@@ -3670,6 +4018,29 @@ export const fetchMachineTrafficModel = () => api<MachineTrafficModelView>('/usa
 
 /* Binary release orders retain audit metadata, never historical executable bytes. */
 export type BinaryComponent = 'agent' | 'xray';
+export type XrayReleaseStrategy = 'restart' | 'handoff' | 'handoff-force';
+export type XrayUpgradePhase =
+  'preparing' | 'candidate-ready' | 'switching' | 'draining' | 'blocked' | 'forcing' | 'rolling-back';
+export interface XrayUpgradeProcess {
+  pid: number;
+  pid_start_ticks: number;
+  boot_id: string;
+  sha256: string;
+  alive: boolean;
+  accepting?: boolean | null;
+  active_connections?: number | null;
+}
+export interface XrayUpgradeRuntime {
+  source?: { kind: 'binary-release' } | { kind: 'config-deployment'; deployment_id: number; claim_generation: number };
+  release_id: number;
+  attempt: number;
+  strategy: XrayReleaseStrategy;
+  phase: XrayUpgradePhase;
+  old: XrayUpgradeProcess;
+  candidate?: XrayUpgradeProcess | null;
+  drain_deadline_unix_secs?: number | null;
+  blocked_reason?: string | null;
+}
 export type BinaryReleaseStatus = 'running' | 'halted' | 'succeeded' | 'canceled';
 export type BinaryReleaseTargetStatus =
   | 'pending'
@@ -3698,9 +4069,13 @@ export interface BinaryReleaseTarget {
   reported_service_enabled: boolean | null;
   reported_installed_sha256: string | null;
   reported_running_sha256: string | null;
+  reported_forced_retirement?: boolean | null;
+  recovered_after_dirty?: boolean;
   verification: BinaryVerification | null;
   retryable: boolean;
   dispatched_at: string | null;
+  execution_deadline_at?: string | null;
+  execution_timed_out?: boolean;
   finished_at: string | null;
 }
 export interface BinaryReleaseEvent {
@@ -3730,6 +4105,8 @@ export interface BinaryRelease {
   status: BinaryReleaseStatus;
   active: boolean;
   note: string | null;
+  xray_strategy?: XrayReleaseStrategy | null;
+  xray_drain_timeout_secs?: number | null;
   created_at: string;
   created_by: string;
   halted_at: string | null;
@@ -3746,6 +4123,8 @@ export interface BinaryReleaseSummary {
   status: BinaryReleaseStatus;
   active: boolean;
   note: string | null;
+  xray_strategy?: XrayReleaseStrategy | null;
+  xray_drain_timeout_secs?: number | null;
   created_at: string;
   created_by: string;
   halted_at: string | null;
@@ -3783,6 +4162,8 @@ export interface CreateBinaryRelease {
   build_id: string;
   nodes: string[];
   note: string | null;
+  xray_strategy?: XrayReleaseStrategy;
+  xray_drain_timeout_secs?: number;
 }
 const binaryReleasePath = (component: BinaryComponent) => `/binary-releases/${component}`;
 export const fetchBinaryReleases = (component: BinaryComponent) => api<BinaryReleaseView>(binaryReleasePath(component));

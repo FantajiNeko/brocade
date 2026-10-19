@@ -14,7 +14,7 @@
 
 use std::{
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpStream},
+    net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream},
     time::Duration,
 };
 
@@ -48,7 +48,9 @@ const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 /// calls never came close to the 64 KiB default, but a `QueryStats` answer is one line per counter
 /// per direction, so a machine with a few hundred grants can outrun it — and outrunning it does
 /// not fail, it stalls until the read timeout, which reads like an unreachable xray.
-const WINDOW_SIZE: u32 = 4 * 1024 * 1024;
+// Billing plus the independent site journal contain at most 32K bounded names.
+// Cover the worst-case encoded snapshot, and enforce the same bound on reads.
+const WINDOW_SIZE: u32 = 32 * 1024 * 1024;
 const DEFAULT_WINDOW_SIZE: u32 = 65_535;
 /// The connection-level WINDOW_UPDATE is sent as the difference of the two, so shrinking the
 /// window below the protocol default has to fail here rather than underflow at runtime.
@@ -79,7 +81,7 @@ pub(crate) enum XrayAccount<'a> {
 }
 
 pub(crate) fn add_user(
-    api_port: u16,
+    api_address: SocketAddr,
     tag: &str,
     email: &str,
     level: u32,
@@ -120,17 +122,17 @@ pub(crate) fn add_user(
 
     let mut operation = Vec::new();
     message_field(&mut operation, 1, &user);
-    alter_inbound(api_port, tag, ADD_USER_OPERATION, &operation)
+    alter_inbound(api_address, tag, ADD_USER_OPERATION, &operation)
 }
 
-pub(crate) fn remove_user(api_port: u16, tag: &str, email: &str) -> Result<(), String> {
+pub(crate) fn remove_user(api_address: SocketAddr, tag: &str, email: &str) -> Result<(), String> {
     let mut operation = Vec::new();
     bytes_field(&mut operation, 1, email.as_bytes());
-    alter_inbound(api_port, tag, REMOVE_USER_OPERATION, &operation)
+    alter_inbound(api_address, tag, REMOVE_USER_OPERATION, &operation)
 }
 
 pub(crate) fn add_forwarding_inbound(
-    api_port: u16,
+    api_address: SocketAddr,
     tag: &str,
     protocol: ForwardingProtocol,
     listen_port: u16,
@@ -138,7 +140,7 @@ pub(crate) fn add_forwarding_inbound(
     target_port: u16,
 ) -> Result<(), String> {
     let request = forwarding_inbound_request(tag, protocol, listen_port, target_host, target_port);
-    grpc_unary(api_port, ADD_INBOUND_PATH, &request).map(|_| ())
+    grpc_unary(api_address, ADD_INBOUND_PATH, &request).map(|_| ())
 }
 
 fn forwarding_inbound_request(
@@ -187,21 +189,21 @@ fn forwarding_inbound_request(
     request
 }
 
-pub(crate) fn remove_inbound(api_port: u16, tag: &str) -> Result<(), String> {
+pub(crate) fn remove_inbound(api_address: SocketAddr, tag: &str) -> Result<(), String> {
     let mut request = Vec::new();
     bytes_field(&mut request, 1, tag.as_bytes());
-    grpc_unary(api_port, REMOVE_INBOUND_PATH, &request).map(|_| ())
+    grpc_unary(api_address, REMOVE_INBOUND_PATH, &request).map(|_| ())
 }
 
-pub(crate) fn inbound_tags(api_port: u16) -> Result<Vec<String>, String> {
+pub(crate) fn inbound_tags(api_address: SocketAddr) -> Result<Vec<String>, String> {
     let mut request = Vec::new();
     varint_field(&mut request, 1, 1);
-    let response = grpc_unary(api_port, LIST_INBOUNDS_PATH, &request)?;
+    let response = grpc_unary(api_address, LIST_INBOUNDS_PATH, &request)?;
     decode_inbound_tags(&response)
 }
 
 fn alter_inbound(
-    api_port: u16,
+    api_address: SocketAddr,
     tag: &str,
     operation_type: &str,
     operation: &[u8],
@@ -212,7 +214,7 @@ fn alter_inbound(
     message_field(&mut request, 2, &operation);
 
     // The response carries nothing: AlterInboundResponse is empty. Its arrival is the answer.
-    grpc_unary(api_port, ALTER_INBOUND_PATH, &request).map(|_| ())
+    grpc_unary(api_address, ALTER_INBOUND_PATH, &request).map(|_| ())
 }
 
 /// Every counter whose name starts with `pattern`, cumulative since xray started.
@@ -220,19 +222,20 @@ fn alter_inbound(
 /// `reset` stays unset (field 2 omitted). The control plane differences successive readings and
 /// needs the counters to survive being read; a reset here would hand every other reader — a human
 /// with `xray api statsquery`, most of all — a zeroed machine.
-pub(crate) fn query_stats(api_port: u16, pattern: &str) -> Result<Vec<XrayStat>, String> {
+pub(crate) fn query_stats(api_address: SocketAddr, pattern: &str) -> Result<Vec<XrayStat>, String> {
     let mut request = Vec::new();
     bytes_field(&mut request, 1, pattern.as_bytes());
-    let response = grpc_unary(api_port, QUERY_STATS_PATH, &request)?;
+    let response = grpc_unary(api_address, QUERY_STATS_PATH, &request)?;
     decode_stats(&response)
 }
 
 /// Every source address currently held by Xray's ref-counted online maps.
 ///
-/// Both request booleans remain false by sending an empty protobuf: traffic already has its own
-/// durable accounting path, and resetting either structure would interfere with other readers.
-pub(crate) fn online_sources(api_port: u16) -> Result<Vec<UserOnlineSources>, String> {
-    let response = grpc_unary(api_port, GET_USERS_STATS_PATH, &[])?;
+/// Both request booleans remain false by sending an empty protobuf: aggregate user traffic already
+/// has its own durable accounting path, while each online entry carries read-only current-session
+/// counters. Resetting either structure would interfere with other readers.
+pub(crate) fn online_sources(api_address: SocketAddr) -> Result<Vec<UserOnlineSources>, String> {
+    let response = grpc_unary(api_address, GET_USERS_STATS_PATH, &[])?;
     decode_online_sources(&response)
 }
 
@@ -240,10 +243,10 @@ pub(crate) fn online_sources(api_port: u16) -> Result<Vec<UserOnlineSources>, St
 ///
 /// An empty email in the request means "all of them" — the same thing `xray api inbounduser -tag`
 /// asked for.
-pub(crate) fn inbound_users(api_port: u16, tag: &str) -> Result<Vec<XrayUser>, String> {
+pub(crate) fn inbound_users(api_address: SocketAddr, tag: &str) -> Result<Vec<XrayUser>, String> {
     let mut request = Vec::new();
     bytes_field(&mut request, 1, tag.as_bytes());
-    let response = grpc_unary(api_port, GET_INBOUND_USERS_PATH, &request)?;
+    let response = grpc_unary(api_address, GET_INBOUND_USERS_PATH, &request)?;
     decode_inbound_users(&response)
 }
 
@@ -278,7 +281,7 @@ fn varint(output: &mut Vec<u8>, mut value: u64) {
 }
 
 /// One request, one response, one connection. Returns the response protobuf, framing stripped.
-fn grpc_unary(api_port: u16, path: &str, request: &[u8]) -> Result<Vec<u8>, String> {
+fn grpc_unary(api_address: SocketAddr, path: &str, request: &[u8]) -> Result<Vec<u8>, String> {
     let mut message = Vec::with_capacity(request.len() + 5);
     message.push(0);
     message.extend_from_slice(
@@ -289,7 +292,7 @@ fn grpc_unary(api_port: u16, path: &str, request: &[u8]) -> Result<Vec<u8>, Stri
     message.extend_from_slice(request);
     let message = &message[..];
 
-    let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, api_port));
+    let address = api_address;
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
         .map_err(|error| format!("connect to xray gRPC api {address}: {error}"))?;
     stream
@@ -320,7 +323,7 @@ fn grpc_unary(api_port: u16, path: &str, request: &[u8]) -> Result<Vec<u8>, Stri
                 1,
                 END_HEADERS,
                 1,
-                &request_headers(api_port, path),
+                &request_headers(api_address, path),
             )
         })
         .and_then(|_| write_frame(&mut stream, 0, END_STREAM, 1, message))
@@ -333,7 +336,12 @@ fn grpc_unary(api_port: u16, path: &str, request: &[u8]) -> Result<Vec<u8>, Stri
             read_frame(&mut stream).map_err(|error| format!("read xray gRPC response: {error}"))?;
         match frame.kind {
             // DATA
-            0 if frame.stream_id == 1 => response_data.extend_from_slice(&frame.payload),
+            0 if frame.stream_id == 1 => {
+                if response_data.len().saturating_add(frame.payload.len()) > WINDOW_SIZE as usize {
+                    return Err("xray gRPC response exceeds snapshot limit".to_owned());
+                }
+                response_data.extend_from_slice(&frame.payload);
+            }
             // RST_STREAM
             3 if frame.stream_id == 1 => return Err("xray gRPC reset the stream".to_owned()),
             // SETTINGS: every non-ACK SETTINGS frame must be acknowledged.
@@ -362,10 +370,10 @@ fn settings_payload() -> Vec<u8> {
     payload
 }
 
-fn request_headers(api_port: u16, path: &str) -> Vec<u8> {
+fn request_headers(api_address: SocketAddr, path: &str) -> Vec<u8> {
     let mut block = vec![0x83, 0x86]; // :method POST, :scheme http
     hpack_literal_indexed_name(&mut block, 4, path); // :path
-    hpack_literal_indexed_name(&mut block, 1, &format!("127.0.0.1:{api_port}")); // :authority
+    hpack_literal_indexed_name(&mut block, 1, &api_address.to_string()); // :authority
     hpack_literal_indexed_name(&mut block, 31, "application/grpc"); // content-type
     hpack_literal_new_name(&mut block, "te", "trailers");
     block
@@ -617,11 +625,15 @@ fn decode_online_user(message: &[u8]) -> Result<UserOnlineSources, String> {
     Ok(UserOnlineSources { label, sources })
 }
 
-/// `OnlineIPEntry { string ip = 1; int64 last_seen = 2; repeated string protocols = 3 }`.
+/// `OnlineIPEntry { string ip = 1; int64 last_seen = 2; repeated string protocols = 3;
+///                  int64 online_since = 4; int64 uplink_bytes = 5; int64 downlink_bytes = 6 }`.
 fn decode_online_source(message: &[u8]) -> Result<OnlineSource, String> {
     let mut ip = None;
     let mut last_seen_unix_secs = 0_i64;
     let mut protocols = Vec::new();
+    let mut online_since_unix_secs = None;
+    let mut session_uplink_bytes = None;
+    let mut session_downlink_bytes = None;
     let mut cursor = 0;
     while let Some((number, field)) = next_field(message, &mut cursor)? {
         match (number, field) {
@@ -640,6 +652,14 @@ fn decode_online_source(message: &[u8]) -> Result<OnlineSource, String> {
                 };
                 protocols.push(protocol);
             }
+            (4, Field::Varint(raw)) => online_since_unix_secs = Some(raw as i64),
+            (5, Field::Varint(raw)) => session_uplink_bytes = Some(raw as i64),
+            (6, Field::Varint(raw)) => session_downlink_bytes = Some(raw as i64),
+            (4..=6, _) => {
+                return Err(
+                    "xray sent an invalid online source session metric wire type".to_owned(),
+                )
+            }
             _ => {}
         }
     }
@@ -655,12 +675,37 @@ fn decode_online_source(message: &[u8]) -> Result<OnlineSource, String> {
     if last_seen_unix_secs <= 0 {
         return Err("xray sent an online source with a non-positive last_seen".to_owned());
     }
+    let (online_since_unix_secs, session_uplink_bytes, session_downlink_bytes) = match (
+        online_since_unix_secs,
+        session_uplink_bytes,
+        session_downlink_bytes,
+    ) {
+        (None, None, None) => (None, None, None),
+        (Some(online_since), uplink, downlink)
+            if online_since > 0 && uplink.unwrap_or(0) >= 0 && downlink.unwrap_or(0) >= 0 =>
+        {
+            // These are ordinary proto3 scalars: Go omits a byte counter when it is zero.
+            // A positive epoch identifies session-capable Xray; only within that epoch may
+            // omitted byte fields mean zero. Legacy sources still retain unknown metrics.
+            (
+                Some(online_since),
+                Some(uplink.unwrap_or(0) as u64),
+                Some(downlink.unwrap_or(0) as u64),
+            )
+        }
+        _ => {
+            return Err("xray sent incomplete or invalid online source session metrics".to_owned())
+        }
+    };
     protocols.sort_unstable();
     protocols.dedup();
     Ok(OnlineSource {
         ip,
         last_seen_unix_secs,
         protocols: (!protocols.is_empty()).then_some(protocols),
+        online_since_unix_secs,
+        session_uplink_bytes,
+        session_downlink_bytes,
     })
 }
 
@@ -762,10 +807,10 @@ fn decode_account(message: &[u8]) -> Result<Option<(String, Option<String>)>, St
 }
 
 pub(crate) fn reverse_health(
-    api_port: u16,
+    api_address: SocketAddr,
 ) -> Result<brocade_deployment::protocol::ReverseHealthReport, String> {
     let response = grpc_unary(
-        api_port,
+        api_address,
         "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot",
         &[],
     )?;
@@ -783,9 +828,9 @@ pub(crate) fn reverse_health(
 }
 
 pub(crate) fn mux_snapshot(
-    api_port: u16,
+    api_address: SocketAddr,
 ) -> Result<brocade_deployment::protocol::MuxReport, String> {
-    let response = grpc_unary(api_port, MUX_SNAPSHOT_PATH, &[])?;
+    let response = grpc_unary(api_address, MUX_SNAPSHOT_PATH, &[])?;
     let mut cursor = 0;
     while let Some((number, field)) = next_field(&response, &mut cursor)? {
         if let (1, Field::Bytes(bytes)) = (number, field) {
@@ -804,6 +849,8 @@ pub(crate) fn mux_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     #[test]
@@ -824,7 +871,7 @@ mod tests {
 
     #[test]
     fn request_headers_use_grpc_h2c_shape() {
-        let headers = request_headers(10085, ALTER_INBOUND_PATH);
+        let headers = request_headers(crate::DEFAULT_XRAY_API_ADDRESS, ALTER_INBOUND_PATH);
         assert_eq!(&headers[..2], &[0x83, 0x86]);
         assert!(headers
             .windows(ALTER_INBOUND_PATH.len())
@@ -833,19 +880,83 @@ mod tests {
             .windows("application/grpc".len())
             .any(|window| window == b"application/grpc"));
 
-        let stats = request_headers(10085, QUERY_STATS_PATH);
+        let stats = request_headers(crate::DEFAULT_XRAY_API_ADDRESS, QUERY_STATS_PATH);
         assert!(stats
             .windows(QUERY_STATS_PATH.len())
             .any(|window| window == QUERY_STATS_PATH.as_bytes()));
-        let online = request_headers(10085, GET_USERS_STATS_PATH);
+        let online = request_headers(crate::DEFAULT_XRAY_API_ADDRESS, GET_USERS_STATS_PATH);
         assert!(online
             .windows(GET_USERS_STATS_PATH.len())
             .any(|window| window == GET_USERS_STATS_PATH.as_bytes()));
         for path in [ADD_INBOUND_PATH, REMOVE_INBOUND_PATH, LIST_INBOUNDS_PATH] {
-            let headers = request_headers(10085, path);
+            let headers = request_headers(crate::DEFAULT_XRAY_API_ADDRESS, path);
             assert!(headers
                 .windows(path.len())
                 .any(|window| window == path.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn grpc_dials_the_configured_ip_and_sends_its_authority() {
+        use std::{net::TcpListener, thread, time::Instant};
+
+        // 127.0.0.2 also catches accidental fallback to the usual IPv4 localhost address.
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let listener = TcpListener::bind((ip, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "no connection to {address}");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept {address}: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut preface = [0_u8; 24];
+                stream.read_exact(&mut preface).unwrap();
+                assert_eq!(&preface, CLIENT_PREFACE);
+                let mut headers = Vec::new();
+                loop {
+                    let frame = read_frame(&mut stream).unwrap();
+                    if frame.kind == 1 {
+                        headers = frame.payload;
+                    } else if frame.kind == 0 && frame.flags & END_STREAM != 0 {
+                        break;
+                    }
+                }
+                write_frame(&mut stream, 4, 0, 0, &[]).unwrap();
+                write_frame(&mut stream, 1, END_HEADERS, 1, &[0x88]).unwrap();
+                write_frame(&mut stream, 0, END_STREAM, 1, &[0; 5]).unwrap();
+                // Drain the client's SETTINGS ACK before closing, otherwise unread receive
+                // data can make TCP send RST and discard the response we just wrote.
+                let acknowledgement = read_frame(&mut stream).unwrap();
+                assert_eq!((acknowledgement.kind, acknowledgement.flags), (4, ACK));
+                headers
+            });
+            let response = inbound_tags(address);
+            let headers = server.join().unwrap();
+            assert_eq!(response.unwrap(), Vec::<String>::new());
+            let authority = address.to_string();
+            assert!(headers
+                .windows(authority.len())
+                .any(|bytes| bytes == authority.as_bytes()));
+            assert!(headers
+                .windows(LIST_INBOUNDS_PATH.len())
+                .any(|bytes| bytes == LIST_INBOUNDS_PATH.as_bytes()));
         }
     }
 
@@ -1024,11 +1135,17 @@ mod tests {
                             ip: "1.1.1.1".to_owned(),
                             last_seen_unix_secs: 1_767_225_600,
                             protocols: None,
+                            online_since_unix_secs: None,
+                            session_uplink_bytes: None,
+                            session_downlink_bytes: None,
                         },
                         OnlineSource {
                             ip: "8.8.8.8".to_owned(),
                             last_seen_unix_secs: 1_767_225_601,
                             protocols: None,
+                            online_since_unix_secs: None,
+                            session_uplink_bytes: None,
+                            session_downlink_bytes: None,
                         },
                     ],
                 },
@@ -1038,6 +1155,9 @@ mod tests {
                         ip: "2606:4700:4700::1111".to_owned(),
                         last_seen_unix_secs: 1_767_225_602,
                         protocols: None,
+                        online_since_unix_secs: None,
+                        session_uplink_bytes: None,
+                        session_downlink_bytes: None,
                     }],
                 },
             ]
@@ -1076,6 +1196,77 @@ mod tests {
             bytes_field(&mut source, 3, b"vless");
         }
         assert!(decode_online_source(&source).is_err());
+    }
+
+    #[test]
+    fn decodes_optional_online_session_metrics_with_proto3_zero_defaults() {
+        let base = || {
+            let mut source = Vec::new();
+            bytes_field(&mut source, 1, b"1.1.1.1");
+            varint_field(&mut source, 2, 1_767_225_600);
+            source
+        };
+        let legacy = decode_online_source(&base()).unwrap();
+        assert_eq!(legacy.online_since_unix_secs, None);
+        assert_eq!(legacy.session_uplink_bytes, None);
+        assert_eq!(legacy.session_downlink_bytes, None);
+
+        let mut measured = base();
+        varint_field(&mut measured, 4, 1_767_225_500);
+        varint_field(&mut measured, 5, 123);
+        varint_field(&mut measured, 6, 456);
+        let measured = decode_online_source(&measured).unwrap();
+        assert_eq!(measured.online_since_unix_secs, Some(1_767_225_500));
+        assert_eq!(measured.session_uplink_bytes, Some(123));
+        assert_eq!(measured.session_downlink_bytes, Some(456));
+
+        for (uplink, downlink) in [
+            (None, None),
+            (Some(123), None),
+            (None, Some(456)),
+            (Some(0), Some(0)),
+        ] {
+            let mut source = base();
+            varint_field(&mut source, 4, 1_767_225_500);
+            if let Some(value) = uplink {
+                varint_field(&mut source, 5, value);
+            }
+            if let Some(value) = downlink {
+                varint_field(&mut source, 6, value);
+            }
+            let decoded = decode_online_source(&source).expect("proto3 omits zero-valued counters");
+            assert_eq!(decoded.online_since_unix_secs, Some(1_767_225_500));
+            assert_eq!(decoded.session_uplink_bytes, Some(uplink.unwrap_or(0)));
+            assert_eq!(decoded.session_downlink_bytes, Some(downlink.unwrap_or(0)));
+        }
+
+        for fields in [
+            vec![(5, 123)],
+            vec![(6, 456)],
+            vec![(5, 0), (6, 0)],
+            vec![(4, 0)],
+            vec![(4, (-1_i64) as u64)],
+            vec![(4, 1_767_225_500), (5, (-1_i64) as u64)],
+            vec![(4, 1_767_225_500), (6, (-1_i64) as u64)],
+        ] {
+            let mut invalid = base();
+            for (field, value) in fields {
+                varint_field(&mut invalid, field, value);
+            }
+            assert!(
+                decode_online_source(&invalid).is_err(),
+                "reject invalid session metadata"
+            );
+        }
+        for field in 4..=6 {
+            let mut invalid = base();
+            varint_field(&mut invalid, 4, 1_767_225_500);
+            bytes_field(&mut invalid, field, b"not-a-counter");
+            assert!(
+                decode_online_source(&invalid).is_err(),
+                "a malformed field is not an omitted zero"
+            );
+        }
     }
 
     #[test]
@@ -1215,6 +1406,16 @@ mod tests {
     #[test]
     #[ignore = "requires the repository's pinned Xray binary"]
     fn native_grpc_round_trips_against_xray() {
+        native_grpc_round_trips_on(IpAddr::V4(Ipv4Addr::LOCALHOST), false);
+    }
+
+    #[test]
+    #[ignore = "requires the repository's pinned Xray binary and IPv6 loopback"]
+    fn native_grpc_round_trips_against_direct_ipv6_xray_api() {
+        native_grpc_round_trips_on(IpAddr::V6(Ipv6Addr::LOCALHOST), true);
+    }
+
+    fn native_grpc_round_trips_on(api_ip: IpAddr, direct_api: bool) {
         use std::{
             fs,
             net::TcpListener,
@@ -1228,7 +1429,10 @@ mod tests {
             .map(PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/xray"));
         assert!(binary.exists(), "{} is missing", binary.display());
-        let api_port = free_port();
+        let api_address = TcpListener::bind((api_ip, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let inbound_port = free_port();
         let hysteria_port = free_port();
         let mtproto_port = free_port();
@@ -1263,82 +1467,85 @@ mod tests {
             .expect("run openssl");
         assert!(openssl.success(), "generate test certificate");
         let config = directory.join("xray.json");
-        fs::write(
-            &config,
-            serde_json::to_vec(&serde_json::json!({
-                "log": { "loglevel": "warning" },
-                "api": { "tag": "api", "services": ["HandlerService", "StatsService"] },
-                "stats": {},
-                "policy": { "levels": { "0": {
-                    "statsUserUplink": true,
-                    "statsUserDownlink": true,
-                    "statsUserOnline": true
-                } } },
-                "inbounds": [
-                    {
-                        "tag": "api",
-                        "listen": "127.0.0.1",
-                        "port": api_port,
-                        "protocol": "dokodemo-door",
-                        "settings": { "address": "127.0.0.1" }
-                    },
-                    {
-                        "tag": "test-vless",
-                        "listen": "127.0.0.1",
-                        "port": inbound_port,
-                        "protocol": "vless",
-                        "settings": { "clients": [], "decryption": "none" },
-                        // A local-only PROXY header supplies a non-loopback fixture source,
-                        // since Xray deliberately excludes localhost from presence statistics.
-                        "streamSettings": { "sockopt": { "acceptProxyProtocol": true } }
-                    },
-                    {
-                        "tag": "test-hysteria2",
-                        "listen": "127.0.0.1",
-                        "port": hysteria_port,
-                        "protocol": "hysteria",
-                        "settings": { "clients": [] },
-                        "streamSettings": {
-                            "network": "hysteria",
-                            "security": "tls",
-                            "tlsSettings": {
-                                "alpn": ["h3"],
-                                "certificates": [{
-                                    "certificateFile": certificate,
-                                    "keyFile": private_key
-                                }]
-                            },
-                            "hysteriaSettings": {
-                                "version": 2,
-                                "masquerade": { "type": "404" }
-                            },
-                            "finalmask": {
-                                "quicParams": { "congestion": "bbr" }
-                            }
+        let mut content = serde_json::json!({
+            "log": { "loglevel": "warning" },
+            "api": { "tag": "api", "services": ["HandlerService", "StatsService"] },
+            "stats": {},
+            "policy": { "levels": { "0": {
+                "statsUserUplink": true,
+                "statsUserDownlink": true,
+                "statsUserOnline": true
+            } } },
+            "inbounds": [
+                {
+                    "tag": "api",
+                    "listen": api_ip.to_string(),
+                    "port": api_address.port(),
+                    "protocol": "dokodemo-door",
+                    "settings": { "address": "127.0.0.1" }
+                },
+                {
+                    "tag": "test-vless",
+                    "listen": "127.0.0.1",
+                    "port": inbound_port,
+                    "protocol": "vless",
+                    "settings": { "clients": [], "decryption": "none" },
+                    // A local-only PROXY header supplies a non-loopback fixture source,
+                    // since Xray deliberately excludes localhost from presence statistics.
+                    "streamSettings": { "sockopt": { "acceptProxyProtocol": true } }
+                },
+                {
+                    "tag": "test-hysteria2",
+                    "listen": "127.0.0.1",
+                    "port": hysteria_port,
+                    "protocol": "hysteria",
+                    "settings": { "clients": [] },
+                    "streamSettings": {
+                        "network": "hysteria",
+                        "security": "tls",
+                        "tlsSettings": {
+                            "alpn": ["h3"],
+                            "certificates": [{
+                                "certificateFile": certificate,
+                                "keyFile": private_key
+                            }]
+                        },
+                        "hysteriaSettings": {
+                            "version": 2,
+                            "masquerade": { "type": "404" }
+                        },
+                        "finalmask": {
+                            "quicParams": { "congestion": "bbr" }
                         }
-                    },
-                    {
-                        "tag": "test-mtproto",
-                        "listen": "127.0.0.1",
-                        "port": mtproto_port,
-                        "protocol": "mtproto",
-                        "settings": { "users": [] },
-                        "streamSettings": { "network": "tcp", "security": "none" },
-                        "sniffing": { "enabled": false }
                     }
-                ],
-                // The integration target is loopback; override the normal private-IP deny only
-                // inside this isolated fixture, never in generated production configuration.
-                "outbounds": [{ "tag": "direct", "protocol": "freedom", "settings": { "ipsBlocked": [] } }],
-                "routing": { "rules": [{
-                    "type": "field",
-                    "inboundTag": ["api"],
-                    "outboundTag": "api"
-                }] }
-            }))
-            .expect("serialize config"),
-        )
-        .expect("write config");
+                },
+                {
+                    "tag": "test-mtproto",
+                    "listen": "127.0.0.1",
+                    "port": mtproto_port,
+                    "protocol": "mtproto",
+                    "settings": { "users": [] },
+                    "streamSettings": { "network": "tcp", "security": "none" },
+                    "sniffing": { "enabled": false }
+                }
+            ],
+            // The integration target is loopback; override the normal private-IP deny only
+            // inside this isolated fixture, never in generated production configuration.
+            "outbounds": [{ "tag": "direct", "protocol": "freedom", "settings": { "ipsBlocked": [] } }],
+            "routing": { "rules": [{
+                "type": "field",
+                "inboundTag": ["api"],
+                "outboundTag": "api"
+            }] }
+        });
+        if direct_api {
+            content["api"]["listen"] = api_address.to_string().into();
+            content["inbounds"].as_array_mut().unwrap().remove(0);
+            content["routing"]["rules"] = serde_json::json!([]);
+        }
+        let encoded = serde_json::to_string(&content).unwrap();
+        assert_eq!(crate::xray_api_address(&encoded), Some(api_address));
+        fs::write(&config, encoded).expect("write config");
 
         struct TestXray(std::process::Child);
         impl Drop for TestXray {
@@ -1356,7 +1563,7 @@ mod tests {
                 .expect("start xray"),
         );
         for _ in 0..50 {
-            if TcpStream::connect((Ipv4Addr::LOCALHOST, api_port)).is_ok() {
+            if TcpStream::connect(api_address).is_ok() {
                 break;
             }
             if let Some(status) = child.0.try_wait().expect("poll xray") {
@@ -1366,7 +1573,7 @@ mod tests {
         }
 
         add_user(
-            api_port,
+            api_address,
             "test-vless",
             "alice@example.test",
             0,
@@ -1379,7 +1586,7 @@ mod tests {
         // Read back natively: this is the decoder under test facing a real GetInboundUsers
         // response, protobuf and HPACK and all.
         assert_eq!(
-            inbound_users(api_port, "test-vless").expect("native list users"),
+            inbound_users(api_address, "test-vless").expect("native list users"),
             vec![XrayUser {
                 email: "alice@example.test".to_owned(),
                 credential: "b831381d-6324-4d53-ad4f-8cda48b30811".to_owned(),
@@ -1388,7 +1595,7 @@ mod tests {
         );
 
         add_user(
-            api_port,
+            api_address,
             "test-hysteria2",
             "bob@example.test",
             0,
@@ -1398,7 +1605,7 @@ mod tests {
         )
         .expect("native add Hysteria 2 user");
         assert_eq!(
-            inbound_users(api_port, "test-hysteria2").expect("native list Hysteria 2 users"),
+            inbound_users(api_address, "test-hysteria2").expect("native list Hysteria 2 users"),
             vec![XrayUser {
                 email: "bob@example.test".to_owned(),
                 credential: "hysteria-secret".to_owned(),
@@ -1411,7 +1618,7 @@ mod tests {
             .args([
                 "api",
                 "inbounduser",
-                &format!("--server=127.0.0.1:{api_port}"),
+                &format!("--server={api_address}"),
                 "-tag=test-hysteria2",
             ])
             .output()
@@ -1422,7 +1629,7 @@ mod tests {
         assert!(listed_hysteria.contains("hysteria-secret"));
 
         add_user(
-            api_port,
+            api_address,
             "test-mtproto",
             "carol@example.test",
             0,
@@ -1432,7 +1639,7 @@ mod tests {
         )
         .expect("native add MTProxy user");
         assert_eq!(
-            inbound_users(api_port, "test-mtproto").expect("native list MTProxy users"),
+            inbound_users(api_address, "test-mtproto").expect("native list MTProxy users"),
             vec![XrayUser {
                 email: "carol@example.test".to_owned(),
                 credential: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
@@ -1443,17 +1650,17 @@ mod tests {
         // No traffic has flowed, so no user counter exists yet. What this proves is the call
         // itself: path, framing, flow-control windows, and an empty response decoding to an
         // empty list rather than an error.
-        let health = reverse_health(api_port).expect("read reverse health API");
+        let health = reverse_health(api_address).expect("read reverse health API");
         assert!(!health.boot_id.is_empty());
         assert!(health.workers.is_empty());
-        let mux = mux_snapshot(api_port).expect("read Mux snapshot API");
+        let mux = mux_snapshot(api_address).expect("read Mux snapshot API");
         assert!(!mux.boot_id.is_empty());
         assert!(mux.pools.is_empty());
         assert!(mux.workers.is_empty());
-        assert!(query_stats(api_port, "user>>>")
+        assert!(query_stats(api_address, "user>>>")
             .expect("native query stats")
             .is_empty());
-        assert!(online_sources(api_port)
+        assert!(online_sources(api_address)
             .expect("native online sources")
             .is_empty());
 
@@ -1504,11 +1711,19 @@ mod tests {
         let mut payload = [0; 4];
         accepted.read_exact(&mut payload).unwrap();
         assert_eq!(&payload, b"ping");
+        // No target response has been sent: the real Go protobuf encoder omits downlink=0.
+        // A single one-way source must not invalidate the entire node's presence snapshot.
+        let one_way =
+            online_sources(api_address).expect("read real VLESS source with zero downlink");
+        assert_eq!(one_way.len(), 1);
+        assert_eq!(one_way[0].sources.len(), 1);
+        assert!(one_way[0].sources[0].online_since_unix_secs.is_some());
+        assert_eq!(one_way[0].sources[0].session_downlink_bytes, Some(0));
         accepted.write_all(b"pong").unwrap();
         let mut response = [0; 6];
         client.read_exact(&mut response).unwrap();
         assert_eq!(&response, b"\0\0pong");
-        let sources = online_sources(api_port).expect("read real VLESS presence");
+        let sources = online_sources(api_address).expect("read real VLESS presence");
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].label, "alice@example.test");
         assert_eq!(sources[0].sources.len(), 1);
@@ -1517,11 +1732,24 @@ mod tests {
             sources[0].sources[0].protocols,
             Some(vec![OnlineSourceProtocol::Vless])
         );
+        assert!(sources[0].sources[0].online_since_unix_secs.is_some());
+        assert!(
+            sources[0].sources[0]
+                .session_uplink_bytes
+                .unwrap_or_default()
+                >= 4
+        );
+        assert!(
+            sources[0].sources[0]
+                .session_downlink_bytes
+                .unwrap_or_default()
+                >= 4
+        );
         drop(accepted);
         drop(client);
         let mut cleared = false;
         for _ in 0..100 {
-            if online_sources(api_port).unwrap().is_empty() {
+            if online_sources(api_address).unwrap().is_empty() {
                 cleared = true;
                 break;
             }
@@ -1532,20 +1760,20 @@ mod tests {
             "closed VLESS connection must retire its protocol reference"
         );
 
-        remove_user(api_port, "test-vless", "alice@example.test").expect("native remove user");
-        assert!(inbound_users(api_port, "test-vless")
+        remove_user(api_address, "test-vless", "alice@example.test").expect("native remove user");
+        assert!(inbound_users(api_address, "test-vless")
             .expect("native list users after removal")
             .is_empty());
-        remove_user(api_port, "test-hysteria2", "bob@example.test")
+        remove_user(api_address, "test-hysteria2", "bob@example.test")
             .expect("native remove Hysteria 2 user");
-        remove_user(api_port, "test-mtproto", "carol@example.test")
+        remove_user(api_address, "test-mtproto", "carol@example.test")
             .expect("native remove MTProxy user");
         assert!(
-            remove_user(api_port, "missing-inbound", "nobody@example.test").is_err(),
+            remove_user(api_address, "missing-inbound", "nobody@example.test").is_err(),
             "a trailers-only gRPC error must not be mistaken for success"
         );
         assert!(
-            inbound_users(api_port, "missing-inbound").is_err(),
+            inbound_users(api_address, "missing-inbound").is_err(),
             "listing an inbound that does not exist is an error, not an empty list"
         );
 

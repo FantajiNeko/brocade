@@ -1,4 +1,4 @@
-use crate::physical::node::{GrantClientPlan, NodePlan};
+use crate::physical::node::{GrantClientPlan, GrantSyncPlan, NodePlan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantSyncBatch {
@@ -21,10 +21,14 @@ pub struct GrantClient {
 }
 
 pub fn build(plan: &NodePlan) -> GrantSyncBatch {
+    build_sync(&plan.grant_sync)
+}
+
+/// Render a grants-only projection without requiring a complete node plan.
+pub fn build_sync(plan: &GrantSyncPlan) -> GrantSyncBatch {
     GrantSyncBatch {
         node_id: plan.node_id.clone(),
         inbounds: plan
-            .grant_sync
             .updates
             .iter()
             .map(|update| GrantInboundUpdate {

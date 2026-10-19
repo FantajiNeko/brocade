@@ -2,6 +2,23 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
+// Most ledger tests use readonly access. Realtime cases also exercise the realtime tab's
+// subscription lifecycle without starting external services.
+const access = vi.hoisted(() => ({ allowed: false, operatorId: 'readonly-test' }));
+vi.mock('../src/session', () => ({
+  canViewUserRealtimeTraffic: () => access.allowed,
+  isVisitor: (who: { operator_id: string; role: string }) => who.operator_id === 'public' || who.role === 'user',
+  useSession: () => ({
+    who: {
+      operator_id: access.operatorId,
+      role: access.allowed ? 'system-admin' : 'readonly',
+      tenant_scope: null,
+      token_prefix: null,
+      masked_assets: false,
+    },
+  }),
+}));
+
 let UsagePane: typeof import('../src/panes/usage').UsagePane;
 
 beforeAll(async () => {
@@ -16,6 +33,8 @@ beforeAll(async () => {
 
 afterEach(() => {
   cleanup();
+  access.allowed = false;
+  access.operatorId = 'readonly-test';
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
@@ -65,6 +84,7 @@ describe('usage month view', () => {
         <UsagePane />
       </QueryClientProvider>,
     );
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
     const ledger = view.getByLabelText('2026 年 9 月用量概览');
     expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('3 KiB');
     expect(readingOf(ledger, '接入')).toBe('0 B');
@@ -101,16 +121,17 @@ describe('usage month view', () => {
         <UsagePane />
       </QueryClientProvider>,
     );
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
     await view.findByLabelText('2026 年 9 月用量概览');
 
-    const panel = view.container.querySelector('.usage-summary-panel');
+    const panel = view.getByRole('tabpanel', { name: '汇总' });
     const cockpit = view.container.querySelector('.usage-cockpit');
     expect(panel).toBeTruthy();
     expect(cockpit).toBeTruthy();
 
     fireEvent.click(view.getByRole('button', { name: '上月' }));
 
-    expect(view.container.querySelector('.usage-summary-panel')).toBe(panel);
+    expect(view.getByRole('tabpanel', { name: '汇总' })).toBe(panel);
     expect(view.container.querySelector('.usage-cockpit')).toBe(cockpit);
     expect(view.getByLabelText('2026 年 9 月用量概览')).toBeTruthy();
     expect(panel?.getAttribute('aria-busy')).toBe('true');
@@ -129,7 +150,7 @@ describe('usage month view', () => {
     });
 
     await view.findByLabelText('2026 年 8 月用量概览');
-    expect(view.container.querySelector('.usage-summary-panel')).toBe(panel);
+    expect(view.getByRole('tabpanel', { name: '汇总' })).toBe(panel);
     expect(view.container.querySelector('.usage-cockpit')).toBe(cockpit);
     expect(panel?.hasAttribute('aria-busy')).toBe(false);
   });
@@ -188,18 +209,21 @@ describe('usage month view', () => {
         <UsagePane />
       </QueryClientProvider>,
     );
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
 
     await waitFor(() =>
       expect(view.getByLabelText('2026 年 9 月用量概览').querySelector('.usage-hero-value')?.textContent).toBe('4 KiB'),
     );
     const title = view.getByRole('heading', { name: '用量' });
-    expect(title.closest('.panel.titled')).toBeTruthy();
-    expect(title.parentElement?.querySelector('.list-ico')).toBeTruthy();
+    expect(title.tagName).toBe('H1');
+    expect(title.closest('.nd-page-head')?.querySelector('.cg-plate')).toBeTruthy();
     expect(title.parentElement?.textContent).not.toContain('2026 年 9 月');
     expect(view.getByRole('heading', { name: '每日流量' }).parentElement?.textContent).not.toContain('2026 年 9 月');
-    // One card: the ledger and the daily chart share the page title instead of a second panel.
-    expect(view.container.querySelectorAll('.panel')).toHaveLength(1);
-    expect(view.getByRole('heading', { name: '每日流量' }).closest('.panel')).toBe(title.closest('.panel'));
+    expect(view.container.querySelectorAll('.nd-paper')).toHaveLength(1);
+    expect(view.container.querySelector('.flt-panel')).toBeNull();
+    expect(view.getByRole('heading', { name: '每日流量' }).closest('[role="tabpanel"]')).toBe(
+      view.getByRole('tabpanel', { name: '汇总' }),
+    );
 
     const ledger = view.getByLabelText('2026 年 9 月用量概览');
     expect(ledger.querySelector('.usage-period')?.textContent).toBe('2026 年 9 月 1 日 – 30 日');
@@ -266,10 +290,9 @@ describe('usage month view', () => {
         label => label.textContent,
       ),
     ).toEqual(['1', '5', '10', '15', '20', '25', '31']);
-    expect(fetchMock.mock.calls.map(call => String(call[0]))).toEqual([
-      '/usage/monthly-summary',
-      '/usage/monthly-summary?month_offset=-1',
-    ]);
+    expect(
+      fetchMock.mock.calls.map(call => String(call[0])).filter(path => path.startsWith('/usage/monthly-summary')),
+    ).toEqual(['/usage/monthly-summary', '/usage/monthly-summary?month_offset=-1']);
   });
 
   it('shows reported totals without repeating collection gaps in summaries, columns or day details', () => {
@@ -298,6 +321,7 @@ describe('usage month view', () => {
         <UsagePane />
       </QueryClientProvider>,
     );
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
 
     expect(view.getByLabelText('2026 年 9 月用量概览').querySelector('.usage-hero-value')?.textContent).toBe('3 KiB');
     expect(view.queryByRole('status')).toBeNull();
@@ -333,6 +357,7 @@ describe('usage month view', () => {
         <UsagePane />
       </QueryClientProvider>,
     );
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
 
     expect(view.getByRole('heading', { name: '用量' })).toBeTruthy();
     expect(view.getByText('当前控制面尚未提供每日流量。')).toBeTruthy();
@@ -351,9 +376,162 @@ describe('usage isolation', () => {
     views: [],
     days: [],
   };
-  it('does not expose or request the fleet model in the user-facing usage view', async () => {
+
+  it('shares the release page shell and preserves the month and day across keyboard tab changes', async () => {
+    access.allowed = true;
+    class FleetStream extends EventTarget {
+      close = vi.fn();
+    }
+    vi.stubGlobal('EventSource', FleetStream);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === '/nodes/agent-state') return json({ nodes: [] });
+        if (path === '/users?include_disabled=false') return json({ users: [] });
+        if (path === '/realtime/fleet-traffic/snapshot')
+          return json({ policy: { enabled: true }, nodes: [], expected: [] });
+        throw new Error(`unexpected request: ${path}`);
+      }),
+    );
+    const queryClient = client();
+    queryClient.setQueryData(['usage-monthly'], monthly);
+    queryClient.setQueryData(['usage-monthly', -1], {
+      ...monthly,
+      month_start: '2026-09-01 00:00:00',
+      days: [
+        { day: '2026-09-01', uplink_bytes: 1024, downlink_bytes: 1024, has_gap: false },
+        { day: '2026-09-02', uplink_bytes: 1024, downlink_bytes: 2048, has_gap: false },
+      ],
+    });
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <UsagePane />
+      </QueryClientProvider>,
+    );
+    const tabs = within(view.getByRole('tablist', { name: '用量页签' })).getAllByRole('tab');
+    expect(tabs.map(tab => tab.textContent)).toEqual(['实时', '汇总']);
+    expect(view.container.querySelectorAll('.nd-sheet > .nd-paper > .nd-page-head')).toHaveLength(1);
+    expect(view.container.querySelector('.panel')).toBeNull();
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+    const panelId = view.getByRole('tabpanel', { name: '实时' }).id;
+    expect(tabs.every(tab => tab.getAttribute('aria-controls') === panelId)).toBe(true);
+
+    tabs[0].focus();
+    fireEvent.keyDown(tabs[0], { key: 'ArrowRight' });
+    await waitFor(() => expect(document.activeElement).toBe(tabs[1]));
+    expect(tabs[1].getAttribute('aria-selected')).toBe('true');
+    expect(tabs[0].tabIndex).toBe(-1);
+    expect(view.getByRole('tabpanel', { name: '汇总' }).getAttribute('aria-labelledby')).toBe(tabs[1].id);
+
+    fireEvent.click(view.getByRole('button', { name: '上月' }));
+    await view.findByLabelText('2026 年 9 月用量概览');
+    fireEvent.click(view.getByRole('button', { name: /查看 2026-09-01：/ }));
+    expect(view.getByLabelText('2026-09-01 流量详情')).toBeTruthy();
+
+    fireEvent.keyDown(tabs[1], { key: 'ArrowRight' });
+    await waitFor(() => expect(document.activeElement).toBe(tabs[0]));
+    expect(view.getByRole('tabpanel', { name: '实时' }).getAttribute('aria-labelledby')).toBe(tabs[0].id);
+    expect(view.queryByRole('group', { name: '用量月份' })).toBeNull();
+    expect(view.queryByLabelText('2026 年 9 月用量概览')).toBeNull();
+
+    fireEvent.keyDown(tabs[0], { key: 'ArrowRight' });
+    await waitFor(() => expect(document.activeElement).toBe(tabs[1]));
+    expect(view.getByRole('button', { name: '上月' }).getAttribute('aria-pressed')).toBe('true');
+    expect(view.getByLabelText('2026-09-01 流量详情')).toBeTruthy();
+    fireEvent.keyDown(tabs[1], { key: 'Home' });
+    await waitFor(() => expect(document.activeElement).toBe(tabs[0]));
+    fireEvent.keyDown(tabs[0], { key: 'End' });
+    await waitFor(() => expect(document.activeElement).toBe(tabs[1]));
+    fireEvent.keyDown(tabs[1], { key: 'ArrowLeft' });
+    await waitFor(() => expect(document.activeElement).toBe(tabs[0]));
+  });
+
+  it('starts the fleet subscription in the default realtime tab and closes it on summary', async () => {
+    access.allowed = true;
+    const streams: { url: string; close: ReturnType<typeof vi.fn> }[] = [];
+    class FleetStream extends EventTarget {
+      url: string;
+      close = vi.fn();
+      constructor(url: string) {
+        super();
+        this.url = url;
+        streams.push(this);
+      }
+    }
+    vi.stubGlobal('EventSource', FleetStream);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === '/nodes/agent-state') return json({ nodes: [] });
+      if (path === '/users?include_disabled=false') return json({ users: [] });
+      if (path === '/realtime/fleet-traffic/snapshot')
+        return json({ policy: { enabled: true }, nodes: [], expected: [] });
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const queryClient = client();
+    queryClient.setQueryData(['usage-monthly'], monthly);
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <UsagePane />
+      </QueryClientProvider>,
+    );
+    await view.findByLabelText('机队当前速率');
+    expect(streams).toHaveLength(1);
+    expect(streams[0].url).toBe('/realtime/fleet-traffic/events');
+    expect(streams[0].close).not.toHaveBeenCalled();
+
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
+    expect(streams[0].close).toHaveBeenCalledOnce();
+    expect(view.queryByLabelText('机队实时流量')).toBeNull();
+    expect(view.getByRole('tabpanel', { name: '汇总' })).toBeTruthy();
+  });
+
+  it('shows visitors the realtime matrix while withholding every detail action', async () => {
+    access.operatorId = 'public';
+    const now = Date.now();
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       if (String(input) === '/usage/monthly-summary') return json(monthly);
+      if (String(input) === '/nodes/agent-state')
+        return json({ nodes: [{ node_id: 'hk', name: '香港 HKIX', lifecycle_phase: 'active' }] });
+      if (String(input) === '/users?include_disabled=false')
+        return json({ users: [{ id: 'alice', tenant_id: 'platform', status: 'active', created_at: '' }] });
+      if (String(input) === '/realtime/fleet-traffic/snapshot')
+        return json({
+          policy: { enabled: true },
+          nodes: [
+            {
+              node_id: 'hk',
+              connected: true,
+              active: true,
+              interval_secs: 1,
+              samples: [
+                {
+                  node_id: 'hk',
+                  received_at_unix_millis: now,
+                  sample: {
+                    sampled_at_unix_millis: now,
+                    rx_bytes_per_sec: 100,
+                    tx_bytes_per_sec: 50,
+                    user_traffic: {
+                      state: 'ready',
+                      all_users: true,
+                      users: [
+                        {
+                          tenant_id: 'platform',
+                          user_id: 'alice',
+                          downlink_bytes_per_sec: 80,
+                          uplink_bytes_per_sec: 20,
+                        },
+                      ],
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+          expected: [{ node_id: 'hk', users: [{ tenant_id: 'platform', user_id: 'alice' }] }],
+        });
       throw new Error(`unexpected request: ${String(input)}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -362,8 +540,21 @@ describe('usage isolation', () => {
         <UsagePane />
       </QueryClientProvider>,
     );
+    const matrix = within(await view.findByLabelText('用户与机器的当前速率')).getByRole('table');
+    const tabs = within(view.getByRole('tablist', { name: '用量页签' })).getAllByRole('tab');
+    expect(tabs.map(tab => tab.textContent)).toEqual(['实时', '汇总']);
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+    expect(within(matrix).getByRole('rowheader', { name: /alice/ })).toBeTruthy();
+    expect(within(matrix).queryByRole('button', { name: /查看机器用量/ })).toBeNull();
+    expect(view.queryByRole('combobox', { name: '选择机器查看用量' })).toBeNull();
+    expect(fetchMock.mock.calls.some(([input]) => String(input) === '/users?include_disabled=false')).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input) === '/realtime/fleet-traffic/snapshot')).toBe(true);
+
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
     await view.findByLabelText('2026 年 10 月用量概览');
     expect(view.queryByText('流量预测')).toBeNull();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(view.queryByLabelText('机队实时流量')).toBeNull();
+    expect(view.getByRole('tabpanel', { name: '汇总' })).toBeTruthy();
+    expect(view.getByRole('group', { name: '用量月份' })).toBeTruthy();
   });
 });

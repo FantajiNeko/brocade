@@ -18,15 +18,24 @@
 //! cumulative counter in here went back to zero.
 
 use std::{
-    collections::BTreeMap, ffi::CString, fs, os::unix::fs::MetadataExt, path::Path, sync::Mutex,
+    collections::BTreeMap,
+    ffi::CString,
+    fs,
+    os::unix::fs::MetadataExt,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
 };
 
 use brocade_deployment::protocol::{
     CpuCoreSample, CpuDetailSample, DiskDetailSample, HostFacts, LoadSample, MemoryDetailSample,
     NetworkDetailSample, ProcessSample,
 };
+use serde::{Deserialize, Serialize};
 
-use crate::run_command;
+use crate::{fsutil, run_command};
 
 /// Sub-sampling interval. The report window is a multiple of this (see `SUBS_PER_WINDOW`).
 ///
@@ -39,14 +48,44 @@ pub(crate) const SUB_INTERVAL_SECS: u64 = 10;
 /// traffic" a glance instead of a guess.
 pub(crate) const SUBS_PER_WINDOW: usize = 3;
 
+/// A normal restart gets one durable handoff rather than turning every ten-second observation into
+/// a disk write. Sixty-five seconds covers the service manager's restart delay and ordinary Agent
+/// startup while remaining short enough that a forgotten file cannot turn stale operational state
+/// into current telemetry.
+const HANDOFF_FILE: &str = "load-handoff.json";
+const HANDOFF_VERSION: u32 = 1;
+const HANDOFF_MAX_AGE_SECS: u64 = 65;
+const HANDOFF_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Serialise sampling against the one exit-time snapshot. The ordinary load thread is the sole
+/// caller during steady state; the main thread joins this critical section only while it is about
+/// to exit, then freezes later ticks so the saved state cannot immediately become stale.
+static SAMPLER_LOCK: Mutex<()> = Mutex::new(());
+static SAMPLER_FROZEN: AtomicBool = AtomicBool::new(false);
+/// The first difference after a verified handoff may span the few seconds in which no Agent
+/// process existed. Kernel counters kept advancing, so the interval is valid even though it is
+/// longer than the ordinary ten-second cadence.
+static FIRST_TICK_AFTER_HANDOFF: AtomicBool = AtomicBool::new(false);
+/// Keep the handoff until a completed window has entered the existing durable load spool. A crash
+/// before that point can safely retry from the same kernel-counter baseline.
+static RESTORED_HANDOFF_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// The previous sub-sample's raw counters. Differencing needs two readings and the first round has
 /// none — it produces nothing rather than reporting everything as zero.
 static PREVIOUS: Mutex<Option<Raw>> = Mutex::new(None);
 /// Sub-samples accumulated towards the current window.
 static PENDING: Mutex<Vec<Sub>> = Mutex::new(Vec::new());
 
+#[derive(Clone, Serialize, Deserialize)]
+struct LoadHandoff {
+    version: u32,
+    saved_at_unix_secs: u64,
+    previous: Raw,
+    pending: Vec<Sub>,
+}
+
 /// One raw reading of the cumulative counters, before differencing.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Raw {
     at: u64,
     btime: i64,
@@ -78,7 +117,7 @@ struct Raw {
 }
 
 /// One differenced sub-sample: rates over `SUB_INTERVAL_SECS`.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Sub {
     window_start_unix_secs: u64,
     window_end_unix_secs: u64,
@@ -118,7 +157,7 @@ struct Sub {
     gap: bool,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct CpuTimes {
     user: u64,
     system: u64,
@@ -131,19 +170,19 @@ struct CpuTimes {
     total: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct PressureTotals {
     some_usec: Option<u64>,
     full_usec: Option<u64>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct SoftirqCounters {
     net_rx: u64,
     net_tx: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct VmCounters {
     oom_kills: u64,
     swap_in_pages: u64,
@@ -154,7 +193,7 @@ struct VmCounters {
     foll_pin_released: Option<u64>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct NetCounters {
     rx_bytes: u64,
     tx_bytes: u64,
@@ -163,7 +202,7 @@ struct NetCounters {
     errs: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct DiskCounters {
     major: u64,
     minor: u64,
@@ -178,7 +217,7 @@ struct DiskCounters {
     weighted_ms: u64,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct DiskDelta {
     read_bytes: u64,
     write_bytes: u64,
@@ -194,7 +233,7 @@ struct DiskDelta {
 /// Raw host-wide network counters. Every field is optional independently: minimal/container
 /// kernels sometimes expose sockstat but not TcpExt (or vice versa), and losing the entire network
 /// observation because one kernel counter is absent would be worse than preserving that absence.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct NetworkRaw {
     // End-of-sub-window levels.
     tcp_curr_estab: Option<u64>,
@@ -258,11 +297,38 @@ impl NetworkRaw {
 /// Take one sub-sample. Called every `SUB_INTERVAL_SECS`; returns a finished window every
 /// `SUBS_PER_WINDOW` calls and `None` in between.
 pub(crate) fn tick(state_dir: &Path, now: u64) -> Option<(LoadSample, Vec<ProcessSample>)> {
+    let _sampler = SAMPLER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if SAMPLER_FROZEN.load(Ordering::SeqCst) {
+        return None;
+    }
+    tick_locked(state_dir, now)
+}
+
+fn tick_locked(state_dir: &Path, now: u64) -> Option<(LoadSample, Vec<ProcessSample>)> {
     let raw = read_raw(now, state_dir);
     let mut previous = PREVIOUS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let sub = previous.as_ref().map(|p| difference(p, &raw));
+
+    // A replacement Agent starts immediately after the old process saves its final whole-second
+    // timestamp. Its first tick can therefore land in that same second. There is no interval to
+    // difference yet: consuming the handoff here would manufacture a clock-regression gap and
+    // break the very window the handoff exists to preserve. Keep both the baseline and the
+    // one-shot resumed allowance for the next real tick.
+    if should_defer_restored_tick(
+        previous.as_ref(),
+        &raw,
+        FIRST_TICK_AFTER_HANDOFF.load(Ordering::SeqCst),
+    ) {
+        return None;
+    }
+
+    let resumed = FIRST_TICK_AFTER_HANDOFF.swap(false, Ordering::SeqCst);
+    let sub = previous
+        .as_ref()
+        .map(|p| difference_inner(p, &raw, resumed));
     *previous = Some(raw.clone());
     drop(previous);
 
@@ -281,13 +347,212 @@ pub(crate) fn tick(state_dir: &Path, now: u64) -> Option<(LoadSample, Vec<Proces
     Some((aggregate(&subs, state_dir), processes(&subs, &raw)))
 }
 
+fn should_defer_restored_tick(previous: Option<&Raw>, raw: &Raw, resumed: bool) -> bool {
+    resumed && previous.is_some_and(|previous| previous.at == raw.at)
+}
+
+/// Freeze the sampler at a normal process-exit boundary and take one final reading. The result is
+/// returned to the caller so a just-completed window can enter the ordinary load spool before the
+/// in-memory baseline is handed to the replacement process.
+pub(crate) fn freeze_for_handoff(
+    state_dir: &Path,
+    now: u64,
+) -> Option<(LoadSample, Vec<ProcessSample>)> {
+    let _sampler = SAMPLER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if SAMPLER_FROZEN.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+
+    // The wall-clock protocol has whole-second precision. A second read in the same second cannot
+    // form a real interval and would be flagged as a clock regression, so retain the existing
+    // baseline and let the new process take the next reading instead.
+    let already_at_now = PREVIOUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|previous| previous.at >= now);
+    if already_at_now {
+        None
+    } else {
+        tick_locked(state_dir, now)
+    }
+}
+
+/// Persist the frozen baseline and unfinished window exactly once for a normal restart.
+pub(crate) fn save_frozen_handoff(state_dir: &Path, now: u64) -> Result<bool, String> {
+    let _sampler = SAMPLER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !SAMPLER_FROZEN.load(Ordering::SeqCst) {
+        return Err("load sampler must be frozen before saving handoff".to_owned());
+    }
+
+    let previous = PREVIOUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let pending = PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let path = state_dir.join(HANDOFF_FILE);
+    let Some(previous) = previous else {
+        remove_handoff_file(&path)?;
+        return Ok(false);
+    };
+    let handoff = LoadHandoff {
+        version: HANDOFF_VERSION,
+        saved_at_unix_secs: now,
+        previous,
+        pending,
+    };
+    validate_handoff(&handoff, now, handoff.previous.btime)?;
+    let bytes =
+        serde_json::to_vec(&handoff).map_err(|error| format!("encode load handoff: {error}"))?;
+    if bytes.len() as u64 > HANDOFF_MAX_BYTES {
+        return Err(format!(
+            "load handoff is {} bytes, over the {} byte limit",
+            bytes.len(),
+            HANDOFF_MAX_BYTES
+        ));
+    }
+    fsutil::atomic_write_private(&path, &bytes)?;
+    Ok(true)
+}
+
+/// Restore a recent same-boot sampler state. Invalid local state is discarded and ordinary
+/// baseline collection continues; telemetry continuity must never become an Agent startup gate.
+pub(crate) fn restore_handoff(state_dir: &Path, now: u64) -> Result<bool, String> {
+    let _sampler = SAMPLER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = state_dir.join(HANDOFF_FILE);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("stat {}: {error}", path.display())),
+    };
+    if metadata.len() > HANDOFF_MAX_BYTES {
+        remove_handoff_file(&path)?;
+        return Err(format!(
+            "discarded load handoff larger than {} bytes",
+            HANDOFF_MAX_BYTES
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let handoff: LoadHandoff = match serde_json::from_slice(&bytes) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            remove_handoff_file(&path)?;
+            return Err(format!("discarded invalid load handoff: {error}"));
+        }
+    };
+    let current_btime = current_btime();
+    if let Err(error) = validate_handoff(&handoff, now, current_btime) {
+        remove_handoff_file(&path)?;
+        crate::warn(format!("load: ignored restart handoff: {error}"));
+        return Ok(false);
+    }
+
+    *PREVIOUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handoff.previous);
+    *PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = handoff.pending;
+    FIRST_TICK_AFTER_HANDOFF.store(true, Ordering::SeqCst);
+    RESTORED_HANDOFF_ACTIVE.store(true, Ordering::SeqCst);
+    SAMPLER_FROZEN.store(false, Ordering::SeqCst);
+    Ok(true)
+}
+
+/// A completed report has reached the durable load spool, so the older restart baseline is no
+/// longer needed. Failure to unlink is recoverable: replaying it can only produce an overlapping
+/// window, and the control plane already deduplicates those by node and window start.
+pub(crate) fn commit_restored_handoff(state_dir: &Path) -> Result<bool, String> {
+    if !RESTORED_HANDOFF_ACTIVE.swap(false, Ordering::SeqCst) {
+        return Ok(false);
+    }
+    // An exit-time freeze may race a report which finished sampling just before the freeze and is
+    // only now reaching the spool. The main thread will overwrite the old handoff with the newer
+    // frozen state; that late reporter must not unlink the freshly written replacement.
+    if SAMPLER_FROZEN.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    remove_handoff_file(&state_dir.join(HANDOFF_FILE))?;
+    Ok(true)
+}
+
+fn remove_handoff_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove {}: {error}", path.display())),
+    }
+}
+
+fn validate_handoff(handoff: &LoadHandoff, now: u64, current_btime: i64) -> Result<(), String> {
+    if handoff.version != HANDOFF_VERSION {
+        return Err(format!(
+            "unsupported version {} (expected {})",
+            handoff.version, HANDOFF_VERSION
+        ));
+    }
+    if handoff.saved_at_unix_secs > now || handoff.previous.at > now {
+        return Err("handoff timestamp is in the future".to_owned());
+    }
+    if now.saturating_sub(handoff.saved_at_unix_secs) > HANDOFF_MAX_AGE_SECS
+        || now.saturating_sub(handoff.previous.at) > HANDOFF_MAX_AGE_SECS
+    {
+        return Err("handoff is older than 65 seconds".to_owned());
+    }
+    if current_btime <= 0 || handoff.previous.btime != current_btime {
+        return Err("machine boot identity changed".to_owned());
+    }
+    if handoff.pending.len() >= SUBS_PER_WINDOW {
+        return Err("handoff contains a completed window".to_owned());
+    }
+    for sub in &handoff.pending {
+        if sub.window_end_unix_secs <= sub.window_start_unix_secs
+            || sub.elapsed_secs
+                != sub
+                    .window_end_unix_secs
+                    .saturating_sub(sub.window_start_unix_secs)
+        {
+            return Err("handoff contains an invalid sub-sample boundary".to_owned());
+        }
+    }
+    if handoff
+        .pending
+        .windows(2)
+        .any(|pair| pair[0].window_end_unix_secs != pair[1].window_start_unix_secs)
+    {
+        return Err("handoff sub-samples are not contiguous".to_owned());
+    }
+    if handoff
+        .pending
+        .last()
+        .is_some_and(|last| last.window_end_unix_secs != handoff.previous.at)
+    {
+        return Err("handoff baseline does not follow its pending window".to_owned());
+    }
+    Ok(())
+}
+
 /// The btime of the reading the caller is about to send. Read separately because the report
 /// carries it once rather than per sample.
 pub(crate) fn current_btime() -> i64 {
     read_btime().unwrap_or(0)
 }
 
+#[cfg(test)]
 fn difference(before: &Raw, now: &Raw) -> Sub {
+    difference_inner(before, now, false)
+}
+
+fn difference_inner(before: &Raw, now: &Raw, resumed_handoff: bool) -> Sub {
     let clock_regressed = now.at <= before.at;
     let elapsed = now.at.saturating_sub(before.at).max(1);
     // A reboot resets every counter in here. Treating that as growth would report a machine that
@@ -300,7 +565,8 @@ fn difference(before: &Raw, now: &Raw) -> Sub {
             .get(cpu)
             .is_some_and(|previous| cpu_times_regressed(*previous, *current))
     });
-    let delayed = elapsed > SUB_INTERVAL_SECS + SUB_INTERVAL_SECS / 2;
+    let delayed = elapsed > SUB_INTERVAL_SECS + SUB_INTERVAL_SECS / 2
+        && !(resumed_handoff && elapsed <= HANDOFF_MAX_AGE_SECS);
     let gap =
         rebooted || clock_regressed || aggregate_cpu_regressed || core_cpu_regressed || delayed;
     if gap {
@@ -1218,7 +1484,7 @@ fn read_btime() -> Option<i64> {
     parse_btime(&fs::read_to_string("/proc/stat").ok()?)
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct MemInfo {
     total: u64,
     available: u64,
@@ -2551,6 +2817,209 @@ mod tests {
         assert_eq!(sub.nic_rx_bps, 80, "400 bytes over 40 seconds");
         assert_eq!(sub.io_pressure_some_pct, Some(5.0));
         assert_eq!(sub.io_pressure_full_pct, Some(1.0));
+    }
+
+    #[test]
+    fn restart_handoff_keeps_a_short_longer_interval_valid() {
+        let before = Raw {
+            at: 100,
+            btime: 1,
+            cpu: CpuTimes {
+                total: 1_000,
+                ..Default::default()
+            },
+            net: NetCounters {
+                rx_bytes: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let after = Raw {
+            at: 140,
+            btime: 1,
+            cpu: CpuTimes {
+                user: 100,
+                total: 1_400,
+                ..Default::default()
+            },
+            net: NetCounters {
+                rx_bytes: 500,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let sub = difference_inner(&before, &after, true);
+        assert!(
+            !sub.gap,
+            "same-boot kernel counters bridge a quick Agent restart"
+        );
+        assert_eq!(sub.elapsed_secs, 40);
+        assert_eq!(sub.nic_rx_bps, 80);
+        assert!(difference_inner(&before, &after, false).gap);
+    }
+
+    #[test]
+    fn restored_handoff_defers_a_same_second_first_tick() {
+        let previous = Raw {
+            at: 2_000_000_000,
+            ..Default::default()
+        };
+        let same_second = Raw {
+            at: previous.at,
+            ..Default::default()
+        };
+        let next_tick = Raw {
+            at: previous.at + SUB_INTERVAL_SECS,
+            ..Default::default()
+        };
+
+        assert!(should_defer_restored_tick(
+            Some(&previous),
+            &same_second,
+            true
+        ));
+        assert!(!should_defer_restored_tick(
+            Some(&previous),
+            &next_tick,
+            true
+        ));
+        assert!(!should_defer_restored_tick(
+            Some(&previous),
+            &same_second,
+            false
+        ));
+    }
+
+    #[test]
+    fn handoff_format_is_bounded_by_age_boot_and_window_shape() {
+        let sub = |start: u64, end: u64| Sub {
+            window_start_unix_secs: start,
+            window_end_unix_secs: end,
+            elapsed_secs: end - start,
+            ..Default::default()
+        };
+        let handoff = LoadHandoff {
+            version: HANDOFF_VERSION,
+            saved_at_unix_secs: 130,
+            previous: Raw {
+                at: 130,
+                btime: 7,
+                ..Default::default()
+            },
+            pending: vec![sub(100, 110), sub(110, 130)],
+        };
+
+        validate_handoff(&handoff, 140, 7).unwrap();
+        let encoded = serde_json::to_vec(&handoff).unwrap();
+        let decoded: LoadHandoff = serde_json::from_slice(&encoded).unwrap();
+        validate_handoff(&decoded, 140, 7).unwrap();
+        assert!(validate_handoff(&handoff, 196, 7).is_err(), "stale handoff");
+        assert!(
+            validate_handoff(&handoff, 140, 8).is_err(),
+            "machine reboot"
+        );
+
+        let broken = LoadHandoff {
+            pending: vec![sub(100, 110), sub(111, 130)],
+            ..handoff
+        };
+        assert!(validate_handoff(&broken, 140, 7).is_err());
+    }
+
+    #[test]
+    fn corrupt_handoff_is_removed_and_sampling_can_start_fresh() {
+        let dir = std::env::temp_dir().join(format!(
+            "brocade-load-handoff-corrupt-{}-{}",
+            std::process::id(),
+            HANDOFF_VERSION
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(HANDOFF_FILE);
+        fs::write(&path, b"{not-json").unwrap();
+
+        assert!(restore_handoff(&dir, 2_000_000_000).is_err());
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn one_restart_write_round_trips_the_sampler_state() {
+        fn reset_sampler() {
+            *PREVIOUS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            PENDING
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            SAMPLER_FROZEN.store(false, Ordering::SeqCst);
+            FIRST_TICK_AFTER_HANDOFF.store(false, Ordering::SeqCst);
+            RESTORED_HANDOFF_ACTIVE.store(false, Ordering::SeqCst);
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "brocade-load-handoff-{}-{}",
+            std::process::id(),
+            HANDOFF_VERSION
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        reset_sampler();
+
+        let now = 2_000_000_000;
+        let btime = current_btime();
+        assert!(btime > 0);
+        *PREVIOUS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Raw {
+            at: now,
+            btime,
+            net: NetCounters {
+                rx_bytes: 123,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Sub {
+                window_start_unix_secs: now - 10,
+                window_end_unix_secs: now,
+                elapsed_secs: 10,
+                ..Default::default()
+            });
+        SAMPLER_FROZEN.store(true, Ordering::SeqCst);
+
+        assert!(save_frozen_handoff(&dir, now).unwrap());
+        assert!(dir.join(HANDOFF_FILE).is_file());
+        reset_sampler();
+        assert!(restore_handoff(&dir, now + 5).unwrap());
+        assert_eq!(
+            PREVIOUS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .unwrap()
+                .net
+                .rx_bytes,
+            123
+        );
+        assert_eq!(
+            PENDING
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+        assert!(commit_restored_handoff(&dir).unwrap());
+        assert!(!dir.join(HANDOFF_FILE).exists());
+
+        reset_sampler();
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

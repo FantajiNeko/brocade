@@ -10,7 +10,7 @@ import { useEffect, useState } from 'react';
 import { QueryClient, QueryClientProvider, useQueryClient } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AGENT_PROTOCOL_VERSION, type CertsView } from '../src/api';
+import { AGENT_PROTOCOL_VERSION, type CertsView, type PingProbeSettings } from '../src/api';
 
 /* settings.tsx 经 ui/branding → … 在模块求值期读 matchMedia，jsdom 没有实现。
    import 是提升的，所以装在这里而不是 beforeEach。 */
@@ -87,25 +87,26 @@ const ROUTES: Record<string, () => unknown> = {
     global: { agent_journal_mib: 100, xray_mib: 100, phantun_mib: 100 },
     nodes: [],
   }),
+  '/data-retention': () => ({ policies: [] }),
   '/host-network-tuning': () => ({ gro_flush_timeout_ns: 20000, napi_defer_hard_irqs: 2 }),
-  '/tunnel-probes': () => ({
-    origin: 'console',
-    endpoint_url: 'http://cp.cloudflare.com/cdn-cgi/trace',
-    retention_days: 7,
-    items: [],
-  }),
-  '/tunnel-probes/capability': () => ({
-    available: true,
-    version: 'test',
-    reason: null,
-    concurrency: 1,
-  }),
   '/ping-probe/settings': () => ({ targets: [], interval_secs: 60, timeout_ms: 420 }),
   '/links/mtu': () => ({ default_mtu: 1420, nodes: [], links: [] }),
   '/nodes/agent-state': () => ({ nodes: [] }),
   '/vpngate': () => ({
     manual_pools_supported: true,
-    status: {},
+    status: {
+      enabled: true,
+      interval_secs: 900,
+      source_url: 'https://www.vpngate.net/api/iphone/',
+      next_sync_at_unix_secs: 1_800_000_000,
+      syncing: false,
+      last_success_run_id: 18,
+      last_error_code: null,
+      last_error_detail: null,
+      current_servers: 27,
+      retained_servers: 63,
+      retained_observations: 412,
+    },
     countries: [],
     admission_policy: {
       minimum_successful_sources: 1,
@@ -126,11 +127,13 @@ const ROUTES: Record<string, () => unknown> = {
     },
     intelligence_credentials: {
       proxycheck_api_key_configured: true,
+      proxycheck_api_keys_masked: ['000000-******-******-333333'],
     },
   }),
   '/revisions?limit=50': () => ({ current_revision: 7, revisions: [{ id: 7 }] }),
 };
 
+const defaultVpngateOverview = ROUTES['/vpngate'] as () => Record<string, unknown>;
 const immediateSettingsWrites: { path: string; body: unknown }[] = [];
 let immediateRevision = 8;
 
@@ -187,6 +190,11 @@ function stubFetch() {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (path: string, init?: RequestInit) => {
+      if (path.startsWith('/vpngate/catalog-nodes/') && init?.method === 'PUT') {
+        const nodeId = decodeURIComponent(path.slice('/vpngate/catalog-nodes/'.length));
+        const enabled = Boolean(JSON.parse(String(init.body)).enabled);
+        return Response.json({ node_id: nodeId, enabled, selected_at_unix_secs: enabled ? 1 : null });
+      }
       if (path.startsWith('/vpngate/intelligence-nodes/') && init?.method === 'PUT') {
         const nodeId = decodeURIComponent(path.slice('/vpngate/intelligence-nodes/'.length));
         const enabled = Boolean(JSON.parse(String(init.body)).enabled);
@@ -198,11 +206,28 @@ function stubFetch() {
       if (path === '/vpngate/intelligence-policy' && init?.method === 'PUT') {
         return Response.json(JSON.parse(String(init.body)));
       }
+      if (path === '/ping-probe/settings' && init?.method === 'PUT') {
+        const saved = JSON.parse(String(init.body));
+        ROUTES[path] = () => saved;
+        return Response.json(saved);
+      }
       if (path === '/vpngate/intelligence-credentials' && init?.method === 'PUT') {
-        return Response.json({ proxycheck_api_key_configured: true });
+        return Response.json({
+          proxycheck_api_key_configured: true,
+          proxycheck_api_keys_masked: [
+            '000000-******-******-333333',
+            '111111-******-******-444444',
+            'aaaaaa-******-******-dddddd',
+          ],
+        });
       }
       if (path === '/vpngate/intelligence-refresh' && init?.method === 'POST') {
         return Response.json({ queued: 2 });
+      }
+      if (path === '/vpngate/settings' && init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        const current = ROUTES['/vpngate']() as { status: Record<string, unknown> };
+        return Response.json({ ...current.status, ...body });
       }
       if (path === '/settings/ports' || path === '/settings/probe') {
         const body = JSON.parse(String(init?.body));
@@ -266,6 +291,41 @@ const fieldInput = (scope: ReturnType<typeof section>, label: string) => {
 
 const settingsOp = () => draft.ops().find(op => op.op === 'update_settings');
 
+const pingPresetCases = [
+  [
+    '北京',
+    [
+      ['北京电信', '220.181.111.232', '240e:83:205:1cd:0:ff:b0b8:dee9'],
+      ['北京联通', '123.125.246.106', '2408:80f0:4105:6:40::100'],
+      ['北京移动', '39.156.70.46', '2409:8c00:6c21:118b:0:ff:b0e8:f003'],
+    ],
+  ],
+  [
+    '上海',
+    [
+      ['上海电信', '101.91.42.232', '240e:e1:a800:120::76'],
+      ['上海联通', '58.246.163.58', '2408:80f1:21:c120::c'],
+      ['上海移动', '183.194.238.117', '2409:8c1e:75b0:1120::27'],
+    ],
+  ],
+  [
+    '广东',
+    [
+      ['广东电信', '125.89.169.2', '240e:97c:2f:1::5c'],
+      ['广东联通', '157.148.118.157', '2408:8756:f50:2::65'],
+      ['广东移动', '120.241.227.7', '2409:8c54:871:1::73'],
+    ],
+  ],
+  [
+    '重庆',
+    [
+      ['重庆电信', '183.66.105.224', '240e:930:1000:1703:3e::1'],
+      ['重庆联通', '58.144.227.55', '2408:8763:0:2b0:5e::1f'],
+      ['重庆移动', '111.10.45.113', '2409:8c60:2600:ea:40::2'],
+    ],
+  ],
+] as const;
+
 beforeEach(() => {
   draft.init(`settings-baseline-${Math.random()}`);
   draft.clear();
@@ -280,6 +340,8 @@ afterEach(() => {
   draft.clear();
   vi.unstubAllGlobals();
   ROUTES['/settings'] = committedSettings;
+  ROUTES['/vpngate'] = defaultVpngateOverview;
+  ROUTES['/ping-probe/settings'] = () => ({ targets: [], interval_secs: 60, timeout_ms: 420 });
   ROUTES['/links/mtu'] = () => ({ default_mtu: 1420, nodes: [], links: [] });
   ROUTES['/nodes/agent-state'] = () => ({ nodes: [] });
   ROUTES['/certs'] = () => ({
@@ -291,10 +353,110 @@ afterEach(() => {
 });
 
 describe('设置页分段保存的基准', () => {
+  it.each(pingPresetCases)('%s 填入六个双栈目标，保存后才持久化', async (label, carriers) => {
+    const original: PingProbeSettings = {
+      targets: [{ name: '原有目标', kind: 'icmp', ipv4: '192.0.2.1', ipv6: null }],
+      interval_secs: 60,
+      timeout_ms: 420,
+    };
+    ROUTES['/ping-probe/settings'] = () => original;
+    render(<Harness />);
+    await screen.findByText('Ping 链路探测');
+    const scope = section('set-ping-probe');
+    expect((scope.getByLabelText('目标 1 名称') as HTMLInputElement).value).toBe('原有目标');
+    const toolbar = scope.getByRole('button', { name: '北京' }).parentElement!;
+    expect(
+      within(toolbar)
+        .getAllByRole('button')
+        .map(button => button.textContent),
+    ).toEqual(['北京', '上海', '广东', '重庆', '＋ TCP', '＋ ICMP']);
+    fireEvent.change(scope.getByLabelText('探测间隔'), { target: { value: '120' } });
+    fireEvent.click(scope.getByRole('button', { name: label }));
+    expect(scope.getByText('6/6')).toBeTruthy();
+    const expected = (['tcp', 'icmp'] as const).flatMap(kind =>
+      carriers.map(([name, ipv4, ipv6]) => ({
+        name,
+        kind,
+        ipv4: kind === 'tcp' ? `${ipv4}:80` : ipv4,
+        ipv6: kind === 'tcp' ? `[${ipv6}]:80` : ipv6,
+      })),
+    );
+    for (const [index, target] of expected.entries()) {
+      expect((scope.getByLabelText(`目标 ${index + 1} 名称`) as HTMLInputElement).value).toBe(target.name);
+      expect((scope.getByLabelText(`目标 ${index + 1} IPv4 地址`) as HTMLInputElement).value).toBe(target.ipv4);
+      expect((scope.getByLabelText(`目标 ${index + 1} IPv6 地址`) as HTMLInputElement).value).toBe(target.ipv6);
+    }
+    for (const kind of ['TCP', 'ICMP']) {
+      expect((scope.getByRole('button', { name: `＋ ${kind}` }) as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+    fireEvent.click(scope.getByRole('button', { name: '北京' }));
+    expect(scope.getByText('6/6')).toBeTruthy();
+    expect((scope.getByLabelText('目标 1 名称') as HTMLInputElement).value).toBe('北京电信');
+    expect((scope.getByLabelText('目标 1 IPv4 地址') as HTMLInputElement).value).toBe('220.181.111.232:80');
+    expect((scope.getByLabelText('探测间隔') as HTMLInputElement).value).toBe('120');
+    fireEvent.click(scope.getByRole('button', { name: label }));
+    fireEvent.click(scope.getByRole('button', { name: '保存这一段' }));
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        '/ping-probe/settings',
+        expect.objectContaining({
+          method: 'PUT',
+          body: JSON.stringify({ ...original, interval_secs: 120, targets: expected }),
+        }),
+      ),
+    );
+    await waitFor(() => expect(scope.queryByRole('button', { name: '保存这一段' })).toBeNull());
+    fireEvent.click(scope.getAllByRole('button', { name: '移除' })[0]);
+    expect((scope.getByRole('button', { name: '＋ TCP' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(scope.getByRole('button', { name: '北京' }));
+    expect(scope.getByText('6/6')).toBeTruthy();
+    expect((scope.getByLabelText('目标 1 名称') as HTMLInputElement).value).toBe('北京电信');
+  });
+
+  it('VPN Gate 总开关独立暂停后台任务并明确保留已发布 Chain', async () => {
+    render(<Harness />);
+    await screen.findByText('整体开关');
+    const scope = section('set-vpngate');
+
+    expect(scope.getByRole('button', { name: '开启' }).getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(scope.getByRole('button', { name: '关闭' }));
+
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        '/vpngate/settings',
+        expect.objectContaining({
+          method: 'PUT',
+          body: JSON.stringify({ enabled: false, interval_secs: 900 }),
+        }),
+      ),
+    );
+    expect(scope.getByText(/已配置 Chain 继续使用关闭前的候选与配置/)).toBeTruthy();
+    expect(scope.getByText(/不会删除目录、节点选择或候选池/)).toBeTruthy();
+    expect(section('set-vpngate-intelligence').getByRole('button', { name: '立即刷新' }).hasAttribute('disabled')).toBe(
+      true,
+    );
+
+    fireEvent.click(scope.getByRole('button', { name: '开启' }));
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.some(
+            ([path, init]) =>
+              path === '/vpngate/settings' &&
+              init?.method === 'PUT' &&
+              init.body === JSON.stringify({ enabled: true, interval_secs: 900 }),
+          ),
+      ).toBe(true),
+    );
+    await waitFor(() => expect(scope.getByText(/后台目录同步、候选拨测和出口 IP 情报正常运行/)).toBeTruthy());
+  });
+
   it('按来源分别保存 VPN Gate 准入阈值，不提交聚合分数', async () => {
     render(<Harness />);
     await screen.findByText('情报任务');
-    const scope = section('set-vpngate-intelligence');
+    const scope = section('set-vpngate');
     const ffraud = fieldInput(scope, 'FFraud');
     fireEvent.change(ffraud, { target: { value: '67' } });
     fireEvent.click(scope.getByRole('button', { name: '保存准入规则' }));
@@ -310,6 +472,39 @@ describe('设置页分段保存的基准', () => {
     );
     const request = vi.mocked(fetch).mock.calls.find(([path]) => path === '/vpngate/admission-policy');
     expect(request?.[1]?.body).not.toContain('max_ip_risk');
+  });
+
+  it('VPN Gate 能力包含目录与准入规则，情报任务只管理出口 IP 情报并列出全部供应 API', async () => {
+    render(<Harness />);
+    await screen.findByText('VPN Gate 能力');
+    const capability = section('set-vpngate');
+    const intelligence = section('set-vpngate-intelligence');
+    expect(capability.getByText('目录收集 Agent')).toBeTruthy();
+    expect(capability.getByText('准入规则')).toBeTruthy();
+    expect(capability.queryByText('IP 情报 Agent')).toBeNull();
+    expect(intelligence.getByText('集中管理出口 IP 情报')).toBeTruthy();
+    expect(intelligence.getByText('IP 情报 Agent')).toBeTruthy();
+    expect(intelligence.queryByText('目录收集 Agent')).toBeNull();
+    expect(intelligence.queryByText('准入规则')).toBeNull();
+    expect(intelligence.getByText('ProxyCheck API')).toBeTruthy();
+    for (const provider of ['FFraud', 'IPLogs']) {
+      const field = intelligence.getByText(`${provider} API`).closest<HTMLElement>('.setfld')!;
+      expect(within(field).getByText('无需配置 API Key')).toBeTruthy();
+      expect(within(field).queryByRole('textbox')).toBeNull();
+    }
+  });
+
+  it('数据保留位于第二栏末尾且默认折叠，设置页不再加载隧道监测', async () => {
+    render(<Harness />);
+    await screen.findByText('VPN Gate 能力');
+    const columns = document.querySelectorAll('.settings-layout > .col');
+    expect(columns).toHaveLength(2);
+    const retention = document.getElementById('set-data-retention') as HTMLDetailsElement;
+    expect(columns[1].querySelector('.settings-column-fields')?.lastElementChild).toBe(retention);
+    expect(retention.open).toBe(false);
+    expect(document.getElementById('set-tunnel-probes')).toBeNull();
+    expect(screen.queryByText('隧道定时监测')).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([path]) => String(path).startsWith('/tunnel-probes'))).toBe(false);
   });
 
   it('只在定期模式显示刷新周期，并按 72 小时条件保存情报更新规则', async () => {
@@ -338,7 +533,7 @@ describe('设置页分段保存的基准', () => {
     );
   });
 
-  it('以不触发密码保存的密钥输入追加 ProxyCheck Key 池，不从 API 读回密钥', async () => {
+  it('显示历史 ProxyCheck Key 的脱敏原文和数量，追加成功后更新列表并清空输入', async () => {
     render(<Harness />);
     await screen.findByText('情报任务');
     const scope = section('set-vpngate-intelligence');
@@ -349,8 +544,16 @@ describe('设置页分段保存的基准', () => {
     expect(first.autocomplete).toBe('off');
     expect(first.classList.contains('config-secret-input')).toBe(true);
     expect(first.placeholder).toContain('追加');
+    expect(first.value).toBe('');
+    expect(scope.getByText('已保存 1 个 Key')).toBeTruthy();
+    const savedKeys = () => within(scope.getByRole('list', { name: '已保存的 ProxyCheck API 密钥' }));
     expect(
-      within(row as HTMLElement).getByText('已配置；旧 Key 不回显，追加不会覆盖 · 最多 32 个，随机起点轮换'),
+      savedKeys()
+        .getAllByRole('listitem')
+        .map(item => item.textContent),
+    ).toEqual(['000000-******-******-333333']);
+    expect(
+      within(row as HTMLElement).getByText('已保存的 Key 仅显示首尾各 6 位；追加不会覆盖 · 最多 32 个，随机起点轮换'),
     ).toBeTruthy();
 
     const replacements = ['111111-222222-333333-444444', 'aaaaaa-bbbbbb-cccccc-dddddd'];
@@ -366,9 +569,61 @@ describe('设置页分段保存的基准', () => {
     const request = vi.mocked(fetch).mock.calls.find(([path]) => path === '/vpngate/intelligence-credentials');
     expect(request?.[1]?.method).toBe('PUT');
     expect(request?.[1]?.body).toBe(JSON.stringify({ proxycheck_api_keys: replacements, mode: 'append' }));
+    expect(scope.getByText('已保存 3 个 Key')).toBeTruthy();
+    expect(
+      savedKeys()
+        .getAllByRole('listitem')
+        .map(item => item.textContent),
+    ).toEqual(['000000-******-******-333333', '111111-******-******-444444', 'aaaaaa-******-******-dddddd']);
+    for (const key of replacements) expect(document.body.innerHTML).not.toContain(key);
   });
 
-  it('可从全机队多选 Agent 分发目录采集与三源 IP 情报任务', async () => {
+  it('未配置 ProxyCheck Key 时显示零条，不创建虚假的历史行', async () => {
+    ROUTES['/vpngate'] = () => ({
+      ...defaultVpngateOverview(),
+      intelligence_credentials: { proxycheck_api_key_configured: false, proxycheck_api_keys_masked: [] },
+    });
+    render(<Harness />);
+    await screen.findByText('情报任务');
+    const scope = section('set-vpngate-intelligence');
+    expect(scope.getByText('已保存 0 个 Key')).toBeTruthy();
+    expect(scope.queryByRole('list', { name: '已保存的 ProxyCheck API 密钥' })).toBeNull();
+    expect((scope.getByLabelText('ProxyCheck API 密钥 1') as HTMLInputElement).value).toBe('');
+  });
+
+  it('旧 Console 未提供列表时保留已配置状态，不把未知数量显示为零', async () => {
+    ROUTES['/vpngate'] = () => ({
+      ...defaultVpngateOverview(),
+      intelligence_credentials: { proxycheck_api_key_configured: true },
+    });
+    render(<Harness />);
+    await screen.findByText('情报任务');
+    const scope = section('set-vpngate-intelligence');
+    expect(scope.getByText('已配置 Key 池')).toBeTruthy();
+    expect(scope.queryByText('已保存 0 个 Key')).toBeNull();
+    expect(scope.queryByRole('list', { name: '已保存的 ProxyCheck API 密钥' })).toBeNull();
+  });
+
+  it('追加失败保留已保存的 Key 列表和未保存输入，并显示错误', async () => {
+    const fetchBeforeFailure = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      input === '/vpngate/intelligence-credentials' && init?.method === 'PUT'
+        ? Response.json({ error: '无法追加 Key' }, { status: 500 })
+        : fetchBeforeFailure(input, init),
+    );
+    render(<Harness />);
+    await screen.findByText('情报任务');
+    const scope = section('set-vpngate-intelligence');
+    const input = scope.getByLabelText('ProxyCheck API 密钥 1') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '111111-222222-333333-444444' } });
+    fireEvent.click(scope.getByRole('button', { name: '追加到 Key 池' }));
+    await scope.findByText(/无法追加 Key/);
+    expect(scope.getByText('已保存 1 个 Key')).toBeTruthy();
+    expect(scope.getByText('000000-******-******-333333')).toBeTruthy();
+    expect(input.value).toBe('111111-222222-333333-444444');
+  });
+
+  it('目录收集与 IP 情报使用独立且默认收起的 Agent 集合', async () => {
     ROUTES['/nodes/agent-state'] = () => ({
       nodes: [
         {
@@ -379,16 +634,36 @@ describe('设置页分段保存的基准', () => {
           operationally_isolated: false,
           agent_protocol_version: AGENT_PROTOCOL_VERSION,
           runtime_report_fresh: true,
+          vpngate_catalog_enabled: false,
           vpngate_intelligence_enabled: false,
         },
       ],
     });
     render(<Harness />);
-    await screen.findByText('情报执行 Agent');
-    expect(screen.getByText(/同时执行 VPN Gate 上游目录采集和出口 IP 情报查询/)).toBeTruthy();
-    const checkbox = await screen.findByRole('checkbox', { name: /香港出口/ });
-    fireEvent.click(checkbox);
-    await waitFor(() => expect((checkbox as HTMLInputElement).checked).toBe(true));
+    await screen.findByText('目录收集 Agent');
+    expect(screen.getByText('IP 情报 Agent')).toBeTruthy();
+    expect(screen.queryByRole('checkbox', { name: /香港出口/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: '修改 目录收集 Agent 集合' }));
+    let checkboxes = screen.getAllByRole('checkbox', { name: /香港出口/ });
+    expect(checkboxes).toHaveLength(1);
+    fireEvent.click(checkboxes[0]);
+    await waitFor(() =>
+      expect((screen.getAllByRole('checkbox', { name: /香港出口/ })[0] as HTMLInputElement).checked).toBe(true),
+    );
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      '/vpngate/catalog-nodes/edge-1',
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ enabled: true }) }),
+    );
+    expect(screen.getByRole('button', { name: '修改 IP 情报 Agent 集合' }).getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(screen.getByRole('button', { name: '修改 IP 情报 Agent 集合' }));
+    checkboxes = screen.getAllByRole('checkbox', { name: /香港出口/ });
+    expect(checkboxes).toHaveLength(2);
+    fireEvent.click(checkboxes[1]);
+    await waitFor(() =>
+      expect((screen.getAllByRole('checkbox', { name: /香港出口/ })[1] as HTMLInputElement).checked).toBe(true),
+    );
     expect(vi.mocked(fetch)).toHaveBeenCalledWith(
       '/vpngate/intelligence-nodes/edge-1',
       expect.objectContaining({ method: 'PUT', body: JSON.stringify({ enabled: true }) }),
@@ -412,8 +687,8 @@ describe('设置页分段保存的基准', () => {
       'set-probe',
       'set-ping-probe',
       'set-geodata',
+      'set-vpngate',
       'set-vpngate-intelligence',
-      'set-tunnel-probes',
     ]) {
       const panel = document.getElementById(id)!;
       expect(panel.classList.contains('config-panel')).toBe(true);
@@ -422,15 +697,18 @@ describe('设置页分段保存的基准', () => {
       expect(panel.querySelector(':scope > header .no')).toBeNull();
     }
 
-    for (const id of ['set-ping-probe', 'set-vpngate-intelligence', 'set-tunnel-probes']) {
+    const retention = document.getElementById('set-data-retention')!;
+    expect(retention.classList.contains('config-panel')).toBe(true);
+    expect(retention.querySelector(':scope > summary .panel-title-icon')).toBeTruthy();
+    for (const id of ['set-ping-probe', 'set-vpngate', 'set-vpngate-intelligence']) {
       const panel = document.getElementById(id)!;
       expect(panel.querySelector(':scope > .cardsub')).toBeTruthy();
     }
     expect(document.querySelector('#set-ping-probe > .settings-block')).toBeTruthy();
     expect(
       document.querySelectorAll('#set-vpngate-intelligence > .vpngate-intelligence-layout > .settings-block'),
-    ).toHaveLength(3);
-    expect(document.querySelector('#set-tunnel-probes > .settings-block')).toBeTruthy();
+    ).toHaveLength(2);
+    expect(document.querySelectorAll('#set-vpngate > .vpngate-capabilities-layout > .settings-block')).toHaveLength(3);
   });
 
   it('端口基线明确区分 VLESS 与 AnyTLS', async () => {
@@ -874,6 +1152,12 @@ describe('设置页分段保存的基准', () => {
     const dest = (await screen.findByPlaceholderText('example.com:443')) as HTMLInputElement;
     expect(dest.matches(':disabled')).toBe(true);
     expect(section('set-xray').queryByRole('button', { name: '保存这一段' })).toBeNull();
+    for (const name of ['北京', '上海', '广东', '重庆']) {
+      expect((section('set-ping-probe').getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
+    }
+    const retention = document.getElementById('set-data-retention') as HTMLDetailsElement;
+    fireEvent.click(retention.querySelector('summary')!);
+    expect(retention.open).toBe(true);
   });
 
   it('保存一段之后该段不再显示「有未保存的改动」', async () => {

@@ -32,12 +32,56 @@ impl NodeTrafficCycleKind {
     }
 }
 
+/// How a provider turns the two default-route directions into one allowance counter.
+/// Raw RX/TX stay immutable; this is only a derived accounting view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeTrafficAccountingMode {
+    BidirectionalSum,
+    BidirectionalMax,
+    OutboundOnly,
+    InboundOnly,
+}
+
+impl NodeTrafficAccountingMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BidirectionalSum => "bidirectional_sum",
+            Self::BidirectionalMax => "bidirectional_max",
+            Self::OutboundOnly => "outbound_only",
+            Self::InboundOnly => "inbound_only",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "bidirectional_sum" => Ok(Self::BidirectionalSum),
+            "bidirectional_max" => Ok(Self::BidirectionalMax),
+            "outbound_only" => Ok(Self::OutboundOnly),
+            "inbound_only" => Ok(Self::InboundOnly),
+            other => Err(StoreError::InvalidData(format!(
+                "invalid node traffic accounting mode {other}"
+            ))),
+        }
+    }
+
+    fn apply(self, rx_bytes: u64, tx_bytes: u64) -> u64 {
+        match self {
+            Self::BidirectionalSum => rx_bytes.saturating_add(tx_bytes),
+            Self::BidirectionalMax => rx_bytes.max(tx_bytes),
+            Self::OutboundOnly => tx_bytes,
+            Self::InboundOnly => rx_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTrafficItem {
     pub node_id: String,
     pub tenant_id: String,
     pub name: String,
     pub cycle_kind: NodeTrafficCycleKind,
+    pub accounting_mode: NodeTrafficAccountingMode,
     pub reset_month: Option<u8>,
     pub reset_day: u8,
     /// Provider allowance for this reset cycle. NULL means the allowance has not been configured.
@@ -65,6 +109,9 @@ pub struct NodeTrafficView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateNodeTrafficRequest {
     pub cycle_kind: NodeTrafficCycleKind,
+    /// Optional for a rolling Console upgrade: an already-open older UI keeps the current mode.
+    #[serde(default)]
+    pub accounting_mode: Option<NodeTrafficAccountingMode>,
     /// Required for yearly and forbidden for monthly.
     pub reset_month: Option<u8>,
     pub reset_day: u8,
@@ -148,6 +195,7 @@ pub struct MachineTrafficModelNode {
     pub tenant_id: String,
     pub name: String,
     pub cycle_kind: NodeTrafficCycleKind,
+    pub accounting_mode: NodeTrafficAccountingMode,
     pub reset_month: Option<u8>,
     pub reset_day: u8,
     pub period_start_unix_secs: i64,
@@ -557,12 +605,27 @@ pub async fn update_node_traffic(
     if !exists {
         return Err(StoreError::NotFound(format!("node {node_id}")));
     }
+    let accounting_mode = match request.accounting_mode {
+        Some(mode) => mode,
+        None => sqlx::query_scalar::<_, String>(
+            "SELECT accounting_mode FROM node_traffic_policy WHERE node_id = $1",
+        )
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_deref()
+        .map(NodeTrafficAccountingMode::parse)
+        .transpose()?
+        .unwrap_or(NodeTrafficAccountingMode::BidirectionalSum),
+    };
     sqlx::query(
         "INSERT INTO node_traffic_policy (
-            node_id, cycle_kind, reset_month, reset_day, quota_bytes, updated_at, updated_by
-         ) VALUES ($1, $2, $3, $4, $5::numeric, now(), $6)
+            node_id, cycle_kind, accounting_mode, reset_month, reset_day, quota_bytes,
+            updated_at, updated_by
+         ) VALUES ($1, $2, $3, $4, $5, $6::numeric, now(), $7)
          ON CONFLICT (node_id) DO UPDATE SET
             cycle_kind = EXCLUDED.cycle_kind,
+            accounting_mode = EXCLUDED.accounting_mode,
             reset_month = EXCLUDED.reset_month,
             reset_day = EXCLUDED.reset_day,
             quota_bytes = EXCLUDED.quota_bytes,
@@ -571,6 +634,7 @@ pub async fn update_node_traffic(
     )
     .bind(node_id)
     .bind(request.cycle_kind.as_str())
+    .bind(accounting_mode.as_str())
     .bind(request.reset_month.map(i32::from))
     .bind(i32::from(request.reset_day))
     .bind(quota.map(|value| value.to_string()))
@@ -581,15 +645,18 @@ pub async fn update_node_traffic(
     if let Some(target) = calibration {
         sqlx::query(
             "INSERT INTO node_traffic_calibrations (
-                node_id, target_total_bytes, accounted_total_bytes, calibrated_by
+                node_id, target_total_bytes, accounted_total_bytes, accounting_mode,
+                accounted_rx_bytes, accounted_tx_bytes, calibrated_by
              )
              SELECT $1, $2::numeric,
-                    COALESCE(accounted_rx_bytes + accounted_tx_bytes, 0), $3
+                    COALESCE(accounted_rx_bytes + accounted_tx_bytes, 0), $3,
+                    COALESCE(accounted_rx_bytes, 0), COALESCE(accounted_tx_bytes, 0), $4
                FROM (SELECT 1) AS singleton
                LEFT JOIN node_traffic_state ON node_id = $1",
         )
         .bind(node_id)
         .bind(target.to_string())
+        .bind(accounting_mode.as_str())
         .bind(actor.operator_id())
         .execute(&mut *tx)
         .await?;
@@ -618,11 +685,14 @@ pub async fn load_node_traffic(pool: &PgPool, actor: &AdminContext) -> Result<No
                     )))
                 }
             };
+            let accounting_mode =
+                NodeTrafficAccountingMode::parse(&row.try_get::<String, _>("accounting_mode")?)?;
             Ok(NodeTrafficItem {
                 node_id: row.try_get("node_id")?,
                 tenant_id: row.try_get("tenant_id")?,
                 name: row.try_get("name")?,
                 cycle_kind: cycle,
+                accounting_mode,
                 reset_month: row
                     .try_get::<Option<i32>, _>("reset_month")?
                     .map(|value| {
@@ -664,13 +734,66 @@ fn mul_div(value: u64, numerator: u64, denominator: u64) -> u64 {
     u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
-/// Ledger days in `[from, to)`, keeping the ascending order of the query.
-fn ledger_window(days: &[(i64, u64)], from: i64, to: i64) -> Vec<MachineTrafficDay> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectionalTrafficDay {
+    day: i64,
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+fn direction_ledger(days: &[DirectionalTrafficDay], receive: bool) -> Vec<(i64, u64)> {
     days.iter()
-        .filter(|(day, _)| *day >= from && *day < to)
-        .map(|(day, bytes)| MachineTrafficDay {
-            day_start_unix_secs: *day,
-            bytes: bytes.to_string(),
+        .map(|day| (day.day, if receive { day.rx_bytes } else { day.tx_bytes }))
+        .collect()
+}
+
+/// Scalar series used only to learn an error band. Current-period totals and projections apply
+/// the mode to cumulative directional values below; in particular, daily maxima are never summed
+/// into the provider total.
+fn accounting_rate_ledger(
+    days: &[DirectionalTrafficDay],
+    mode: NodeTrafficAccountingMode,
+) -> Vec<(i64, u64)> {
+    days.iter()
+        .map(|day| (day.day, mode.apply(day.rx_bytes, day.tx_bytes)))
+        .collect()
+}
+
+fn directional_window_totals(days: &[DirectionalTrafficDay], from: i64, to: i64) -> (u64, u64) {
+    days.iter()
+        .filter(|day| day.day >= from && day.day < to)
+        .fold((0_u64, 0_u64), |(rx, tx), day| {
+            (
+                rx.saturating_add(day.rx_bytes),
+                tx.saturating_add(day.tx_bytes),
+            )
+        })
+}
+
+/// Ledger days in `[from, to)`, keeping the ascending query order. Each point is the increase of
+/// the selected cumulative accounting counter on that day, so the series sums to
+/// `mode.apply(sum(rx), sum(tx))` even for bidirectional max.
+fn ledger_window(
+    days: &[DirectionalTrafficDay],
+    mode: NodeTrafficAccountingMode,
+    from: i64,
+    to: i64,
+) -> Vec<MachineTrafficDay> {
+    let mut rx = 0_u64;
+    let mut tx = 0_u64;
+    let mut accounted = 0_u64;
+    days.iter()
+        .filter(|day| day.day >= from && day.day < to)
+        .map(|day| {
+            rx = rx.saturating_add(day.rx_bytes);
+            tx = tx.saturating_add(day.tx_bytes);
+            let next = mode.apply(rx, tx);
+            let bytes = next.saturating_sub(accounted);
+            accounted = next;
+            MachineTrafficDay {
+                day_start_unix_secs: day.day,
+                bytes: bytes.to_string(),
+            }
         })
         .collect()
 }
@@ -1055,6 +1178,13 @@ struct NodeForecast {
     gap: Option<TrafficGap>,
 }
 
+struct DirectionalNodeForecast {
+    accounting: NodeForecast,
+    rx_daily_rate: f64,
+    tx_daily_rate: f64,
+    rate_days: usize,
+}
+
 fn prepare_forecast(
     anchors: PeriodAnchors,
     ledger: &[(i64, u64)],
@@ -1098,10 +1228,37 @@ fn prepare_forecast(
 }
 
 /// `used` is known; only the remaining days are forecast, so both values meet `used` at the end.
+#[cfg(test)]
 fn project(used: u64, daily_rate: f64, remaining_days: f64, upper_error: f64) -> (u64, u64) {
     let remaining = daily_rate * remaining_days;
     let p50 = used.saturating_add(estimated_bytes(remaining));
     let p90 = used.saturating_add(estimated_bytes(remaining * (1.0 + upper_error)));
+    (p50, p90.max(p50))
+}
+
+/// Project each immutable direction, then apply the provider rule to the cumulative period. This
+/// is the critical distinction for `bidirectional_max`: `max(sum(rx), sum(tx))`, never
+/// `sum(max(daily_rx, daily_tx))`.
+fn project_directional(
+    mode: NodeTrafficAccountingMode,
+    used: u64,
+    current: (u64, u64),
+    daily_rate: (f64, f64),
+    remaining_days: f64,
+    upper_error: f64,
+) -> (u64, u64) {
+    let (current_rx, current_tx) = current;
+    let (rx_daily_rate, tx_daily_rate) = daily_rate;
+    let current_accounted = mode.apply(current_rx, current_tx);
+    let projected = |multiplier: f64| {
+        let rx =
+            current_rx.saturating_add(estimated_bytes(rx_daily_rate * remaining_days * multiplier));
+        let tx =
+            current_tx.saturating_add(estimated_bytes(tx_daily_rate * remaining_days * multiplier));
+        used.saturating_add(mode.apply(rx, tx).saturating_sub(current_accounted))
+    };
+    let p50 = projected(1.0);
+    let p90 = projected(1.0 + upper_error);
     (p50, p90.max(p50))
 }
 
@@ -1163,7 +1320,8 @@ pub async fn load_machine_traffic_model(
     let physical_rows = sqlx::query(
         "SELECT d.node_id,
                 extract(epoch FROM d.day::timestamp AT TIME ZONE 'UTC')::bigint AS day_start,
-                (d.rx_bytes + d.tx_bytes)::text AS bytes
+                d.rx_bytes::text AS rx_bytes,
+                d.tx_bytes::text AS tx_bytes
            FROM node_traffic_daily AS d
            JOIN nodes AS n ON n.id = d.node_id
           WHERE d.day >= (now() AT TIME ZONE 'UTC')::date - 740
@@ -1174,13 +1332,17 @@ pub async fn load_machine_traffic_model(
     .bind(&tenant_pattern)
     .fetch_all(pool)
     .await?;
-    let mut physical_days: HashMap<String, Vec<(i64, u64)>> = HashMap::new();
+    let mut physical_days: HashMap<String, Vec<DirectionalTrafficDay>> = HashMap::new();
     for row in physical_rows {
         let node_id: String = row.try_get("node_id")?;
         physical_days
             .entry(node_id)
             .or_default()
-            .push((row.try_get("day_start")?, parse_u64_column(&row, "bytes")?));
+            .push(DirectionalTrafficDay {
+                day: row.try_get("day_start")?,
+                rx_bytes: parse_u64_column(&row, "rx_bytes")?,
+                tx_bytes: parse_u64_column(&row, "tx_bytes")?,
+            });
     }
 
     let gap_rows = sqlx::query(
@@ -1313,24 +1475,31 @@ pub async fn load_machine_traffic_model(
         .nodes
         .iter()
         .map(|item| {
-            prepare_forecast(
-                PeriodAnchors {
-                    start: item.period_start_unix_secs,
-                    end: item.period_end_unix_secs,
-                    tracking_started_at: item.tracking_started_at_unix_secs,
-                    calibrated_at: item.calibrated_at_unix_secs,
-                },
-                physical_days
-                    .get(&item.node_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                gaps_by_node
-                    .get(&item.node_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                now,
-                &weights,
-            )
+            let days = physical_days
+                .get(&item.node_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let gaps = gaps_by_node
+                .get(&item.node_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let rx_ledger = direction_ledger(days, true);
+            let tx_ledger = direction_ledger(days, false);
+            let accounting_ledger = accounting_rate_ledger(days, item.accounting_mode);
+            let anchors = PeriodAnchors {
+                start: item.period_start_unix_secs,
+                end: item.period_end_unix_secs,
+                tracking_started_at: item.tracking_started_at_unix_secs,
+                calibrated_at: item.calibrated_at_unix_secs,
+            };
+            let rx = prepare_forecast(anchors, &rx_ledger, gaps, now, &weights);
+            let tx = prepare_forecast(anchors, &tx_ledger, gaps, now, &weights);
+            DirectionalNodeForecast {
+                accounting: prepare_forecast(anchors, &accounting_ledger, gaps, now, &weights),
+                rx_daily_rate: rx.daily_rate,
+                tx_daily_rate: tx.daily_rate,
+                rate_days: rx.rate_days.min(tx.rate_days),
+            }
         })
         .collect::<Vec<_>>();
     // Machines with too little history of their own borrow the error of the whole scope.
@@ -1338,12 +1507,18 @@ pub async fn load_machine_traffic_model(
         let mut fleet = FleetBacktests::new(
             forecasts
                 .iter()
-                .map(|forecast| &forecast.backtest)
+                .map(|forecast| &forecast.accounting.backtest)
                 .collect(),
         );
         forecasts
             .iter()
-            .map(|forecast| forecast_band(&forecast.backtest, &mut fleet, forecast.remaining_days))
+            .map(|forecast| {
+                forecast_band(
+                    &forecast.accounting.backtest,
+                    &mut fleet,
+                    forecast.accounting.remaining_days,
+                )
+            })
             .collect::<Vec<_>>()
     };
 
@@ -1357,14 +1532,25 @@ pub async fn load_machine_traffic_model(
             .get(&item.node_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let current_days = ledger_window(days, start, end);
-        let previous_days = ledger_window(days, previous_start, start);
-        let previous_total = days
-            .iter()
-            .filter(|(day, _)| *day >= previous_start && *day < start)
-            .fold(0_u64, |sum, (_, value)| sum.saturating_add(*value));
+        let current_days = ledger_window(days, item.accounting_mode, start, end);
+        let previous_days = ledger_window(days, item.accounting_mode, previous_start, start);
+        let (current_rx, current_tx) = directional_window_totals(days, start, end);
+        let (previous_rx, previous_tx) = directional_window_totals(days, previous_start, start);
+        let previous_total = item.accounting_mode.apply(previous_rx, previous_tx);
         let used = parse_decimal_u64(&item.total_bytes, "机器物理流量")?;
-        let (p50, p90) = project(used, forecast.daily_rate, forecast.remaining_days, upper);
+        let (p50, p90) = project_directional(
+            item.accounting_mode,
+            used,
+            (current_rx, current_tx),
+            (forecast.rx_daily_rate, forecast.tx_daily_rate),
+            forecast.accounting.remaining_days,
+            upper,
+        );
+        let effective_daily_rate = if forecast.accounting.remaining_days > 0.0 {
+            bytes_f64(p50.saturating_sub(used)) / forecast.accounting.remaining_days
+        } else {
+            0.0
+        };
 
         let mut user_demand: BTreeMap<(String, String), UserDemand> = BTreeMap::new();
         for usage in demand_by_node
@@ -1424,14 +1610,18 @@ pub async fn load_machine_traffic_model(
                 parse_decimal_u64(&user.projected_bytes, "用户预测流量").unwrap_or(0),
             )
         }));
-        let confidence =
-            forecast_confidence(forecast.needs_calibration, forecast.rate_days, band.basis);
+        let confidence = forecast_confidence(
+            forecast.accounting.needs_calibration,
+            forecast.rate_days,
+            band.basis,
+        );
         let last_period_accuracy = accuracy.remove(&item.node_id);
         nodes.push(MachineTrafficModelNode {
             node_id: item.node_id,
             tenant_id: item.tenant_id,
             name: item.name,
             cycle_kind: item.cycle_kind,
+            accounting_mode: item.accounting_mode,
             reset_month: item.reset_month,
             reset_day: item.reset_day,
             period_start_unix_secs: start,
@@ -1440,19 +1630,22 @@ pub async fn load_machine_traffic_model(
             quota_bytes: item.quota_bytes,
             used_bytes: used.to_string(),
             previous_period_bytes: previous_total.to_string(),
-            daily_rate_bytes: estimated_bytes(forecast.daily_rate).to_string(),
+            daily_rate_bytes: estimated_bytes(effective_daily_rate).to_string(),
             rate_days: u32::try_from(forecast.rate_days).unwrap_or(u32::MAX),
             projected_p50_bytes: p50.to_string(),
             projected_p90_bytes: p90.to_string(),
             band,
             confidence,
-            needs_calibration: forecast.needs_calibration,
+            needs_calibration: forecast.accounting.needs_calibration,
             days: current_days,
             previous_days,
             tracking_started_at_unix_secs: item.tracking_started_at_unix_secs,
             calibrated_at_unix_secs: item.calibrated_at_unix_secs,
-            gap_at_unix_secs: forecast.gap.map(|gap| gap.occurred_at),
-            gap_reason: forecast.gap.map(|gap| gap.reason.as_str().to_owned()),
+            gap_at_unix_secs: forecast.accounting.gap.map(|gap| gap.occurred_at),
+            gap_reason: forecast
+                .accounting
+                .gap
+                .map(|gap| gap.reason.as_str().to_owned()),
             last_period_accuracy,
             users,
             unattributed_bytes: unattributed.to_string(),
@@ -1476,42 +1669,83 @@ async fn load_forecast_accuracy(
 ) -> Result<HashMap<String, MachineTrafficAccuracy>> {
     let rows = sqlx::query(
         "WITH latest AS (
-             SELECT DISTINCT ON (f.node_id) f.node_id, f.period_start, f.period_end
+             SELECT DISTINCT ON (f.node_id) f.node_id, f.period_start, f.period_end,
+                    f.accounting_mode
                FROM node_traffic_forecasts AS f
                JOIN nodes AS n ON n.id = f.node_id
+               LEFT JOIN node_traffic_policy AS p ON p.node_id = f.node_id
               WHERE f.period_end <= (now() AT TIME ZONE 'UTC')::date
+                AND f.accounting_mode = COALESCE(p.accounting_mode, 'bidirectional_sum')
                 AND ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\\')
               ORDER BY f.node_id, f.period_end DESC, f.period_start DESC
          ), closing AS (
              SELECT latest.*,
                     CASE WHEN calibration.target_total_bytes IS NOT NULL
-                         THEN calibration.target_total_bytes + GREATEST(
-                                  COALESCE(state.accounted_rx_bytes + state.accounted_tx_bytes, 0)
-                                  - COALESCE(later.bytes, 0)
-                                  - calibration.accounted_total_bytes, 0)
-                         ELSE COALESCE(within.bytes, 0)
+                         THEN calibration.target_total_bytes +
+                              CASE latest.accounting_mode
+                                  WHEN 'bidirectional_sum' THEN
+                                      CASE WHEN calibration.accounted_rx_bytes IS NULL THEN
+                                          GREATEST(
+                                              COALESCE(state.accounted_rx_bytes + state.accounted_tx_bytes, 0)
+                                              - COALESCE(later.rx_bytes + later.tx_bytes, 0)
+                                              - calibration.accounted_total_bytes, 0)
+                                      ELSE
+                                          GREATEST(COALESCE(state.accounted_rx_bytes, 0)
+                                                   - COALESCE(later.rx_bytes, 0)
+                                                   - calibration.accounted_rx_bytes, 0)
+                                          + GREATEST(COALESCE(state.accounted_tx_bytes, 0)
+                                                     - COALESCE(later.tx_bytes, 0)
+                                                     - calibration.accounted_tx_bytes, 0)
+                                      END
+                                  WHEN 'bidirectional_max' THEN GREATEST(
+                                      GREATEST(COALESCE(state.accounted_rx_bytes, 0)
+                                               - COALESCE(later.rx_bytes, 0)
+                                               - calibration.accounted_rx_bytes, 0),
+                                      GREATEST(COALESCE(state.accounted_tx_bytes, 0)
+                                               - COALESCE(later.tx_bytes, 0)
+                                               - calibration.accounted_tx_bytes, 0)
+                                  )
+                                  WHEN 'outbound_only' THEN
+                                      GREATEST(COALESCE(state.accounted_tx_bytes, 0)
+                                               - COALESCE(later.tx_bytes, 0)
+                                               - calibration.accounted_tx_bytes, 0)
+                                  WHEN 'inbound_only' THEN
+                                      GREATEST(COALESCE(state.accounted_rx_bytes, 0)
+                                               - COALESCE(later.rx_bytes, 0)
+                                               - calibration.accounted_rx_bytes, 0)
+                              END
+                         ELSE CASE latest.accounting_mode
+                                  WHEN 'bidirectional_sum' THEN
+                                      COALESCE(within.rx_bytes + within.tx_bytes, 0)
+                                  WHEN 'bidirectional_max' THEN GREATEST(
+                                      COALESCE(within.rx_bytes, 0), COALESCE(within.tx_bytes, 0))
+                                  WHEN 'outbound_only' THEN COALESCE(within.tx_bytes, 0)
+                                  WHEN 'inbound_only' THEN COALESCE(within.rx_bytes, 0)
+                              END
                     END AS actual_bytes
                FROM latest
                LEFT JOIN node_traffic_state AS state ON state.node_id = latest.node_id
                LEFT JOIN LATERAL (
-                   SELECT sum(day.rx_bytes + day.tx_bytes) AS bytes
+                   SELECT sum(day.rx_bytes) AS rx_bytes, sum(day.tx_bytes) AS tx_bytes
                      FROM node_traffic_daily AS day
                     WHERE day.node_id = latest.node_id
                       AND day.day >= latest.period_start
                       AND day.day < latest.period_end
                ) AS within ON TRUE
                LEFT JOIN LATERAL (
-                   SELECT sum(day.rx_bytes + day.tx_bytes) AS bytes
+                   SELECT sum(day.rx_bytes) AS rx_bytes, sum(day.tx_bytes) AS tx_bytes
                      FROM node_traffic_daily AS day
                     WHERE day.node_id = latest.node_id
                       AND day.day >= latest.period_end
                ) AS later ON TRUE
                LEFT JOIN LATERAL (
-                   SELECT item.target_total_bytes, item.accounted_total_bytes
+                   SELECT item.target_total_bytes, item.accounted_total_bytes,
+                          item.accounted_rx_bytes, item.accounted_tx_bytes
                      FROM node_traffic_calibrations AS item
                     WHERE item.node_id = latest.node_id
                       AND item.calibrated_at >= latest.period_start::timestamp AT TIME ZONE 'UTC'
                       AND item.calibrated_at < latest.period_end::timestamp AT TIME ZONE 'UTC'
+                      AND item.accounting_mode = latest.accounting_mode
                     ORDER BY item.calibrated_at DESC, item.id DESC
                     LIMIT 1
                ) AS calibration ON TRUE
@@ -1531,6 +1765,7 @@ async fn load_forecast_accuracy(
              ON f.node_id = closing.node_id
             AND f.period_start = closing.period_start
             AND f.period_end = closing.period_end
+            AND f.accounting_mode = closing.accounting_mode
           WHERE closing.actual_bytes > 0
           GROUP BY closing.node_id, closing.period_start, closing.period_end,
                    closing.actual_bytes",
@@ -1579,18 +1814,28 @@ pub async fn record_machine_traffic_forecasts(pool: &PgPool) -> Result<u64> {
     let inserted = sqlx::query(
         "INSERT INTO node_traffic_forecasts (
             node_id, day, taken_at, period_start, period_end,
-            quota_bytes, used_bytes, p50_bytes, p90_bytes
+            quota_bytes, accounting_mode, used_bytes, p50_bytes, p90_bytes
          )
          SELECT item.node_id,
                 (to_timestamp($1) AT TIME ZONE 'UTC')::date,
                 to_timestamp($1),
                 (to_timestamp(item.period_start) AT TIME ZONE 'UTC')::date,
                 (to_timestamp(item.period_end) AT TIME ZONE 'UTC')::date,
-                item.quota::numeric, item.used::numeric, item.p50::numeric, item.p90::numeric
+                item.quota::numeric, item.accounting_mode,
+                item.used::numeric, item.p50::numeric, item.p90::numeric
            FROM UNNEST($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::text[],
-                       $7::text[], $8::text[])
-                AS item(node_id, period_start, period_end, quota, used, p50, p90)
-         ON CONFLICT (node_id, day) DO NOTHING",
+                       $7::text[], $8::text[], $9::text[])
+                AS item(node_id, period_start, period_end, quota, accounting_mode, used, p50, p90)
+         ON CONFLICT (node_id, day) DO UPDATE SET
+            taken_at = EXCLUDED.taken_at,
+            period_start = EXCLUDED.period_start,
+            period_end = EXCLUDED.period_end,
+            quota_bytes = EXCLUDED.quota_bytes,
+            accounting_mode = EXCLUDED.accounting_mode,
+            used_bytes = EXCLUDED.used_bytes,
+            p50_bytes = EXCLUDED.p50_bytes,
+            p90_bytes = EXCLUDED.p90_bytes
+         WHERE node_traffic_forecasts.accounting_mode <> EXCLUDED.accounting_mode",
     )
     .bind(view.generated_at_unix_secs as f64)
     .bind(column(|node| node.node_id.clone()))
@@ -1612,6 +1857,12 @@ pub async fn record_machine_traffic_forecasts(pool: &PgPool) -> Result<u64> {
             .map(|node| node.quota_bytes.clone())
             .collect::<Vec<_>>(),
     )
+    .bind(
+        measured
+            .iter()
+            .map(|node| node.accounting_mode.as_str())
+            .collect::<Vec<_>>(),
+    )
     .bind(column(|node| node.used_bytes.clone()))
     .bind(column(|node| node.projected_p50_bytes.clone()))
     .bind(column(|node| node.projected_p90_bytes.clone()))
@@ -1621,13 +1872,19 @@ pub async fn record_machine_traffic_forecasts(pool: &PgPool) -> Result<u64> {
 }
 
 pub async fn prune_machine_traffic_forecasts(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = i32::try_from(retain_days)
-        .map_err(|_| StoreError::InvalidData("forecast retention exceeds i32 days".to_owned()))?;
+    prune_machine_traffic_forecasts_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_machine_traffic_forecasts_hours(
+    pool: &PgPool,
+    retain_hours: u32,
+) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let deleted = sqlx::query(
         "DELETE FROM node_traffic_forecasts
-          WHERE day < (now() AT TIME ZONE 'UTC')::date - $1",
+          WHERE day < ((now() - make_interval(secs => $1::double precision)) AT TIME ZONE 'UTC')::date",
     )
-    .bind(retain_days)
+    .bind(retain_secs)
     .execute(pool)
     .await?;
     Ok(deleted.rows_affected())
@@ -1637,6 +1894,7 @@ const NODE_TRAFFIC_VIEW_SQL: &str = r#"
 WITH policies AS (
     SELECT n.id AS node_id, n.tenant_id, n.name,
            COALESCE(p.cycle_kind, 'monthly') AS cycle_kind,
+           COALESCE(p.accounting_mode, 'bidirectional_sum') AS accounting_mode,
            p.reset_month,
            COALESCE(p.reset_day, 1) AS reset_day,
            p.quota_bytes,
@@ -1700,7 +1958,8 @@ WITH policies AS (
            ) AS period_end
       FROM periods
 )
-SELECT b.node_id, b.tenant_id, b.name, b.cycle_kind, b.reset_month, b.reset_day,
+SELECT b.node_id, b.tenant_id, b.name, b.cycle_kind, b.accounting_mode,
+       b.reset_month, b.reset_day,
        b.quota_bytes::text AS quota_bytes,
        extract(epoch FROM b.period_start::timestamp AT TIME ZONE 'UTC')::bigint
            AS period_start_unix_secs,
@@ -1710,9 +1969,39 @@ SELECT b.node_id, b.tenant_id, b.name, b.cycle_kind, b.reset_month, b.reset_day,
        daily.tx_bytes::text AS tx_bytes,
        (CASE WHEN calibration.target_total_bytes IS NOT NULL
              THEN calibration.target_total_bytes
-                  + GREATEST(COALESCE(state.accounted_rx_bytes + state.accounted_tx_bytes, 0)
-                             - calibration.accounted_total_bytes, 0)
-             ELSE daily.rx_bytes + daily.tx_bytes
+                  + CASE b.accounting_mode
+                        WHEN 'bidirectional_sum' THEN
+                            CASE WHEN calibration.accounted_rx_bytes IS NULL THEN
+                                GREATEST(
+                                    COALESCE(state.accounted_rx_bytes + state.accounted_tx_bytes, 0)
+                                    - calibration.accounted_total_bytes,
+                                    0
+                                )
+                            ELSE
+                                GREATEST(COALESCE(state.accounted_rx_bytes, 0)
+                                         - calibration.accounted_rx_bytes, 0)
+                                + GREATEST(COALESCE(state.accounted_tx_bytes, 0)
+                                           - calibration.accounted_tx_bytes, 0)
+                            END
+                        WHEN 'bidirectional_max' THEN GREATEST(
+                            GREATEST(COALESCE(state.accounted_rx_bytes, 0)
+                                     - calibration.accounted_rx_bytes, 0),
+                            GREATEST(COALESCE(state.accounted_tx_bytes, 0)
+                                     - calibration.accounted_tx_bytes, 0)
+                        )
+                        WHEN 'outbound_only' THEN
+                            GREATEST(COALESCE(state.accounted_tx_bytes, 0)
+                                     - calibration.accounted_tx_bytes, 0)
+                        WHEN 'inbound_only' THEN
+                            GREATEST(COALESCE(state.accounted_rx_bytes, 0)
+                                     - calibration.accounted_rx_bytes, 0)
+                    END
+             ELSE CASE b.accounting_mode
+                      WHEN 'bidirectional_sum' THEN daily.rx_bytes + daily.tx_bytes
+                      WHEN 'bidirectional_max' THEN GREATEST(daily.rx_bytes, daily.tx_bytes)
+                      WHEN 'outbound_only' THEN daily.tx_bytes
+                      WHEN 'inbound_only' THEN daily.rx_bytes
+                  END
         END)::text AS total_bytes,
        state.interface,
        extract(epoch FROM state.tracking_started_at)::bigint AS tracking_started_at_unix_secs,
@@ -1738,9 +2027,11 @@ SELECT b.node_id, b.tenant_id, b.name, b.cycle_kind, b.reset_month, b.reset_day,
          AND day.day < b.period_end
   ) AS daily ON TRUE
   LEFT JOIN LATERAL (
-      SELECT item.calibrated_at, item.target_total_bytes, item.accounted_total_bytes
+      SELECT item.calibrated_at, item.target_total_bytes, item.accounted_total_bytes,
+             item.accounted_rx_bytes, item.accounted_tx_bytes
         FROM node_traffic_calibrations AS item
        WHERE item.node_id = b.node_id
+         AND item.accounting_mode = b.accounting_mode
          AND item.calibrated_at >= b.period_start::timestamp AT TIME ZONE 'UTC'
          AND item.calibrated_at < b.period_end::timestamp AT TIME ZONE 'UTC'
        ORDER BY item.calibrated_at DESC, item.id DESC
@@ -1768,6 +2059,7 @@ mod tests {
     fn policy_shape_requires_only_yearly_month() {
         assert!(valid_policy(&UpdateNodeTrafficRequest {
             cycle_kind: NodeTrafficCycleKind::Monthly,
+            accounting_mode: Some(NodeTrafficAccountingMode::BidirectionalSum),
             reset_month: None,
             reset_day: 31,
             quota_bytes: Some("10995116277760".to_owned()),
@@ -1776,6 +2068,7 @@ mod tests {
         .is_ok());
         assert!(valid_policy(&UpdateNodeTrafficRequest {
             cycle_kind: NodeTrafficCycleKind::Yearly,
+            accounting_mode: Some(NodeTrafficAccountingMode::BidirectionalMax),
             reset_month: Some(2),
             reset_day: 29,
             quota_bytes: None,
@@ -1784,6 +2077,7 @@ mod tests {
         .is_ok());
         assert!(valid_policy(&UpdateNodeTrafficRequest {
             cycle_kind: NodeTrafficCycleKind::Monthly,
+            accounting_mode: Some(NodeTrafficAccountingMode::OutboundOnly),
             reset_month: Some(1),
             reset_day: 1,
             quota_bytes: None,
@@ -2075,25 +2369,96 @@ mod tests {
     fn ledger_window_is_half_open_and_keeps_exact_bytes() {
         let day = 86_400;
         let ledger = [
-            (9 * day, 1),
-            (10 * day, 2),
-            (11 * day, u64::MAX),
-            (12 * day, 4),
+            DirectionalTrafficDay {
+                day: 9 * day,
+                rx_bytes: 1,
+                tx_bytes: 0,
+            },
+            DirectionalTrafficDay {
+                day: 10 * day,
+                rx_bytes: 2,
+                tx_bytes: 3,
+            },
+            DirectionalTrafficDay {
+                day: 11 * day,
+                rx_bytes: 5,
+                tx_bytes: 7,
+            },
+            DirectionalTrafficDay {
+                day: 12 * day,
+                rx_bytes: 4,
+                tx_bytes: 0,
+            },
         ];
         assert_eq!(
-            ledger_window(&ledger, 10 * day, 12 * day),
+            ledger_window(
+                &ledger,
+                NodeTrafficAccountingMode::BidirectionalSum,
+                10 * day,
+                12 * day,
+            ),
             vec![
                 MachineTrafficDay {
                     day_start_unix_secs: 10 * day,
-                    bytes: "2".to_owned(),
+                    bytes: "5".to_owned(),
                 },
                 MachineTrafficDay {
                     day_start_unix_secs: 11 * day,
-                    bytes: u64::MAX.to_string(),
+                    bytes: "12".to_owned(),
                 },
             ]
         );
-        assert!(ledger_window(&ledger, 13 * day, 14 * day).is_empty());
+        assert!(ledger_window(
+            &ledger,
+            NodeTrafficAccountingMode::BidirectionalSum,
+            13 * day,
+            14 * day,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn bidirectional_max_is_taken_after_period_directions_are_accumulated() {
+        let ledger = [
+            DirectionalTrafficDay {
+                day: 0,
+                rx_bytes: 100,
+                tx_bytes: 0,
+            },
+            DirectionalTrafficDay {
+                day: DAY,
+                rx_bytes: 0,
+                tx_bytes: 100,
+            },
+        ];
+        let days = ledger_window(
+            &ledger,
+            NodeTrafficAccountingMode::BidirectionalMax,
+            0,
+            2 * DAY,
+        );
+        assert_eq!(
+            days.iter()
+                .map(|day| day.bytes.as_str())
+                .collect::<Vec<_>>(),
+            ["100", "0"]
+        );
+        let (rx, tx) = directional_window_totals(&ledger, 0, 2 * DAY);
+        assert_eq!(
+            NodeTrafficAccountingMode::BidirectionalMax.apply(rx, tx),
+            100
+        );
+    }
+
+    #[test]
+    fn every_machine_accounting_mode_derives_from_the_same_raw_directions() {
+        use NodeTrafficAccountingMode::{
+            BidirectionalMax, BidirectionalSum, InboundOnly, OutboundOnly,
+        };
+        assert_eq!(BidirectionalSum.apply(120, 80), 200);
+        assert_eq!(BidirectionalMax.apply(120, 80), 120);
+        assert_eq!(InboundOnly.apply(120, 80), 120);
+        assert_eq!(OutboundOnly.apply(120, 80), 80);
     }
 
     #[test]

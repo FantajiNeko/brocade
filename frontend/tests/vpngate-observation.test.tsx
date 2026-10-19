@@ -90,7 +90,7 @@ it('shows both backend roles, failover reason and replenishment counters', () =>
     }),
   );
 
-  expect(screen.getByLabelText('VPN Gate 实时路径').textContent).toContain('候选 16');
+  expect(screen.getByLabelText('VPN Gate 网络').textContent).toContain('候选 16');
   fireEvent.click(screen.getByText('JP'));
   expect(screen.getByText('vpn-jp-2')).toBeTruthy();
   expect(screen.getByText(/探活 20 \/ 失败 2/)).toBeTruthy();
@@ -137,8 +137,8 @@ it('treats an old initial VPN Gate snapshot as warm-up before declaring it stale
 
   expect(screen.getByRole('status').textContent).toBe('正在获取实时状态…');
   expect(screen.queryByText(/正在同步实时数据/)).toBeNull();
-  expect(screen.getByLabelText('VPN Gate 实时路径').textContent).not.toContain('出口池');
-  expect(screen.getByLabelText('VPN Gate 实时路径').textContent).not.toContain('vpngate-us');
+  expect(screen.getByLabelText('VPN Gate 网络').textContent).not.toContain('出口池');
+  expect(screen.getByLabelText('VPN Gate 网络').textContent).not.toContain('vpngate-us');
   expect(screen.queryByText(/实时数据连接已中断/)).toBeNull();
 
   act(() => vi.advanceTimersByTime(16_000));

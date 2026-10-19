@@ -69,12 +69,59 @@ test('所有页面只能复用机器、线路和用户页的三种面板骨架',
   }
 });
 
+test('用户详情数据卡共用面板留白令牌和满幅正文契约', () => {
+  const users = panes.get('users.tsx');
+  const forwarding = panes.get('user-forwarding.tsx');
+  const realtime = source('../src/user-traffic-realtime.tsx');
+  const machines = source('../src/user-machine-usage.tsx');
+  const machineStyles = source('../src/user-machine-usage.css');
+  const sites = source('../src/user-site-usage.tsx');
+
+  assert.match(
+    styles,
+    /\.panel\s*\{[^}]*--panel-pad-top:\s*11px;[^}]*--panel-pad-x:\s*13px;[^}]*--panel-pad-bottom:\s*11px;[^}]*--panel-content-x:\s*16px;[^}]*--panel-content-x-compact:\s*14px;/s,
+  );
+  assert.match(
+    styles,
+    /\.panel-full-bleed-body\s*\{[^}]*margin:\s*calc\(0px - var\(--panel-body-gap\)\) calc\(0px - var\(--panel-pad-x\)\)[^}]*calc\(0px - var\(--panel-pad-bottom\)\);/s,
+  );
+  for (const [name, contents] of [
+    ['用量与额度', users],
+    ['转发用量与额度 / 转发入口', forwarding],
+    ['实时流量', realtime],
+    ['机器流量', machines],
+    ['站点流量', sites],
+  ]) {
+    assert.match(contents, /panel-full-bleed-body/, `${name} 必须复用满幅正文契约`);
+  }
+  assert.match(
+    styles,
+    /\.fwd-main\s*\{[^}]*--fwd-content-x:\s*var\(--panel-content-x\);[^}]*padding:\s*12px var\(--panel-content-x\) 4px;/s,
+  );
+  assert.match(
+    styles,
+    /\.fwe-new\s*\{[^}]*margin:\s*8px calc\(0px - var\(--fwd-content-x\)\) 0;[^}]*padding:\s*10px var\(--fwd-content-x\) 14px calc\(var\(--fwd-content-x\) \+ 18px\);/s,
+  );
+  assert.match(
+    styles,
+    /\.qta-r\.fwe-open\s*\{[^}]*margin-inline:\s*calc\(0px - var\(--panel-content-x\)\);[^}]*padding-inline:\s*var\(--panel-content-x\);/s,
+  );
+  assert.match(styles, /\.fwe-sheet\s*\{[^}]*grid-column:\s*2 \/ -1;/s);
+  assert.doesNotMatch(styles, /\.(?:fwd-policy-inline|fwd-edit|fwd-quota-pick|fwd-node-settings)\b/);
+  assert.match(
+    styles,
+    /@container rut \(max-width: 700px\)\s*\{[\s\S]*?\.rut-now\s*\{[^}]*padding:\s*16px var\(--panel-content-x-compact\);/,
+  );
+  assert.doesNotMatch(styles, /\.(?:user-usage|rut-body|site-usage-body)\s*\{[^}]*margin:\s*-11px -13px;/s);
+  assert.doesNotMatch(machineStyles, /\.uxm-body\s*\{[^}]*margin:\s*-11px -13px;/s);
+});
+
 test('所有面板标题固定使用 PanelTitle，列表页只使用 ListIcon 标题', () => {
   const delegatedHeaders = /^\s*(?:\{(?:renderHeader\(|head\})|<(?:MachineEgressDnsRules|NodeChainsSection)\b)/;
 
   for (const { file, classes, tail } of panelDeclarations()) {
     const content = tail.replace(/^(?:\s*\{\/\*[\s\S]*?\*\/\})*\s*/, '');
-    const header = content.match(/^<(header|summary)>([\s\S]*?)<\/\1>/);
+    const header = content.match(/^<(header|summary)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/);
     if (!header) {
       if (classes.includes('config-panel') || classes.includes('titled')) {
         assert.match(content, delegatedHeaders, `${file}: 带色带的面板必须有公共标题或显式委托标题`);
@@ -102,6 +149,41 @@ test('主列表页标题不显示数量或状态汇总', () => {
   assert.doesNotMatch(chains, /<span className="rd">/);
   assert.doesNotMatch(tunnels, /<span className="hint">\{tunnels\.length\} 条<\/span>/);
   assert.doesNotMatch(users, /user-roster-availability/);
+});
+
+test('门面标题使用 42px 公共令牌，内部面板保持 36px 且不继承门面高度', () => {
+  assert.match(styles, /--page-title-h:\s*42px;/);
+  assert.match(styles, /--panel-title-h:\s*36px;/);
+  assert.match(styles, /\.panel\.titled > :is\(header, summary\)\s*\{[^}]*min-height:\s*var\(--panel-title-h\);/s);
+  assert.match(
+    styles,
+    /\.panel\.titled\[data-page-title='true'\] > header\s*\{\s*min-height:\s*var\(--page-title-h\);\s*\}/,
+  );
+
+  const declarations = panelDeclarations();
+  const pagePanels = declarations.filter(({ tag }) => tag.includes('data-page-title="true"'));
+  assert.deepEqual(
+    pagePanels.map(({ file }) => file).sort(),
+    [
+      'capacity.tsx',
+      'chain-proxy.tsx',
+      'chains.tsx',
+      'nodes.tsx',
+      'password.tsx',
+      'tunnels.tsx',
+      'users.tsx',
+      'users.tsx',
+    ],
+    '门面标题包括各列表、预测、密码页和用户名册的正常/空状态；用量使用连续纸页头',
+  );
+  for (const { file, classes, tag } of declarations) {
+    if (classes.some(name => name.endsWith('-list-panel'))) {
+      assert.match(tag, /data-page-title="true"/, `${file}: 主列表必须声明门面标题层级`);
+    }
+    if (classes.includes('config-panel') || classes.includes('node-retired-panel')) {
+      assert.doesNotMatch(tag, /data-page-title/, `${file}: 内部配置和次级列表不得升级为门面标题`);
+    }
+  }
 });
 
 test('列表标题继承普通面板字体，所有标题图标共用 14px 尺寸', () => {
@@ -148,6 +230,11 @@ test('配置控件与说明文字共用 6px 垂直间距', () => {
   assert.match(styles, /\.setfld \.v\s*\{[^}]*row-gap:\s*var\(--field-note-gap\)/s);
   assert.match(styles, /\.fgrid \.v \.sub\s*\{[^}]*margin-top:\s*var\(--field-note-gap\)/s);
   assert.match(styles, /\.chain-face dd > :not\(\.note\) \+ \.note,[\s\S]*?margin-top:\s*var\(--field-note-gap\)/);
+});
+
+test('机器流量设置与其他配置面板共用字段网格', () => {
+  assert.match(styles, /\.nd-tab-config \.fgrid \.k\s*\{[^}]*width:\s*124px;/s);
+  assert.doesNotMatch(styles, /\.node-traffic-accounting \.node-traffic-settings \.(?:row|k|v)\s*\{/);
 });
 
 const splitSelectors = selectorList => {

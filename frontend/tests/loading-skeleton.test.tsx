@@ -114,15 +114,17 @@ it('首帧资料决定机器数以及每个线路分组的成员数', () => {
   expect(groups[1]?.querySelectorAll('.chain-card')).toHaveLength(0);
 });
 
-it('线路详情按配置双列与通栏规则占位，不渲染机器观测面板', () => {
+it('线路详情沿用机器详情连续纸，不渲染页签占位', () => {
   const view = render(<Loading variant="chain-detail" />);
+  expect(view.container.querySelector('.loading-skeleton-chain-detail.nd-sheet')).toBeTruthy();
+  expect(view.container.querySelector('.nd-paper > .nd-page-head')).toBeTruthy();
+  expect(view.container.querySelector('.loading-skeleton-tabs')).toBeNull();
   expect(view.container.querySelectorAll('.chain-config-grid > .col')).toHaveLength(2);
   expect(view.container.querySelector('.loading-skeleton-chain-probe')).toBeTruthy();
   expect(view.container.querySelector('.loading-skeleton-chain-ingress')).toBeTruthy();
   expect(view.container.querySelector('.loading-skeleton-chain-client')).toBeTruthy();
   expect(view.container.querySelector('.loading-skeleton-chain-protocols')).toBeTruthy();
   expect(view.container.querySelector('.loading-skeleton-chain-rules')).toBeTruthy();
-  expect(view.container.querySelectorAll('.protocol-choice')).toHaveLength(4);
   expect(view.container.querySelector('.loading-skeleton-metrics, .loading-skeleton-observation-panel')).toBeNull();
   expect(view.container.querySelector('button, input, select, summary, [tabindex]')).toBeNull();
 });

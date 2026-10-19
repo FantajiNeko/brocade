@@ -812,17 +812,9 @@ function SkeletonRuntimePanel() {
   );
 }
 
-function SkeletonChainPanel({
-  className = '',
-  children,
-  folded = false,
-}: {
-  className?: string;
-  children?: ReactNode;
-  folded?: boolean;
-}) {
+function SkeletonChainPanel({ className = '', children }: { className?: string; children?: ReactNode }) {
   return (
-    <section className={`panel config-panel ${className}${folded ? ' loading-skeleton-chain-fold' : ''}`}>
+    <section className={`panel config-panel ${className}`}>
       <header>
         <i className="loading-skeleton-title-icon" />
         <i className="loading-bar title" />
@@ -849,59 +841,65 @@ function SkeletonChainFields({ rows }: { rows: number }) {
 
 function SkeletonChainDetail() {
   return (
-    <div className="loading-skeleton-chain-detail">
-      <div className="chain-hd">
-        <i className="loading-skeleton-title-icon" />
-        <i className="loading-bar title" />
-        <i className="loading-bar faint" />
-      </div>
-      <div className="loading-skeleton-chain-body">
-        <div className="duo chain-config-grid">
-          <div className="col">
-            <div className="blk loading-skeleton-chain-probe">
-              <div className="blk-hd">
-                <i className="loading-bar title" />
-              </div>
-              <div className="blk-bd">
-                <i className="loading-bar value" />
-                <i className="loading-bar" />
-                <i className="loading-bar faint" />
-              </div>
-            </div>
-            <SkeletonChainPanel className="loading-skeleton-chain-ingress">
-              <SkeletonChainFields rows={2} />
-            </SkeletonChainPanel>
-            <SkeletonChainPanel className="loading-skeleton-chain-client">
-              <SkeletonChainFields rows={3} />
-              <i className="loading-bar faint" />
-            </SkeletonChainPanel>
-            <SkeletonChainPanel className="loading-skeleton-chain-guard" folded />
-          </div>
-          <div className="col">
-            <SkeletonChainPanel className="loading-skeleton-chain-protocols">
-              <div className="protocol-picker">
-                {skeletonRange(4).map(protocol => (
-                  <div className="protocol-choice" key={protocol}>
-                    <i className="loading-skeleton-title-icon" />
-                    <span className="protocol-choice-copy">
-                      <i className="loading-bar title" />
-                      <i className="loading-bar faint" />
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </SkeletonChainPanel>
-            <SkeletonChainPanel className="loading-skeleton-chain-protocol-config" folded />
+    <div className="loading-skeleton-chain-detail nd-sheet nd-page">
+      <div className="loading-skeleton-detail-paper fg-sheet nd-paper">
+        <div className="loading-skeleton-detail-head nd-page-head chain-detail-head">
+          <div className="loading-skeleton-chain-identity nd-page-identity">
+            <i className="loading-skeleton-page-icon" />
+            <span>
+              <i className="loading-bar title" />
+              <i className="loading-bar subtitle" />
+            </span>
           </div>
         </div>
-        <SkeletonChainPanel className="rule-sheet-card loading-skeleton-chain-rules">
-          <SkeletonRows count={2} />
-          <div className="toolbar">
-            <i className="loading-bar faint" />
-            <span className="sp" />
-            <i className="loading-skeleton-head-action" />
+        <div className="loading-skeleton-chain-body nd-paper-body">
+          <div className="duo chain-config-grid">
+            <div className="col">
+              <div className="blk loading-skeleton-chain-probe">
+                <div className="blk-hd">
+                  <i className="loading-bar title" />
+                </div>
+                <div className="blk-bd">
+                  <i className="loading-bar value" />
+                  <i className="loading-bar" />
+                  <i className="loading-bar faint" />
+                </div>
+              </div>
+              <SkeletonChainPanel className="loading-skeleton-chain-ingress">
+                <SkeletonChainFields rows={2} />
+              </SkeletonChainPanel>
+              <SkeletonChainPanel className="loading-skeleton-chain-client">
+                <SkeletonChainFields rows={3} />
+                <i className="loading-bar faint" />
+              </SkeletonChainPanel>
+              <SkeletonChainPanel className="loading-skeleton-chain-guard" />
+            </div>
+            <div className="col">
+              <SkeletonChainPanel className="loading-skeleton-chain-protocols">
+                <div className="protocol-picker">
+                  {skeletonRange(4).map(protocol => (
+                    <div className="protocol-choice" key={protocol}>
+                      <i className="loading-skeleton-title-icon" />
+                      <span className="protocol-choice-copy">
+                        <i className="loading-bar title" />
+                        <i className="loading-bar faint" />
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </SkeletonChainPanel>
+              <SkeletonChainPanel className="loading-skeleton-chain-protocol-config" />
+            </div>
           </div>
-        </SkeletonChainPanel>
+          <SkeletonChainPanel className="rule-sheet-card loading-skeleton-chain-rules">
+            <SkeletonRows count={2} />
+            <div className="toolbar">
+              <i className="loading-bar faint" />
+              <span className="sp" />
+              <i className="loading-skeleton-head-action" />
+            </div>
+          </SkeletonChainPanel>
+        </div>
       </div>
     </div>
   );

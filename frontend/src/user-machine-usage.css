@@ -1,0 +1,493 @@
+/* 机器 × 时间：复用生产卡壳与读数，只补矩阵布局。 */
+.uxm-card {
+  container: uxm-card / inline-size;
+}
+.uxm-card > header {
+  justify-content: space-between;
+  gap: 12px;
+}
+.uxm-card > header .rut-status b {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.uxm-card > header .rut-status.warn b {
+  color: inherit;
+}
+/* 正文铺满卡片内距以外的区域，间距由共享 .panel-full-bleed-body 管理。 */
+/* 机器标识：实时卡的地区旗方牌缩小，行内与 13px 名称同高 */
+.uxm-card .nd-idplate.uxm-plate {
+  width: 20px;
+  height: 20px;
+}
+.uxm-plate .nd-idplate-clip {
+  border-radius: 6px;
+  box-shadow: none;
+}
+.uxm-plate-slot {
+  width: 20px;
+  height: 20px;
+  flex: none;
+}
+.uxm-tag {
+  flex: none;
+  margin-left: 6px;
+  color: var(--ink-4);
+  font-size: 11px;
+  font-weight: 400;
+}
+.uxm-tag.warn {
+  color: var(--gold);
+}
+.uxm-num {
+  color: var(--ink);
+  font: 500 13px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.uxm-num small {
+  margin-left: 3px;
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 400;
+}
+.uxm-pct {
+  color: var(--ink-4);
+  font: 500 11.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.uxm-idle {
+  margin: 8px 0 0;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  line-height: 16px;
+}
+.uxm-empty {
+  margin: 4px 0 2px;
+  color: var(--ink-4);
+  font-size: 12px;
+}
+/* 窄卡：合计行的范围筛选移到最上方，三档等宽（同站点流量卡的窄卡规则） */
+@container uxm-card (max-width: 620px) {
+  .uxm-card .site-usage-head > .segsw {
+    order: -1;
+    display: flex;
+    width: 100%;
+    margin-left: 0;
+  }
+  .uxm-card .site-usage-head > .segsw button {
+    flex: 1 1 0;
+  }
+  .uxm-card .site-usage-meta {
+    width: 100%;
+  }
+  .uxm-card .site-usage-meta::before {
+    display: none;
+  }
+}
+
+/* ══ B：机器 × 时间 ══ */
+.uxm-b {
+  position: relative;
+  padding: 12px var(--panel-content-x) 10px;
+}
+.uxm-mx {
+  --uxm-cols: 188px minmax(0, 1fr) 82px 46px;
+  display: grid;
+  margin-top: 2px;
+}
+.uxm-row {
+  display: grid;
+  grid-template-columns: var(--uxm-cols);
+  column-gap: 12px;
+  align-items: center;
+  min-height: 30px;
+  margin: 0 -8px;
+  padding: 0 8px;
+  border-radius: 6px;
+}
+@media (hover: hover) {
+  .uxm-row:not(.total, .axis):hover {
+    background: color-mix(in srgb, var(--ink) 4%, transparent);
+  }
+}
+.uxm-who {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.uxm-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 13px/18px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.uxm-row .uxm-tag {
+  margin-left: -2px;
+}
+.uxm-row.total {
+  align-items: end;
+  min-height: 0;
+  padding-top: 16px;
+}
+.uxm-row.total .uxm-name {
+  padding-bottom: 2px;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 400;
+}
+.uxm-row.axis {
+  align-items: start;
+  min-height: 24px;
+}
+.uxm-row.unsplit .uxm-name {
+  color: var(--ink-3);
+}
+.uxm-lane {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+/* 格带：每格之间 2px；当周按天成块，块内每小时一条、块间 4px */
+.uxm-strip {
+  display: grid;
+  height: 18px;
+  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
+  gap: 2px;
+}
+.uxm-strip.wk,
+.uxm-bars.wk {
+  display: flex;
+  gap: 4px;
+}
+.uxm-blk {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 0;
+  grid-template-columns: repeat(24, minmax(0, 1fr));
+}
+.uxm-strip.wk .uxm-blk {
+  overflow: hidden;
+  border-radius: 3px;
+}
+.uxm-cell {
+  display: block;
+  min-width: 0;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.uxm-blk .uxm-cell {
+  border-radius: 0;
+}
+/* 深浅四档按数量级分（对数刻度），单一数据色；暗、亮两档的透明度分别校验过明度单调与浅端对比度 */
+.uxm-cell.t {
+  background: color-mix(in srgb, var(--ink) 13%, transparent);
+}
+.uxm-cell.l1 {
+  background: color-mix(in srgb, var(--observe-1) 40%, transparent);
+}
+.uxm-cell.l2 {
+  background: color-mix(in srgb, var(--observe-1) 60%, transparent);
+}
+.uxm-cell.l3 {
+  background: color-mix(in srgb, var(--observe-1) 80%, transparent);
+}
+.uxm-cell.l4 {
+  background: var(--observe-1);
+}
+:root[data-theme='light'] .uxm-cell.l1 {
+  background: color-mix(in srgb, var(--observe-1) 48%, transparent);
+}
+:root[data-theme='light'] .uxm-cell.l2 {
+  background: color-mix(in srgb, var(--observe-1) 66%, transparent);
+}
+:root[data-theme='light'] .uxm-cell.l3 {
+  background: color-mix(in srgb, var(--observe-1) 83%, transparent);
+}
+/* 未按机器记录：同样四档，用墨色，与机器的数据色区分 */
+.uxm-card .uxm-cell.u.l1 {
+  background: color-mix(in srgb, var(--ink) 22%, transparent);
+}
+.uxm-card .uxm-cell.u.l2 {
+  background: color-mix(in srgb, var(--ink) 32%, transparent);
+}
+.uxm-card .uxm-cell.u.l3 {
+  background: color-mix(in srgb, var(--ink) 44%, transparent);
+}
+.uxm-card .uxm-cell.u.l4 {
+  background: color-mix(in srgb, var(--ink) 58%, transparent);
+}
+.uxm-cell.f {
+  background: none;
+}
+/* 未采集：颜色只给异常 */
+.uxm-cell.g {
+  background: color-mix(in srgb, var(--gold) 28%, transparent);
+}
+.uxm-cell.gp {
+  box-shadow: inset 0 -2px 0 var(--gold);
+}
+.uxm-cell.uxm-hot {
+  outline: 1px solid var(--ink-2);
+  outline-offset: 0;
+}
+/* 合计柱：与格带同一套列，柱从底线长出 */
+.uxm-bars {
+  position: relative;
+  display: grid;
+  height: 40px;
+  grid-template-columns: repeat(var(--n), minmax(0, 1fr));
+  align-items: end;
+  gap: 2px;
+  border-bottom: 1px solid color-mix(in srgb, var(--ink) 24%, transparent);
+}
+.uxm-bars.wk .uxm-blk {
+  height: 40px;
+  align-items: end;
+}
+.uxm-slot {
+  display: flex;
+  height: 100%;
+  min-width: 0;
+  align-items: flex-end;
+  justify-content: center;
+}
+.uxm-slot b {
+  display: block;
+  width: 100%;
+  border-radius: 2px 2px 0 0;
+  background: var(--observe-1);
+}
+.uxm-bars.wk .uxm-slot b {
+  width: calc(100% - 1px);
+  border-radius: 1px 1px 0 0;
+}
+.uxm-slot.uxm-hot b {
+  background: color-mix(in srgb, var(--observe-1) 70%, var(--ink));
+}
+.uxm-now {
+  position: absolute;
+  top: -6px;
+  bottom: -6px;
+  width: 1px;
+  margin-left: -0.5px;
+  background: var(--ink-4);
+  pointer-events: none;
+}
+.uxm-bars .uxm-now {
+  top: 0;
+  bottom: 0;
+}
+.uxm-now-label {
+  position: absolute;
+  top: -15px;
+  color: var(--ink-4);
+  font: 9.5px/12px var(--mono);
+  white-space: nowrap;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.uxm-axis {
+  position: relative;
+  display: block;
+  height: 18px;
+}
+.uxm-tick {
+  position: absolute;
+  top: 5px;
+  color: var(--ink-3);
+  font: 9.5px/12px var(--mono);
+  white-space: nowrap;
+}
+.uxm-tick::before {
+  content: '';
+  position: absolute;
+  top: -5px;
+  left: 0;
+  width: 1px;
+  height: 4px;
+  background: color-mix(in srgb, var(--ink) 24%, transparent);
+}
+/* 按小时、按天的刻度标签居中于刻度（同生产图表）；当周按天成块，标签从块首写起 */
+.uxm-tick.mid {
+  transform: translateX(-50%);
+}
+.uxm-tick.mid::before {
+  left: 50%;
+}
+.uxm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 16px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-4);
+  font-size: 11px;
+  line-height: 16px;
+}
+.uxm-scale {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+}
+.uxm-scale > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.uxm-scale .uxm-cell {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border-radius: 2px;
+}
+.uxm-scale .uxm-ramp {
+  gap: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.uxm-ramp .uxm-cell.l1 {
+  margin-left: 4px;
+}
+.uxm-ramp .uxm-cell.l4 {
+  margin-right: 4px;
+}
+/* 悬停提示：与生产图表提示框同一写法（玻璃底、细边线、8px 圆角） */
+.uxm-tip {
+  position: absolute;
+  z-index: 5;
+  min-width: 150px;
+  max-width: 280px;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--glass-strong);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
+  color: var(--ink-3);
+  font: 11px/16px var(--mono);
+  pointer-events: none;
+}
+.uxm-tip-head {
+  margin-bottom: 3px;
+  color: var(--ink-4);
+  font-size: 9.5px;
+}
+.uxm-tip-name {
+  color: var(--ink-2);
+  font: 500 12px/17px var(--sans);
+}
+.uxm-tip-value {
+  color: var(--ink);
+  font: 600 14px/20px var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+.uxm-tip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}
+.uxm-tip-row b {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.uxm-tip-row.dim,
+.uxm-tip-dim {
+  color: var(--ink-4);
+}
+.uxm-tip-warn {
+  color: var(--gold);
+}
+/* 手机：名称与读数一行，格带独占下一行 */
+.uxm-opt-b.narrow .uxm-b {
+  padding: 12px var(--panel-content-x-compact) 10px;
+}
+.uxm-opt-b.narrow .uxm-row {
+  grid-template-areas:
+    'who num pct'
+    'lane lane lane';
+  grid-template-columns: minmax(0, 1fr) auto 40px;
+  row-gap: 6px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.uxm-opt-b.narrow .uxm-row > .uxm-who {
+  grid-area: who;
+}
+.uxm-opt-b.narrow .uxm-row > .uxm-lane {
+  grid-area: lane;
+}
+.uxm-opt-b.narrow .uxm-row > .uxm-num {
+  grid-area: num;
+}
+.uxm-opt-b.narrow .uxm-row > .uxm-pct {
+  grid-area: pct;
+}
+.uxm-opt-b.narrow .uxm-row.total {
+  padding-top: 8px;
+}
+.uxm-opt-b.narrow .uxm-row.total > .uxm-lane {
+  margin-top: 14px;
+}
+.uxm-opt-b.narrow .uxm-row.axis {
+  grid-template-areas: 'lane lane lane';
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.uxm-opt-b.narrow .uxm-row.axis > span:not(.uxm-lane) {
+  display: none;
+}
+.uxm-opt-b.narrow .uxm-now {
+  top: -3px;
+  bottom: -3px;
+}
+
+/* Production cells are keyboard/touch controls, with one tab stop per row. */
+.uxm-card {
+  position: relative;
+}
+.uxm-card button.uxm-cell,
+.uxm-card button.uxm-slot {
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+.uxm-card button.uxm-slot {
+  background: none;
+  border-radius: 0;
+}
+.uxm-card button.uxm-cell:focus-visible,
+.uxm-card button.uxm-slot:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+  z-index: 1;
+}
+.uxm-card .uxm-tip {
+  pointer-events: auto;
+  width: 232px;
+}
+.uxm-card .uxm-tip p {
+  margin: 4px 0;
+}
+.uxm-card .uxm-tip .btn {
+  margin-top: 6px;
+}
+.uxm-card .uxm-idle {
+  overflow-wrap: anywhere;
+}
+.uxm-card .uxm-num {
+  font-size: 12px;
+}
+.uxm-card .uxm-mx {
+  --uxm-cols: minmax(120px, 188px) minmax(0, 1fr) 92px 46px;
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>转发 A · 产品组件隔离预览</title>
+    <style>
+      html,
+      body {
+        height: auto !important;
+        min-height: 100%;
+        overflow: auto !important;
+      }
+      #root {
+        max-width: 1120px;
+        margin: auto;
+        padding: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./forwarding-inline-preview.tsx"></script>
+  </body>
+</html>

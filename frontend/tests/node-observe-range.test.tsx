@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { NodeAgentStateItem, Whoami } from '../src/api';
 import * as route from '../src/forge/route';
@@ -137,6 +137,17 @@ const enterFrom = (fromHash: string, hash: string) =>
   window.history.replaceState({ brocadeRoute: { index: 2, scrollTop: 0, fromHash } }, '', hash);
 
 describe('machine detail observation range in the address', () => {
+  it('keeps machine detail focused on observation, configuration and rules', () => {
+    mount({ p: 'node', id: 'n1' });
+
+    const observed = screen.getByRole('tabpanel', { name: /观测/ });
+    expect(within(observed).queryByRole('region', { name: '实时流量' })).toBeNull();
+    expect(screen.getAllByRole('tab').map(tab => tab.textContent?.trim())).toEqual(['观测', '配置', '规则']);
+    expect(screen.queryByRole('tab', { name: '流量' })).toBeNull();
+    expect(screen.queryByRole('region', { name: '流入统计' })).toBeNull();
+    expect(screen.queryByRole('region', { name: '流出统计' })).toBeNull();
+  });
+
   it('shows the fixed range from the address and writes a changed range as one history entry', async () => {
     const navigateInPlace = vi.spyOn(route, 'navigateInPlace').mockReturnValue(true);
     mount({ p: 'node', id: 'n1', from: 1_700_000_000, to: 1_700_000_600 });

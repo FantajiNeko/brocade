@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -18,6 +18,8 @@ const POSTGRES_MAJOR: &str = "17";
 const POSTGRES_VERSION_NUM: u32 = 170_011;
 const ZONKY_RELEASES: &str = "https://github.com/zonkyio/embedded-postgres-binaries";
 const MAVEN_CENTRAL: &str = "https://repo.maven.apache.org/maven2/io/zonky/test/postgres";
+const MAX_POSTGRES_TXZ_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_POSTGRES_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum DatabaseChoice {
@@ -283,12 +285,87 @@ async fn prepare_engine(
         asset.artifact
     );
     let bytes = download::verified_bytes(client, &url, asset.sha256).await?;
-    postgresql_archive::extract(ZONKY_RELEASES, &bytes, &engine).await?;
+    extract_postgres_archive(&bytes, &engine)?;
     if !postgres.is_file() {
         bail!("PostgreSQL 归档解压后缺少 bin/postgres");
     }
     atomic_write_private(&marker, format!("{}\n", asset.sha256).as_bytes(), 0o600)?;
     Ok(engine)
+}
+
+fn extract_postgres_archive(bytes: &[u8], engine: &Path) -> Result<()> {
+    let mut archive =
+        zip::ZipArchive::new(io::Cursor::new(bytes)).context("PostgreSQL 外层 ZIP 归档无效")?;
+    let mut txz = None;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let path = entry
+            .enclosed_name()
+            .context("PostgreSQL ZIP 包含不安全路径")?;
+        if !entry.is_file() || path.extension().is_none_or(|extension| extension != "txz") {
+            continue;
+        }
+        if txz.is_some() {
+            bail!("PostgreSQL ZIP 必须只包含一个 txz 运行时归档");
+        }
+        if entry.size() > MAX_POSTGRES_TXZ_BYTES {
+            bail!("PostgreSQL txz 运行时归档超过大小限制");
+        }
+        let mut contents = Vec::with_capacity(entry.size().min(16 * 1024 * 1024) as usize);
+        entry
+            .take(MAX_POSTGRES_TXZ_BYTES + 1)
+            .read_to_end(&mut contents)?;
+        if contents.len() as u64 > MAX_POSTGRES_TXZ_BYTES {
+            bail!("PostgreSQL txz 运行时归档超过大小限制");
+        }
+        txz = Some(contents);
+    }
+    let txz = txz.context("PostgreSQL ZIP 缺少 txz 运行时归档")?;
+
+    ensure_private_dir(engine)?;
+    let decoder = liblzma::bufread::XzDecoder::new(io::Cursor::new(txz));
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_preserve_permissions(false);
+    archive.set_preserve_ownerships(false);
+    archive.set_unpack_xattrs(false);
+    let mut extracted_bytes = 0_u64;
+    for entry in archive.entries().context("无法读取 PostgreSQL tar 归档")? {
+        let mut entry = entry.context("PostgreSQL tar 条目无效")?;
+        let path = entry.path()?.into_owned();
+        validate_archive_relative_path(&path, "条目")?;
+
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            let target = entry.link_name()?.context("PostgreSQL tar 链接缺少目标")?;
+            validate_archive_relative_path(&target, "链接目标")?;
+        } else if !kind.is_file() && !kind.is_dir() {
+            bail!("PostgreSQL tar 包含不支持的条目类型：{}", path.display());
+        }
+
+        extracted_bytes = extracted_bytes
+            .checked_add(entry.header().size()?)
+            .context("PostgreSQL tar 解压大小溢出")?;
+        if extracted_bytes > MAX_POSTGRES_EXTRACTED_BYTES {
+            bail!("PostgreSQL tar 解压内容超过大小限制");
+        }
+        // Strip setuid/setgid/sticky and group/world-write bits while preserving executability.
+        entry.set_mask(0o7022);
+        if !entry.unpack_in(engine)? {
+            bail!("PostgreSQL tar 条目尝试逃逸目标目录：{}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_relative_path(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("PostgreSQL tar {label}不是受限相对路径：{}", path.display());
+    }
+    Ok(())
 }
 
 async fn existing_postmaster(settings: &Settings) -> Result<bool> {
@@ -518,6 +595,46 @@ fn load_or_create_password(path: &Path, initialized: bool) -> Result<String> {
 mod tests {
     use super::*;
     use crate::platform::Libc;
+    use std::io::Write;
+
+    fn postgres_test_archive(link_target: &str) -> Vec<u8> {
+        let mut txz = Vec::new();
+        {
+            let encoder = liblzma::write::XzEncoder::new(&mut txz, 6);
+            let mut archive = tar::Builder::new(encoder);
+
+            let payload = b"postgres fixture";
+            let mut file = tar::Header::new_gnu();
+            file.set_size(payload.len() as u64);
+            file.set_mode(0o6777);
+            file.set_cksum();
+            archive
+                .append_data(&mut file, "bin/postgres.real", payload.as_slice())
+                .unwrap();
+
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            link.set_cksum();
+            archive
+                .append_link(&mut link, "bin/postgres", link_target)
+                .unwrap();
+
+            archive.into_inner().unwrap().finish().unwrap();
+        }
+
+        let cursor = io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(cursor);
+        archive
+            .start_file(
+                "postgres-linux-fixture.txz",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(&txz).unwrap();
+        archive.finish().unwrap().into_inner()
+    }
 
     #[test]
     fn database_selection_never_falls_back_from_explicit_external_configuration() {
@@ -562,5 +679,53 @@ mod tests {
         assert!(validate_cluster_files(None, true, false).is_err());
         assert!(validate_cluster_files(Some("ready 123\n"), true, true).is_ok());
         assert!(ensure_current_user_record().is_ok());
+    }
+
+    #[test]
+    fn postgres_archive_paths_cannot_escape_the_engine_directory() {
+        assert!(validate_archive_relative_path(Path::new("bin/postgres"), "条目").is_ok());
+        assert!(validate_archive_relative_path(Path::new("libpq.so.5.17"), "链接目标").is_ok());
+        for path in [
+            "",
+            ".",
+            "./bin/postgres",
+            "../escape",
+            "lib/../escape",
+            "/escape",
+        ] {
+            assert!(validate_archive_relative_path(Path::new(path), "条目").is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn postgres_archive_extraction_preserves_safe_links_and_strips_privileged_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let engine = root.path().join("engine");
+        extract_postgres_archive(&postgres_test_archive("postgres.real"), &engine).unwrap();
+
+        assert_eq!(
+            fs::read(engine.join("bin/postgres")).unwrap(),
+            b"postgres fixture"
+        );
+        assert_eq!(
+            fs::read_link(engine.join("bin/postgres")).unwrap(),
+            Path::new("postgres.real")
+        );
+        let mode = fs::metadata(engine.join("bin/postgres.real"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn postgres_archive_extraction_rejects_escaping_link_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = root.path().join("engine");
+        assert!(extract_postgres_archive(&postgres_test_archive("../../escape"), &engine).is_err());
+        assert!(!root.path().join("escape").exists());
     }
 }

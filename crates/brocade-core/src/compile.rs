@@ -133,6 +133,15 @@ impl CompileOutput {
         Ok(node::project_node(&self.system, &apps, node_id))
     }
 
+    /// The grants-only projection keeps the same publishability gate as a full node projection.
+    pub fn project_grants(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<node::GrantSyncPlan>, PublishBlocked> {
+        self.ensure_publishable()?;
+        Ok(node::project_grants(&self.apps, node_id))
+    }
+
     pub fn project_user(&self, tenant: &str, user_id: &str) -> Result<UserPlan, PublishBlocked> {
         self.ensure_publishable()?;
         let apps = user::scope_user_apps(&self.apps, tenant, user_id);

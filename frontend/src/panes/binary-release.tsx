@@ -11,6 +11,8 @@ import {
   type BinaryReleaseTargetStatus,
   type BinaryReleaseView,
   type BinaryComponent,
+  type XrayReleaseStrategy,
+  XRAY_HANDOFF_PROTOCOL_VERSION,
 } from '../api';
 import { Confirm, ErrorBox } from '../ui/bits';
 import { randomKey } from '../ui/platform';
@@ -34,7 +36,7 @@ import {
 const agentHash = (node: NodeAgentStateItem) => node.agent_version?.replace(/^brocade-agent\//, '') ?? null;
 const runningHash = (node: NodeAgentStateItem, component: BinaryComponent) =>
   component === 'agent' ? agentHash(node) : node.runtime_versions?.xray_running_sha256;
-function eligible(node: NodeAgentStateItem, component: BinaryComponent) {
+function baseEligible(node: NodeAgentStateItem, component: BinaryComponent) {
   if (component === 'agent')
     return node.lifecycle_phase === 'active' && node.desired_poll_fresh && /^[0-9a-f]{64}$/.test(agentHash(node) ?? '');
   const installed = node.runtime_versions?.xray_installed_sha256;
@@ -48,7 +50,19 @@ function eligible(node: NodeAgentStateItem, component: BinaryComponent) {
   );
 }
 
-function unavailableReason(node: NodeAgentStateItem, component: BinaryComponent) {
+function handoffReady(node: NodeAgentStateItem) {
+  return (
+    node.agent_protocol_version != null &&
+    node.agent_protocol_version >= XRAY_HANDOFF_PROTOCOL_VERSION &&
+    node.runtime_versions?.xray_handoff?.state === 'ready'
+  );
+}
+
+function eligible(node: NodeAgentStateItem, component: BinaryComponent, strategy: XrayReleaseStrategy) {
+  return baseEligible(node, component) && (component !== 'xray' || strategy === 'restart' || handoffReady(node));
+}
+
+function unavailableReason(node: NodeAgentStateItem, component: BinaryComponent, strategy: XrayReleaseStrategy) {
   if (node.lifecycle_phase !== 'active') return '机器不在 active 生命周期';
   if (!node.desired_poll_fresh) return '最近 90 秒没有领取期望状态';
   if (component === 'agent') return /^[0-9a-f]{64}$/.test(agentHash(node) ?? '') ? '' : '还没有上报有效的 Agent 摘要';
@@ -58,6 +72,9 @@ function unavailableReason(node: NodeAgentStateItem, component: BinaryComponent)
   if (!installed) return '还没上报 Xray 摘要；先发布支持该能力的 Agent';
   if (!running) return 'Xray 当前未运行';
   if (running !== installed) return '运行中 Xray 与受管路径不一致；先完成本地收敛';
+  if (strategy !== 'restart' && !handoffReady(node)) {
+    return node.runtime_versions?.xray_handoff?.reason || 'Agent 尚未确认运行中的 Xray 可平滑交接';
+  }
   return '';
 }
 
@@ -96,6 +113,9 @@ export function useBinaryRelease(component: BinaryComponent) {
   const [picked, setSelected] = useState<string[]>([]);
   const [idempotencyKey, setIdempotencyKey] = useState(randomKey);
   const [askCancel, setAskCancel] = useState(false);
+  const [askCreate, setAskCreate] = useState(false);
+  const [xrayStrategy, setXrayStrategy] = useState<Exclude<XrayReleaseStrategy, 'handoff'>>('restart');
+  const [xrayDrainTimeoutSecs, setXrayDrainTimeoutSecs] = useState(120);
 
   const view = releases.data;
   const fleet = nodes.data?.nodes ?? [];
@@ -103,10 +123,10 @@ export function useBinaryRelease(component: BinaryComponent) {
   const active = latest?.active ? latest : undefined;
   const onThisBuild = (node: NodeAgentStateItem) =>
     !!view &&
-    eligible(node, component) &&
+    baseEligible(node, component) &&
     view.available.artifacts.some(artifact => artifact.sha256 === runningHash(node, component));
   const stateOf = (node: NodeAgentStateItem): BinaryState =>
-    onThisBuild(node) ? 'current' : eligible(node, component) ? 'behind' : 'blocked';
+    onThisBuild(node) ? 'current' : eligible(node, component, xrayStrategy) ? 'behind' : 'blocked';
   const targets = new Map((active?.targets ?? []).map(target => [target.node_id, target]));
   const states = fleet.map(node => ({ node, state: stateOf(node), target: targets.get(node.node_id) }));
   const outside = states.filter(item => !item.target);
@@ -133,8 +153,15 @@ export function useBinaryRelease(component: BinaryComponent) {
         build_id: releases.data!.available.build_id,
         nodes: selected,
         note: null,
+        ...(component === 'xray'
+          ? {
+              xray_strategy: xrayStrategy,
+              ...(xrayStrategy === 'restart' ? {} : { xray_drain_timeout_secs: xrayDrainTimeoutSecs }),
+            }
+          : {}),
       }),
     onSuccess: async view => {
+      setAskCreate(false);
       await accept(view);
       setSelected([]);
       setIdempotencyKey(randomKey());
@@ -169,6 +196,12 @@ export function useBinaryRelease(component: BinaryComponent) {
     setSelected,
     askCancel,
     setAskCancel,
+    askCreate,
+    setAskCreate,
+    xrayStrategy,
+    setXrayStrategy,
+    xrayDrainTimeoutSecs,
+    setXrayDrainTimeoutSecs,
     create,
     cancel,
     retry,
@@ -235,7 +268,7 @@ export function BinaryReleaseTab({
       status: status[state].text,
       current: versionOf(node),
       target: state === 'behind' ? target : null,
-      reason: state === 'blocked' ? unavailableReason(node, release.component) || null : null,
+      reason: state === 'blocked' ? unavailableReason(node, release.component, release.xrayStrategy) || null : null,
       pick: {
         checked: selected.includes(node.node_id),
         disabled: !editable || busy || state !== 'behind',
@@ -259,6 +292,9 @@ export function BinaryReleaseTab({
 
   const facts: [string, ReactNode][] = [
     ['可发版本', <span className="cgc-mono">{target}</span>],
+    ...(release.component === 'xray' && active
+      ? ([['执行策略', xrayStrategyLabel(active.xray_strategy)]] as [string, ReactNode][])
+      : []),
     active
       ? ['不可升级', `${release.counts.blocked} 台`]
       : [
@@ -275,12 +311,25 @@ export function BinaryReleaseTab({
   if (active) {
     const tally = (...statuses: BinaryReleaseTargetStatus[]) =>
       active.targets.filter(item => statuses.includes(item.status)).length;
+    const forcedRetirement = active.targets.filter(
+      item => item.status === 'succeeded' && item.reported_forced_retirement === true,
+    ).length;
+    const recoveredAfterDirty = active.targets.filter(
+      item =>
+        item.status === 'succeeded' && item.recovered_after_dirty === true && item.reported_forced_retirement !== true,
+    ).length;
+    const ordinarySucceeded = tally('succeeded') - forcedRetirement - recoveredAfterDirty;
     const failed = tally('unverified', 'failed-recovered', 'failed-dirty');
+    const timedOut = active.targets.filter(item => item.status === 'dispatched' && item.execution_timed_out).length;
+    const running = tally('dispatched') - timedOut;
     const pending = tally('pending');
     const skipped = tally('unsupported', 'canceled');
     const parts: LedgerPart[] = [
-      { tone: 'ok', label: '本次已升级', count: tally('succeeded') },
-      { tone: 'run', label: '升级中', count: tally('dispatched') },
+      ...(ordinarySucceeded ? [{ tone: 'ok' as const, label: '本次已升级', count: ordinarySucceeded }] : []),
+      ...(recoveredAfterDirty ? [{ tone: 'ok' as const, label: '自动恢复完成', count: recoveredAfterDirty }] : []),
+      ...(forcedRetirement ? [{ tone: 'warn' as const, label: '强制退役完成', count: forcedRetirement }] : []),
+      { tone: 'run', label: '升级中', count: running },
+      ...(timedOut ? [{ tone: 'warn' as const, label: '整体执行超时', count: timedOut }] : []),
       ...(pending ? [{ tone: 'run' as const, label: '待升级', count: pending }] : []),
       ...(failed ? [{ tone: 'err' as const, label: '失败', count: failed }] : []),
       ...(skipped ? [{ tone: 'none' as const, label: '未执行', count: skipped }] : []),
@@ -320,6 +369,13 @@ export function BinaryReleaseTab({
     release.create.reset();
     onEditingChange(false);
   };
+  const approve = () => {
+    if (release.component === 'xray') {
+      release.setAskCreate(true);
+      return;
+    }
+    release.create.mutate(undefined, { onSuccess: () => onEditingChange(false) });
+  };
   const mutationError = release.create.error ?? release.cancel.error ?? release.retry.error;
 
   return (
@@ -350,10 +406,52 @@ export function BinaryReleaseTab({
               note={
                 release.component === 'agent'
                   ? '批准时冻结本次机器名单。Agent 下载校验、重启后恢复轮询和运行上报，才确认成功。'
-                  : '批准时冻结本次机器名单。Xray 替换后验证监听与运行摘要；启动失败时恢复原版本。'
+                  : xrayStrategyDescription(release.xrayStrategy)
               }
               error={release.create.error ? <ErrorBox error={release.create.error} /> : undefined}
             >
+              {release.component === 'xray' && (
+                <div className="cgc-strategy" role="radiogroup" aria-label="Xray 升级策略">
+                  {(
+                    [
+                      ['restart', '直接重启'],
+                      ['handoff-force', '双跑交接 Beta'],
+                    ] as const
+                  ).map(([value, text]) => (
+                    <label key={value} title={xrayStrategyDescription(value)}>
+                      <input
+                        type="radio"
+                        name="xray-release-strategy"
+                        value={value}
+                        checked={release.xrayStrategy === value}
+                        disabled={busy}
+                        onChange={() => release.setXrayStrategy(value)}
+                      />
+                      <span>{text}</span>
+                    </label>
+                  ))}
+                  {release.xrayStrategy !== 'restart' && (
+                    <label className="cgc-drain-timeout">
+                      <span>等待</span>
+                      <input
+                        type="number"
+                        min={10}
+                        max={86_400}
+                        step={10}
+                        aria-label="旧进程排空等待秒数"
+                        value={release.xrayDrainTimeoutSecs}
+                        disabled={busy}
+                        onChange={event =>
+                          release.setXrayDrainTimeoutSecs(
+                            Math.min(86_400, Math.max(10, Number(event.currentTarget.value) || 10)),
+                          )
+                        }
+                      />
+                      <span>秒</span>
+                    </label>
+                  )}
+                </div>
+              )}
               <span className="cgc-picked">
                 {selected.length ? `已选 ${selected.length} 台` : '勾选下方可升级的机器'}
               </span>
@@ -365,7 +463,7 @@ export function BinaryReleaseTab({
                 className={selected.length ? 'btn primary' : 'btn'}
                 type="button"
                 disabled={!editable || selected.length === 0 || busy}
-                onClick={() => release.create.mutate(undefined, { onSuccess: () => onEditingChange(false) })}
+                onClick={approve}
               >
                 {release.create.isPending ? '批准中…' : '批准'}
               </button>
@@ -393,8 +491,39 @@ export function BinaryReleaseTab({
           onCancel={() => release.setAskCancel(false)}
         />
       )}
+      {release.askCreate && release.component === 'xray' && (
+        <Confirm
+          title={release.xrayStrategy === 'restart' ? '确认直接重启 Xray？' : '确认允许超时后强制退役？'}
+          body={
+            release.xrayStrategy === 'restart' ? (
+              <>直接重启会立即中断这批机器上的现有 Xray 连接；该选择会写入发布审计。</>
+            ) : (
+              <>
+                新 Xray 接管后，旧连接最多保留 {release.xrayDrainTimeoutSecs}{' '}
+                秒；到期后会结束旧进程并中断剩余连接，新连接继续由新实例接入。
+              </>
+            )
+          }
+          confirmLabel="确认破坏性升级"
+          confirmDisabled={release.create.isPending}
+          onConfirm={() => release.create.mutate(undefined, { onSuccess: () => onEditingChange(false) })}
+          onCancel={() => release.setAskCreate(false)}
+        />
+      )}
     </>
   );
+}
+
+function xrayStrategyLabel(strategy: XrayReleaseStrategy | null | undefined) {
+  // 历史发布仍按批准时冻结的策略显示；新建发布不再提供普通 handoff。
+  if (strategy === 'handoff') return '平滑交接';
+  if (strategy === 'handoff-force') return '双跑交接 Beta';
+  return '直接重启';
+}
+
+function xrayStrategyDescription(strategy: Exclude<XrayReleaseStrategy, 'handoff'>) {
+  if (strategy === 'handoff-force') return 'Beta：新实例先接管；旧连接到期后强制结束';
+  return '停止旧进程再启动新版本，现有连接会中断';
 }
 
 /** 本次升级里的一台：状态取自升级记录，失败原因写在机器名下，可重试的给重试按钮。 */
@@ -406,18 +535,60 @@ function targetRow(
   release: BinaryRelease,
   editable: boolean,
 ): MachineRow {
-  const status = BINARY_TARGET_STATUS[target.status];
+  const overallTimedOut = target.status === 'dispatched' && target.execution_timed_out === true;
+  const forcedRetirement = target.status === 'succeeded' && target.reported_forced_retirement === true;
+  const recoveredAfterDirty = target.status === 'succeeded' && target.recovered_after_dirty === true;
+  const status = forcedRetirement
+    ? { tone: 'warn' as const, text: '强制退役完成' }
+    : recoveredAfterDirty
+      ? { tone: 'ok' as const, text: '自动恢复完成' }
+      : overallTimedOut
+        ? { tone: 'warn' as const, text: '整体执行超时' }
+        : BINARY_TARGET_STATUS[target.status];
+  const reportedUpgrade = node.xray_upgrade;
+  const runtime =
+    release.component === 'xray' &&
+    reportedUpgrade != null &&
+    reportedUpgrade.release_id === release.active?.id &&
+    reportedUpgrade.attempt === target.attempt
+      ? reportedUpgrade
+      : null;
+  const runtimeText = runtime
+    ? [
+        `阶段 ${runtime.phase}`,
+        `旧 PID ${runtime.old.pid}${runtime.old.alive ? '' : '（已退出）'}`,
+        runtime.candidate
+          ? `新 PID ${runtime.candidate.pid}${runtime.candidate.alive ? '' : '（已退出）'}`
+          : '新 PID 尚未启动',
+        runtime.old.active_connections == null ? null : `旧连接 ${runtime.old.active_connections}`,
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    : null;
+  const timeoutText = overallTimedOut
+    ? `超过 1 小时仍未收到终态回执${
+        target.execution_deadline_at ? `（截止 ${stamp(target.execution_deadline_at)}）` : ''
+      }；不会自动终止 Xray`
+    : null;
+  const completionText = forcedRetirement
+    ? '旧进程未在等待期内自然排空，已按本次明确授权强制退役'
+    : recoveredAfterDirty
+      ? '本次曾进入需处理状态，Agent 随后完成本地恢复并确认目标版本正常运行'
+      : null;
+  const detail =
+    [completionText, timeoutText, runtime?.blocked_reason ?? runtimeText].filter(Boolean).join(' · ') || null;
   return {
     node,
     tone: status.tone,
     status: status.text,
     current: target.status === 'succeeded' ? version : current,
-    target: status.tone === 'run' || status.tone === 'err' ? version : null,
+    target: target.status === 'dispatched' || status.tone === 'err' ? version : null,
     reason:
       target.error ??
+      detail ??
       (target.verification === 'observed' ? '兼容升级：已观测到目标进程恢复，旧 Agent 没有执行回执' : null),
     action:
-      target.retryable && release.active && release.active.build_id === release.view?.available.build_id ? (
+      target.retryable && !runtime && release.active && release.active.build_id === release.view?.available.build_id ? (
         <button
           className="btn cgc-retry"
           type="button"

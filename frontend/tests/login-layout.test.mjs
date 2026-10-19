@@ -19,6 +19,11 @@ test('登录、初始化与直达登录共用分栏版式', () => {
   assert.match(login, /<svg className="login-routes" viewBox="0 0 440 300" aria-hidden="true">/);
 });
 
+test('品牌标语使用常规字重', () => {
+  const tagline = rule('.login-tagline');
+  assert.match(tagline, /font-weight:\s*400;/);
+});
+
 test('访客模式排在登录按钮之下，且不会提交登录表单', () => {
   const form = login.slice(
     login.indexOf('export function PasswordLogin'),

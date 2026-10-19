@@ -9,7 +9,8 @@ use brocade_deployment::protocol::{
 };
 use brocade_store::{
     AdminContext, CreateAppRequest, CreateChainRequest, CreateTenantRequest, ModelOp, PgStore,
-    PutStepRequest, RequestVpngatePoolSwitch, UpdateVpngateIntelligenceCredentials,
+    PutStepRequest, RequestVpngatePoolSwitch, UpdateVpngateCatalogNode,
+    UpdateVpngateCatalogSettings, UpdateVpngateIntelligenceCredentials,
     UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode, UpdateVpngateProbeSettings,
     UpsertExternalOutboundRequest, VpngateDirectoryFilter, VpngateIntelligenceCredentialUpdateMode,
     VpngateIntelligencePolicy, VpngateIntelligenceRefreshMode, VpngateManualSwitchResult,
@@ -140,6 +141,104 @@ fn vpngate_outbound(id: &str, country_code: &str) -> UpsertExternalOutboundReque
     }
 }
 
+async fn enable_vpngate(store: &PgStore, admin: &AdminContext) {
+    store
+        .update_vpngate_catalog_settings(
+            admin,
+            UpdateVpngateCatalogSettings {
+                enabled: true,
+                interval_secs: 900,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn compatibility_script_splits_legacy_workers_and_turns_vpngate_off() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let admin = AdminContext::system_admin("vpngate-compat-test");
+    db.store
+        .create_tenant(
+            &admin,
+            CreateTenantRequest {
+                id: "platform.compat".to_owned(),
+                name: "Compatibility".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO nodes
+            (id, tenant_id, name, overlay_addr, wg_private_key, wg_public_key,
+             wg_listen_port, egress_allowed, dns_kind)
+         VALUES ('compat-worker', 'platform.compat', 'Compat', '10.88.0.90',
+                 'private-compat', 'public-compat', 51820, TRUE, 'system');
+         DROP TABLE vpngate_intelligence_nodes;
+         ALTER TABLE vpngate_catalog_nodes RENAME TO vpngate_intelligence_nodes;
+         ALTER TABLE vpngate_intelligence_nodes
+             RENAME CONSTRAINT vpngate_catalog_nodes_pkey TO vpngate_intelligence_nodes_pkey;
+         ALTER TABLE vpngate_intelligence_nodes
+             RENAME CONSTRAINT vpngate_catalog_nodes_node_fkey TO vpngate_intelligence_nodes_node_fkey;
+         ALTER TABLE vpngate_intelligence_nodes
+             RENAME CONSTRAINT vpngate_catalog_nodes_selected_by_shape TO vpngate_intelligence_nodes_selected_by_shape;
+         ALTER TABLE vpngate_intelligence_nodes
+             RENAME CONSTRAINT vpngate_catalog_nodes_generation_nonnegative TO vpngate_intel_nodes_catalogue_generation_nonnegative;
+         ALTER TABLE vpngate_intelligence_nodes
+             RENAME CONSTRAINT vpngate_catalog_nodes_lease_coherent TO vpngate_intel_nodes_catalogue_lease_coherent;
+         ALTER TABLE vpngate_intelligence_nodes
+             RENAME CONSTRAINT vpngate_catalog_nodes_active_run_fkey TO vpngate_intel_nodes_catalogue_active_run_fkey;
+         ALTER TABLE vpngate_intelligence_nodes
+             RENAME CONSTRAINT vpngate_catalog_nodes_success_run_fkey TO vpngate_intel_nodes_catalogue_success_run_fkey;
+         INSERT INTO vpngate_intelligence_nodes (node_id, selected_by)
+         VALUES ('compat-worker', 'legacy-operator');
+         ALTER TABLE vpngate_catalog_state ALTER COLUMN enabled SET DEFAULT true;
+         UPDATE vpngate_catalog_state SET enabled = true WHERE id = TRUE;",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let compatibility = include_str!("../../../scripts/compat-vpngate-worker-sets.sql")
+        .lines()
+        .filter(|line| !line.starts_with("\\set"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("SET LOCAL ROLE :\"app_role\";", "SET LOCAL ROLE postgres;");
+    sqlx::raw_sql(&compatibility)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let rows: (bool, bool, bool) = sqlx::query_as(
+        "SELECT NOT enabled,
+                EXISTS (SELECT 1 FROM vpngate_catalog_nodes WHERE node_id = 'compat-worker'),
+                EXISTS (SELECT 1 FROM vpngate_intelligence_nodes WHERE node_id = 'compat-worker')
+           FROM vpngate_catalog_state
+          WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, (true, true, true));
+    let default: String = sqlx::query_scalar(
+        "SELECT column_default
+           FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'vpngate_catalog_state'
+            AND column_name = 'enabled'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(default, "false");
+}
+
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn intelligence_due_index_serves_new_and_expired_leases() {
@@ -148,6 +247,7 @@ async fn intelligence_due_index_serves_new_and_expired_leases() {
     };
     db.store.migrate().await.unwrap();
     let admin = AdminContext::system_admin("intelligence-index-test");
+    enable_vpngate(&db.store, &admin).await;
     db.store
         .create_tenant(
             &admin,
@@ -552,6 +652,9 @@ async fn completed_catalogue_leases_reject_replayed_results_without_null_decode_
     };
     db.store.migrate().await.unwrap();
 
+    let admin = AdminContext::system_admin("vpngate-replayed-result-test");
+    enable_vpngate(&db.store, &admin).await;
+
     let global_claim = db
         .store
         .claim_vpngate_sync("legacy-replay-worker", "startup")
@@ -585,7 +688,6 @@ async fn completed_catalogue_leases_reject_replayed_results_without_null_decode_
         Err(brocade_store::StoreError::Conflict(_))
     ));
 
-    let admin = AdminContext::system_admin("vpngate-replayed-result-test");
     db.store
         .create_tenant(
             &admin,
@@ -617,10 +719,10 @@ async fn completed_catalogue_leases_reject_replayed_results_without_null_decode_
     .await
     .unwrap();
     db.store
-        .update_vpngate_intelligence_node(
+        .update_vpngate_catalog_node(
             &admin,
             "replay-collector",
-            UpdateVpngateIntelligenceNode { enabled: true },
+            UpdateVpngateCatalogNode { enabled: true },
         )
         .await
         .unwrap();
@@ -667,6 +769,7 @@ async fn selected_agents_merge_origin_catalogues_but_compete_for_one_ip_intellig
     };
     db.store.migrate().await.unwrap();
     let admin = AdminContext::system_admin("vpngate-intelligence-test");
+    enable_vpngate(&db.store, &admin).await;
     let mut policy = VpngateAdmissionPolicy {
         minimum_successful_sources: 2,
         country_policy: VpngateCountryPolicy::Ignore,
@@ -722,14 +825,19 @@ async fn selected_agents_merge_origin_catalogues_but_compete_for_one_ip_intellig
     .unwrap();
     for node_id in ["intel-a", "intel-b"] {
         db.store
-            .update_vpngate_intelligence_node(
+            .update_vpngate_catalog_node(
                 &admin,
                 node_id,
-                UpdateVpngateIntelligenceNode { enabled: true },
+                UpdateVpngateCatalogNode { enabled: true },
             )
             .await
             .unwrap();
     }
+    let catalogue_only = db.store.list_node_agent_states(&admin).await.unwrap();
+    assert!(catalogue_only
+        .nodes
+        .iter()
+        .all(|node| { node.vpngate_catalog_enabled && !node.vpngate_intelligence_enabled }));
 
     let catalogue_a = db
         .store
@@ -792,7 +900,7 @@ async fn selected_agents_merge_origin_catalogues_but_compete_for_one_ip_intellig
     .await
     .unwrap();
     sqlx::query(
-        "UPDATE vpngate_intelligence_nodes
+        "UPDATE vpngate_catalog_nodes
             SET catalogue_next_sync_at = now()
           WHERE node_id = 'intel-a'",
     )
@@ -856,7 +964,7 @@ async fn selected_agents_merge_origin_catalogues_but_compete_for_one_ip_intellig
     );
 
     sqlx::query(
-        "UPDATE vpngate_intelligence_nodes
+        "UPDATE vpngate_catalog_nodes
             SET catalogue_next_sync_at = now()
           WHERE node_id = 'intel-a'",
     )
@@ -881,7 +989,7 @@ async fn selected_agents_merge_origin_catalogues_but_compete_for_one_ip_intellig
     assert_eq!(after_failure, current_ids);
     let collector_error = sqlx::query_as::<_, (Option<String>, Option<String>)>(
         "SELECT catalogue_last_error_code, catalogue_last_error_detail
-           FROM vpngate_intelligence_nodes
+           FROM vpngate_catalog_nodes
           WHERE node_id = 'intel-a'",
     )
     .fetch_one(db.pool())
@@ -931,6 +1039,45 @@ async fn selected_agents_merge_origin_catalogues_but_compete_for_one_ip_intellig
         .execute(db.pool())
         .await
         .unwrap();
+
+    assert!(db
+        .store
+        .claim_vpngate_exit_intelligence("intel-a")
+        .await
+        .unwrap()
+        .is_none());
+    for node_id in ["intel-a", "intel-b"] {
+        db.store
+            .update_vpngate_intelligence_node(
+                &admin,
+                node_id,
+                UpdateVpngateIntelligenceNode { enabled: true },
+            )
+            .await
+            .unwrap();
+    }
+    db.store
+        .update_vpngate_catalog_node(
+            &admin,
+            "intel-b",
+            UpdateVpngateCatalogNode { enabled: false },
+        )
+        .await
+        .unwrap();
+    let split_sets = db.store.list_node_agent_states(&admin).await.unwrap();
+    let intel_b = split_sets
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "intel-b")
+        .unwrap();
+    assert!(!intel_b.vpngate_catalog_enabled);
+    assert!(intel_b.vpngate_intelligence_enabled);
+    assert!(db
+        .store
+        .claim_vpngate_catalog_sync("intel-b")
+        .await
+        .unwrap()
+        .is_none());
 
     let claim = db
         .store
@@ -1133,13 +1280,18 @@ async fn proxycheck_keys_are_sealed_random_start_round_robined_and_legacy_values
     };
     db.store.migrate().await.unwrap();
     let admin = AdminContext::system_admin("vpngate-credentials-test");
-    assert!(
-        !db.store
-            .vpngate_overview()
-            .await
-            .unwrap()
-            .intelligence_credentials
-            .proxycheck_api_key_configured
+    enable_vpngate(&db.store, &admin).await;
+    let empty = db
+        .store
+        .vpngate_overview()
+        .await
+        .unwrap()
+        .intelligence_credentials;
+    assert!(!empty.proxycheck_api_key_configured);
+    assert_eq!(empty.proxycheck_api_keys_masked, Some(Vec::new()));
+    assert_eq!(
+        serde_json::to_value(&empty).unwrap(),
+        serde_json::json!({ "proxycheck_api_key_configured": false, "proxycheck_api_keys_masked": [] })
     );
     assert!(db
         .store
@@ -1166,6 +1318,20 @@ async fn proxycheck_keys_are_sealed_random_start_round_robined_and_legacy_values
     .execute(db.pool())
     .await
     .unwrap();
+
+    let legacy_summary = db
+        .store
+        .vpngate_overview()
+        .await
+        .unwrap()
+        .intelligence_credentials;
+    assert_eq!(
+        legacy_summary.proxycheck_api_keys_masked.as_deref(),
+        Some(["000000-******-******-333333".to_owned()].as_slice())
+    );
+    assert!(!serde_json::to_string(&legacy_summary)
+        .unwrap()
+        .contains(legacy_key));
 
     db.store
         .create_tenant(
@@ -1237,6 +1403,22 @@ async fn proxycheck_keys_are_sealed_random_start_round_robined_and_legacy_values
         .await
         .unwrap();
     assert!(credentials.proxycheck_api_key_configured);
+    let expected_masked = vec![
+        "111111-******-******-444444".to_owned(),
+        "aaaaaa-******-******-dddddd".to_owned(),
+    ];
+    assert_eq!(
+        credentials.proxycheck_api_keys_masked.as_ref(),
+        Some(&expected_masked)
+    );
+    assert_eq!(
+        db.store
+            .vpngate_overview()
+            .await
+            .unwrap()
+            .intelligence_credentials,
+        credentials
+    );
     let sealed: String = sqlx::query_scalar(
         "SELECT proxycheck_api_key_sealed FROM vpngate_catalog_state WHERE id = TRUE",
     )
@@ -1265,7 +1447,8 @@ async fn proxycheck_keys_are_sealed_random_start_round_robined_and_legacy_values
     assert_eq!(claimed_keys, expected_keys);
 
     let appended_key = "zzzzzz-yyyyyy-xxxxxx-wwwwww";
-    db.store
+    let appended = db
+        .store
         .update_vpngate_intelligence_credentials(
             &admin,
             UpdateVpngateIntelligenceCredentials {
@@ -1275,6 +1458,22 @@ async fn proxycheck_keys_are_sealed_random_start_round_robined_and_legacy_values
         )
         .await
         .unwrap();
+    assert_eq!(
+        appended.proxycheck_api_keys_masked,
+        Some(vec![
+            "111111-******-******-444444".to_owned(),
+            "aaaaaa-******-******-dddddd".to_owned(),
+            "zzzzzz-******-******-wwwwww".to_owned(),
+        ])
+    );
+    assert_eq!(
+        db.store
+            .vpngate_overview()
+            .await
+            .unwrap()
+            .intelligence_credentials,
+        appended
+    );
     sqlx::query(
         "INSERT INTO vpngate_exit_reputations (exit_ip, next_check_at, last_seen_at)
          VALUES ('192.0.2.47', now(), now()),
@@ -1308,6 +1507,35 @@ async fn proxycheck_keys_are_sealed_random_start_round_robined_and_legacy_values
         .collect::<Vec<_>>();
     expected_appended_keys.sort();
     assert_eq!(appended_claim_keys, expected_appended_keys);
+
+    // The older JSON-array pool remains readable without rewriting its ciphertext on a GET.
+    let legacy_pool = brocade_store::secrets::seal(
+        brocade_store::secrets::CTX_PROXYCHECK_API_KEY,
+        &serde_json::to_string(&replacements).unwrap(),
+    )
+    .unwrap();
+    sqlx::query("UPDATE vpngate_catalog_state SET proxycheck_api_key_sealed = $1 WHERE id = TRUE")
+        .bind(&legacy_pool)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let legacy_pool_summary = db
+        .store
+        .vpngate_overview()
+        .await
+        .unwrap()
+        .intelligence_credentials;
+    assert_eq!(
+        legacy_pool_summary.proxycheck_api_keys_masked,
+        Some(expected_masked)
+    );
+    let stored: String = sqlx::query_scalar(
+        "SELECT proxycheck_api_key_sealed FROM vpngate_catalog_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, legacy_pool);
 }
 
 #[tokio::test]
@@ -1317,6 +1545,8 @@ async fn country_view_returns_the_complete_retained_directory() {
         return;
     };
     db.store.migrate().await.unwrap();
+    let admin = AdminContext::system_admin("vpngate-country-view-test");
+    enable_vpngate(&db.store, &admin).await;
     let claim = db
         .store
         .claim_vpngate_sync("complete-country-view", "startup")
@@ -1417,6 +1647,7 @@ async fn probe_report_survives_a_concurrent_catalogue_identity_change() {
     };
     db.store.migrate().await.unwrap();
     let admin = AdminContext::system_admin("vpngate-probe-race-test");
+    enable_vpngate(&db.store, &admin).await;
     db.store
         .create_tenant(
             &admin,
@@ -1555,6 +1786,7 @@ async fn same_region_probe_nodes_partition_one_resilient_queue() {
     };
     db.store.migrate().await.unwrap();
     let admin = AdminContext::system_admin("vpngate-shared-probe-test");
+    enable_vpngate(&db.store, &admin).await;
     db.store
         .create_tenant(
             &admin,
@@ -2099,6 +2331,10 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
     ));
     let initial = db.store.vpngate_overview().await.unwrap();
     assert!(initial.manual_pools_supported);
+    assert!(
+        !initial.status.enabled,
+        "fresh installs keep VPN Gate background work off"
+    );
     assert_eq!(initial.status.current_servers, 0);
     assert!(initial.sync_history.is_empty());
     assert!(db
@@ -2107,6 +2343,7 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         .await
         .unwrap()
         .is_empty());
+    enable_vpngate(&db.store, &admin).await;
 
     let first = db
         .store
@@ -2260,6 +2497,12 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         .await
         .unwrap();
     assert!(intelligence_selection.enabled);
+    let catalogue_selection = db
+        .store
+        .update_vpngate_catalog_node(&admin, "edge", UpdateVpngateCatalogNode { enabled: true })
+        .await
+        .unwrap();
+    assert!(catalogue_selection.enabled);
     let desired = db
         .store
         .vpngate_agent_desired("edge")
@@ -2470,6 +2713,135 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         ranked_desired.pools[0].candidates[1].verified_ip_scores,
         scores(60)
     );
+
+    // The settings switch pauses every background producer without withdrawing already-published
+    // VPN Gate pools. Cached evidence is frozen while paused so an automatic Chain does not lose
+    // its relays merely because the normal probe/intelligence freshness windows elapse.
+    db.store
+        .update_vpngate_catalog_settings(
+            &admin,
+            UpdateVpngateCatalogSettings {
+                enabled: false,
+                interval_secs: 900,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_latest
+            SET last_success_received_at = now() - interval '30 days'
+          WHERE country_code = 'JP'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE vpngate_exit_reputations
+            SET verified_at = now() - interval '30 days',
+                next_check_at = now(), lease_owner = NULL, lease_until = NULL",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // Move the frozen clock and its once-fresh evidence together to simulate a month passing
+    // after the switch was turned off, without making the test sleep.
+    sqlx::query(
+        "UPDATE vpngate_catalog_state
+            SET next_sync_at = now() - interval '30 days'
+          WHERE id = TRUE",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let paused = db
+        .store
+        .vpngate_agent_desired("edge")
+        .await
+        .unwrap()
+        .expect("turning VPN Gate off preserves its operational desired state");
+    assert_eq!(paused.pools[0].candidates.len(), 2);
+    assert!(paused.probe_assignments.is_empty());
+    assert!(db
+        .store
+        .claim_vpngate_sync("paused-global", "manual")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .store
+        .claim_vpngate_catalog_sync("edge")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .store
+        .claim_vpngate_exit_intelligence("edge")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db.store.request_vpngate_sync(&admin).await.is_err());
+    assert!(db
+        .store
+        .request_vpngate_intelligence_refresh(&admin)
+        .await
+        .is_err());
+    let retained_selections: (bool, bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM vpngate_probe_nodes WHERE node_id = 'edge'),
+                EXISTS (SELECT 1 FROM vpngate_catalog_nodes WHERE node_id = 'edge'),
+                EXISTS (SELECT 1 FROM vpngate_intelligence_nodes WHERE node_id = 'edge')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained_selections, (true, true, true));
+
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_latest
+            SET last_success_received_at = now()
+          WHERE country_code = 'JP'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE vpngate_exit_reputations
+            SET verified_at = now(), next_check_at = now() + interval '1 day'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.store
+        .update_vpngate_catalog_settings(
+            &admin,
+            UpdateVpngateCatalogSettings {
+                enabled: true,
+                interval_secs: 900,
+            },
+        )
+        .await
+        .unwrap();
+    let resumed = db
+        .store
+        .vpngate_agent_desired("edge")
+        .await
+        .unwrap()
+        .expect("turning VPN Gate back on resumes probe assignment");
+    assert_eq!(resumed.pools[0].candidates.len(), 2);
+    assert!(!resumed.probe_assignments.is_empty());
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT next_sync_at <= now() FROM vpngate_catalog_state WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap());
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT catalogue_next_sync_at <= now()
+           FROM vpngate_catalog_nodes
+          WHERE node_id = 'edge'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap());
 
     // ISP exclusions remove both the active shortlist and its ranked reserve, but keep the
     // catalogue and probe evidence visible. Explicitly selected pools must not bypass the rule.

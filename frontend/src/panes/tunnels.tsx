@@ -194,7 +194,7 @@ function TunnelList({ go }: { go: (drill: Drill) => void }) {
 
   return (
     <div className="cardpage tunnel-cardpage">
-      <section className="panel titled tunnel-list-panel">
+      <section className="panel titled tunnel-list-panel" data-page-title="true">
         {/* 与机器、线路列表共用页面级面板标题和主操作布局。 */}
         <header>
           <ListIcon of="tunnels" />

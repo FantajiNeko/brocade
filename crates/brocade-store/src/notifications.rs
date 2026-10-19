@@ -3,7 +3,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{AdminContext, Result, StoreError};
 
-pub const MACHINE_EVENT_RETENTION_DAYS: u32 = 90;
+pub const MACHINE_EVENT_RETENTION_DAYS: u32 = 7;
 const OFFLINE_AFTER_SECS: i32 = 90;
 const DELIVERY_LEASE_SECS: i32 = 30;
 
@@ -79,6 +79,57 @@ pub(crate) async fn initialize_waiting(
     Ok(())
 }
 
+pub(crate) async fn mark_online_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    previous: Option<&str>,
+    occurred_at_unix_secs: i64,
+) -> Result<bool> {
+    match previous {
+        // A pre-feature database or direct test fixture has no row. Establish its baseline without
+        // sending a fleet-wide "online" storm during rollout.
+        None => {
+            sqlx::query(
+                "INSERT INTO node_presence_state (node_id, status, since_at)
+                 VALUES ($1, 'online', to_timestamp($2))",
+            )
+            .bind(node_id)
+            .bind(occurred_at_unix_secs as f64)
+            .execute(&mut **tx)
+            .await?;
+            Ok(false)
+        }
+        Some(previous @ ("waiting" | "offline")) => {
+            sqlx::query(
+                "UPDATE node_presence_state
+                    SET status = 'online', since_at = to_timestamp($2)
+                  WHERE node_id = $1",
+            )
+            .bind(node_id)
+            .bind(occurred_at_unix_secs as f64)
+            .execute(&mut **tx)
+            .await?;
+            insert_machine_event(
+                tx,
+                node_id,
+                "node_online",
+                None,
+                Some(previous),
+                Some("online"),
+                occurred_at_unix_secs,
+                None,
+                None,
+            )
+            .await?;
+            Ok(true)
+        }
+        Some("online") => Ok(false),
+        Some(other) => Err(StoreError::InvalidData(format!(
+            "node {node_id} has invalid presence status {other}"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_machine_event(
     tx: &mut Transaction<'_, Postgres>,
@@ -137,20 +188,24 @@ pub(crate) async fn insert_machine_event(
     Ok(event_id)
 }
 
-/// Mark online machines offline after six missed desired-state polls. The Agent currently polls
-/// every 15 seconds, so 90 seconds tolerates transient connection failures without delaying a
-/// genuine outage notification for minutes.
-pub async fn reconcile_offline(pool: &PgPool) -> Result<u64> {
+/// Reconcile machine presence from any authenticated Agent contact.
+///
+/// Desired-state polling remains the release-eligibility signal, but it deliberately pauses while
+/// two Xray generations coexist. Token use is refreshed, at most once per minute, by every
+/// authenticated Agent endpoint, so it remains a valid control-plane heartbeat during that drain.
+/// Ninety seconds therefore tolerates the write throttle plus transient connection failures without
+/// turning a long-lived Xray handoff into a false machine outage.
+pub async fn reconcile_presence(pool: &PgPool) -> Result<(u64, u64)> {
     let mut tx = pool.begin().await?;
-    let rows = sqlx::query(
-        "SELECT presence.node_id,
-                extract(epoch FROM agent.last_poll_at)::bigint AS last_contact_at,
+    let recovered = sqlx::query(
+        "SELECT presence.node_id, presence.status,
                 extract(epoch FROM clock_timestamp())::bigint AS occurred_at
            FROM node_presence_state presence
            JOIN node_agent_state agent ON agent.node_id = presence.node_id
            LEFT JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = presence.node_id
-          WHERE presence.status = 'online'
-            AND agent.last_poll_at < now() - make_interval(secs => $1)
+          WHERE presence.status IN ('waiting', 'offline')
+            AND GREATEST(agent.last_poll_at, agent.token_last_used_at)
+                >= now() - make_interval(secs => $1)
             AND COALESCE(lifecycle.phase, 'active') = 'active'
           ORDER BY presence.node_id
           FOR UPDATE OF presence SKIP LOCKED",
@@ -158,7 +213,34 @@ pub async fn reconcile_offline(pool: &PgPool) -> Result<u64> {
     .bind(OFFLINE_AFTER_SECS)
     .fetch_all(&mut *tx)
     .await?;
-    for row in &rows {
+    for row in &recovered {
+        let node_id: String = row.try_get("node_id")?;
+        let previous: String = row.try_get("status")?;
+        let occurred_at: i64 = row.try_get("occurred_at")?;
+        mark_online_locked(&mut tx, &node_id, Some(&previous), occurred_at).await?;
+    }
+
+    let offline = sqlx::query(
+        "SELECT presence.node_id,
+                extract(epoch FROM GREATEST(
+                    agent.last_poll_at,
+                    agent.token_last_used_at
+                ))::bigint AS last_contact_at,
+                extract(epoch FROM clock_timestamp())::bigint AS occurred_at
+           FROM node_presence_state presence
+           JOIN node_agent_state agent ON agent.node_id = presence.node_id
+           LEFT JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = presence.node_id
+          WHERE presence.status = 'online'
+            AND GREATEST(agent.last_poll_at, agent.token_last_used_at)
+                < now() - make_interval(secs => $1)
+            AND COALESCE(lifecycle.phase, 'active') = 'active'
+          ORDER BY presence.node_id
+          FOR UPDATE OF presence SKIP LOCKED",
+    )
+    .bind(OFFLINE_AFTER_SECS)
+    .fetch_all(&mut *tx)
+    .await?;
+    for row in &offline {
         let node_id: String = row.try_get("node_id")?;
         let last_contact_at: i64 = row.try_get("last_contact_at")?;
         let occurred_at: i64 = row.try_get("occurred_at")?;
@@ -185,7 +267,7 @@ pub async fn reconcile_offline(pool: &PgPool) -> Result<u64> {
         .await?;
     }
     tx.commit().await?;
-    Ok(rows.len() as u64)
+    Ok((recovered.len() as u64, offline.len() as u64))
 }
 
 /// Reconcile the optional external channel before the HTTP listener starts accepting events.
@@ -322,6 +404,9 @@ pub async fn fail_delivery(
 }
 
 pub async fn list(pool: &PgPool, actor: &AdminContext, limit: u32) -> Result<MachineEventList> {
+    let retention_days = crate::retention::ttl_hours(pool, "machine_events")
+        .await?
+        .div_ceil(24);
     let limit = i64::from(limit.clamp(1, 200));
     let (personal_last_seen_event_id, personal_cleared_through_event_id, global_clear_floor) =
         sqlx::query_as::<_, (i64, i64, i64)>(
@@ -487,7 +572,7 @@ pub async fn list(pool: &PgPool, actor: &AdminContext, limit: u32) -> Result<Mac
     let unread_count = u64::try_from(summary_row.try_get::<i64, _>("unread_count")?)
         .map_err(|_| StoreError::InvalidData("negative notification unread count".to_owned()))?;
     Ok(MachineEventList {
-        retention_days: MACHINE_EVENT_RETENTION_DAYS,
+        retention_days,
         latest_event_id: summary_row.try_get("latest_event_id")?,
         last_seen_event_id,
         cleared_through_event_id,
@@ -639,12 +724,16 @@ async fn advance_cursor(
 }
 
 pub async fn prune(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = retain_days.clamp(1, 3650) as i32;
+    prune_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let result = sqlx::query(
         "DELETE FROM machine_events
-          WHERE created_at < now() - make_interval(days => $1)",
+          WHERE created_at < now() - make_interval(secs => $1::double precision)",
     )
-    .bind(retain_days)
+    .bind(retain_secs)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

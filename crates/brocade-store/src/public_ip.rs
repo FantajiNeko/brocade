@@ -8,7 +8,7 @@ use crate::{public_route_ip, AdminContext, Result, StoreError};
 
 const MAX_OBSERVATION_CLOCK_SKEW_SECS: i64 = 600;
 const CHANGE_CONFIRMATION_SECS: i64 = 10;
-pub const PUBLIC_IP_EVENT_RETENTION_DAYS: u32 = 90;
+pub const PUBLIC_IP_EVENT_RETENTION_DAYS: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -344,12 +344,16 @@ fn normalize_country(value: Option<&str>) -> Result<Option<String>> {
 }
 
 pub async fn prune(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = retain_days.clamp(1, 3650) as i32;
+    prune_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let result = sqlx::query(
         "DELETE FROM node_public_ip_events
-          WHERE recorded_at < now() - make_interval(days => $1)",
+          WHERE recorded_at < now() - make_interval(secs => $1::double precision)",
     )
-    .bind(retain_days)
+    .bind(retain_secs)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -361,7 +365,10 @@ pub async fn history(
     node_id: &str,
     visible_days: u32,
 ) -> Result<NodePublicIpHistory> {
-    let visible_days = visible_days.clamp(1, PUBLIC_IP_EVENT_RETENTION_DAYS);
+    let retention_days = crate::retention::ttl_hours(pool, "node_public_ip_events")
+        .await?
+        .div_ceil(24);
+    let visible_days = visible_days.clamp(1, retention_days);
     let visible = if actor.is_system_admin() {
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM nodes WHERE id = $1)")
             .bind(node_id)
@@ -433,7 +440,7 @@ pub async fn history(
     Ok(NodePublicIpHistory {
         node_id: node_id.to_owned(),
         visible_days,
-        retention_days: PUBLIC_IP_EVENT_RETENTION_DAYS,
+        retention_days,
         events,
     })
 }

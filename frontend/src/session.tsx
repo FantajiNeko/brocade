@@ -120,8 +120,7 @@ export const PUBLIC_ID = 'public';
 export const isPublic = (who: Whoami) => who.operator_id === PUBLIC_ID;
 export const isVisitor = (who: Whoami) => isPublic(who) || who.role === 'user';
 
-export const canViewUserRealtimeTraffic = (who: Whoami) =>
-  !isPublic(who) && (who.role === 'system-admin' || who.role === 'tenant-admin');
+export const canViewUserRealtimeTraffic = (who: Whoami) => !isVisitor(who);
 
 /* 该标签页中已执行退出的标记：设置后不再自动登录为 public，否则退出后的下一帧
    会回到访客视角，无法显示登录表单。使用 sessionStorage 而非 localStorage：

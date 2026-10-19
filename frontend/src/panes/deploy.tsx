@@ -19,8 +19,10 @@ import {
   fetchArtifactContent,
   fetchDeployment,
   fetchDeployments,
+  fetchNodes,
   fetchRevisions,
   haltDeployment,
+  forceConfigXrayRetirement,
   isolateDeploymentTarget,
   planDeployment,
   retryTarget,
@@ -36,6 +38,7 @@ import {
   type RevisionList,
   type RevisionListItem,
 } from '../api';
+import { configHandoffForceCandidate } from '../xray-handoff';
 import { draft } from '../draft';
 import { AgentReleaseTab, agentBadge, useAgentRelease } from './agent-release';
 import { XrayReleaseTab, useXrayRelease, xrayBadge } from './xray-release';
@@ -97,12 +100,23 @@ const ACTION_NOTE: Record<PlannedAction, string> = {
   'apply-hy2-port-hop': '只调整 nft，进程不停',
   'sync-grants': '热更新访问名单，连接不中断',
   'apply-wire-guard': '同步隧道配置，已有链路不中断',
-  'apply-xray': '重写配置并重启，当前连接会中断',
+  'apply-xray': '优先在原进程热更新；需要交接时，旧连接最多排空 5 分钟，超时后终止上一代',
   'disable-phantun': '依赖 fake TCP 的链路会中断',
   'disable-hy2-port-hop': '客户端将只能连接固定落点端口',
   'disable-wire-guard': '经过该隧道的链路会中断',
   'disable-xray': '该机器上的所有连接会中断',
 };
+
+const CONNECTION_PRESERVING_ACTIONS = new Set<string>(['apply-hy2-port-hop', 'apply-wire-guard', 'sync-grants']);
+
+/**
+ * `disruptive` is the immutable planning-time worst case and remains useful for confirmation.
+ * An Xray configuration apply normally hands off first, but its default bounded drain may still
+ * terminate old TCP sessions at the deadline. Keep that possibility visible at approval time.
+ */
+function interruptsConnections(target: { disruptive: boolean }, actions: readonly string[]) {
+  return target.disruptive && actions.some(action => !CONNECTION_PRESERVING_ACTIONS.has(action));
+}
 
 type DeploymentStage = 'config' | 'verify' | 'rollout' | 'stop';
 
@@ -158,7 +172,7 @@ function deploymentSteps<T extends { wave: number; disruptive: boolean }>(
               : '全量发布',
       step: stageWaves.indexOf(wave) + 1,
       steps: stageWaves.length,
-      disruptive: inWave.some(target => target.disruptive),
+      disruptive: inWave.some(target => interruptsConnections(target, actions(target))),
       needsConfirmation: inWave.some(
         target =>
           target.disruptive &&
@@ -465,6 +479,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   if (
     all.isPending ||
     revisions.isPending ||
+    (current != null && verify.isPending) ||
     agent.releases.isPending ||
     agent.nodes.isPending ||
     xray.releases.isPending
@@ -478,27 +493,30 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   const activeConfig = deployments.find(d => d.active && d.kind === 'config');
   const publishedBase = latestSuccessfulRevision(deployments.filter(item => item.kind === 'config'));
   const coveredRevision = activeConfig?.revision_id ?? publishedBase;
-  const pendingRevisions = revisions.data.revisions.filter(
+  const revisionsSinceConfigBase = revisions.data.revisions.filter(
     revision =>
       revision.has_snapshot &&
       revision.status !== 'aborted' &&
       revision.id > (coveredRevision ?? 0) &&
       revision.id <= revisions.data.current_revision,
   );
+  const changedConfigTargets = verify.data?.summary.changed_targets;
+  const hasPendingConfig = changedConfigTargets != null && changedConfigTargets > 0;
   const draftDirty = !draft.isEmpty();
   const fleet = agent.nodes.data?.nodes ?? [];
 
   const liveDeployments = deployments.filter(d => d.active);
   const failing = liveDeployments.some(d => d.failed_targets > 0 || d.status === 'halted');
   const attention =
-    pendingRevisions.length > 0 ||
+    hasPendingConfig ||
     draftDirty ||
     liveDeployments.some(d => d.awaiting_confirmation) ||
     agent.counts.behind > 0 ||
     xray.counts.behind > 0;
   const running = liveDeployments.length > 0 || !!agent.active || !!xray.active;
-  const lamp =
-    failing || agent.active?.status === 'halted' || xray.active?.status === 'halted'
+  const lamp = verify.error
+    ? { tone: 'err', why: '配置发布状态读取失败' }
+    : failing || agent.active?.status === 'halted' || xray.active?.status === 'halted'
       ? { tone: 'err', why: '有发布失败或已暂停，需要处理' }
       : attention
         ? { tone: 'warn', why: '有待处理的发布' }
@@ -506,7 +524,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
           ? { tone: 'run', why: '发布进行中' }
           : { tone: 'ok', why: '配置与软件版本均已收敛' };
   const badges: Record<DeployTab, TabBadge> = {
-    config: pendingRevisions.length ? { tone: 'gold', text: String(pendingRevisions.length) } : null,
+    config: hasPendingConfig ? { tone: 'gold', text: String(changedConfigTargets) } : null,
     agent: agentBadge(agent),
     xray: xrayBadge(xray),
   };
@@ -659,7 +677,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
                 revisions={revisions.data}
                 verify={verify}
                 fleet={fleet}
-                pendingRevisions={pendingRevisions}
+                revisionsSinceConfigBase={revisionsSinceConfigBase}
                 publishedBase={publishedBase}
                 draftDirty={draftDirty}
               />
@@ -691,7 +709,7 @@ function ConfigTab({
   revisions,
   verify,
   fleet,
-  pendingRevisions,
+  revisionsSinceConfigBase,
   publishedBase,
   draftDirty,
 }: {
@@ -700,7 +718,7 @@ function ConfigTab({
   revisions: RevisionList;
   verify: UseQueryResult<Awaited<ReturnType<typeof verifyDeployment>>>;
   fleet: NodeAgentStateItem[];
-  pendingRevisions: RevisionListItem[];
+  revisionsSinceConfigBase: RevisionListItem[];
   publishedBase: number | null;
   draftDirty: boolean;
 }) {
@@ -717,7 +735,11 @@ function ConfigTab({
   const current = revisions.current_revision;
   const targets = verify.data?.targets;
   const changed = targets?.filter(target => target.status !== 'skipped');
-  const disruptive = changed?.filter(target => target.disruptive);
+  const changedTargets = verify.data?.summary.changed_targets ?? null;
+  const configKnown = verify.data != null;
+  const targetCount = targets?.length ?? 0;
+  const hasPendingConfig = changedTargets != null && changedTargets > 0;
+  const disruptive = changed?.filter(target => interruptsConnections(target, target.actions));
   const nodeById = new Map(fleet.map(node => [node.node_id, node]));
   const latestRevision = revisions.revisions.find(revision => revision.id === current);
   const lastConfig = deployments
@@ -734,9 +756,9 @@ function ConfigTab({
   return (
     <>
       <ReleaseLedger
-        label="待发布修订"
-        value={pendingRevisions.length}
-        unit="个"
+        label={!configKnown ? '配置状态未知' : hasPendingConfig ? '待变更机器' : '已一致'}
+        value={!configKnown ? '—' : hasPendingConfig ? changedTargets : targetCount}
+        unit={!configKnown ? '台' : `/ ${targetCount} 台`}
         period={`线上 ${publishedBase == null ? '—' : `R${publishedBase}`} → 当前 R${current}${
           draftDirty ? ' · 草稿未提交，不在预览中' : ''
         }`}
@@ -768,10 +790,10 @@ function ConfigTab({
         {verify.error && <ErrorBox error={verify.error} />}
         <div className="cgf-well" aria-busy={list.isPlaceholderData || undefined}>
           <ol className="cgf-list">
-            {kind !== 'grants' && pendingRevisions.length > 0 && (
+            {kind !== 'grants' && hasPendingConfig && revisionsSinceConfigBase.length > 0 && (
               <>
-                <FlowGroup label="待发布" tone="warn" meta={`${pendingRevisions.length} 个修订`} />
-                {pendingRevisions.map(revision => (
+                <FlowGroup label="本次变更包含" tone="warn" meta={`${revisionsSinceConfigBase.length} 个修订`} />
+                {revisionsSinceConfigBase.map(revision => (
                   <FlowRow
                     key={`revision-${revision.id}`}
                     tone="idle"
@@ -1182,6 +1204,7 @@ function PlanPreview({
   const data = plan.data;
   const actingTargets = data.targets.filter(t => t.status !== 'skipped');
   const activeTargets = data.targets.filter(t => t.status === 'pending');
+  const disruptiveTargets = activeTargets.filter(target => interruptsConnections(target, target.actions)).length;
   const steps = deploymentSteps(activeTargets, target => target.actions);
   const stages = stageCount(steps);
   const confirmations = confirmationSummary(steps);
@@ -1297,8 +1320,8 @@ function PlanPreview({
                 <dt>变更机器</dt>
                 <dd>{data.summary.changed_targets} 台</dd>
                 <dt>中断连接</dt>
-                <dd className={data.summary.disruptive_targets ? 'warn' : 'dim'}>
-                  {data.summary.disruptive_targets ? `${data.summary.disruptive_targets} 台` : '无'}
+                <dd className={disruptiveTargets ? 'warn' : 'dim'}>
+                  {disruptiveTargets ? `${disruptiveTargets} 台` : '无'}
                 </dd>
                 <dt>需确认</dt>
                 <dd className={confirmations ? 'warn' : 'dim'}>{confirmations || '无'}</dd>
@@ -1410,7 +1433,11 @@ function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
     <>
       {stepTargets.map(target => (
         <div className="cgr-row" key={target.node_id}>
-          <span className={`cg-lamp ${target.status === 'deferred' ? 'defer' : target.disruptive ? 'warn' : 'ok'}`} />
+          <span
+            className={`cg-lamp ${
+              target.status === 'deferred' ? 'defer' : interruptsConnections(target, target.actions) ? 'warn' : 'ok'
+            }`}
+          />
           <span className="cgo-main">
             <b title={target.node_id}>{nameOf(target.node_id)}</b>
             <small>
@@ -1430,7 +1457,7 @@ function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
               })}
             </small>
           </span>
-          <span className={`cgr-effect ${target.disruptive ? 'risk' : ''}`}>
+          <span className={`cgr-effect ${interruptsConnections(target, target.actions) ? 'risk' : ''}`}>
             {target.status === 'deferred'
               ? '机器已隔离，恢复服务后补发'
               : target.actions.map(action => ACTION_NOTE[action]).join('；')}
@@ -2340,13 +2367,14 @@ type Ask =
   | { kind: 'cancel' }
   | { kind: 'cancelRollback' }
   | { kind: 'rollback' }
-  | { kind: 'wave'; wave: number };
+  | { kind: 'wave'; wave: number }
+  | { kind: 'forceXray'; nodeId: string; activeConnections: number };
 
 const ISOLATABLE_TARGET = new Set(['pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty']);
 
 /* 阶段的固定说明，放在阶段名的 title 里：正文只写这一步做什么、结果如何。 */
 const STAGE_NOTE: Record<DeploymentStage, string> = {
-  config: '自动下发，不中断现有连接',
+  config: '自动下发；Xray 旧连接超出排空时限后会中断',
   verify: '先验证一台机器，再继续扩大范围',
   stop: '停止服务前需要明确确认',
   rollout: '按监听依赖顺序更新其余机器',
@@ -2610,6 +2638,7 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   // 按 deployment_wave_confirmations 计算。与外壳顶栏同一个查询键，直接用它的缓存与轮询。
   // 需要确认的步骤在确认前一台都不会下发，单看「这一步需要确认」会把已确认、正在执行的步骤也算进去。
   const runtime = useQuery({ queryKey: ['deployments', 'runtime'], queryFn: () => fetchActiveDeployments() });
+  const fleet = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 3_000 });
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ['deployment', id] });
@@ -2661,6 +2690,14 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
       qc.invalidateQueries({ queryKey: ['nodes'] });
     },
   });
+  const forceRetirement = useMutation({
+    mutationFn: (nodeId: string) => forceConfigXrayRetirement(id, nodeId),
+    onSuccess: () => {
+      setAsk(null);
+      refresh();
+      qc.invalidateQueries({ queryKey: ['nodes'] });
+    },
+  });
 
   if (detail.isPending) return <Loading variant="deployment" />;
   if (detail.error) return <ErrorBox error={detail.error} />;
@@ -2668,6 +2705,10 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   if (OPEN_STATES.has(detail.data.status) && runtime.isPending) return <Loading variant="deployment" />;
 
   const d = detail.data;
+  const forceCandidates = (fleet.data?.nodes ?? []).flatMap(node => {
+    const candidate = configHandoffForceCandidate(node);
+    return candidate?.deploymentId === d.id ? [{ node, candidate }] : [];
+  });
   // 只列出实际有操作的机器。十余行 skipped 会使实际执行的行难以定位，
   // 而本次发布涉及哪些机器正是详情页的主要内容。总数在列表页的 changed/total 中。
   const acting = d.targets.filter(t => t.status !== 'skipped');
@@ -2682,7 +2723,7 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   const askedStep = ask?.kind === 'wave' ? steps.find(step => step.wave === ask.wave) : undefined;
   const finishedTargets = acting.filter(target => target.status === 'succeeded').length;
   const finishedSteps = steps.filter(step => step.targets.every(target => target.status === 'succeeded')).length;
-  const disruptiveTargets = acting.filter(target => target.disruptive).length;
+  const disruptiveTargets = acting.filter(target => interruptsConnections(target, actionsOf(target))).length;
   const executionDone = d.status === 'succeeded';
   const effective = d.activation_status === 'activated';
   const halted = d.status === 'halted';
@@ -2816,6 +2857,31 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                 </div>
               )}
 
+              {forceCandidates.map(({ node, candidate }) => (
+                <div className="callout warn" key={`xray-force:${node.node_id}`}>
+                  <div>
+                    <b>{node.name || node.node_id} 的上一代 Xray 已超过排空时限。</b>
+                    新实例仍在接入；上一代还承载 {candidate.activeConnections} 条存量 TCP 连接。
+                  </div>
+                  <div className="toolbar">
+                    <button
+                      type="button"
+                      className="btn danger"
+                      disabled={!can(who.role, 'system') || forceRetirement.isPending}
+                      onClick={() =>
+                        setAsk({
+                          kind: 'forceXray',
+                          nodeId: node.node_id,
+                          activeConnections: candidate.activeConnections,
+                        })
+                      }
+                    >
+                      强制完成交接
+                    </button>
+                  </div>
+                </div>
+              ))}
+
               <section className="panel config-panel cg-sec">
                 <header>
                   <PanelTitle of="deploy">执行进度</PanelTitle>
@@ -2849,7 +2915,9 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                 cancelRollback.error ||
                 rollback.error ||
                 retry.error ||
-                isolate.error) && (
+                isolate.error ||
+                forceRetirement.error ||
+                fleet.error) && (
                 <ErrorBox
                   error={
                     confirm.error ??
@@ -2859,6 +2927,8 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                     rollback.error ??
                     retry.error ??
                     isolate.error ??
+                    forceRetirement.error ??
+                    fleet.error ??
                     runtime.error
                   }
                 />
@@ -2981,6 +3051,21 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
           onCancel={() => setAsk(null)}
         />
       )}
+      {ask?.kind === 'forceXray' && (
+        <Confirm
+          title={`强制完成 ${nameOf(ask.nodeId)} 的 Xray 交接？`}
+          body={
+            <p>
+              新 Xray 已接管新连接；上一代仍承载 {ask.activeConnections} 条存量 TCP 连接。继续会中断这些存量连接，
+              并让配置发布 #{d.id} 使用当前新实例继续收口。
+            </p>
+          }
+          confirmLabel="强制完成交接"
+          confirmDisabled={forceRetirement.isPending}
+          onConfirm={() => forceRetirement.mutate(ask.nodeId)}
+          onCancel={() => setAsk(null)}
+        />
+      )}
     </>
   );
 }
@@ -2994,7 +3079,7 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
    逐台明细在页面的波次表中已有，关闭该框即可查看。 */
 function WaveSummary({ targets, nameOf }: { targets: DeploymentTargetDetail[]; nameOf: (id: string) => string }) {
   const actionCount = targets.reduce((n, t) => n + actionsOf(t).length, 0);
-  const disruptive = targets.filter(t => t.disruptive);
+  const disruptive = targets.filter(target => interruptsConnections(target, actionsOf(target)));
 
   // 动作到机器数的映射。按机器数排序，影响最大的排在前面（重写 xray 的机器数通常最多）。
   const byAction = new Map<string, number>();

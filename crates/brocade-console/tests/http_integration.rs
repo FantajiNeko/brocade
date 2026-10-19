@@ -16,7 +16,8 @@ use brocade_store::{
     AdminContext, AdminInitRequest, CreateChainRequest, CreateTenantRequest, IssuedAdminToken,
     IssuedNodeToken, ModelOp, PgStore, PingProbeFamily, PingProbeKind, PingProbeReportRequest,
     PingProbeSample, PingProbeSettings, PingProbeTarget, RegisterWarpBindingRequest,
-    UpdateVpngateIntelligenceNode, UpsertExternalOutboundRequest, ENROLLMENT_TOKEN_PREFIX,
+    UpdateVpngateCatalogNode, UpdateVpngateCatalogSettings, UpsertExternalOutboundRequest,
+    ENROLLMENT_TOKEN_PREFIX,
 };
 use flate2::{write::GzEncoder, Compression};
 use futures_util::{SinkExt, StreamExt};
@@ -31,6 +32,421 @@ use tower::ServiceExt;
 
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
 const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn data_retention_api_lists_only_bounded_tables_and_updates_without_a_revision() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let (app, token) = admin_app(&db).await;
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(Request::get("/data-retention").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(!unauthenticated.status().is_success());
+
+    let revision_before: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let (status, initial) = get_json(&app, &token, "/data-retention").await;
+    assert_eq!(status, StatusCode::OK);
+    let policies = initial["policies"].as_array().unwrap();
+    assert!(policies
+        .iter()
+        .any(|policy| policy["table_name"] == "node_ping_probe_samples"));
+    assert!(!policies
+        .iter()
+        .any(|policy| policy["table_name"] == "users"));
+
+    let (status, updated) = put_json(
+        &app,
+        &token,
+        "/data-retention/node_ping_probe_samples",
+        json!({"ttl_hours": 72}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(updated["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|policy| {
+            policy["table_name"] == "node_ping_probe_samples" && policy["ttl_hours"] == 72
+        }));
+    let rejected = put_json(
+        &app,
+        &token,
+        "/data-retention/users",
+        json!({"ttl_hours": 24}),
+    )
+    .await;
+    assert_eq!(rejected.0, StatusCode::NOT_FOUND);
+    let revision_after: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id = TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(revision_after, revision_before);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn sniffing_failed_api_is_admin_scoped_default_off_and_never_cached() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/sniffing-failed/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    let (status, policy) = get_json(&app, &token, "/sniffing-failed/settings").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["enabled"], false);
+    assert_eq!(policy["top_n"], 128);
+    assert_eq!(policy["max_targets_per_user"], 1024);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/users/platform.acme/alice/sniffing-failed-targets?period=day")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let invalid = put_json(
+        &app,
+        &token,
+        "/sniffing-failed/settings",
+        json!({"top_n":513}),
+    )
+    .await;
+    assert!(!invalid.0.is_success());
+    for role in ["readonly", "editor", "publisher", "tenant-admin"] {
+        let id = format!("target-{role}");
+        let created=post_json(&app,&token,"/admin/operators",json!({"id":id,"display_name":"Domain test","role":role,"password":"domain-test-password-only","tenant_scope":"platform.acme"})).await;
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+        let issued = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(issued.0, StatusCode::CREATED);
+        let scoped = issued.1["token"].as_str().unwrap();
+        let own = get_json(
+            &app,
+            scoped,
+            "/users/platform.acme/alice/sniffing-failed-targets?period=week",
+        )
+        .await;
+        assert_eq!(
+            own.0,
+            if role == "tenant-admin" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(
+            get_json(
+                &app,
+                scoped,
+                "/users/platform.other/alice/sniffing-failed-targets?period=month"
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            put_json(&app, scoped, "/sniffing-failed/settings", policy.clone())
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_traffic_statistics_are_admin_only_visible_and_never_cached() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes/n1/inflow-usage")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.status().is_success(), "anonymous is refused");
+    for path in [
+        "/nodes/n1/inflow-usage?period=week",
+        "/nodes/n1/site-usage?period=month",
+        "/nodes/n1/other-domains?period=day",
+        "/nodes/n1/sniffing-failed-targets",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(response.headers()["cache-control"], "no-store", "{path}");
+    }
+    let (status, inflow) = get_json(&app, &token, "/nodes/n1/inflow-usage?period=week").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inflow["period"], "week");
+    assert!(inflow["rows"].is_array() && inflow["idle_users"].is_array());
+    let (status, sites) = get_json(&app, &token, "/nodes/n1/site-usage?period=month").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sites["bucket_secs"], 86_400);
+    assert!(sites["series"].is_array() && sites["top_users"].is_array());
+    assert_eq!(
+        get_json(&app, &token, "/nodes/missing/inflow-usage")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    for path in [
+        "/nodes/n1/inflow-usage?period=year",
+        "/nodes/n1/site-usage?period=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    for role in ["readonly", "editor", "publisher", "tenant-admin"] {
+        let id = format!("node-traffic-{role}");
+        let created = post_json(
+            &app,
+            &token,
+            "/admin/operators",
+            json!({"id":id,"display_name":"Node traffic test","role":role,"password":"node-traffic-test-password","tenant_scope":"platform.acme"}),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+        let issued = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(issued.0, StatusCode::CREATED);
+        let scoped = issued.1["token"].as_str().unwrap();
+        for path in ["/nodes/n1/inflow-usage", "/nodes/n1/site-usage"] {
+            assert_eq!(
+                get_json(&app, scoped, path).await.0,
+                if role == "tenant-admin" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{role} {path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn other_domain_api_is_admin_scoped_default_off_and_never_cached() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/other-domain/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    let (status, policy) = get_json(&app, &token, "/other-domain/settings").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["enabled"], false);
+    assert_eq!(policy["top_n"], 128);
+    assert_eq!(policy["max_domains_per_user"], 1024);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/users/platform.acme/alice/other-domains?period=day")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/users/platform.acme/alice/machine-usage?period=month")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    // The merged site card reads categories and both detail lists for the same calendar period.
+    let (status, sites) = get_json(
+        &app,
+        &token,
+        "/users/platform.acme/alice/site-usage?period=month",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sites["period"], "month");
+    assert_eq!(sites["bucket_secs"], 86_400);
+    assert!(sites["series"].is_array());
+    assert!(
+        sites["range_start_unix_secs"].as_i64().unwrap()
+            <= sites["range_end_unix_secs"].as_i64().unwrap()
+            && sites["range_end_unix_secs"].as_i64().unwrap()
+                < sites["period_end_unix_secs"].as_i64().unwrap()
+    );
+    for path in [
+        "/users/platform.acme/alice/site-usage?period=year",
+        "/users/platform.acme/alice/machine-usage?period=year",
+        "/users/platform.acme/alice/other-domains?period=year",
+        "/users/platform.acme/alice/sniffing-failed-targets?period=",
+    ] {
+        // The query extractor rejects an unknown period before the handler runs (plain-text body).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    // A page loaded before the upgrade still sends the old rolling-hours parameter; it is ignored
+    // and the calendar day answers.
+    let (status, legacy) = get_json(
+        &app,
+        &token,
+        "/users/platform.acme/alice/site-usage?hours=24",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(legacy["period"], "day");
+    let invalid = put_json(&app, &token, "/other-domain/settings", json!({"top_n":513})).await;
+    assert!(!invalid.0.is_success());
+    for role in ["readonly", "editor", "publisher", "tenant-admin"] {
+        let id = format!("domain-{role}");
+        let created=post_json(&app,&token,"/admin/operators",json!({"id":id,"display_name":"Domain test","role":role,"password":"domain-test-password-only","tenant_scope":"platform.acme"})).await;
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+        let issued = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(issued.0, StatusCode::CREATED);
+        let scoped = issued.1["token"].as_str().unwrap();
+        let own = get_json(
+            &app,
+            scoped,
+            "/users/platform.acme/alice/other-domains?period=week",
+        )
+        .await;
+        assert_eq!(
+            own.0,
+            if role == "tenant-admin" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(
+            get_json(
+                &app,
+                scoped,
+                "/users/platform.other/alice/other-domains?period=month"
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get_json(
+                &app,
+                scoped,
+                "/users/platform.acme/alice/machine-usage?period=week"
+            )
+            .await
+            .0,
+            if role == "tenant-admin" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(
+            get_json(&app, scoped, "/users/platform.other/alice/machine-usage")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            put_json(&app, scoped, "/other-domain/settings", policy.clone())
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
@@ -404,7 +820,7 @@ async fn clearing_machine_incidents_preserves_public_ip_notifications() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn proxycheck_credential_http_api_is_write_only() {
+async fn proxycheck_credential_http_api_returns_only_masked_keys_to_system_admin() {
     std::env::set_var(
         brocade_store::secrets::SECRET_KEY_ENV,
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -414,6 +830,13 @@ async fn proxycheck_credential_http_api_is_write_only() {
     };
     db.store.migrate().await.unwrap();
     let (app, token) = admin_app(&db).await;
+
+    let empty = get_json(&app, &token, "/vpngate").await;
+    assert_eq!(empty.0, StatusCode::OK);
+    assert_eq!(
+        empty.1["intelligence_credentials"],
+        json!({ "proxycheck_api_key_configured": false, "proxycheck_api_keys_masked": [] })
+    );
 
     let rejected = put_json(
         &app,
@@ -433,20 +856,101 @@ async fn proxycheck_credential_http_api_is_write_only() {
     )
     .await;
     assert_eq!(saved.0, StatusCode::OK);
-    assert_eq!(saved.1, json!({ "proxycheck_api_key_configured": true }));
+    let summary = json!({
+        "proxycheck_api_key_configured": true,
+        "proxycheck_api_keys_masked": ["111111-******-******-444444", "aaaaaa-******-******-dddddd"]
+    });
+    assert_eq!(saved.1, summary);
     for replacement in replacements {
         assert!(!saved.1.to_string().contains(replacement));
     }
 
     let overview = get_json(&app, &token, "/vpngate").await;
     assert_eq!(overview.0, StatusCode::OK);
-    assert_eq!(
-        overview.1["intelligence_credentials"],
-        json!({ "proxycheck_api_key_configured": true })
-    );
+    assert_eq!(overview.1["intelligence_credentials"], summary);
     for replacement in replacements {
         assert!(!overview.1.to_string().contains(replacement));
     }
+
+    let appended_key = "zzzzzz-yyyyyy-xxxxxx-wwwwww";
+    let appended = put_json(
+        &app,
+        &token,
+        "/vpngate/intelligence-credentials",
+        json!({ "proxycheck_api_keys": [replacements[0], appended_key], "mode": "append" }),
+    )
+    .await;
+    assert_eq!(appended.0, StatusCode::OK);
+    assert_eq!(
+        appended.1,
+        json!({
+            "proxycheck_api_key_configured": true,
+            "proxycheck_api_keys_masked": [
+                "111111-******-******-444444",
+                "aaaaaa-******-******-dddddd",
+                "zzzzzz-******-******-wwwwww"
+            ]
+        })
+    );
+    let refreshed = get_json(&app, &token, "/vpngate").await;
+    assert_eq!(refreshed.0, StatusCode::OK);
+    assert_eq!(refreshed.1["intelligence_credentials"], appended.1);
+    for key in replacements.into_iter().chain([appended_key]) {
+        assert!(!appended.1.to_string().contains(key));
+        assert!(!refreshed.1.to_string().contains(key));
+        for hidden_group in key.split('-').skip(1).take(2) {
+            assert!(!appended.1.to_string().contains(hidden_group));
+        }
+    }
+
+    db.store
+        .create_tenant(
+            &AdminContext::system_admin("test-admin"),
+            CreateTenantRequest {
+                id: "platform.acme".to_owned(),
+                name: "Key viewer tenant".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    for role in ["readonly", "editor", "publisher", "tenant-admin"] {
+        let id = format!("proxycheck-{role}");
+        let created = post_json(
+            &app,
+            &token,
+            "/admin/operators",
+            json!({
+                "id": id, "display_name": "Key viewer", "role": role,
+                "password": "fixture-key-viewer-password", "tenant_scope": "platform.acme"
+            }),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+        let issued = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(issued.0, StatusCode::CREATED);
+        let restricted = get_json(&app, issued.1["token"].as_str().unwrap(), "/vpngate").await;
+        assert_eq!(restricted.0, StatusCode::OK);
+        assert_eq!(
+            restricted.1["intelligence_credentials"],
+            json!({ "proxycheck_api_key_configured": true })
+        );
+    }
+    let enabled = put_json(&app, &token, "/visitor-access", json!({ "enabled": true })).await;
+    assert_eq!(enabled.0, StatusCode::OK);
+    let visitor_cookie = login_cookie(&app, "public", "").await;
+    let visitor = get_json_with_cookie(&app, "/vpngate", &visitor_cookie).await;
+    assert_eq!(visitor.0, StatusCode::OK);
+    assert_eq!(
+        visitor.1["intelligence_credentials"],
+        json!({ "proxycheck_api_key_configured": true })
+    );
 }
 
 #[tokio::test]
@@ -1438,6 +1942,304 @@ async fn realtime_user_traffic_is_admin_only_and_filters_shared_machine_samples(
     }
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn fleet_realtime_keeps_machine_rates_public_and_user_intersections_admin_only() {
+    use brocade_deployment::protocol::{
+        AgentRealtimeCommand, AgentRealtimeSample, RealtimeUserTrafficSelector,
+    };
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO forwarding_entitlements (tenant_id, user_id, node_id, updated_by)
+         VALUES ('platform.acme', 'alice', 'n1', 'fixture')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let rule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO forwarding_rules (tenant_id, user_id, node_id, name, protocol,
+             listen_port, target_host, target_port)
+         VALUES ('platform.acme', 'alice', 'n1', 'Web', 'tcp', 30001, 'example.com', 443)
+         RETURNING id",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let token = admin_token(&db).await;
+    let service = RealtimeService::new(Default::default());
+    let agent = service.register_agent("n1".to_owned()).await;
+    let app = admin_router_with_services(
+        db.store.clone(),
+        ConsoleServices::new(
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            brocade_console::geoip::GeoIpLookup::default(),
+            service.clone(),
+        ),
+    );
+    assert_eq!(
+        put_json(&app, &token, "/visitor-access", json!({ "enabled": true }))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let cookie = login_cookie(&app, "public", "").await;
+    let path = "/realtime/fleet-traffic/snapshot";
+    let public = get_json_with_cookie(&app, path, &cookie).await;
+    assert_eq!(public.0, StatusCode::OK);
+    assert_eq!(public.1["expected"], json!([]));
+
+    let mut ordinary_tokens = Vec::new();
+    for role in ["readonly", "editor", "publisher"] {
+        let id = format!("fleet-{role}");
+        let created = post_json(
+            &app,
+            &token,
+            "/admin/operators",
+            json!({
+                "id": id,
+                "display_name": "Fleet traffic permission fixture",
+                "role": role,
+                "tenant_scope": "platform.acme",
+                "password": "fleet-traffic-test-password"
+            }),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::CREATED, "{role}: {}", created.1);
+        let issued = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(issued.0, StatusCode::CREATED, "{role}: {}", issued.1);
+        let credential = issued.1["token"].as_str().unwrap().to_owned();
+        let machine_only = get_json_with_token(&app, path, &credential).await;
+        assert_eq!(machine_only.0, StatusCode::OK, "{role}");
+        assert_eq!(machine_only.1["expected"], json!([]), "{role}");
+        ordinary_tokens.push((role, credential));
+    }
+    let created = post_json(
+        &app,
+        &token,
+        "/admin/operators",
+        json!({
+            "id": "fleet-tenant-admin",
+            "display_name": "Fleet tenant administrator",
+            "role": "tenant-admin",
+            "tenant_scope": "platform.acme",
+            "password": "fleet-traffic-admin-password"
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let issued = post_json(
+        &app,
+        &token,
+        "/admin/operators/fleet-tenant-admin/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED, "{}", issued.1);
+    let tenant_token = issued.1["token"].as_str().unwrap().to_owned();
+
+    let first = get_json_with_token(&app, path, &token).await;
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(
+        first.1["expected"],
+        json!([{
+            "node_id": "n1", "users": [{"tenant_id": "platform.acme", "user_id": "alice"}]
+        }])
+    );
+    match agent.commands.borrow().clone() {
+        AgentRealtimeCommand::Start {
+            diagnostics: false,
+            user_traffic: Some(RealtimeUserTrafficSelector::All { forwarding }),
+            ..
+        } => {
+            assert_eq!(forwarding.len(), 1);
+            assert_eq!(forwarding[0].rule_id, rule_id);
+        }
+        command => panic!("administrator fleet view did not request user rates: {command:?}"),
+    }
+    for role in [
+        brocade_store::AdminRole::User,
+        brocade_store::AdminRole::Readonly,
+        brocade_store::AdminRole::Editor,
+        brocade_store::AdminRole::Publisher,
+    ] {
+        let actor = AdminContext::new("operator", role, Some("platform.acme".to_owned()));
+        assert!(matches!(
+            db.store.fleet_realtime_targets(&actor).await,
+            Err(brocade_store::StoreError::Forbidden(_))
+        ));
+    }
+    let tenant = AdminContext::new(
+        "tenant-admin",
+        brocade_store::AdminRole::TenantAdmin,
+        Some("platform.acme".to_owned()),
+    );
+    assert_eq!(
+        db.store
+            .fleet_realtime_targets(&tenant)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let outside = AdminContext::new(
+        "tenant-admin",
+        brocade_store::AdminRole::TenantAdmin,
+        Some("platform.other".to_owned()),
+    );
+    assert!(db
+        .store
+        .fleet_realtime_targets(&outside)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let sampled_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let sample: AgentRealtimeSample = serde_json::from_value(json!({
+        "sequence": 1, "sampled_at_unix_millis": sampled_at, "elapsed_millis": 1000,
+        "interface": "eth0", "rx_bytes_per_sec": 9000, "tx_bytes_per_sec": 8000, "has_gap": false,
+        "user_traffic": { "state": "ready", "all_users": true, "elapsed_millis": 1000,
+            "forwarding_supported": true, "users": [
+            { "tenant_id": "platform.acme", "user_id": "alice", "ingress_id": "ing-b2c3", "uplink_bytes_per_sec": 10, "downlink_bytes_per_sec": 20 },
+            { "tenant_id": "platform.acme", "user_id": "alice", "forwarding_rule_id": rule_id, "uplink_bytes_per_sec": 30, "downlink_bytes_per_sec": 40 },
+            { "tenant_id": "outside", "user_id": "mallory", "ingress_id": "other", "uplink_bytes_per_sec": 50, "downlink_bytes_per_sec": 60 }
+        ] }
+    })).unwrap();
+    service
+        .record_sample("n1", agent.session, sample)
+        .await
+        .unwrap();
+
+    let public = get_json_with_cookie(&app, path, &cookie).await;
+    assert_eq!(public.0, StatusCode::OK);
+    assert_eq!(public.1["expected"], json!([]));
+    assert_eq!(
+        public.1["nodes"][0]["samples"][0]["sample"]["rx_bytes_per_sec"],
+        9000
+    );
+    assert!(public.1["nodes"][0]["samples"][0]["sample"]
+        .get("user_traffic")
+        .is_none());
+    for (role, credential) in &ordinary_tokens {
+        let machine_only = get_json_with_token(&app, path, credential).await;
+        assert_eq!(machine_only.0, StatusCode::OK, "{role}");
+        assert_eq!(machine_only.1["expected"], json!([]), "{role}");
+        assert!(machine_only.1["nodes"][0]["samples"][0]["sample"]
+            .get("user_traffic")
+            .is_none());
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .header("authorization", format!("Bearer {tenant_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let snapshot = response_json(response).await;
+    let sample = &snapshot["nodes"][0]["samples"][0]["sample"];
+    let rates = sample["user_traffic"]["users"].as_array().unwrap();
+    assert_eq!(
+        rates.len(),
+        2,
+        "tenant traffic must stay in the administrator's tenant scope"
+    );
+    assert!(rates.iter().all(|rate| rate["user_id"] == "alice"));
+    assert_eq!(rates[0]["downlink_bytes_per_sec"], 20);
+    assert_eq!(rates[1]["forwarding_rule_id"], rule_id);
+    assert_eq!(sample["user_traffic"]["forwarding_expected"], true);
+    for key in ["mux", "reverse_health", "vpngate"] {
+        assert!(sample.get(key).is_none());
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/realtime/fleet-traffic/events")
+                .header("authorization", format!("Bearer {tenant_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut body = response.into_body().into_data_stream();
+    let initial = tokio::time::timeout(Duration::from_secs(1), body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let initial = std::str::from_utf8(&initial).unwrap();
+    assert!(initial.contains("event: snapshot"));
+    let data = initial
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let streamed: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(&streamed["nodes"][0]["samples"][0]["sample"], sample);
+    drop(body);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/realtime/fleet-traffic/events")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let initial = tokio::time::timeout(Duration::from_secs(1), body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let data = std::str::from_utf8(&initial)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let streamed: Value = serde_json::from_str(data).unwrap();
+    assert!(streamed["nodes"][0]["samples"][0]["sample"]
+        .get("user_traffic")
+        .is_none());
+    drop(body);
+    assert_eq!(
+        get_json_with_cookie(&app, "/realtime/settings", &cookie)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_json_with_cookie(&app, "/users/platform.acme/alice/realtime/history", &cookie)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
 /// One listener carries both faces, which is what a deployment gets unless it asks for the split.
 ///
 /// Three things can break here and none of them shows up as a compile error. `/healthz` is declared
@@ -2375,7 +3177,10 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert!(zero_exists);
+    assert!(
+        !zero_exists,
+        "initialization must not invent a network user"
+    );
     let zero_login_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM admin_operators WHERE id = 'platform/zero')",
     )
@@ -2384,8 +3189,17 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
     .unwrap();
     assert!(
         !zero_login_exists,
-        "zero must be unable to log in by default"
+        "initialization must not invent a login for a network user"
     );
+    let onboarding: (String, bool) = sqlx::query_as(
+        "SELECT root_tenant_id, completed_at IS NOT NULL
+           FROM first_run_onboarding
+          WHERE id = TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(onboarding, ("platform".to_owned(), false));
     // Initialization signs no API token: a browser needs nothing beyond the session cookie, and a
     // script wanting one signs it through /admin/operators/{id}/token. One token fewer is one
     // long-lived credential fewer.
@@ -2405,6 +3219,16 @@ async fn http_admin_init_login_and_logout_use_session_cookie() {
         .unwrap();
     let body = response_json(response).await;
     assert_eq!(body["initialized"], true);
+
+    let bootstrap = get_json_with_cookie(&app, "/bootstrap", &init_cookie_pair).await;
+    assert_eq!(bootstrap.0, StatusCode::OK);
+    assert_eq!(bootstrap.1["initial"]["onboarding"], "active");
+    assert_eq!(bootstrap.1["initial"]["node_count"], 0);
+    let onboarding = get_json_with_cookie(&app, "/onboarding", &init_cookie_pair).await;
+    assert_eq!(onboarding.0, StatusCode::OK);
+    assert_eq!(onboarding.1["status"], "active");
+    assert_eq!(onboarding.1["root_tenant_id"], "platform");
+    assert!(onboarding.1["user_id"].is_null());
 
     let duplicate = app
         .clone()
@@ -2847,6 +3671,77 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         .get("x-brocade-agent-upgrade-required")
         .is_none());
 
+    // Protocol v32 fails closed and can drain gracefully, but it cannot guarantee that an expired
+    // old generation is retired. Keep desired state withheld until the v33 Agent can make every
+    // configuration release use the bounded force policy by default.
+    let pre_handoff_only_protocol = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/desired")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    (brocade_deployment::protocol::CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION
+                        - 1)
+                    .to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pre_handoff_only_protocol.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        pre_handoff_only_protocol
+            .headers()
+            .get("x-brocade-agent-upgrade-required")
+            .unwrap(),
+        "1"
+    );
+
+    let force_command_for_old_agent = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/v1/xray-handoff/force")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    (brocade_deployment::protocol::CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION
+                        - 1)
+                    .to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(force_command_for_old_agent.status(), StatusCode::NO_CONTENT);
+    let force_command_is_not_a_read = agent
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/agent/v1/xray-handoff/force")
+                .header("authorization", format!("Bearer {}", issued.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION
+                        .to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        force_command_is_not_a_read.status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+
     // Isolation is not implicit release approval. Before an administrator stages this build for
     // the node, the independent update channel remains quiet.
     let update_before_approval = agent
@@ -2865,9 +3760,15 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
     assert_eq!(update_before_approval.status(), StatusCode::NO_CONTENT);
 
     sqlx::query(
-        "UPDATE node_agent_state SET agent_version = $1, last_poll_at = now() WHERE node_id = 'n1'",
+        "UPDATE node_agent_state
+            SET agent_version = $1,
+                last_poll_at = now(),
+                runtime_reported_at = now(),
+                runtime_versions = jsonb_build_object('agent', $2::text)
+          WHERE node_id = 'n1'",
     )
     .bind(format!("brocade-agent/{}", "a".repeat(64)))
+    .bind("a".repeat(64))
     .execute(db.pool())
     .await
     .unwrap();
@@ -2891,7 +3792,14 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         )
         .await
         .unwrap();
-    assert_eq!(approve.status(), StatusCode::OK);
+    let approve_status = approve.status();
+    let approve_body = to_bytes(approve.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        approve_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&approve_body)
+    );
 
     // The node deliberately omits the desired-state protocol header here. The self-update route
     // must stay reachable so an isolated node can install the approved build without SSH.
@@ -3156,12 +4064,19 @@ async fn selected_agent_catalogue_upload_is_deduplicated_and_published_by_consol
     .execute(db.pool())
     .await
     .unwrap();
+    let admin = AdminContext::system_admin("catalogue-test");
     db.store
-        .update_vpngate_intelligence_node(
-            &AdminContext::system_admin("catalogue-test"),
-            "n1",
-            UpdateVpngateIntelligenceNode { enabled: true },
+        .update_vpngate_catalog_settings(
+            &admin,
+            UpdateVpngateCatalogSettings {
+                enabled: true,
+                interval_secs: 900,
+            },
         )
+        .await
+        .unwrap();
+    db.store
+        .update_vpngate_catalog_node(&admin, "n1", UpdateVpngateCatalogNode { enabled: true })
         .await
         .unwrap();
 
@@ -4722,6 +5637,13 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
     assert_eq!(whoami.1["self_user"]["tenant_id"], "platform.acme");
     assert_eq!(whoami.1["self_user"]["user_id"], "alice");
 
+    assert_eq!(
+        get_json_with_cookie(&app, "/users/platform.acme/alice/machine-usage", &cookie)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+
     let users = get_json_with_cookie(&app, "/users?include_disabled=true", &cookie).await;
     assert_eq!(users.0, StatusCode::OK);
     let general = &users.1["users"][0];
@@ -4886,6 +5808,226 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_forwarding_tcp_ping_is_manual_scoped_fenced_and_shared_across_listeners() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    sqlx::query("INSERT INTO users(tenant_id,id,uuid) VALUES ('platform.acme','bob','4f84aaf8-49ea-4cce-8a93-683ee21ba3c6')")
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO nodes(id,name,tenant_id,public_ipv4,overlay_addr,wg_private_key,wg_public_key,wg_listen_port,api_port,overlay,egress_allowed,dns_kind,dns_servers) SELECT 'n2','Other node',tenant_id,'n2.example.net','10.66.0.2','wg-private-2','wg-public-2',wg_listen_port,api_port,overlay,egress_allowed,dns_kind,dns_servers FROM nodes WHERE id='n1'")
+        .execute(db.pool()).await.unwrap();
+    let token = admin_token(&db).await;
+    let services = ConsoleServices::new(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        brocade_console::geoip::GeoIpLookup::default(),
+        RealtimeService::new(Default::default()),
+    );
+    let agent = services
+        .clone()
+        .agent_router(db.store.clone(), "http://127.0.0.1".to_owned());
+    let app = admin_router_with_services(db.store.clone(), services);
+    for user in ["alice", "bob"] {
+        assert_eq!(put_json(&app,&token,&format!("/users/platform.acme/{user}/forwarding-nodes/n1"),json!({
+            "enabled":true,"listen_port_start":20000,"listen_port_end":20100,"allow_private_targets":false
+        })).await.0,StatusCode::OK);
+    }
+    let node_token = db.store.issue_node_token("n1").await.unwrap().token;
+    let other_node_token = db.store.issue_node_token("n2").await.unwrap().token;
+    db.store
+        .record_node_poll_with_protocol("n1", None, Some(36))
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (user, port) in [("alice", 20042), ("bob", 20043)] {
+        let created = post_json(
+            &app,
+            &token,
+            &format!("/users/platform.acme/{user}/forwarding"),
+            json!({
+                "node_id":"n1","name":"TCP test","protocol":"tcp","listen_port":port,
+                "target_host":"1.1.1.1","target_port":443,"enabled":true
+            }),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+        ids.push(created.1["rules"][0]["id"].as_i64().unwrap());
+    }
+    let desired = db.store.forwarding_desired_for_node("n1").await.unwrap();
+    db.store
+        .record_forwarding_reconcile(
+            "n1",
+            brocade_deployment::protocol::ForwardingReconcileReport {
+                generation: desired.generation,
+                applied_rule_ids: ids.clone(),
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let base = "/users/platform.acme/alice/forwarding";
+    let list = format!("{base}/tcp-pings");
+    // Saving rules does not send any TCP pings.
+    assert_eq!(get_json(&app, &token, &list).await.1, json!([]));
+    let ping = format!("{base}/{}/tcp-ping", ids[0]);
+    let issued = post_json(&app, &token, "/users/platform.acme/alice/login", json!({})).await;
+    let cookie = login_cookie(&app, "alice", issued.1["password"].as_str().unwrap()).await;
+    let own = app
+        .clone()
+        .oneshot(
+            Request::post(&ping)
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(own.status(), StatusCode::ACCEPTED);
+    let started = response_json(own).await;
+    let job = started["id"].as_str().unwrap();
+    assert_eq!(started["state"], "queued");
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/users/platform.acme/bob/forwarding/{}/tcp-ping",
+                ids[1]
+            ))
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    // An administrator cannot turn this into an arbitrary-address scanner either.
+    let injected = app
+        .clone()
+        .oneshot(
+            Request::post(&ping)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"target_host":"127.0.0.1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    async fn claim(app: &Router, token: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/agent/v1/forwarding/tcp-ping-target")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-brocade-protocol-version", "36")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+    assert!(claim(&agent, &other_node_token).await.is_null());
+    let target = claim(&agent, &node_token).await;
+    assert_eq!(target["probe_id"], job);
+    assert_eq!(target["target_host"], "1.1.1.1");
+    assert!(claim(&agent, &node_token).await.is_null());
+    let report = json!({"probe_id":job,"result":{"status":"reachable","code":"connected",
+        "dns_ms":null,"connect_ms":12,"resolved_ip":"1.1.1.1"}});
+    assert_eq!(
+        post_json(
+            &agent,
+            &other_node_token,
+            "/agent/v1/forwarding/tcp-ping-report",
+            report.clone()
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(
+            &agent,
+            &node_token,
+            "/agent/v1/forwarding/tcp-ping-report",
+            report.clone()
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post_json(
+            &agent,
+            &node_token,
+            "/agent/v1/forwarding/tcp-ping-report",
+            report
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let result = get_json(&app, &token, &list).await.1;
+    assert_eq!(result[0]["state"], "complete");
+    assert_eq!(result[0]["result"]["connect_ms"], 12);
+    assert_eq!(
+        get_json(
+            &app,
+            &token,
+            "/users/platform.acme/bob/forwarding/tcp-pings"
+        )
+        .await
+        .1,
+        json!([])
+    );
+    let before = db.store.forwarding_desired_for_node("n1").await.unwrap();
+    let usage: i64 = sqlx::query_scalar("SELECT count(*) FROM forwarding_usage_rollups")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(usage, 0, "TCP ping must not fabricate user usage");
+    // Quota pause makes Alice's old reading unusable and cannot pause Bob's rule.
+    sqlx::query("INSERT INTO forwarding_usage_rollups(period_start,node_id,tenant_id,user_id,rule_id,uplink_bytes,downlink_bytes,has_gap) VALUES(date_trunc('month',now()),'n1','platform.acme','alice',$1,1,0,false)")
+        .bind(ids[0]).execute(db.pool()).await.unwrap();
+    put_json(
+        &app,
+        &token,
+        "/users/platform.acme/alice/forwarding-nodes/n1/quota",
+        json!({"limit_bytes":1}),
+    )
+    .await;
+    db.store.enforce_forwarding_quotas().await.unwrap();
+    let result = get_json(&app, &token, &list).await.1;
+    assert_eq!(result[0]["state"], "obsolete");
+    assert!(result[0]["result"].is_null());
+    assert_eq!(
+        post_json(&app, &token, &ping, json!({})).await.0,
+        StatusCode::CONFLICT
+    );
+    let after = db.store.forwarding_desired_for_node("n1").await.unwrap();
+    assert!(before.rules.iter().any(|rule| rule.id == ids[1]));
+    assert!(after.rules.iter().any(|rule| rule.id == ids[1]));
+    assert!(!after.rules.iter().any(|rule| rule.id == ids[0]));
+    let usage: i64 = sqlx::query_scalar(
+        "SELECT sum(uplink_bytes + downlink_bytes)::bigint FROM forwarding_usage_rollups",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        usage, 1,
+        "Only the explicitly inserted quota fixture can affect usage"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_forwarding_grants_nodes_to_admins_and_rules_to_the_exact_user() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -5010,6 +6152,174 @@ async fn http_forwarding_grants_nodes_to_admins_and_rules_to_the_exact_user() {
     let removed = response_json(removed).await;
     assert_eq!(removed["entitlements"], json!([]));
     assert_eq!(removed["rules"], json!([]));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_forwarding_quota_routes_authorize_admins_and_expose_durable_jobs() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let base = "/users/platform.acme/alice/forwarding-nodes/n1";
+    assert_eq!(
+        put_json(&app, &token, base, json!({"enabled":true}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let quota = format!("{base}/quota");
+    let history = format!("{quota}/jobs");
+    for role in ["readonly", "editor", "publisher", "tenant-admin"] {
+        let id = format!("forwarding-quota-{role}");
+        let created = post_json(
+            &app,
+            &token,
+            "/admin/operators",
+            json!({
+                "id":id,"display_name":"Quota test","role":role,
+                "password":"quota-test-password-only","tenant_scope":"platform.acme"
+            }),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+        let issued = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(issued.0, StatusCode::CREATED);
+        let result = put_json(
+            &app,
+            issued.1["token"].as_str().unwrap(),
+            &quota,
+            json!({"limit_bytes":100}),
+        )
+        .await;
+        assert_eq!(
+            result.0,
+            if role == "tenant-admin" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "{}",
+            result.1
+        );
+    }
+    let issued = post_json(&app, &token, "/users/platform.acme/alice/login", json!({})).await;
+    let cookie = login_cookie(&app, "alice", issued.1["password"].as_str().unwrap()).await;
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&quota)
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"limit_bytes":null}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        get_json_with_cookie(
+            &app,
+            "/users/platform.acme/bob/forwarding-nodes/n1/quota/jobs",
+            &cookie
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!put_json(&app, &token, &quota, json!({"limit_bytes":0}))
+        .await
+        .0
+        .is_success());
+    let unknown_field = app
+        .clone()
+        .oneshot(
+            Request::put(&quota)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"limit_bytes":100,"suspended":false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let absent = app
+        .clone()
+        .oneshot(
+            Request::put(&quota)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"limit_bytes":null}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!absent.status().is_success());
+    let created = post_json(
+        &app,
+        &token,
+        "/users/platform.acme/alice/forwarding",
+        json!({
+            "node_id":"n1","name":"quota test","protocol":"tcp","listen_port":40001,
+            "target_host":"1.1.1.1","target_port":443,"enabled":true
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let rule_id = created.1["rules"][0]["id"].as_i64().unwrap();
+    sqlx::query("INSERT INTO forwarding_usage_rollups(period_start,node_id,tenant_id,user_id,rule_id,uplink_bytes,downlink_bytes,has_gap)
+        VALUES(date_trunc('day',now() AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong','n1','platform.acme','alice',$1,40,60,false)")
+        .bind(rule_id).execute(db.pool()).await.unwrap();
+    assert_eq!(
+        db.store
+            .enforce_forwarding_quotas()
+            .await
+            .unwrap()
+            .suspended,
+        1
+    );
+    let overview =
+        get_json_with_cookie(&app, "/users/platform.acme/alice/forwarding", &cookie).await;
+    assert_eq!(overview.1["entitlements"][0]["monthly_used_bytes"], 100);
+    assert_eq!(overview.1["rules"][0]["runtime_status"], "quota-paused");
+    let jobs = get_json(&app, &token, &history).await;
+    assert_eq!(jobs.0, StatusCode::OK, "{}", jobs.1);
+    assert_eq!(jobs.1["jobs"][0]["status"], "queued");
+    let id = jobs.1["jobs"][0]["id"].as_i64().unwrap();
+    assert_eq!(
+        get_json(&app, &token, &format!("{history}?before_id={id}"))
+            .await
+            .1["jobs"],
+        json!([])
+    );
+    assert!(!get_json(&app, &token, &format!("{history}?before_id=-1"))
+        .await
+        .0
+        .is_success());
+    assert_eq!(
+        put_json(&app, &token, &quota, json!({"limit_bytes":null}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        db.store.enforce_forwarding_quotas().await.unwrap().restored,
+        1
+    );
+    let jobs = get_json(&app, &token, &history).await;
+    assert_eq!(jobs.1["jobs"][0]["suspended"], false);
+    assert_eq!(jobs.1["jobs"][1]["status"], "canceled");
 }
 
 #[tokio::test]

@@ -9,9 +9,26 @@
 //! Every rule here was measured against xray 26.4.25 rather than read off documentation —
 //! several of them contradict what the command help implies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
+
+/// A bounded, reusable runtime alias. Telemetry folds its counters into the original hop.
+pub const ENDPOINT_SWAP_SUFFIX: &str = "~brocade-endpoint-swap";
+const ENDPOINT_RULE_PREFIX: &str = "brocade:endpoint-swap:";
+
+pub enum HotSwapOperation {
+    AddOutbounds(Vec<Value>),
+    RemoveOutbounds(Vec<String>),
+    AddRules(Vec<Value>),
+    RemoveRules(Vec<String>),
+}
+
+pub struct EndpointSwap {
+    pub outbounds: Vec<Value>,
+    pub bridge_outbounds: Vec<Value>,
+    pub bridge_rules: Vec<Value>,
+}
 
 /// What one xray can be made to accept without being restarted.
 ///
@@ -26,22 +43,59 @@ pub struct HotSwap {
     /// Tags of outbounds that no longer appear. They come out last, once nothing refers
     /// to them any more.
     pub remove_outbounds: Vec<String>,
-    /// Inbounds to take out: the ones that vanished, plus the ones whose definition
-    /// changed — xray refuses a second inbound under a tag that already exists, so a change
-    /// in place can only be expressed as a removal followed by an addition.
-    pub remove_inbounds: Vec<String>,
-    /// Inbounds to put in: the ones that appeared, plus the replacements for the above.
-    ///
-    /// Whoever installs these owes the machine one more thing. An inbound comes back with an
-    /// empty account list — the compiled config carries none, they are pushed in at runtime —
-    /// and a configuration deployment does not sync accounts afterwards
-    /// (`DesiredGrants::Unmanaged` is a no-op). Left there, the inbound listens and turns
-    /// every subscription away as an unknown user.
-    pub add_inbounds: Vec<Value>,
     /// The complete new table, in order.
     pub add_rules: Vec<Value>,
     /// The complete old table, by name.
     pub remove_rule_tags: Vec<String>,
+    /// Temporary routing protects the same-tag replacement's remove/add interval.
+    pub endpoint_swap: Option<EndpointSwap>,
+}
+
+impl HotSwap {
+    /// All mutations in dependency order. A failed prefix keeps listeners and grants intact,
+    /// so the Agent's existing handoff recovery can still install the desired configuration.
+    pub fn operations(&self) -> Vec<HotSwapOperation> {
+        use HotSwapOperation::*;
+        let mut operations = Vec::new();
+        if !self.add_outbounds.is_empty() {
+            operations.push(AddOutbounds(self.add_outbounds.clone()));
+        }
+        if let Some(swap) = &self.endpoint_swap {
+            operations.extend([
+                AddOutbounds(swap.bridge_outbounds.clone()),
+                AddRules(swap.bridge_rules.clone()),
+                RemoveRules(self.remove_rule_tags.clone()),
+                RemoveOutbounds(tags_of(&swap.outbounds, "tag")),
+                AddOutbounds(swap.outbounds.clone()),
+                AddRules(self.add_rules.clone()),
+                RemoveRules(tags_of(&swap.bridge_rules, "ruleTag")),
+                RemoveOutbounds(tags_of(&swap.bridge_outbounds, "tag")),
+            ]);
+        } else {
+            if !self.add_rules.is_empty() {
+                operations.push(AddRules(self.add_rules.clone()));
+            }
+            if !self.remove_rule_tags.is_empty() {
+                operations.push(RemoveRules(self.remove_rule_tags.clone()));
+            }
+        }
+        if !self.remove_outbounds.is_empty() {
+            operations.push(RemoveOutbounds(self.remove_outbounds.clone()));
+        }
+        operations
+    }
+}
+
+fn tags_of(entries: &[Value], key: &str) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            entry[key]
+                .as_str()
+                .expect("hot_swap validates every outbound and rule tag")
+                .to_owned()
+        })
+        .collect()
 }
 
 /// Decides whether the difference between two configs is one a running xray can be talked
@@ -58,9 +112,9 @@ pub struct HotSwap {
 /// - **Any balancer difference.** A balancer cannot be modified, cannot be removed, and is
 ///   never reclaimed once created; only entirely new tags can be added. Selector changes
 ///   therefore have no runtime expression at all.
-/// - **An outbound that changed while keeping its tag.** Expressing that means taking it
-///   out and putting it back, and in between the rules pointing at it name nothing.
-///   Additions and removals have no such window, which is why those two are allowed.
+/// - **Same-tag changes other than ordinary VLESS endpoints.** Endpoint replacements use
+///   a temporary outbound and routing table. Default, reverse and indirectly referenced
+///   outbounds cannot be protected by that routing-table switch and remain excluded.
 /// - **A WireGuard outbound appearing or disappearing.** HandlerService can acknowledge the
 ///   add/remove operation while the stateful WireGuard outbound is not yet carrying traffic.
 ///   Starting or retiring one therefore goes through a full xray restart; unrelated rule edits
@@ -76,7 +130,7 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
     // on one side only — iterating one map would miss a block that was added or dropped.
     let untouched = |value: &serde_json::Map<String, Value>, key: &str| -> Option<Value> {
         match key {
-            "inbounds" | "outbounds" => None,
+            "outbounds" => None,
             "routing" => value.get(key).and_then(|routing| {
                 let mut routing = routing.as_object()?.clone();
                 routing.remove("rules");
@@ -93,12 +147,14 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
 
     let by_tag =
         |value: &serde_json::Map<String, Value>, key: &str| -> Option<BTreeMap<String, Value>> {
-            value
-                .get(key)?
-                .as_array()?
-                .iter()
-                .map(|entry| Some((entry.get("tag")?.as_str()?.to_owned(), entry.clone())))
-                .collect()
+            let mut tagged = BTreeMap::new();
+            for entry in value.get(key)?.as_array()? {
+                let tag = entry.get("tag")?.as_str()?;
+                if tag.is_empty() || tagged.insert(tag.to_owned(), entry.clone()).is_some() {
+                    return None;
+                }
+            }
+            Some(tagged)
         };
     let (before_outbounds, after_outbounds) =
         (by_tag(before, "outbounds")?, by_tag(after, "outbounds")?);
@@ -123,11 +179,17 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
         return None;
     }
 
-    for (tag, outbound) in &after_outbounds {
-        if before_outbounds
-            .get(tag)
-            .is_some_and(|previous| previous != outbound)
-        {
+    let changed = after_outbounds
+        .iter()
+        .filter(|(tag, outbound)| {
+            before_outbounds
+                .get(*tag)
+                .is_some_and(|old| old != *outbound)
+        })
+        .map(|(tag, outbound)| (tag.clone(), outbound.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for (tag, outbound) in &changed {
+        if *tag == head(before)? || !vless_endpoint_only(&before_outbounds[tag], outbound) {
             return None;
         }
     }
@@ -144,42 +206,6 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
         return None;
     }
 
-    let (before_inbounds, after_inbounds) =
-        (by_tag(before, "inbounds")?, by_tag(after, "inbounds")?);
-
-    // The api inbound is the channel every call in this plan travels over. Taking it out
-    // would sever the connection mid-plan and leave the machine holding whichever half had
-    // been installed, with no way left to finish or undo it. The `api` block itself is
-    // already required to be identical, so its tag is the same on both sides.
-    let api_tag = before
-        .get("api")
-        .and_then(|api| api.get("tag"))
-        .and_then(Value::as_str);
-    if let Some(api_tag) = api_tag {
-        if before_inbounds.get(api_tag) != after_inbounds.get(api_tag) {
-            return None;
-        }
-    }
-
-    let remove_inbounds = before_inbounds
-        .iter()
-        .filter(|(tag, inbound)| {
-            after_inbounds
-                .get(*tag)
-                .is_none_or(|desired| desired != *inbound)
-        })
-        .map(|(tag, _)| tag.clone())
-        .collect::<Vec<_>>();
-    let add_inbounds = after_inbounds
-        .iter()
-        .filter(|(tag, inbound)| {
-            before_inbounds
-                .get(*tag)
-                .is_none_or(|previous| previous != *inbound)
-        })
-        .map(|(_, inbound)| inbound.clone())
-        .collect::<Vec<_>>();
-
     let rules = |value: &serde_json::Map<String, Value>| -> Option<Vec<Value>> {
         Some(value.get("routing")?.get("rules")?.as_array()?.clone())
     };
@@ -187,18 +213,46 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
     let tags = |rules: &[Value]| -> Option<Vec<String>> {
         rules
             .iter()
-            .map(|rule| Some(rule.get("ruleTag")?.as_str()?.to_owned()))
+            .map(|rule| {
+                Some(
+                    rule.get("ruleTag")?
+                        .as_str()
+                        .filter(|tag| !tag.is_empty())?
+                        .to_owned(),
+                )
+            })
             .collect()
     };
     // A table with an unnamed rule in it cannot be swapped: `rmrules` works by name, so the
     // unnamed one would survive the removal and sit in front of the new table forever.
     let remove_rule_tags = tags(&before_rules)?;
     let new_tags = tags(&after_rules)?;
+    if remove_rule_tags.iter().collect::<BTreeSet<_>>().len() != remove_rule_tags.len()
+        || new_tags.iter().collect::<BTreeSet<_>>().len() != new_tags.len()
+    {
+        return None;
+    }
+
+    let endpoint_swap = if changed.is_empty() {
+        None
+    } else {
+        Some(endpoint_swap_plan(
+            before,
+            after,
+            &changed,
+            &before_rules,
+            &after_rules,
+        )?)
+    };
 
     // A table that did not change is not reinstalled. Beyond saving two calls this is what
     // keeps the check below meaningful: an unchanged table necessarily reuses every name,
     // which is indistinguishable from a genuine collision by name alone.
-    let (add_rules, remove_rule_tags) = if before_rules == after_rules {
+    let (add_rules, remove_rule_tags) = if endpoint_swap.is_some() {
+        // The bridge table has disjoint names and removes the old table before the final
+        // one returns, so unchanged rule tags are safe in this path.
+        (after_rules, remove_rule_tags)
+    } else if before_rules == after_rules {
         (Vec::new(), Vec::new())
     } else {
         // Both tables are installed at once during the swap, and xray rejects a duplicate
@@ -213,8 +267,6 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
     };
 
     Some(HotSwap {
-        remove_inbounds,
-        add_inbounds,
         add_outbounds: after_outbounds
             .iter()
             .filter(|(tag, _)| !before_outbounds.contains_key(*tag))
@@ -227,7 +279,153 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
             .collect(),
         add_rules,
         remove_rule_tags,
+        endpoint_swap,
     })
+}
+
+fn vless_endpoint_only(before: &Value, after: &Value) -> bool {
+    if before["protocol"] != "vless" || after["protocol"] != "vless" {
+        return false;
+    }
+    let Some(old) = before.pointer("/settings/vnext").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(new) = after.pointer("/settings/vnext").and_then(Value::as_array) else {
+        return false;
+    };
+    if old.len() != 1 || new.len() != 1 {
+        return false;
+    }
+    let Some(users) = old[0]["users"].as_array() else {
+        return false;
+    };
+    if users.iter().any(|user| user.get("reverse").is_some()) {
+        return false;
+    }
+    let mut normalized = after.clone();
+    for key in ["address", "port"] {
+        normalized["settings"]["vnext"][0][key] = old[0][key].clone();
+    }
+    normalized == *before
+}
+
+fn endpoint_swap_plan(
+    before: &serde_json::Map<String, Value>,
+    after: &serde_json::Map<String, Value>,
+    changed: &BTreeMap<String, Value>,
+    before_rules: &[Value],
+    after_rules: &[Value],
+) -> Option<EndpointSwap> {
+    // No empty table: Xray's adrules CLI needs a nonempty payload and both generations
+    // must provide a route while the other table is removed.
+    if before_rules.is_empty() || after_rules.is_empty() {
+        return None;
+    }
+    for config in [before, after] {
+        for (key, value) in config {
+            if key != "routing" && has_indirect_reference(value, changed) {
+                return None;
+            }
+        }
+        for outbound in config.get("outbounds")?.as_array()? {
+            if outbound["tag"].as_str()?.ends_with(ENDPOINT_SWAP_SUFFIX) {
+                return None;
+            }
+        }
+        let routing = config.get("routing")?;
+        if let Some(balancers) = routing.get("balancers").and_then(Value::as_array) {
+            for balancer in balancers {
+                let references_changed = balancer["selector"].as_array()?.iter().any(|selector| {
+                    selector
+                        .as_str()
+                        .is_some_and(|prefix| changed.keys().any(|tag| tag.starts_with(prefix)))
+                }) || balancer["fallbackTag"]
+                    .as_str()
+                    .is_some_and(|tag| changed.contains_key(tag));
+                if references_changed {
+                    // The compiler's health-only balancer does not route application traffic.
+                    // Real balancer selections / fallback tags cannot be redirected by our
+                    // bridge table, and therefore must use handoff instead.
+                    use brocade_core::artifacts::xray::{
+                        HOP_HEALTH_BALANCER_TAG, NEVER_MATCH_DOMAIN,
+                    };
+                    if balancer["tag"] != HOP_HEALTH_BALANCER_TAG
+                        || balancer.get("fallbackTag").is_some()
+                        || before_rules.iter().chain(after_rules).any(|rule| {
+                            rule["balancerTag"] == HOP_HEALTH_BALANCER_TAG
+                                && rule["domain"] != serde_json::json!([NEVER_MATCH_DOMAIN])
+                        })
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    if before_rules.iter().chain(after_rules).any(|rule| {
+        rule["ruleTag"]
+            .as_str()
+            .is_some_and(|tag| tag.starts_with(ENDPOINT_RULE_PREFIX))
+    }) {
+        return None;
+    }
+    let bridge_outbounds = changed
+        .values()
+        .map(|outbound| {
+            let mut bridge = outbound.clone();
+            bridge["tag"] = format!(
+                "{}{ENDPOINT_SWAP_SUFFIX}",
+                outbound["tag"].as_str().expect("validated outbound tag")
+            )
+            .into();
+            bridge
+        })
+        .collect();
+    let bridge_rules = after_rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let mut bridge = rule.clone();
+            bridge["ruleTag"] = format!("{ENDPOINT_RULE_PREFIX}{index}").into();
+            if let Some(tag) = rule["outboundTag"]
+                .as_str()
+                .filter(|tag| changed.contains_key(*tag))
+            {
+                bridge["outboundTag"] = format!("{tag}{ENDPOINT_SWAP_SUFFIX}").into();
+            }
+            bridge
+        })
+        .collect();
+    Some(EndpointSwap {
+        outbounds: changed.values().cloned().collect(),
+        bridge_outbounds,
+        bridge_rules,
+    })
+}
+
+fn has_indirect_reference(value: &Value, changed: &BTreeMap<String, Value>) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("proxySettings")
+                .and_then(|settings| settings.get("tag"))
+                .and_then(Value::as_str)
+                .is_some_and(|tag| changed.contains_key(tag))
+                || ["dialerProxy", "outboundTag"].iter().any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|tag| changed.contains_key(tag))
+                })
+                || object
+                    .values()
+                    .any(|child| has_indirect_reference(child, changed))
+        }
+        Value::Array(array) => array
+            .iter()
+            .any(|child| has_indirect_reference(child, changed)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +470,160 @@ mod tests {
             &[("r:g1:000", "out:egress"), ("r:g1:001", "out:a")],
             &["out:a"],
         )
+    }
+
+    fn endpoint_configs() -> (Value, Value) {
+        let mut before: Value = serde_json::from_str(&base()).unwrap();
+        before["outbounds"][1] = json!({
+            "tag":"out:a", "protocol":"vless", "settings":{"vnext":[{
+                "address":"192.0.2.1", "port":443,
+                "users":[{"id":"00000000-0000-4000-8000-000000000001", "encryption":"none"}]
+            }]}
+        });
+        let mut after = before.clone();
+        after["outbounds"][1]["settings"]["vnext"][0]["address"] = json!("2001:db8::1");
+        (before, after)
+    }
+
+    #[test]
+    fn endpoint_swap_keeps_every_routing_target_present_at_each_api_boundary() {
+        use super::HotSwapOperation::*;
+        let (before, after) = endpoint_configs();
+        let swap = hot_swap(&before.to_string(), &after.to_string()).unwrap();
+        assert!(swap.endpoint_swap.is_some());
+        let mut outbounds = before["outbounds"].as_array().unwrap().clone();
+        let mut rules = before["routing"]["rules"].as_array().unwrap().clone();
+        for operation in swap.operations() {
+            match operation {
+                AddOutbounds(added) => {
+                    for added in &added {
+                        assert!(outbounds.iter().all(|old| old["tag"] != added["tag"]));
+                    }
+                    outbounds.extend(added);
+                }
+                RemoveOutbounds(tags) => {
+                    outbounds.retain(|out| !tags.iter().any(|tag| out["tag"] == *tag))
+                }
+                AddRules(added) => {
+                    for added in &added {
+                        assert!(rules.iter().all(|old| old["ruleTag"] != added["ruleTag"]));
+                    }
+                    rules.extend(added);
+                }
+                RemoveRules(tags) => {
+                    rules.retain(|rule| !tags.iter().any(|tag| rule["ruleTag"] == *tag))
+                }
+            }
+            assert!(!rules.is_empty());
+            for rule in &rules {
+                assert!(outbounds
+                    .iter()
+                    .any(|out| out["tag"] == rule["outboundTag"]));
+            }
+            assert_eq!(
+                outbounds[0], before["outbounds"][0],
+                "default handler remains installed"
+            );
+        }
+        assert_eq!(&outbounds, after["outbounds"].as_array().unwrap());
+        assert_eq!(&rules, after["routing"]["rules"].as_array().unwrap());
+        assert!(hot_swap(&after.to_string(), &before.to_string())
+            .unwrap()
+            .endpoint_swap
+            .is_some());
+        assert!(hot_swap(&after.to_string(), &after.to_string())
+            .unwrap()
+            .operations()
+            .is_empty());
+    }
+
+    #[test]
+    fn endpoint_swap_allows_a_changed_rule_table_with_reused_names() {
+        let (before, mut after) = endpoint_configs();
+        after["routing"]["rules"][1]["domain"] = json!(["full:example.test"]);
+        let swap = hot_swap(&before.to_string(), &after.to_string()).unwrap();
+        assert_eq!(
+            &swap.add_rules,
+            after["routing"]["rules"].as_array().unwrap()
+        );
+        assert_eq!(
+            swap.endpoint_swap.unwrap().bridge_rules[1]["domain"],
+            json!(["full:example.test"])
+        );
+    }
+
+    #[test]
+    fn endpoint_swap_rejects_duplicate_tags() {
+        let (before, mut after) = endpoint_configs();
+        let duplicate = after["outbounds"][1].clone();
+        after["outbounds"].as_array_mut().unwrap().push(duplicate);
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
+        let (before, mut after) = endpoint_configs();
+        after["routing"]["rules"][1]["ruleTag"] = after["routing"]["rules"][0]["ruleTag"].clone();
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
+        after["routing"]["rules"][1]["ruleTag"] = json!("");
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
+    }
+
+    #[test]
+    fn removing_the_last_rule_leaves_the_default_outbound_installed() {
+        let mut after: Value = serde_json::from_str(&base()).unwrap();
+        after["routing"]["rules"] = json!([]);
+        let swap = hot_swap(&base(), &after.to_string()).unwrap();
+        assert!(
+            matches!(swap.operations().as_slice(), [super::HotSwapOperation::RemoveRules(tags)] if tags.len() == 2)
+        );
+    }
+
+    #[test]
+    fn endpoint_swap_rejects_unsafe_references_and_other_outbound_changes() {
+        let (before, after) = endpoint_configs();
+        for (path, value) in [
+            (
+                "/outbounds/1/settings/vnext/0/users/0/reverse",
+                json!({"tag":"bridge"}),
+            ),
+            ("/outbounds/0/proxySettings", json!({"tag":"out:a"})),
+            (
+                "/outbounds/0/streamSettings",
+                json!({"sockopt":{"dialerProxy":"out:a"}}),
+            ),
+            ("/routing/balancers/0/tag", json!("application-balancer")),
+            ("/routing/balancers/0/fallbackTag", json!("out:a")),
+            ("/routing/rules/1/balancerTag", json!("hop-health")),
+            ("/routing/rules/1/ruleTag", json!("brocade:endpoint-swap:0")),
+        ] {
+            let mut old = before.clone();
+            let mut new = after.clone();
+            let (parent, key) = path.rsplit_once('/').unwrap();
+            old.pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_owned(), value.clone());
+            new.pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_owned(), value);
+            assert!(
+                hot_swap(&old.to_string(), &new.to_string()).is_none(),
+                "{path}"
+            );
+        }
+        let mut new = after.clone();
+        new["outbounds"][1]["settings"]["vnext"][0]["users"][0]["encryption"] = json!("changed");
+        assert!(hot_swap(&before.to_string(), &new.to_string()).is_none());
+        let mut old = before.clone();
+        let mut new = after.clone();
+        old["outbounds"].as_array_mut().unwrap().swap(0, 1);
+        new["outbounds"].as_array_mut().unwrap().swap(0, 1);
+        assert!(hot_swap(&old.to_string(), &new.to_string()).is_none());
+        for config in [&mut old, &mut new] {
+            config["outbounds"].as_array_mut().unwrap().swap(0, 1);
+            config["outbounds"].as_array_mut().unwrap().push(json!({"tag":format!("out:a{}", super::ENDPOINT_SWAP_SUFFIX),"protocol":"blackhole"}));
+        }
+        assert!(hot_swap(&old.to_string(), &new.to_string()).is_none());
     }
 
     #[test]
@@ -439,44 +791,27 @@ mod tests {
         assert!(hot_swap(&base(), &serde_json::to_string(&after).unwrap()).is_none());
     }
 
-    /// Replacing an inbound is expressible: xray refuses a second inbound under a tag that
-    /// already exists, so the change becomes a removal and an addition of the same tag.
-    ///
-    /// Measured on 26.4.25, this costs far less than it reads: removing an inbound closes
-    /// its listener but does not touch the connections already on it (a transfer in flight
-    /// ran on to completion 15 seconds after its inbound was gone), and the traffic
-    /// counters survive under the same names. What it does cost is the accounts, which is
-    /// why `add_inbounds` obliges whoever installs it to push them back.
     #[test]
-    fn an_inbound_change_is_swappable_as_a_removal_and_an_addition() {
+    fn an_inbound_replacement_requires_handoff() {
         let after = config(
             8443,
             &["out:egress", "out:a"],
             &[("r:g1:000", "out:egress"), ("r:g1:001", "out:a")],
             &["out:a"],
         );
-        let swap = hot_swap(&base(), &after).expect("换入站是可表达的");
-        assert_eq!(swap.remove_inbounds, vec!["in:frt/i-a".to_owned()]);
-        assert_eq!(swap.add_inbounds.len(), 1);
-        assert_eq!(swap.add_inbounds[0]["port"], 8443);
-        // The rest of the config did not move, so nothing else is asked for.
-        assert!(swap.add_rules.is_empty() && swap.add_outbounds.is_empty());
+        assert!(hot_swap(&base(), &after).is_none());
     }
 
-    /// An inbound that only appears has nothing to remove, and therefore not even the
-    /// moment of not listening that a replacement has.
     #[test]
-    fn a_new_inbound_is_added_without_removing_anything() {
+    fn adding_or_removing_an_inbound_requires_handoff() {
         let mut after: Value = serde_json::from_str(&base()).unwrap();
         after["inbounds"]
             .as_array_mut()
             .unwrap()
             .push(json!({ "tag": "in:frt/i-b", "port": 8443, "protocol": "vless" }));
-        let swap =
-            hot_swap(&base(), &serde_json::to_string(&after).unwrap()).expect("新增入站没有空窗");
-        assert!(swap.remove_inbounds.is_empty());
-        assert_eq!(swap.add_inbounds.len(), 1);
-        assert_eq!(swap.add_inbounds[0]["tag"], "in:frt/i-b");
+        let after = serde_json::to_string(&after).unwrap();
+        assert!(hot_swap(&base(), &after).is_none());
+        assert!(hot_swap(&after, &base()).is_none());
     }
 
     /// The api inbound carries every call the swap is made of. Removing it would cut the

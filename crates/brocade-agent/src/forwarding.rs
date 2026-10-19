@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    net::{Ipv4Addr, TcpListener, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     path::Path,
     sync::{Arc, Mutex},
     thread,
@@ -22,28 +22,39 @@ use crate::{
     options::Options,
     reserve_usage_sequence,
     spool::{spool_push, FORWARDING_USAGE_SPOOL},
-    xray_api_port, xray_grpc, xray_process_identity,
+    xray_api_address, xray_grpc, xray_process_identity,
 };
 
 const FORWARDING_INTERVAL: Duration = Duration::from_secs(15);
+const FORWARDING_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const FORWARDING_STATE_FILE: &str = "forwarding-applied.json";
+const FORWARDING_DESIRED_FILE: &str = "forwarding-desired.json";
 const FORWARDING_TAG_PREFIX: &str = "fwd:";
 
 pub(crate) fn run_forever(options: Options, meter: Arc<Mutex<()>>) {
     let mut tick = Instant::now();
     loop {
-        if let Err(error) = run_round(&options, &meter) {
-            eprintln!("forwarding: {error}");
-        }
+        let interval = match run_round(&options, &meter) {
+            Ok(true) => FORWARDING_INTERVAL,
+            Ok(false) => FORWARDING_RETRY_INTERVAL,
+            Err(error) => {
+                eprintln!("forwarding: {error}");
+                FORWARDING_RETRY_INTERVAL
+            }
+        };
         let now = Instant::now();
-        tick = next_periodic_tick(tick, FORWARDING_INTERVAL, now);
+        tick = next_periodic_tick(tick, interval, now);
         thread::sleep(tick.saturating_duration_since(now));
     }
 }
 
-fn run_round(options: &Options, meter: &Mutex<()>) -> Result<(), String> {
+fn run_round(options: &Options, meter: &Mutex<()>) -> Result<bool, String> {
     let client = HttpClient::new(&options.server)?;
     let desired = fetch_desired(&client, options)?;
+    // Persist the complete control-plane answer before changing the runtime. The applied
+    // checkpoint below is intentionally allowed to become partial when one listener fails; using
+    // that partial set as the restart source would silently forget the missing rule forever.
+    write_desired_state(&options.state_dir, &desired)?;
     let (report, usage) = {
         let _guard = meter
             .lock()
@@ -57,7 +68,62 @@ fn run_round(options: &Options, meter: &Mutex<()>) -> Result<(), String> {
     } else if let Err(error) = usage {
         eprintln!("forwarding usage: {error}");
     }
-    send_reconcile(&client, options, &report)
+    let complete = report.error.is_none();
+    send_reconcile(&client, options, &report)?;
+    Ok(complete)
+}
+
+/// Restore the last complete desired set without contacting the control plane.
+///
+/// Older Agents only wrote `forwarding-applied.json`. On the first restart after upgrading, that
+/// proven-serving set is the safest recovery source available; persist the migration immediately
+/// so later partial reconciles can no longer shrink it.
+pub(crate) fn restore_after_xray_restart(
+    state_dir: &Path,
+    xray_content: &str,
+    api_address: SocketAddr,
+) -> Result<Option<ForwardingReconcileReport>, String> {
+    let Some(desired) = desired_state_on_disk(state_dir)? else {
+        return Ok(None);
+    };
+    let report = reconcile_listeners(
+        state_dir,
+        &desired,
+        forwarding_outbound_is_ready(xray_content),
+        &mut XrayForwardingApi(api_address),
+    )?;
+    Ok(Some(report))
+}
+
+pub(crate) fn recovery_complete(state_dir: &Path, api_address: SocketAddr) -> Result<bool, String> {
+    let Some(desired) = desired_state_on_disk(state_dir)? else {
+        return Ok(true);
+    };
+    let wanted = desired
+        .rules
+        .iter()
+        .map(|rule| rule.id)
+        .collect::<BTreeSet<_>>();
+    let actual = xray_grpc::inbound_tags(api_address)?
+        .into_iter()
+        .filter_map(|tag| forwarding_id(&tag))
+        .collect::<BTreeSet<_>>();
+    if actual != wanted {
+        return Ok(false);
+    }
+    let applied = read_state(state_dir)?;
+    let applied = applied
+        .rules
+        .into_iter()
+        .map(|rule| (rule.id, rule))
+        .collect::<BTreeMap<_, _>>();
+    let desired = desired
+        .rules
+        .iter()
+        .cloned()
+        .map(|rule| (rule.id, rule))
+        .collect::<BTreeMap<_, _>>();
+    Ok(applied == desired)
 }
 
 fn fetch_desired(client: &HttpClient, options: &Options) -> Result<ForwardingDesiredState, String> {
@@ -125,12 +191,12 @@ fn reconcile_inner(
         Ok(_) => return Err("Xray is disabled while forwarding rules are enabled".to_owned()),
         Err(error) => return Err(format!("read {}: {error}", xray_path.display())),
     };
-    let api_port = xray_api_port(&content).ok_or("xray config has no API port")?;
+    let api_address = xray_api_address(&content).ok_or("xray config has no API address")?;
     reconcile_listeners(
         state_dir,
         desired,
         forwarding_outbound_is_ready(&content),
-        &mut XrayForwardingApi(api_port),
+        &mut XrayForwardingApi(api_address),
     )
 }
 
@@ -147,7 +213,7 @@ trait ForwardingRuntime {
     }
 }
 
-struct XrayForwardingApi(u16);
+struct XrayForwardingApi(SocketAddr);
 
 impl ForwardingRuntime for XrayForwardingApi {
     fn inbound_tags(&mut self) -> Result<Vec<String>, String> {
@@ -432,8 +498,8 @@ fn forwarding_outbound_is_ready(content: &str) -> bool {
 fn current_forwarding_rule_ids(state_dir: &Path) -> Result<Vec<i64>, String> {
     let content = fs::read_to_string(state_dir.join("xray.json"))
         .map_err(|error| format!("read xray config: {error}"))?;
-    let api_port = xray_api_port(&content).ok_or("xray config has no API port")?;
-    Ok(xray_grpc::inbound_tags(api_port)?
+    let api_address = xray_api_address(&content).ok_or("xray config has no API address")?;
+    Ok(xray_grpc::inbound_tags(api_address)?
         .into_iter()
         .filter_map(|tag| forwarding_id(&tag))
         .collect())
@@ -442,11 +508,11 @@ fn current_forwarding_rule_ids(state_dir: &Path) -> Result<Vec<i64>, String> {
 fn collect_usage(state_dir: &Path) -> Result<ForwardingUsageReportRequest, String> {
     let content = fs::read_to_string(state_dir.join("xray.json"))
         .map_err(|error| format!("read xray config: {error}"))?;
-    let api_port = xray_api_port(&content).ok_or("xray config has no API port")?;
+    let api_address = xray_api_address(&content).ok_or("xray config has no API address")?;
     let process = xray_process_identity(state_dir)?;
     let counter_epoch = crate::accounting::epoch(state_dir, &process.epoch, process.pid)?;
     let (agent_instance_id, sequence) = reserve_usage_sequence(state_dir)?;
-    let counters = read_counters(api_port)?;
+    let counters = read_counters(api_address)?;
     crate::accounting::sync_live_journal(state_dir, &process.epoch, process.pid)?;
     crate::validate_xray_sample_process(state_dir, &process)?;
     Ok(ForwardingUsageReportRequest {
@@ -467,9 +533,9 @@ fn collect_usage(state_dir: &Path) -> Result<ForwardingUsageReportRequest, Strin
     })
 }
 
-pub(crate) fn read_counters(api_port: u16) -> Result<BTreeMap<i64, (u64, u64)>, String> {
+pub(crate) fn read_counters(api_address: SocketAddr) -> Result<BTreeMap<i64, (u64, u64)>, String> {
     let mut counters = BTreeMap::<i64, (u64, u64)>::new();
-    for stat in xray_grpc::query_stats(api_port, "inbound>>>fwd:")? {
+    for stat in xray_grpc::query_stats(api_address, "inbound>>>fwd:")? {
         let Ok(value) = u64::try_from(stat.value) else {
             continue;
         };
@@ -509,9 +575,39 @@ fn read_state(state_dir: &Path) -> Result<ForwardingDesiredState, String> {
     serde_json::from_str(&content).map_err(|error| error.to_string())
 }
 
+pub(crate) fn desired_state_on_disk(
+    state_dir: &Path,
+) -> Result<Option<ForwardingDesiredState>, String> {
+    let desired_path = state_dir.join(FORWARDING_DESIRED_FILE);
+    match fs::read_to_string(&desired_path) {
+        Ok(content) => serde_json::from_str(&content)
+            .map(Some)
+            .map_err(|error| format!("decode {}: {error}", desired_path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let applied_path = state_dir.join(FORWARDING_STATE_FILE);
+            match fs::read_to_string(&applied_path) {
+                Ok(content) => {
+                    let state = serde_json::from_str::<ForwardingDesiredState>(&content)
+                        .map_err(|error| format!("decode {}: {error}", applied_path.display()))?;
+                    write_desired_state(state_dir, &state)?;
+                    Ok(Some(state))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(format!("read {}: {error}", applied_path.display())),
+            }
+        }
+        Err(error) => Err(format!("read {}: {error}", desired_path.display())),
+    }
+}
+
 fn write_state(state_dir: &Path, desired: &ForwardingDesiredState) -> Result<(), String> {
     let content = serde_json::to_vec_pretty(desired).map_err(|error| error.to_string())?;
     atomic_write_private(&state_dir.join(FORWARDING_STATE_FILE), &content)
+}
+
+fn write_desired_state(state_dir: &Path, desired: &ForwardingDesiredState) -> Result<(), String> {
+    let content = serde_json::to_vec_pretty(desired).map_err(|error| error.to_string())?;
+    atomic_write_private(&state_dir.join(FORWARDING_DESIRED_FILE), &content)
 }
 
 #[cfg(test)]
@@ -804,6 +900,16 @@ mod tests {
     #[test]
     #[ignore = "requires the repository's pinned Xray binary"]
     fn native_failed_convergence_preserves_the_previous_xray_listener() {
+        native_failed_convergence_on(false);
+    }
+
+    #[test]
+    #[ignore = "requires the repository's pinned Xray binary and IPv6 loopback"]
+    fn native_ipv6_api_restores_forwarding_after_restart() {
+        native_failed_convergence_on(true);
+    }
+
+    fn native_failed_convergence_on(ipv6_api: bool) {
         use std::{
             net::{Ipv4Addr, TcpListener, TcpStream},
             path::PathBuf,
@@ -822,8 +928,12 @@ mod tests {
             .local_addr()
             .expect("collision address")
             .port();
-        let api_port = distinct_free_port(&[collision_port]);
-        let original_port = distinct_free_port(&[collision_port, api_port]);
+        let api_address = if ipv6_api {
+            TcpListener::bind("[::1]:0").unwrap().local_addr().unwrap()
+        } else {
+            SocketAddr::from(([127, 0, 0, 1], distinct_free_port(&[collision_port])))
+        };
+        let original_port = distinct_free_port(&[collision_port, api_address.port()]);
         let dir = TestDir::new();
         let config = dir.0.join("xray.json");
         fs::write(
@@ -833,8 +943,8 @@ mod tests {
                 "api": { "tag": "api", "services": ["HandlerService"] },
                 "inbounds": [{
                     "tag": "api",
-                    "listen": "127.0.0.1",
-                    "port": api_port,
+                    "listen": api_address.ip().to_string(),
+                    "port": api_address.port(),
                     "protocol": "dokodemo-door",
                     "settings": { "address": "127.0.0.1" }
                 }],
@@ -874,7 +984,7 @@ mod tests {
         );
         let mut ready = false;
         for _ in 0..50 {
-            if xray_grpc::inbound_tags(api_port).is_ok() {
+            if xray_grpc::inbound_tags(api_address).is_ok() {
                 ready = true;
                 break;
             }
@@ -893,7 +1003,8 @@ mod tests {
             target_port: 9,
         };
         let wanted = desired(vec![original.clone()]);
-        let mut runtime = XrayForwardingApi(api_port);
+        write_desired_state(&dir.0, &wanted).unwrap();
+        let mut runtime = XrayForwardingApi(api_address);
         let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
         assert_eq!(report.error, None);
         TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))
@@ -904,7 +1015,7 @@ mod tests {
             report.error.is_some(),
             "the outbound preflight must still report failure"
         );
-        assert!(xray_grpc::inbound_tags(api_port)
+        assert!(xray_grpc::inbound_tags(api_address)
             .unwrap()
             .contains(&forwarding_tag(42)));
         TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))
@@ -922,16 +1033,49 @@ mod tests {
             "the real bind conflict must be rejected before replacement: {:?}",
             report.error
         );
-        assert!(xray_grpc::inbound_tags(api_port)
+        assert!(xray_grpc::inbound_tags(api_address)
             .unwrap()
             .contains(&forwarding_tag(42)));
         assert_eq!(read_state(&dir.0).unwrap().rules, [original]);
         TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))
             .expect("failed replacement restores the original listener immediately");
 
+        child.0.kill().expect("stop the first isolated Xray");
+        child.0.wait().expect("reap the first isolated Xray");
+        child.0 = Command::new(&binary)
+            .args([
+                "run",
+                "-config",
+                config.to_str().expect("utf-8 config path"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("restart isolated Xray");
+        let mut ready = false;
+        for _ in 0..50 {
+            if xray_grpc::inbound_tags(api_address).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "restarted isolated Xray API did not become ready");
+        assert!(!xray_grpc::inbound_tags(api_address)
+            .unwrap()
+            .contains(&forwarding_tag(42)));
+        let content = fs::read_to_string(&config).unwrap();
+        let report = restore_after_xray_restart(&dir.0, &content, api_address)
+            .unwrap()
+            .expect("persisted forwarding desired state");
+        assert_eq!(report.error, None);
+        assert!(recovery_complete(&dir.0, api_address).unwrap());
+        TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))
+            .expect("restart recovery restores the forwarding listener immediately");
+
         let report = reconcile_listeners(&dir.0, &desired(vec![]), true, &mut runtime).unwrap();
         assert_eq!(report.error, None);
-        assert!(!xray_grpc::inbound_tags(api_port)
+        assert!(!xray_grpc::inbound_tags(api_address)
             .unwrap()
             .contains(&forwarding_tag(42)));
         drop(collision_guard);
@@ -948,6 +1092,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn complete_desired_snapshot_survives_a_partial_runtime_checkpoint() {
+        let dir = TestDir::new();
+        let wanted = desired(vec![rule(1), rule(2)]);
+        write_desired_state(&dir.0, &wanted).unwrap();
+
+        let mut runtime = FakeRuntime::default();
+        runtime.fail_add.insert(2);
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert_eq!(report.applied_rule_ids, [1]);
+        assert_eq!(read_state(&dir.0).unwrap().rules, [rule(1)]);
+        assert_eq!(desired_state_on_disk(&dir.0).unwrap(), Some(wanted));
+    }
+
+    #[test]
+    fn legacy_applied_checkpoint_is_migrated_once_as_restart_desired_state() {
+        let dir = TestDir::new();
+        let legacy = desired(vec![rule(3)]);
+        write_state(&dir.0, &legacy).unwrap();
+
+        assert_eq!(desired_state_on_disk(&dir.0).unwrap(), Some(legacy.clone()));
+        assert!(dir.0.join(FORWARDING_DESIRED_FILE).exists());
+
+        write_state(&dir.0, &desired(vec![])).unwrap();
+        assert_eq!(desired_state_on_disk(&dir.0).unwrap(), Some(legacy));
     }
 
     #[test]

@@ -1,22 +1,26 @@
+import { useMetricQuery } from './ui/metric-cadence';
 import { lazy, memo, Suspense, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { fetchNodeUserTrafficHistory, fetchUserTrafficHistory, type UserTrafficHistory } from './api';
 import { useNodeRealtime, type RealtimeUserTrafficRate } from './node-realtime';
 import { throughputAxis } from './panes/telemetry-format';
 import { SegmentedControl } from './ui/bits';
 import { bytes, shareOf } from './ui/format';
 import { Icon, PanelTitle } from './ui/icons';
+import { useNodeCountries } from './ui/node-name';
 import { observeBpsReadingParts } from './ui/observe-chart';
+import { RegionFlag } from './ui/region-flag';
 import { sparklinePaths } from './ui/sparkline';
+import { PARTIAL_TEXT, PHASE_TEXT, RATE_SUM_NOTE, type TrafficPhase } from './user-traffic-phase';
 import { FRESH_MILLIS, useUserTrafficSource, type UserTrafficNode } from './user-traffic-source';
 
-/* 用户实时流量卡（机器详情 / 用户详情）。两路数据分开呈现，不拼接：
- * - 近 1 小时：Agent 每 30 秒上报的计费窗口，打开时读取、每 30 秒重读，画成走势。
- * - 当前：打开页面后按需订阅的每秒速率，只画成读数（顶部合计加上下行占比条，每格数值）。打开前没有秒级数据，
+/* 用户实时流量卡（用量中的机器弹层 / 用户详情）。两路数据分开呈现，不拼接：
+ * - 近 1 小时：Agent 每 30 秒上报的计费窗口，打开时读取、每 30 秒重读，画成每格的走势；
+ *   机器弹层用它画本机合计柱状图，用户详情用它呈现入口机器合计图和每台机器的走势。
+ * - 当前：打开页面后按需订阅的每秒速率，以读数呈现（左侧合计加上下行占比条）。打开前没有秒级数据，
  *   画成时间序列会在打开时出现空图。
  * 出现过的行保留到离开页面：机器详情的 all 模式不上报速率为 0 的用户，按最新报告重建列表
- * 会让用户每秒出现又消失。默认按名称排列且不自动重排；选了下行 / 上行 / 近 1 小时后每 5 秒
- * 按数值重排一次，指针停在列表上时暂停。 */
+ * 会让用户每秒出现又消失。默认按名称排列且不自动重排；选择数值排序后只更新读数，当前可见
+ * 名次变化时提示用户确认重排，避免阅读中的卡片自己跳动。 */
 
 const LazyThroughputChart = lazy(() =>
   import('./panes/telemetry').then(module => ({ default: module.ThroughputChart })),
@@ -27,31 +31,21 @@ const SLOT_SECS = 30;
 const SLOTS = HOUR_SECS / SLOT_SECS;
 /** 连续这么久没有流量才算空闲：突发流量之间的空档不改变行的样式。 */
 const IDLE_MILLIS = 10_000;
-const RESORT_MILLIS = 5_000;
 const HISTORY_REFRESH_MILLIS = 30_000;
-/** 两个页面都排成多列紧凑格；默认显示前 18 项（宽屏三列六行）。 */
-const FOLD = 18;
+/** 大人群列表只展开到与左侧读数栏大致齐平；手机上再缩短首屏。 */
+const CROWD_FOLD = 14;
+const CROWD_FOLD_NARROW = 8;
+/** 读数栏只列当前最忙的几条接入链，其余合为一行，读数栏不随链数变长。 */
+const CHAIN_FOLD = 5;
+const MORE_STEP = 60;
 /** 与协议 MAX_REALTIME_USER_TRAFFIC_ROWS 一致：一台机器一份报告最多这么多行。 */
 const RETAINED_LIMIT = 2_048;
-const SPARK_HEIGHT = 28;
+const SPARK_HEIGHT = 30;
 const SCOPE_NOTE = '统计入口 Xray 的接入与转发；中继不提供最终用户身份';
 const NO_TARGETS: readonly string[] = [];
 
-type TrafficPhase =
-  'pending' | 'ready' | 'unavailable' | 'offline' | 'unsupported' | 'disabled' | 'empty' | 'forwarding-unsupported';
-const PHASE_TEXT: Record<TrafficPhase, string> = {
-  pending: '正在建立速率基线',
-  ready: '实时 · 每秒更新',
-  unavailable: 'Xray 用户统计暂不可用',
-  offline: '实时通道未连接',
-  unsupported: '当前 Agent 尚未支持用户速率',
-  disabled: '实时观测已关闭',
-  empty: '尚未授权接入线路或转发入口',
-  'forwarding-unsupported': '转发实时待升级 Agent',
-};
-
 type TrafficSort = 'name' | 'down' | 'up' | 'hour';
-const SORTS: readonly { value: TrafficSort; label: string }[] = [
+const USER_SORTS: readonly { value: TrafficSort; label: string }[] = [
   { value: 'name', label: '名称' },
   { value: 'down', label: '下行' },
   { value: 'up', label: '上行' },
@@ -65,12 +59,18 @@ export interface LiveTrafficRow {
   detail: string;
   down: number | null;
   up: number | null;
+  /** False keeps a last-known row visible without counting it as a current measurement. */
+  current?: boolean;
+  /** Console receipt time for this row, never the newest receipt of another machine. */
+  measuredAt?: number;
   /** 用户详情：这台入口机器的实时通道未连接或数据已过期。 */
   offline?: boolean;
   /** 用户详情：该用户在这台机器上报告的接入点数。 */
   ingresses?: number;
   forwardingDown?: number;
   forwardingUp?: number;
+  /** 机器详情：按来源分的当前速率，键为 `ingress:<接入点>` 或 `forwarding`，页面再映射到接入链。 */
+  sources?: Readonly<Record<string, { down: number; up: number }>>;
 }
 
 interface RetainedRow extends LiveTrafficRow {
@@ -109,25 +109,55 @@ export interface CardRow {
   down: number | null;
   up: number | null;
   offline: boolean;
+  current?: boolean;
+  measuredAt?: number;
   ingresses?: number;
   forwardingDown?: number;
   forwardingUp?: number;
+  sources?: LiveTrafficRow['sources'];
   hour: HourRow | null;
   hourBytes: number;
   lastActiveMs: number | null;
 }
 
+/** 机器详情一项当前来源的显示：接入链（多个接入点合并）、端口转发，或已不在模型里的接入点。 */
+export interface TrafficSource {
+  key: string;
+  name: string;
+  country: string | null;
+  muted?: boolean;
+}
+
+export const FORWARDING_SOURCE = 'forwarding';
+
+/** 没有模型可查时的写法：接入点只写编号，转发写「端口转发」。 */
+export function fallbackSource(key: string): TrafficSource {
+  if (key === FORWARDING_SOURCE) return { key, name: '端口转发', country: null, muted: true };
+  const ingress = key.startsWith('ingress:') ? key.slice('ingress:'.length) : key;
+  return { key, name: ingress ? `接入点 ${ingress}` : '接入点未知', country: null, muted: true };
+}
+
 const userKey = (tenantId: string, userId: string) => `${tenantId}/${userId}`;
 const slotOf = (unixSecs: number) => Math.floor(unixSecs / SLOT_SECS) * SLOT_SECS;
 
+/** 一行报告的来源：转发规则合为一项，接入按接入点区分。 */
+const sourceKey = (user: RealtimeUserTrafficRate) =>
+  user.forwarding_rule_id !== undefined ? FORWARDING_SOURCE : `ingress:${user.ingress_id ?? ''}`;
+
 /** 同一用户可能经由多个接入点；租户不同的同名用户是两个人。 */
 export function aggregateUserTraffic(users: RealtimeUserTrafficRate[]): LiveTrafficRow[] {
-  const grouped = new Map<string, LiveTrafficRow & { down: number; up: number }>();
+  const grouped = new Map<
+    string,
+    LiveTrafficRow & { down: number; up: number; sources: Record<string, { down: number; up: number }> }
+  >();
   for (const user of users) {
     const key = userKey(user.tenant_id, user.user_id);
-    const row = grouped.get(key) ?? { key, name: user.user_id, detail: user.tenant_id, down: 0, up: 0 };
+    const row = grouped.get(key) ?? { key, name: user.user_id, detail: user.tenant_id, down: 0, up: 0, sources: {} };
     row.down += user.downlink_bytes_per_sec;
     row.up += user.uplink_bytes_per_sec;
+    const source = (row.sources[sourceKey(user)] ??= { down: 0, up: 0 });
+    source.down += user.downlink_bytes_per_sec;
+    source.up += user.uplink_bytes_per_sec;
     if (user.forwarding_rule_id !== undefined) {
       row.forwardingDown = (row.forwardingDown ?? 0) + user.downlink_bytes_per_sec;
       row.forwardingUp = (row.forwardingUp ?? 0) + user.uplink_bytes_per_sec;
@@ -376,22 +406,33 @@ export function mergeRetained(
       ...row,
       down: known ? row.down : (before?.down ?? null),
       up: known ? row.up : (before?.up ?? null),
+      current: known && row.current !== false,
+      measuredAt: known ? (row.measuredAt ?? at) : before?.measuredAt,
       ingresses: row.ingresses ?? before?.ingresses,
       forwardingDown: known ? row.forwardingDown : before?.forwardingDown,
       forwardingUp: known ? row.forwardingUp : before?.forwardingUp,
-      lastActiveMs: active ? at : (before?.lastActiveMs ?? null),
+      sources: known ? row.sources : before?.sources,
+      lastActiveMs: active ? (row.measuredAt ?? at) : (before?.lastActiveMs ?? null),
     });
   }
-  if (complete) {
-    for (const [key, row] of previous)
-      if (!seen.has(key))
-        next.set(key, {
-          ...row,
-          down: 0,
-          up: 0,
-          forwardingDown: row.forwardingDown === undefined ? undefined : 0,
-          forwardingUp: row.forwardingUp === undefined ? undefined : 0,
-        });
+  for (const [key, row] of previous) {
+    if (!seen.has(key)) {
+      next.set(
+        key,
+        complete
+          ? {
+              ...row,
+              down: 0,
+              up: 0,
+              current: true,
+              measuredAt: at,
+              forwardingDown: row.forwardingDown === undefined ? undefined : 0,
+              forwardingUp: row.forwardingUp === undefined ? undefined : 0,
+              sources: row.sources === undefined ? undefined : {},
+            }
+          : { ...row, current: false },
+      );
+    }
   }
   if (next.size > RETAINED_LIMIT) {
     const evict = [...next.values()]
@@ -403,13 +444,14 @@ export function mergeRetained(
 }
 
 /** 渲染期按新报告调整保留的行（React 的「上一次渲染的信息」写法）：同一份报告只合并一次。 */
-function useRetained(at: number | null, live: readonly LiveTrafficRow[], complete: boolean) {
-  const [state, setState] = useState<{ at: number | null; rows: ReadonlyMap<string, RetainedRow> }>({
+function useRetained(at: number | null, live: readonly LiveTrafficRow[], complete: boolean, revision: unknown = at) {
+  const [state, setState] = useState<{ at: number | null; revision: unknown; rows: ReadonlyMap<string, RetainedRow> }>({
     at: null,
+    revision: null,
     rows: new Map(),
   });
-  if (at !== null && at !== state.at) {
-    const next = { at, rows: mergeRetained(state.rows, live, complete, at) };
+  if (at !== null && revision !== state.revision) {
+    const next = { at, revision, rows: mergeRetained(state.rows, live, complete, at) };
     setState(next);
     return next;
   }
@@ -435,35 +477,43 @@ interface ListOrder {
   keys: string[];
   at: number;
   sort: TrafficSort;
+  /** 数值排序第一次拿到当前读数时可建立初始快照；之后实时变化必须由用户确认。 */
+  measured?: boolean;
 }
 
-/** 下一份顺序；不需要变化时原样返回，调用方据此决定是否更新状态。 */
+/** 下一份顺序；数值变化只更新读数，只有切换排序或用户确认时才移动已有卡片。 */
 export function nextListOrder(
   order: ListOrder,
   rows: readonly CardRow[],
   sort: TrafficSort,
-  hold: boolean,
+  resort: boolean,
   now: number,
 ): ListOrder {
   const known = new Set(order.keys);
   const added = rows.filter(row => !known.has(row.key)).map(row => row.key);
   const present = new Set(rows.map(row => row.key));
-  const dynamic = sort !== 'name';
-  const resort =
+  const kept = order.keys.filter(key => present.has(key));
+  const removed = kept.length !== order.keys.length;
+  const measured = rows.some(row => row.down !== null && row.up !== null);
+  const shouldSort =
+    resort ||
     order.sort !== sort ||
     (order.keys.length === 0 && rows.length > 0) ||
-    (!dynamic && added.length > 0) ||
-    (dynamic && !hold && now - order.at >= RESORT_MILLIS);
-  if (resort) return { keys: [...rows].sort(compareRows(sort)).map(row => row.key), at: now, sort };
-  if (added.length > 0) return { ...order, keys: [...order.keys.filter(key => present.has(key)), ...added] };
+    (sort === 'name' && added.length > 0) ||
+    (sort !== 'name' && measured && !order.measured);
+  if (shouldSort) return { keys: [...rows].sort(compareRows(sort)).map(row => row.key), at: now, sort, measured };
+  if (added.length > 0 || removed) return { ...order, keys: [...kept, ...added] };
   return order;
 }
 
-function useListOrder(rows: readonly CardRow[], sort: TrafficSort, hold: boolean, now: number) {
+function useListOrder(rows: readonly CardRow[], sort: TrafficSort, now: number) {
   const [order, setOrder] = useState<ListOrder>({ keys: [], at: Number.NEGATIVE_INFINITY, sort });
-  const next = nextListOrder(order, rows, sort, hold, now);
+  const next = nextListOrder(order, rows, sort, false, now);
   if (next !== order) setOrder(next);
-  return next.keys;
+  return {
+    keys: next.keys,
+    resort: () => setOrder(current => nextListOrder(current, rows, sort, true, now)),
+  };
 }
 
 /** 位置变化的行从旧位置平移到新位置（FLIP）；只在顺序或可见集合变化后执行。返回挂在列表上的 ref。 */
@@ -543,25 +593,41 @@ const idleLabel = (idleMillis: number) =>
         ? `空闲 ${Math.floor(idleMillis / 60_000)} 分钟`
         : `空闲 ${Math.floor(idleMillis / 3_600_000)} 小时`;
 
-/** 近 1 小时走势：每格一个窗口的平均速率，下行画面积、上行画细线（与上方合计图同一编码）；
- * 缺失的格断开。按本行峰值缩放，下限是全体峰值的 6%，零星流量不会被放大成满格。 */
-const HourSpark = memo(function HourSpark({ hour, peak }: { hour: HourRow | null; peak: number }) {
+/** 近 1 小时走势：每格一个窗口的平均速率，下行画面积、上行画细线（与用户详情合计图同一编码）；
+ * 缺失的格断开，采集到而没有流量的时段只留底线。按本行峰值缩放，下限是全体峰值的 6%，
+ * 零星流量不会被放大成满格。 */
+const HourSpark = memo(function HourSpark({
+  hour,
+  peak,
+  sharedScale = false,
+}: {
+  hour: HourRow | null;
+  peak: number;
+  sharedScale?: boolean;
+}) {
   const paths = useMemo(() => {
     if (!hour) return null;
     const perSecond = (values: (number | null)[]) => values.map(value => (value === null ? null : value / SLOT_SECS));
     const down = perSecond(hour.down);
     const up = perSecond(hour.up);
     const own = Math.max(0, ...down.map(value => value ?? 0), ...up.map(value => value ?? 0));
-    const scale = Math.max(own, peak * 0.06, 1024) * 1.06;
-    return { down: sparklinePaths(down, scale, SPARK_HEIGHT), up: sparklinePaths(up, scale, SPARK_HEIGHT) };
-  }, [hour, peak]);
+    const scale = Math.max(sharedScale ? peak : own, sharedScale ? 0 : peak * 0.06, 1024) * 1.06;
+    return {
+      width: Math.max(1, down.length - 1),
+      down: sparklinePaths(down, scale, SPARK_HEIGHT),
+      up: sparklinePaths(up, scale, SPARK_HEIGHT),
+    };
+  }, [hour, peak, sharedScale]);
   return (
     <svg
       className="rut-spark"
-      viewBox={`0 0 ${SLOTS - 1} ${SPARK_HEIGHT}`}
+      viewBox={`0 0 ${paths?.width ?? SLOTS - 1} ${SPARK_HEIGHT}`}
       preserveAspectRatio="none"
       aria-hidden="true"
     >
+      {paths?.down.bases.map((path, index) => (
+        <path key={`b${index}`} className="rut-spark-base" d={path} />
+      ))}
       {paths?.down.areas.map((path, index) => (
         <path key={`a${index}`} className="rut-spark-area" d={path} />
       ))}
@@ -575,40 +641,143 @@ const HourSpark = memo(function HourSpark({ hour, peak }: { hour: HourRow | null
   );
 });
 
-function RateCell({ value, pair, direction }: { value: number | null; pair: number; direction: 'd' | 'u' }) {
+/** 入口机器的身份牌，同机器详情页头的 .nd-idplate：地区旗铺满圆角方牌，国别取公网 IPv4 的归属。
+ * 没有国别时与页头一样不画底板，只占位对齐。 */
+function MachineMark({ country }: { country: string | null }) {
+  if (!country) return <span className="rut-mark-slot" aria-hidden="true" />;
   return (
-    <span className={`rut-rate ${direction}${value === null ? ' none' : ''}`}>
-      <span className="rut-rate-text">
-        <Rate value={value} pair={pair} />
+    <span className="nd-idplate">
+      <span className="nd-idplate-clip">
+        <RegionFlag code={country} square />
       </span>
-      <i className="rut-dot" aria-hidden="true" />
     </span>
   );
 }
 
-function TrafficItem({ row, meta, idle, peak }: { row: CardRow; meta: string; idle: boolean; peak: number }) {
-  const pair = Math.max(row.down ?? 0, row.up ?? 0);
-  const label = `${row.name}：当前下行 ${row.down === null ? '未知' : bytes(row.down) + '/s'}，当前上行 ${
+/** 当前一栏：下行在上、上行在下，箭头与走势同色。连续 10 秒没有流量后只写空闲多久。
+ * 读数未知写「—」；实时通道断开（整张卡或这一台机器）时停在最后一次读数，为 0 的也写「—」。 */
+function CurrentRate({
+  row,
+  idle,
+  idleMillis,
+  frozen,
+}: {
+  row: CardRow;
+  idle: boolean;
+  idleMillis: number;
+  frozen: boolean;
+}) {
+  if (row.down === null || row.up === null || (frozen && totalOf(row) === 0)) {
+    return <span className="rut-cur none">—</span>;
+  }
+  if (idle) return <span className="rut-cur idle">{idleLabel(idleMillis)}</span>;
+  const pair = Math.max(row.down, row.up);
+  return (
+    <span className="rut-cur">
+      <span className="d">
+        <Icon of="rx" size={11} className="rut-dir" />
+        <Rate value={row.down} pair={pair} />
+      </span>
+      <span className="u">
+        <Icon of="tx" size={11} className="rut-dir" />
+        <Rate value={row.up} pair={pair} />
+      </span>
+    </span>
+  );
+}
+
+interface RowMeta {
+  /** 空闲多久；没有流量记录时为无穷大。 */
+  idleMillis: number;
+  idle: boolean;
+  /** 用量之前的说明（接入点数、含转发）与之后的说明（历史与连接）。 */
+  lead: string[];
+  tail: string[];
+}
+
+/** 用户详情的一台入口机器：地区旗方牌、名称与近 1 小时用量、走势、当前下行 / 上行。 */
+function TrafficItem({
+  row,
+  meta,
+  frozen,
+  peak,
+  country,
+}: {
+  row: CardRow;
+  meta: RowMeta;
+  frozen: boolean;
+  peak: number;
+  country: string | null;
+}) {
+  const label = `${row.name}：${row.current === false || frozen ? '上次' : '当前'}下行 ${row.down === null ? '未知' : bytes(row.down) + '/s'}，上行 ${
     row.up === null ? '未知' : bytes(row.up) + '/s'
   }，近 1 小时 ${bytes(row.hourBytes)}`;
+  const [figure, unit = ''] = bytes(row.hourBytes).split(' ');
   return (
     <div
-      className={`rut-item${idle ? ' idle' : ''}${row.offline ? ' offline' : ''}`}
+      className={`rut-item${meta.idle ? ' idle' : ''}${row.offline ? ' offline' : ''}`}
       role="listitem"
       aria-label={label}
       data-key={row.key}
     >
+      <MachineMark country={country} />
       <span className="rut-who">
         <b className="rut-name">{row.name}</b>
-        <span className={`rut-meta${row.offline ? ' warn' : ''}`} title={meta}>
-          {meta}
+        <span
+          className={`rut-meta${row.offline ? ' warn' : ''}`}
+          title={[...meta.lead, bytes(row.hourBytes), ...meta.tail].join(' · ')}
+        >
+          {meta.lead.map(part => `${part} · `).join('')}
+          <em>{figure}</em>
+          {unit && ` ${unit}`}
+          {meta.tail.map(part => ` · ${part}`).join('')}
         </span>
       </span>
       <HourSpark hour={row.hour} peak={peak} />
-      <RateCell value={row.down} pair={pair} direction="d" />
-      <RateCell value={row.up} pair={pair} direction="u" />
+      <CurrentRate
+        row={row}
+        idle={meta.idle}
+        idleMillis={meta.idleMillis}
+        frozen={frozen || row.offline || row.current === false}
+      />
     </div>
   );
+}
+
+function SourceName({ source }: { source: TrafficSource }) {
+  return (
+    <span className={`rut-source${source.muted ? ' muted' : ''}`}>
+      {source.key === FORWARDING_SOURCE ? (
+        <Icon of="forwarding" size={13} className="traffic-source-icon" />
+      ) : (
+        source.country && <RegionFlag code={source.country} />
+      )}
+      <span className="rut-source-name">{source.name}</span>
+    </span>
+  );
+}
+
+/** 当前来源按接入链合并（同一条链的多个接入点合为一项），从大到小。 */
+function sourcesOf(row: CardRow, sourceOf: (key: string) => TrafficSource) {
+  const merged = new Map<string, TrafficSource & { value: number }>();
+  for (const [key, rate] of Object.entries(row.sources ?? {})) {
+    const value = rate.down + rate.up;
+    if (value <= 0) continue;
+    const source = sourceOf(key);
+    const entry = merged.get(source.key) ?? { ...source, value: 0 };
+    entry.value += value;
+    merged.set(source.key, entry);
+  }
+  return [...merged.values()].sort((a, b) => b.value - a.value || nameOrder.compare(a.name, b.name));
+}
+
+type TrafficTier = 'empty' | 'list' | 'crowd' | 'machines';
+
+/** 机器详情 24 位以内全部列出；更多时折叠到首屏，默认按名称排，可继续展开。 */
+function tierOf(page: 'node' | 'user', count: number): TrafficTier {
+  if (count === 0) return 'empty';
+  if (page === 'user') return 'machines';
+  return count <= 24 ? 'list' : 'crowd';
 }
 
 /* ── 卡片 ── */
@@ -625,8 +794,12 @@ interface TrafficCardProps {
   complete: boolean;
   history: { model: HourModel | null; pending: boolean; failed: boolean };
   nameOf: (key: string) => string;
+  /** 用户详情：入口机器公网 IPv4 的归属地区，给身份牌的地区旗用。 */
+  countryOf?: (key: string) => string | null;
   /** 用户详情：快照列出的全部入口机器。 */
   targets?: readonly string[];
+  /** 机器用量：来源键（接入点 / 转发）对应的接入链名称与地区。 */
+  sourceOf?: (key: string) => TrafficSource;
   className?: string;
 }
 
@@ -640,18 +813,19 @@ function TrafficCard({
   complete,
   history,
   nameOf,
+  countryOf,
   targets = NO_TARGETS,
+  sourceOf = fallbackSource,
   className = '',
 }: TrafficCardProps) {
-  const [sort, setSort] = useState<TrafficSort>('name');
   const [query, setQuery] = useState('');
-  const [expanded, setExpanded] = useState(false);
-  const [hover, setHover] = useState(false);
-  // 机器详情列的是用户，用户详情列的是入口机器；两者都排成多列紧凑格
+  const [expanded, setExpanded] = useState(0);
+  const [narrow, setNarrow] = useState(false);
+  const cardRef = useRef<HTMLElement>(null);
   const users = page === 'node';
   const unit = users ? '位' : '台';
   const stale = phase === 'offline' && staleSince !== null;
-  const showsLive = phase === 'ready' || stale;
+  const showsLive = phase === 'ready' || phase === 'recovering' || stale;
 
   const rows = useMemo(() => {
     const keys = new Set<string>([...live.keys(), ...targets]);
@@ -668,9 +842,12 @@ function TrafficCard({
         down: showsLive ? (retained?.down ?? absent) : null,
         up: showsLive ? (retained?.up ?? absent) : null,
         offline: !!retained?.offline,
+        current: retained?.current ?? (phase === 'ready' && complete),
+        measuredAt: retained?.measuredAt,
         ingresses: retained?.ingresses,
         forwardingDown: retained?.forwardingDown,
         forwardingUp: retained?.forwardingUp,
+        sources: retained?.sources,
         hour,
         hourBytes: hour ? hour.hourDown + hour.hourUp : 0,
         lastActiveMs: Math.max(retained?.lastActiveMs ?? 0, hour?.lastActiveMs ?? 0) || null,
@@ -678,20 +855,43 @@ function TrafficCard({
     });
   }, [complete, users, history.model, live, nameOf, phase, showsLive, targets]);
 
-  const dynamic = sort !== 'name';
-  const held = hover && dynamic;
-  const order = useListOrder(rows, sort, held, now);
+  const tier = tierOf(page, rows.length);
+  const [sort, setSort] = useState<TrafficSort>('name');
+  const order = useListOrder(rows, sort, now);
   const byKey = new Map(rows.map(row => [row.key, row]));
-  const ordered = order.map(key => byKey.get(key)).filter((row): row is CardRow => !!row);
+  const ordered = order.keys.map(key => byKey.get(key)).filter((row): row is CardRow => !!row);
   const needle = query.trim().toLowerCase();
-  const matched = needle
-    ? ordered.filter(row => row.name.toLowerCase().includes(needle) || row.detail.toLowerCase().includes(needle))
-    : ordered;
-  const visible = expanded ? matched : matched.slice(0, FOLD);
+  const matched = needle ? ordered.filter(row => row.name.toLowerCase().includes(needle)) : ordered;
+  const searchable = !users && (rows.length > 6 || query !== '');
+  const fold = narrow ? CROWD_FOLD_NARROW : CROWD_FOLD;
+  const limit = tier === 'crowd' ? (needle ? MORE_STEP : fold) + expanded : Number.POSITIVE_INFINITY;
+  const visible = matched.slice(0, limit);
+  const latest = [...rows]
+    .sort(compareRows(sort))
+    .filter(row => !needle || row.name.toLowerCase().includes(needle))
+    .slice(0, limit);
+  const rankChanged =
+    sort !== 'name' && visible.map(row => row.key).join('\n') !== latest.map(row => row.key).join('\n');
   const listRef = useFlip(visible.map(row => row.key).join('\n'));
 
+  useLayoutEffect(() => {
+    const card = cardRef.current;
+    if (!card) return;
+    const update = () => setNarrow(card.clientWidth > 0 && card.clientWidth <= 700);
+    update();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(update);
+    observer.observe(card);
+    return () => observer.disconnect();
+  }, []);
+
+  /* 合计只算当前有效的读数：完整报告里缺席的已知行算 0，恢复中的旧读数超过新鲜期不再计入。 */
+  const counted = (row: CardRow) =>
+    !(phase === 'ready' && row.current === false) &&
+    !(phase === 'recovering' && row.measuredAt !== undefined && now - row.measuredAt > FRESH_MILLIS);
   const totals = rows.reduce(
     (sum, row) => {
+      if (!counted(row)) return sum;
       sum.down += row.down ?? 0;
       sum.up += row.up ?? 0;
       if (totalOf(row) > 0) sum.active += 1;
@@ -699,6 +899,20 @@ function TrafficCard({
     },
     { down: 0, up: 0, active: 0 },
   );
+  /* 当前经过的接入链：各用户按来源分的当前速率映射到接入链后相加，与上面的合计同一口径。 */
+  const chainRates = users
+    ? [
+        ...rows
+          .filter(row => showsLive && row.down !== null && counted(row))
+          .flatMap(row => sourcesOf(row, sourceOf))
+          .reduce((merged, source) => {
+            const entry = merged.get(source.key) ?? { ...source, value: 0 };
+            entry.value += source.value;
+            return merged.set(source.key, entry);
+          }, new Map<string, TrafficSource & { value: number }>())
+          .values(),
+      ].sort((a, b) => b.value - a.value || nameOrder.compare(a.name, b.name))
+    : [];
   const currentSum = totals.down + totals.up;
   const hero = observeBpsReadingParts(currentSum * 8);
   const pair = Math.max(totals.down, totals.up);
@@ -718,207 +932,346 @@ function TrafficCard({
     };
   }, [history.model]);
 
-  const lamp = phase === 'ready' && !partial ? '' : phase === 'ready' || phase === 'pending' ? 'idle' : 'warn';
-  const status = phase === 'ready' && partial ? '部分数据待恢复' : PHASE_TEXT[phase];
-  const emptyText =
-    rows.length === 0
-      ? history.pending
-        ? null
-        : users
-          ? `近 1 小时没有用户流量（${SCOPE_NOTE}）`
-          : '尚未授权入口机器'
-      : needle && matched.length === 0
-        ? `没有匹配「${query.trim()}」的${users ? '用户' : '机器'}`
-        : null;
-  const rest = matched.length - FOLD;
+  const lamp =
+    phase === 'ready' && !partial
+      ? ''
+      : phase === 'ready' || phase === 'pending' || phase === 'recovering'
+        ? 'idle'
+        : 'warn';
+  const status = phase === 'ready' && partial ? PARTIAL_TEXT : PHASE_TEXT[phase];
+  const emptyText = needle && matched.length === 0 ? `没有匹配「${query.trim()}」的${users ? '用户' : '机器'}` : null;
+  const rest = Math.max(0, matched.length - visible.length);
 
-  const metaOf = (row: CardRow) => {
-    const idleFor = row.lastActiveMs === null ? Number.POSITIVE_INFINITY : now - row.lastActiveMs;
-    const idle = phase === 'ready' && totalOf(row) === 0 && idleFor >= IDLE_MILLIS;
-    // 第二行：租户（机器详情）或接入点数（用户详情）· 近 1 小时用量 · 空闲或未连接
-    const parts = [
-      users ? row.detail : row.ingresses ? `${row.ingresses} 个接入点` : '',
-      row.forwardingDown !== undefined || row.hour?.forwarding ? '含转发' : '',
-      bytes(row.hourBytes),
-      row.hour?.unplaced ? '部分历史无精确时间' : '',
-      row.offline ? '未连接' : idle ? idleLabel(idleFor) : '',
-    ].filter(Boolean);
-    return { text: parts.join(' · '), idle };
+  const metaOf = (row: CardRow): RowMeta => {
+    const idleMillis = row.lastActiveMs === null ? Number.POSITIVE_INFINITY : now - row.lastActiveMs;
+    // 第二行只放身份与用量：接入点数（用户详情）· 含转发 · 近 1 小时用量 · 历史与连接说明；
+    // 空闲多久写在「当前」一栏。机器详情不再写租户。
+    return {
+      idleMillis,
+      idle:
+        phase === 'ready' && row.current !== false && !row.offline && totalOf(row) === 0 && idleMillis >= IDLE_MILLIS,
+      lead: [
+        !users && row.ingresses ? `${row.ingresses} 个接入点` : '',
+        row.forwardingDown !== undefined || row.hour?.forwarding ? '含转发' : '',
+      ].filter(Boolean),
+      tail: [
+        row.hour?.unplaced ? '部分历史无精确时间' : '',
+        row.offline ? '未连接' : row.current === false && row.down !== null ? '上次读数' : '',
+        !users && row.measuredAt !== undefined && now - row.measuredAt >= 3_000
+          ? `${Math.floor((now - row.measuredAt) / 1_000)} 秒前收到`
+          : '',
+      ].filter(Boolean),
+    };
   };
+
+  const nowPanel = (
+    <section className="rut-now" aria-label="当前速率">
+      <div className="user-usage-hero">
+        <span className="user-usage-hero-label" title={users ? undefined : RATE_SUM_NOTE}>
+          {phase === 'recovering' || stale ? '上次速率合计' : partial ? '部分速率合计' : '最近速率合计'}
+        </span>
+        <strong className="user-usage-hero-value">
+          {showsLive ? (
+            <>
+              {currentSum > 0 ? hero.number : '0'} <small>{hero.unit}</small>
+            </>
+          ) : (
+            <span className="rut-wait">—</span>
+          )}
+        </strong>
+        <span className="rut-hero-sub">
+          {showsLive ? (
+            <>
+              <b>{totals.active}</b> {unit}活跃 ·{' '}
+              {!users && phase === 'ready' ? (
+                `${rows.filter(row => row.current).length} / ${targets.length} 台有读数`
+              ) : (
+                <>
+                  共 <b>{rows.length}</b> {unit}
+                </>
+              )}
+            </>
+          ) : (
+            `共 ${rows.length} ${unit}`
+          )}
+        </span>
+      </div>
+      <div>
+        <div className="usage-split" aria-hidden="true">
+          {totals.down > 0 && <i className="down" style={{ flexGrow: totals.down }} />}
+          {totals.up > 0 && <i className="up" style={{ flexGrow: totals.up }} />}
+        </div>
+        <dl className="usage-io">
+          <div className="down">
+            <dt>
+              <i aria-hidden="true" />
+              下行
+            </dt>
+            <dd>{showsLive ? rateText(totals.down, pair) : '—'}</dd>
+            <dd className="usage-share">{showsLive && currentSum > 0 ? shareOf(totals.down, currentSum) : ''}</dd>
+          </div>
+          <div className="up">
+            <dt>
+              <i aria-hidden="true" />
+              上行
+            </dt>
+            <dd>{showsLive ? rateText(totals.up, pair) : '—'}</dd>
+            <dd className="usage-share">{showsLive && currentSum > 0 ? shareOf(totals.up, currentSum) : ''}</dd>
+          </div>
+        </dl>
+      </div>
+      {users && (
+        <section className="rut-chains" aria-label="当前经过的接入链">
+          <span className="rut-chains-title">当前经过的接入链</span>
+          {chainRates.length === 0 ? (
+            <span className="rut-chains-none">{showsLive ? '没有正在传输的连接' : '—'}</span>
+          ) : (
+            <ol>
+              {chainRates.slice(0, CHAIN_FOLD).map(chain => (
+                <li key={chain.key} title={`${chain.name} · 占当前 ${shareOf(chain.value, currentSum)}`}>
+                  <SourceName source={chain} />
+                  <b>
+                    <Rate value={chain.value} pair={chain.value} />
+                  </b>
+                </li>
+              ))}
+              {chainRates.length > CHAIN_FOLD && (
+                <li
+                  className="rest"
+                  title={chainRates
+                    .slice(CHAIN_FOLD)
+                    .map(chain => chain.name)
+                    .join('、')}
+                >
+                  <span>其余 {chainRates.length - CHAIN_FOLD} 条</span>
+                  <b>
+                    <Rate
+                      value={chainRates.slice(CHAIN_FOLD).reduce((sum, chain) => sum + chain.value, 0)}
+                      pair={chainRates.slice(CHAIN_FOLD).reduce((sum, chain) => sum + chain.value, 0)}
+                    />
+                  </b>
+                </li>
+              )}
+            </ol>
+          )}
+        </section>
+      )}
+    </section>
+  );
+
+  const searchControl = searchable && (
+    <span className="user-list-search">
+      <Icon of="search" size={13} className="user-list-search-icon" />
+      <input
+        type="search"
+        value={query}
+        aria-label="搜索机器"
+        placeholder="搜索机器"
+        autoComplete="off"
+        spellCheck={false}
+        onChange={event => setQuery(event.target.value)}
+        onKeyDown={event => {
+          if (event.key === 'Escape') setQuery('');
+        }}
+      />
+      {query && (
+        <button type="button" aria-label="清空搜索" title="清空" onClick={() => setQuery('')}>
+          <Icon of="close" size={13} />
+        </button>
+      )}
+    </span>
+  );
+
+  const staleNotice = stale && (
+    <p className="rut-notice" role="status">
+      <i className="node-lamp warn" />
+      实时通道未连接：当前速率停在 {clockText(staleSince)}，近 1 小时仍每 30 秒更新
+    </p>
+  );
+
+  const main = !users && (
+    <div className="rut-main">
+      <div className="rut-tools">
+        {searchControl}
+        {needle && (
+          <span className="rut-count">
+            {matched.length} / {ordered.length}
+          </span>
+        )}
+        {rankChanged && (
+          <span className="rut-rank-change" role="status" aria-live="polite" aria-atomic="true">
+            <span>排名已变化</span>
+            <button className="btn sm" type="button" aria-label="按最新排名重排" onClick={order.resort}>
+              重排
+            </button>
+          </span>
+        )}
+
+        <SegmentedControl
+          className="rut-sort"
+          ariaLabel="排序"
+          value={sort}
+          onChange={value => {
+            setSort(value);
+            setExpanded(0);
+          }}
+          options={USER_SORTS}
+        />
+      </div>
+      {staleNotice}
+      <p className="rut-caption" aria-hidden="true">
+        <span>走势：近 1 小时 · 每 30 秒</span>
+        <span className="rut-legend">
+          <i className="d" />
+          下行
+          <i className="u" />
+          上行
+        </span>
+        <span>用量：近 1 小时</span>
+      </p>
+      <div ref={listRef} className="rut-grid machines" role="list" aria-label="各入口机器流量">
+        {visible.map(row => (
+          <TrafficItem
+            key={row.key}
+            row={row}
+            meta={metaOf(row)}
+            frozen={stale}
+            peak={peak}
+            country={countryOf?.(row.key) ?? null}
+          />
+        ))}
+      </div>
+      {emptyText && <p className="rut-empty">{emptyText}</p>}
+      {rest > 0 && (
+        <div className="rut-more">
+          <button
+            className="btn text sm"
+            type="button"
+            onClick={() => setExpanded(value => value + MORE_STEP)}
+            aria-expanded={expanded > 0}
+          >
+            显示更多 {Math.min(MORE_STEP, rest)} {unit}
+          </button>
+          {expanded > 0 && (
+            <button className="btn text sm" type="button" onClick={() => setExpanded(0)}>
+              收起
+            </button>
+          )}
+        </div>
+      )}
+      {rest === 0 && expanded > 0 && (
+        <button className="btn text sm rut-more" type="button" onClick={() => setExpanded(0)}>
+          收起
+        </button>
+      )}
+    </div>
+  );
+
+  const hourPanel = (
+    <section className="rut-hour" aria-label="近 1 小时">
+      <div className="rut-hour-head">
+        <span title="按真实采样窗口计算平均速率；确认重启停机期间为 0，未知缺失仍为空">近 1 小时 · 每 30 秒</span>
+        {chart && <span className="chart-unit">({chart.unit.name})</span>}
+        <span className="rut-legend" aria-hidden="true">
+          <i className="d" />
+          下行
+          <i className="u" />
+          上行
+        </span>
+        {chart && (
+          <b>
+            <Bytes value={chart.total} />
+          </b>
+        )}
+      </div>
+      {history.model && chart && history.model.totalDown.some(value => value !== null) ? (
+        <Suspense fallback={<div className="rut-chart-wait" />}>
+          <LazyThroughputChart
+            presentation={users ? 'bar' : 'line'}
+            timesUnixSecs={history.model.slots}
+            rangeStartUnixSecs={history.model.rangeStart}
+            rangeEndUnixSecs={history.model.rangeEnd}
+            rx={chart.rx}
+            tx={chart.tx}
+            rxName="下行"
+            txName="上行"
+          />
+        </Suspense>
+      ) : (
+        <div className="rut-chart-wait">
+          {history.failed ? (
+            <span className="rut-chart-note">近 1 小时数据暂不可用</span>
+          ) : history.model ? (
+            <span className="rut-chart-note">近 1 小时没有上报记录</span>
+          ) : null}
+        </div>
+      )}
+    </section>
+  );
+
+  const emptyCopy = history.pending ? '正在读取近 1 小时流量' : '尚未授权入口机器';
+
+  if (users) {
+    return (
+      <section
+        ref={cardRef}
+        className={`panel config-panel realtime-user-traffic rut-node${stale ? ' stale' : ''}${className ? ` ${className}` : ''}`}
+        aria-label="实时流量"
+      >
+        <header className="realtime-panel-header">
+          <span title={SCOPE_NOTE}>
+            <PanelTitle of="usage">实时流量</PanelTitle>
+          </span>
+          <span className={`rut-status${lamp === 'warn' ? ' warn' : ''}`} role="status">
+            <i className={`node-lamp${lamp ? ` ${lamp}` : ''}`} />
+            {status}
+          </span>
+        </header>
+        <div className="rut-body panel-full-bleed-body">
+          {staleNotice}
+          <div className="rut-overview">
+            {nowPanel}
+            {hourPanel}
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section
+      ref={cardRef}
       className={`panel config-panel realtime-user-traffic${stale ? ' stale' : ''} ${className}`}
-      aria-label="用户实时流量"
+      aria-label="实时流量"
     >
-      <header>
+      <header className="realtime-panel-header">
         <span title={SCOPE_NOTE}>
-          <PanelTitle of="usage">用户实时流量</PanelTitle>
+          <PanelTitle of="usage">实时流量</PanelTitle>
         </span>
         <span className={`rut-status${lamp === 'warn' ? ' warn' : ''}`} role="status">
           <i className={`node-lamp${lamp ? ` ${lamp}` : ''}`} />
           {status}
         </span>
       </header>
-      <div className="rut-body">
-        <div className="rut-cockpit">
-          <section className="rut-now" aria-label="当前速率">
-            <div className="user-usage-hero">
-              <span className="user-usage-hero-label">当前速率</span>
-              <strong className="user-usage-hero-value">
-                {showsLive ? (
-                  <>
-                    {currentSum > 0 ? hero.number : '0'} <small>{hero.unit}</small>
-                  </>
-                ) : (
-                  <span className="rut-wait">—</span>
-                )}
-              </strong>
-              <span className="rut-hero-sub">
-                {showsLive ? (
-                  <>
-                    <b>{totals.active}</b> {unit}活跃 · 共 <b>{rows.length}</b> {unit}
-                  </>
-                ) : (
-                  `共 ${rows.length} ${unit}`
-                )}
-              </span>
+      <div className="rut-body panel-full-bleed-body">
+        {tier === 'empty' ? (
+          phase === 'ready' || phase === 'empty' ? (
+            <p className="rut-empty rut-zero">{emptyCopy}</p>
+          ) : (
+            <div className="rut-split rut-zero-state">
+              {nowPanel}
+              <p className="rut-empty rut-zero">{emptyCopy}</p>
             </div>
-            <div>
-              <div className="usage-split" aria-hidden="true">
-                {totals.down > 0 && <i className="down" style={{ flexGrow: totals.down }} />}
-                {totals.up > 0 && <i className="up" style={{ flexGrow: totals.up }} />}
-              </div>
-              <dl className="usage-io">
-                <div className="down">
-                  <dt>
-                    <i aria-hidden="true" />
-                    下行
-                  </dt>
-                  <dd>{showsLive ? rateText(totals.down, pair) : '—'}</dd>
-                  <dd className="usage-share">{showsLive && currentSum > 0 ? shareOf(totals.down, currentSum) : ''}</dd>
-                </div>
-                <div className="up">
-                  <dt>
-                    <i aria-hidden="true" />
-                    上行
-                  </dt>
-                  <dd>{showsLive ? rateText(totals.up, pair) : '—'}</dd>
-                  <dd className="usage-share">{showsLive && currentSum > 0 ? shareOf(totals.up, currentSum) : ''}</dd>
-                </div>
-              </dl>
+          )
+        ) : (
+          <>
+            <div className="rut-cockpit">
+              {nowPanel}
+              {hourPanel}
             </div>
-          </section>
-          <section className="rut-hour" aria-label="近 1 小时">
-            <div className="rut-hour-head">
-              <span title="按真实采样窗口计算平均速率；确认重启停机期间为 0，未知缺失仍为空">近 1 小时 · 每 30 秒</span>
-              {chart && <span className="chart-unit">({chart.unit.name})</span>}
-              <span className="rut-legend" aria-hidden="true">
-                <i className="d" />
-                下行
-                <i className="u" />
-                上行
-              </span>
-              {chart && (
-                <b>
-                  <Bytes value={chart.total} />
-                </b>
-              )}
-            </div>
-            {history.model && chart && history.model.totalDown.some(value => value !== null) ? (
-              <Suspense fallback={<div className="rut-chart-wait" />}>
-                <LazyThroughputChart
-                  timesUnixSecs={history.model.slots}
-                  rangeStartUnixSecs={history.model.rangeStart}
-                  rangeEndUnixSecs={history.model.rangeEnd}
-                  rx={chart.rx}
-                  tx={chart.tx}
-                  rxName="下行"
-                  txName="上行"
-                />
-              </Suspense>
-            ) : (
-              <div className="rut-chart-wait">
-                {history.failed ? (
-                  <span className="rut-chart-note">近 1 小时数据暂不可用</span>
-                ) : history.model ? (
-                  <span className="rut-chart-note">近 1 小时没有上报记录</span>
-                ) : null}
-              </div>
-            )}
-          </section>
-        </div>
-        <div className="rut-main">
-          <div className="rut-tools">
-            <span className="user-list-search">
-              <Icon of="search" size={13} className="user-list-search-icon" />
-              <input
-                type="search"
-                value={query}
-                aria-label={users ? '搜索用户' : '搜索机器'}
-                placeholder={users ? '搜索用户或租户' : '搜索机器'}
-                autoComplete="off"
-                spellCheck={false}
-                onChange={event => setQuery(event.target.value)}
-                onKeyDown={event => {
-                  if (event.key === 'Escape') setQuery('');
-                }}
-              />
-              {query && (
-                <button type="button" aria-label="清空搜索" title="清空" onClick={() => setQuery('')}>
-                  <Icon of="close" size={13} />
-                </button>
-              )}
-            </span>
-            {needle && (
-              <span className="rut-count">
-                {matched.length} / {ordered.length}
-              </span>
-            )}
-            {held && <span className="rut-hold">排序已暂停</span>}
-            <SegmentedControl className="rut-sort" ariaLabel="排序" value={sort} onChange={setSort} options={SORTS} />
-          </div>
-          {stale && (
-            <p className="rut-notice" role="status">
-              <i className="node-lamp warn" />
-              实时通道未连接：当前速率停在 {clockText(staleSince)}，近 1 小时仍每 30 秒更新
-            </p>
-          )}
-          <p className="rut-caption" aria-hidden="true">
-            <span>走势：近 1 小时 · 每 30 秒</span>
-            <span className="rut-legend">
-              <i className="d" />
-              当前下行
-              <i className="u" />
-              当前上行
-            </span>
-            <span>用量：近 1 小时</span>
-          </p>
-          <div
-            ref={listRef}
-            className="rut-grid"
-            role="list"
-            aria-label={users ? '各用户流量' : '各入口机器流量'}
-            onPointerEnter={() => setHover(true)}
-            onPointerLeave={() => setHover(false)}
-          >
-            {visible.map(row => {
-              const meta = metaOf(row);
-              return <TrafficItem key={row.key} row={row} meta={meta.text} idle={meta.idle} peak={peak} />;
-            })}
-          </div>
-          {emptyText && <p className="rut-empty">{emptyText}</p>}
-          {rest > 0 && (
-            <button
-              className="btn text sm rut-more"
-              type="button"
-              onClick={() => setExpanded(value => !value)}
-              aria-expanded={expanded}
-            >
-              {expanded ? '收起' : `显示其余 ${rest} ${unit}`}
-            </button>
-          )}
-        </div>
+            {main}
+          </>
+        )}
       </div>
     </section>
   );
@@ -928,7 +1281,7 @@ const clockText = (millis: number | null) =>
   millis === null ? '—' : new Date(millis).toLocaleTimeString('zh-CN', { hour12: false });
 
 function useHourHistory(queryKey: readonly unknown[], load: () => Promise<UserTrafficHistory>, page: 'node' | 'user') {
-  const history = useQuery({
+  const history = useMetricQuery({
     queryKey,
     queryFn: load,
     refetchInterval: HISTORY_REFRESH_MILLIS,
@@ -938,13 +1291,30 @@ function useHourHistory(queryKey: readonly unknown[], load: () => Promise<UserTr
   return { model, pending: history.isPending, failed: history.isError && !history.data };
 }
 
-/* ── 机器详情 ── */
+/* ── 机器用量 ── */
 
-export function NodeUserTrafficCard({ nodeId }: { nodeId: string }) {
-  return <NodeTrafficCard key={nodeId} nodeId={nodeId} />;
+/** 用量弹层的机器实时流量。`sourceOf` 把接入点映射到接入链（来自页面已有的模型快照）。 */
+export function NodeUserTrafficCard({
+  nodeId,
+  sourceOf,
+  targets = NO_TARGETS,
+}: {
+  nodeId: string;
+  sourceOf?: (key: string) => TrafficSource;
+  targets?: readonly string[];
+}) {
+  return <NodeTrafficCard key={nodeId} nodeId={nodeId} sourceOf={sourceOf} targets={targets} />;
 }
 
-function NodeTrafficCard({ nodeId }: { nodeId: string }) {
+function NodeTrafficCard({
+  nodeId,
+  sourceOf,
+  targets,
+}: {
+  nodeId: string;
+  sourceOf?: (key: string) => TrafficSource;
+  targets: readonly string[];
+}) {
   const { last, now, connected, enabled, observingSince } = useNodeRealtime(nodeId);
   const report = last?.event.sample.user_traffic;
   const fresh =
@@ -967,7 +1337,9 @@ function NodeTrafficCard({ nodeId }: { nodeId: string }) {
   const complete = ready && !report.has_gap && !report.truncated;
   const liveRows = useMemo(() => (ready ? aggregateUserTraffic(report?.users ?? []) : []), [ready, report]);
   const at = ready ? (last?.event.received_at_unix_millis ?? null) : null;
-  const retained = useRetained(at, liveRows, complete);
+  const retained = useRetained(at, liveRows, complete, last?.event);
+  if (phase === 'pending' && report?.state === 'warming' && retained.at !== null && now - retained.at <= FRESH_MILLIS)
+    phase = 'recovering';
   const history = useHourHistory(
     ['user-traffic-history', 'node', nodeId],
     () => fetchNodeUserTrafficHistory(nodeId),
@@ -985,6 +1357,8 @@ function NodeTrafficCard({ nodeId }: { nodeId: string }) {
       complete={complete}
       history={history}
       nameOf={nameOf}
+      sourceOf={sourceOf}
+      targets={targets}
     />
   );
 }
@@ -995,7 +1369,7 @@ function NodeTrafficCard({ nodeId }: { nodeId: string }) {
 function userNodeRow(node: UserTrafficNode, tenantId: string, userId: string, now: number) {
   const event = node.samples.at(-1);
   const report = event?.sample.user_traffic;
-  const base = { key: node.node_id, name: node.node_id, detail: '' };
+  const base = { key: node.node_id, name: node.node_id, detail: '', current: false };
   if (!node.connected || !event || now - event.received_at_unix_millis > FRESH_MILLIS) {
     return { row: { ...base, down: null, up: null, offline: true }, state: 'offline' as const, at: null };
   }
@@ -1015,6 +1389,8 @@ function userNodeRow(node: UserTrafficNode, tenantId: string, userId: string, no
   return {
     row: {
       ...base,
+      current: true,
+      measuredAt: event.received_at_unix_millis,
       down: users.reduce((sum, user) => sum + user.downlink_bytes_per_sec, 0),
       up: users.reduce((sum, user) => sum + user.uplink_bytes_per_sec, 0),
       ingresses: new Set(users.map(user => user.ingress_id).filter(Boolean)).size,
@@ -1028,15 +1404,17 @@ function userNodeRow(node: UserTrafficNode, tenantId: string, userId: string, no
   };
 }
 
-export function UserRealtimeTrafficCard({
-  tenantId,
-  userId,
-  nameOf,
-}: {
+interface UserTrafficCardProps {
   tenantId: string;
   userId: string;
   nameOf: (id: string) => string;
-}) {
+}
+
+export function UserRealtimeTrafficCard(props: UserTrafficCardProps) {
+  return <UserTrafficCard key={`${props.tenantId}/${props.userId}`} {...props} />;
+}
+
+function UserTrafficCard({ tenantId, userId, nameOf }: UserTrafficCardProps) {
   const { payload, now, failed } = useUserTrafficSource(tenantId, userId);
   const nodes = useMemo(
     () => (payload?.nodes ?? []).map(node => userNodeRow(node, tenantId, userId, now)),
@@ -1054,13 +1432,22 @@ export function UserRealtimeTrafficCard({
   else if (payload && nodes.every(node => node.state === 'offline')) phase = 'offline';
   const liveRows = useMemo(() => nodes.map(node => node.row), [nodes]);
   const at = ready.length > 0 ? Math.max(...ready.map(node => node.at ?? 0)) : null;
-  const retained = useRetained(at, liveRows, false);
+  const retained = useRetained(at, liveRows, false, payload);
+  // Renewing a subscription can briefly warm the Agent's counters again. Keep the last
+  // measured rates within their original freshness budget; warming frames never renew it.
+  if (
+    phase === 'pending' &&
+    nodes.some(node => node.state === 'pending') &&
+    retained.at !== null &&
+    now - retained.at <= FRESH_MILLIS
+  )
+    phase = 'recovering';
   // 未连接的机器只标记离线，读数保留最后一次有效数据
   const live = useMemo(() => {
     const next = new Map(retained.rows);
     for (const node of nodes) {
       const row = next.get(node.row.key);
-      if (row) next.set(node.row.key, { ...row, offline: node.state === 'offline' });
+      if (row) next.set(node.row.key, { ...row, offline: node.state === 'offline', current: node.row.current });
     }
     return next;
   }, [nodes, retained]);
@@ -1070,6 +1457,7 @@ export function UserRealtimeTrafficCard({
     'user',
   );
   const targets = useMemo(() => (payload?.nodes ?? []).map(node => node.node_id), [payload]);
+  const countryOf = useNodeCountries();
   return (
     <TrafficCard
       page="user"
@@ -1081,6 +1469,7 @@ export function UserRealtimeTrafficCard({
       complete={false}
       history={history}
       nameOf={nameOf}
+      countryOf={countryOf}
       targets={targets}
       className="user-dcard"
     />

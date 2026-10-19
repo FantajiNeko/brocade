@@ -14,10 +14,11 @@
 //!      job queued while an in-flight configuration prevents a global serving checkpoint.
 //!
 //! Why this approach works (drop any one of these and it does not):
-//!   - Revoking does not disconnect anyone: xray is Unmanaged in a grants deployment, the
+//!   - Revoking does not restart the shared process: xray is Unmanaged in a grants deployment, the
 //!     agent's `converge_linux_xray` returns on seeing that, and never reaches the `pkill` in
 //!     `apply_xray`. This did not hold while the deployment kinds were undivided — back then
-//!     changing one grant restarted xray and dropped everyone;
+//!     changing one grant restarted xray and dropped everyone. A runtime advertising
+//!     user-session-revocation-v1 closes only the removed user's authenticated sessions;
 //!   - `SyncGrants`'s `is_disruptive` is always false and it does not wave, so
 //!     `requires_confirmation` is always false too (the first row of that table), and one wave
 //!     completes without anyone confirming;
@@ -100,6 +101,7 @@ const MONTH_USED_SQL: &str = "
     SELECT q.tenant_id, q.user_id, q.app_id, q.limit_bytes,
            coalesce((
                SELECT sum(s.uplink_bytes + s.downlink_bytes)
+                      * CASE owner.traffic_accounting_mode WHEN 'double' THEN 2 ELSE 1 END
                FROM usage_rollups s
                WHERE s.tenant_id = q.tenant_id
                  AND s.user_id = q.user_id
@@ -110,6 +112,7 @@ const MONTH_USED_SQL: &str = "
                                         + INTERVAL '1 month') AT TIME ZONE 'Asia/Hong_Kong')
            ), 0)::bigint AS used_bytes
     FROM user_app_quotas q
+    JOIN users owner ON owner.tenant_id = q.tenant_id AND owner.id = q.user_id
 ";
 
 /// Account. Writes nothing.

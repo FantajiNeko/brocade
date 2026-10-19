@@ -1324,15 +1324,16 @@ pub struct Ingress {
 ///
 /// Hand-written rules are error-prone: a match one step too broad disables the whole ingress, and
 /// one too narrow appears to protect while blocking nothing. Each flag here compiles to a fixed
-/// match reviewed once. The cost is that a sixth class of block cannot be defined here; that
-/// belongs in the chain's own rules, which already support arbitrary matching.
+/// match reviewed once. Traffic-destination policy still belongs in the chain's own rules; this
+/// guard also owns source-admission policy, which a destination rule cannot express.
 ///
 /// # What is on by default, and why
 ///
-/// Four of the five. Those four cover traffic no subscriber requests deliberately: reaching the
+/// Four of the six. Those four cover traffic no subscriber requests deliberately: reaching the
 /// fleet's own overlay from outside it, seeding torrents from a shared address, sending mail from
 /// an address that will be blacklisted for it, and reflecting amplification traffic off open UDP
-/// services. The fifth is off because it breaks ordinary use: games and voice both require UDP.
+/// services. The two opt-in policies are off because one breaks ordinary UDP use and the other is
+/// an operator-specific geographic admission decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngressGuard {
@@ -1355,6 +1356,33 @@ pub struct IngressGuard {
     /// Everything UDP except 443. Off by default, because it also blocks games, voice, and every
     /// self-hosted UDP service. QUIC continues to work, since it runs on 443.
     pub tcp_and_quic_only: bool,
+    /// Connections whose source address belongs to the `CN` entry in the managed GeoIP database.
+    ///
+    /// Added after revisions already existed, so absence in a historical snapshot means disabled.
+    /// An upstream proxy that does not preserve the real peer address is classified by the proxy
+    /// address instead.
+    #[serde(default)]
+    pub cn_source_block: CnSourceBlock,
+}
+
+/// Address families covered by the optional China-source admission rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CnSourceBlock {
+    #[default]
+    Off,
+    Ipv4,
+    Ipv4AndIpv6,
+}
+
+impl CnSourceBlock {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ipv4 => "ipv4",
+            Self::Ipv4AndIpv6 => "ipv4-and-ipv6",
+        }
+    }
 }
 
 /// Fixed destination ports emitted by [`IngressGuard::no_mail`]. Shared by machine artifact
@@ -1372,6 +1400,7 @@ impl Default for IngressGuard {
             no_mail: true,
             no_udp_amplification: true,
             tcp_and_quic_only: false,
+            cn_source_block: CnSourceBlock::Off,
         }
     }
 }
@@ -1384,6 +1413,7 @@ impl IngressGuard {
         no_mail: false,
         no_udp_amplification: false,
         tcp_and_quic_only: false,
+        cn_source_block: CnSourceBlock::Off,
     };
 
     pub fn blocks_nothing(&self) -> bool {

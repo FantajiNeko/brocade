@@ -275,6 +275,7 @@ test('workspace backgrounds share the theme-aware square grid without painting o
   assert.doesNotMatch(styles, /--desk-mist-(?:image|opacity)/);
   assert.match(
     styles,
-    /#stage::before,\s*\.topo-deck::before,\s*\.loading-skeleton-canvas::before,\s*\.fg-desk > \.fg-view::before\s*\{[^}]*z-index:\s*-1;[^}]*pointer-events:\s*none;[^}]*background-image:\s*var\(--grid-image\);[^}]*background-size:\s*32px 32px;[^}]*background-position:\s*center top;[^}]*background-attachment:\s*fixed;/s,
+    /#stage::before,\s*\.topo-deck::before,\s*\.loading-skeleton-canvas::before,\s*body:has\(\.forge\)::before\s*\{[^}]*z-index:\s*-1;[^}]*pointer-events:\s*none;[^}]*background-image:\s*var\(--grid-image\);[^}]*background-size:\s*32px 32px;[^}]*background-position:\s*center top;/s,
   );
+  assert.match(styles, /body:has\(\.forge\)::before\s*\{\s*position:\s*sticky;/);
 });

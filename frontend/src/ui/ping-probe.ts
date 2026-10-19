@@ -1,6 +1,58 @@
-import type { PingProbeFamily, PingProbePoint, PingProbeSkipReason } from '../api';
+import type { PingProbeFamily, PingProbePoint, PingProbeSkipReason, PingProbeTarget } from '../api';
 
 export const PING_FAMILY_LABEL: Record<PingProbeFamily, string> = { ipv4: 'IPv4', ipv6: 'IPv6' };
+export const MAX_PING_PROBE_TARGETS = 6;
+
+/** 北京、上海、重庆按 2026-10-19 ITDOG 当地测点延迟核对；地域不取 IPv6 地址库的默认标注。 */
+export const PING_PROBE_PRESETS = [
+  {
+    label: '北京',
+    source: '电信、移动：百度；联通：微信静态资源 CDN',
+    carriers: [
+      { name: '北京电信', ipv4: '220.181.111.232', ipv6: '240e:83:205:1cd:0:ff:b0b8:dee9' },
+      { name: '北京联通', ipv4: '123.125.246.106', ipv6: '2408:80f0:4105:6:40::100' },
+      { name: '北京移动', ipv4: '39.156.70.46', ipv6: '2409:8c00:6c21:118b:0:ff:b0e8:f003' },
+    ],
+  },
+  {
+    label: '上海',
+    source: 'QQ 首页 CDN',
+    carriers: [
+      { name: '上海电信', ipv4: '101.91.42.232', ipv6: '240e:e1:a800:120::76' },
+      { name: '上海联通', ipv4: '58.246.163.58', ipv6: '2408:80f1:21:c120::c' },
+      { name: '上海移动', ipv4: '183.194.238.117', ipv6: '2409:8c1e:75b0:1120::27' },
+    ],
+  },
+  {
+    label: '广东',
+    source: '广东三网探测地址',
+    carriers: [
+      { name: '广东电信', ipv4: '125.89.169.2', ipv6: '240e:97c:2f:1::5c' },
+      { name: '广东联通', ipv4: '157.148.118.157', ipv6: '2408:8756:f50:2::65' },
+      { name: '广东移动', ipv4: '120.241.227.7', ipv6: '2409:8c54:871:1::73' },
+    ],
+  },
+  {
+    label: '重庆',
+    source: '腾讯视频 CDN；移动 IPv4：微信头像 CDN',
+    carriers: [
+      { name: '重庆电信', ipv4: '183.66.105.224', ipv6: '240e:930:1000:1703:3e::1' },
+      { name: '重庆联通', ipv4: '58.144.227.55', ipv6: '2408:8763:0:2b0:5e::1f' },
+      { name: '重庆移动', ipv4: '111.10.45.113', ipv6: '2409:8c60:2600:ea:40::2' },
+    ],
+  },
+] as const;
+
+export function pingProbePresetTargets(preset: (typeof PING_PROBE_PRESETS)[number]): PingProbeTarget[] {
+  return (['tcp', 'icmp'] as const).flatMap(kind =>
+    preset.carriers.map(carrier => ({
+      name: carrier.name,
+      kind,
+      ipv4: kind === 'tcp' ? `${carrier.ipv4}:80` : carrier.ipv4,
+      ipv6: kind === 'tcp' ? `[${carrier.ipv6}]:80` : carrier.ipv6,
+    })),
+  );
+}
 
 export function pingLatencyMs(sample: Pick<PingProbePoint, 'latency_us'>): number | null {
   return sample.latency_us == null ? null : sample.latency_us / 1000;

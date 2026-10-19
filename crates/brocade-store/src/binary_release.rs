@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use brocade_deployment::protocol::{
     AgentReleaseOutcome, AgentReleaseReport, XrayReleaseOutcome, XrayReleaseReport,
+    XrayReleaseStrategy, XRAY_HANDOFF_EXECUTION_TIMEOUT_SECS, XRAY_HANDOFF_MAX_DRAIN_SECS,
+    XRAY_HANDOFF_MIN_DRAIN_SECS, XRAY_HANDOFF_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -17,7 +19,7 @@ const MAX_ERROR_CHARS: usize = 4_000;
 const MAX_VERSION_CHARS: usize = 128;
 const MAX_TARGETS: usize = 10_000;
 const MAX_ARTIFACTS: usize = 16;
-const DISPATCH_LEASE_MINUTES: i32 = 30;
+const DEFAULT_EXECUTION_TIMEOUT_MINUTES: i32 = 30;
 const BINARY_RELEASE_ADVISORY_LOCK: i64 = 0x5852_4159;
 const MAX_ATTEMPTS: u32 = 32;
 
@@ -68,6 +70,10 @@ pub struct CreateBinaryReleaseRequest {
     pub nodes: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
+    #[serde(default)]
+    pub xray_strategy: Option<XrayReleaseStrategy>,
+    #[serde(default)]
+    pub xray_drain_timeout_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,11 +143,22 @@ pub struct BinaryReleaseTarget {
     pub reported_service_enabled: Option<bool>,
     pub reported_installed_sha256: Option<String>,
     pub reported_running_sha256: Option<String>,
-    /// Failed outcomes and an expired dispatch lease can be retried by an operator. Calculating
-    /// this at the database clock keeps the browser from inventing lease state from its own clock.
+    pub reported_forced_retirement: Option<bool>,
+    /// This attempt first reported `failed-dirty`, then the Agent completed its bounded local
+    /// recovery and proved the approved Xray bytes healthy. The original failure stays in the
+    /// append-only event ledger even though the current operational state is successful.
+    pub recovered_after_dirty: bool,
+    /// Failed outcomes and an execution that exceeded its overall deadline can be retried by an
+    /// operator. Calculating this at the database clock keeps the browser from inventing state
+    /// from its own clock.
     pub retryable: bool,
     pub verification: Option<String>,
     pub dispatched_at: Option<String>,
+    /// Derived from `dispatched_at` and the strategy-specific overall execution timeout.
+    pub execution_deadline_at: Option<String>,
+    /// Observation only. The persisted target remains dispatched so a late same-attempt report is
+    /// accepted and the timeout cannot terminate Xray or release the Agent's local handoff gate.
+    pub execution_timed_out: bool,
     pub finished_at: Option<String>,
 }
 
@@ -177,6 +194,8 @@ pub struct BinaryRelease {
     pub status: BinaryReleaseStatus,
     pub active: bool,
     pub note: Option<String>,
+    pub xray_strategy: Option<XrayReleaseStrategy>,
+    pub xray_drain_timeout_secs: Option<u32>,
     pub created_at: String,
     pub created_by: String,
     pub halted_at: Option<String>,
@@ -200,6 +219,8 @@ pub struct BinaryReleaseSummary {
     pub status: BinaryReleaseStatus,
     pub active: bool,
     pub note: Option<String>,
+    pub xray_strategy: Option<XrayReleaseStrategy>,
+    pub xray_drain_timeout_secs: Option<u32>,
     pub created_at: String,
     pub created_by: String,
     pub halted_at: Option<String>,
@@ -217,12 +238,64 @@ pub struct BinaryReleaseAssignment {
     pub version: String,
     pub sha256: String,
     pub previous_sha256: String,
+    pub strategy: XrayReleaseStrategy,
+    pub drain_timeout_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BinaryReleaseObservation {
     installed_sha256: String,
     running_sha256: Option<String>,
+    agent_protocol_version: Option<u32>,
+    xray_handoff_ready: bool,
+}
+
+fn release_strategy(value: Option<&str>) -> Result<Option<XrayReleaseStrategy>> {
+    match value {
+        None => Ok(None),
+        Some("restart") => Ok(Some(XrayReleaseStrategy::Restart)),
+        Some("handoff") => Ok(Some(XrayReleaseStrategy::Handoff)),
+        Some("handoff-force") => Ok(Some(XrayReleaseStrategy::HandoffForce)),
+        Some(other) => Err(StoreError::InvalidData(format!(
+            "unknown Xray release strategy {other}"
+        ))),
+    }
+}
+
+fn release_strategy_name(value: XrayReleaseStrategy) -> &'static str {
+    match value {
+        XrayReleaseStrategy::Restart => "restart",
+        XrayReleaseStrategy::Handoff => "handoff",
+        XrayReleaseStrategy::HandoffForce => "handoff-force",
+    }
+}
+
+fn execution_timeout_minutes(
+    component: BinaryComponent,
+    strategy: Option<XrayReleaseStrategy>,
+) -> i32 {
+    if component == BinaryComponent::Xray
+        && matches!(
+            strategy,
+            Some(XrayReleaseStrategy::Handoff | XrayReleaseStrategy::HandoffForce)
+        )
+    {
+        i32::try_from(XRAY_HANDOFF_EXECUTION_TIMEOUT_SECS / 60)
+            .expect("the Xray handoff execution timeout fits PostgreSQL minutes")
+    } else {
+        DEFAULT_EXECUTION_TIMEOUT_MINUTES
+    }
+}
+
+fn blocks_retry_while_handoff_is_reported(
+    component: BinaryComponent,
+    strategy: Option<XrayReleaseStrategy>,
+) -> bool {
+    component == BinaryComponent::Xray
+        && matches!(
+            strategy,
+            Some(XrayReleaseStrategy::Handoff | XrayReleaseStrategy::HandoffForce)
+        )
 }
 
 pub async fn list_binary_releases(
@@ -280,7 +353,8 @@ pub async fn list_binary_release_summaries(
               ORDER BY id DESC LIMIT $1
          )
          SELECT r.id, r.component, r.build_id, r.version, r.status, r.active,
-                r.note, r.created_at::text AS created_at, r.created_by,
+                r.note, r.xray_strategy, r.xray_drain_timeout_seconds,
+                r.created_at::text AS created_at, r.created_by,
                 r.halted_at::text AS halted_at, r.finished_at::text AS finished_at,
                 count(t.node_id) AS target_count,
                 count(t.node_id) FILTER (WHERE t.status = 'succeeded') AS succeeded_count,
@@ -292,7 +366,8 @@ pub async fn list_binary_release_summaries(
            FROM page r
            LEFT JOIN binary_release_targets t ON t.release_id = r.id
           GROUP BY r.id, r.component, r.build_id, r.version, r.status, r.active,
-                   r.note, r.created_at, r.created_by, r.halted_at, r.finished_at
+                   r.note, r.xray_strategy, r.xray_drain_timeout_seconds,
+                   r.created_at, r.created_by, r.halted_at, r.finished_at
           ORDER BY r.id DESC",
     )
     .bind(i64::from(limit.clamp(1, 50)))
@@ -310,6 +385,17 @@ pub async fn list_binary_release_summaries(
                 status: BinaryReleaseStatus::parse(row.try_get::<String, _>("status")?.as_str())?,
                 active: row.try_get("active")?,
                 note: row.try_get("note")?,
+                xray_strategy: release_strategy(
+                    row.try_get::<Option<String>, _>("xray_strategy")?
+                        .as_deref(),
+                )?,
+                xray_drain_timeout_secs: row
+                    .try_get::<Option<i32>, _>("xray_drain_timeout_seconds")?
+                    .map(|value| {
+                        u32::try_from(value)
+                            .map_err(|_| invalid_number("xray_drain_timeout_seconds"))
+                    })
+                    .transpose()?,
                 created_at: row.try_get("created_at")?,
                 created_by: row.try_get("created_by")?,
                 halted_at: row.try_get("halted_at")?,
@@ -334,6 +420,49 @@ pub async fn create_binary_release(
     require_system_admin(actor)?;
     let component = build.component;
     validate_build(build)?;
+    let (xray_strategy, xray_drain_timeout_secs) = match component {
+        BinaryComponent::Agent => {
+            if request.xray_strategy.is_some() || request.xray_drain_timeout_secs.is_some() {
+                return Err(StoreError::InvalidData(
+                    "Agent release cannot carry Xray execution settings".to_owned(),
+                ));
+            }
+            (None, None)
+        }
+        BinaryComponent::Xray => {
+            let strategy = request.xray_strategy.ok_or_else(|| {
+                StoreError::InvalidData("Xray release strategy must be explicit".to_owned())
+            })?;
+            let timeout = match strategy {
+                XrayReleaseStrategy::Restart => {
+                    if request.xray_drain_timeout_secs.is_some() {
+                        return Err(StoreError::InvalidData(
+                            "restart strategy cannot carry a drain timeout".to_owned(),
+                        ));
+                    }
+                    None
+                }
+                XrayReleaseStrategy::Handoff | XrayReleaseStrategy::HandoffForce => {
+                    let timeout = request.xray_drain_timeout_secs.ok_or_else(|| {
+                        StoreError::InvalidData(
+                            "handoff strategy requires a drain timeout".to_owned(),
+                        )
+                    })?;
+                    if !(XRAY_HANDOFF_MIN_DRAIN_SECS..=XRAY_HANDOFF_MAX_DRAIN_SECS)
+                        .contains(&timeout)
+                    {
+                        return Err(StoreError::InvalidData(
+                            format!(
+                                "Xray drain timeout must be between {XRAY_HANDOFF_MIN_DRAIN_SECS} and {XRAY_HANDOFF_MAX_DRAIN_SECS} seconds"
+                            ),
+                        ));
+                    }
+                    Some(timeout)
+                }
+            };
+            (Some(strategy), timeout)
+        }
+    };
     let requested_build_id = request.build_id.trim().to_ascii_lowercase();
     if requested_build_id != build.build_id {
         return Err(StoreError::Conflict(
@@ -370,7 +499,7 @@ pub async fn create_binary_release(
         .execute(&mut *tx)
         .await?;
     if let Some(existing) = sqlx::query(
-        "SELECT id, build_id, version, note
+        "SELECT id, build_id, version, note, xray_strategy, xray_drain_timeout_seconds
            FROM binary_releases WHERE idempotency_key = $1 AND component = $2",
     )
     .bind(&idempotency_key)
@@ -393,6 +522,18 @@ pub async fn create_binary_release(
         if existing.try_get::<String, _>("build_id")? != requested_build_id
             || existing.try_get::<String, _>("version")? != build.version
             || existing.try_get::<Option<String>, _>("note")? != note
+            || release_strategy(
+                existing
+                    .try_get::<Option<String>, _>("xray_strategy")?
+                    .as_deref(),
+            )? != xray_strategy
+            || existing
+                .try_get::<Option<i32>, _>("xray_drain_timeout_seconds")?
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| invalid_number("xray_drain_timeout_seconds"))
+                })
+                .transpose()?
+                != xray_drain_timeout_secs
             || existing_nodes != nodes
         {
             return Err(StoreError::Conflict(
@@ -416,6 +557,16 @@ pub async fn create_binary_release(
     let observations = release_observations(&mut tx, component, &nodes).await?;
     for node_id in &nodes {
         let observation = &observations[node_id];
+        if component == BinaryComponent::Xray
+            && xray_strategy != Some(XrayReleaseStrategy::Restart)
+            && (observation.agent_protocol_version.unwrap_or_default()
+                < XRAY_HANDOFF_PROTOCOL_VERSION
+                || !observation.xray_handoff_ready)
+        {
+            return Err(StoreError::InvalidData(format!(
+                "node {node_id} has not reported a ready managed Xray handoff runtime"
+            )));
+        }
         if observation.running_sha256.as_deref() != Some(observation.installed_sha256.as_str()) {
             return Err(StoreError::InvalidData(format!(
                 "node {node_id} is not currently running its managed Xray"
@@ -434,8 +585,9 @@ pub async fn create_binary_release(
 
     let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO binary_releases
-                    (idempotency_key, build_id, version, artifacts, component, note, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (idempotency_key, build_id, version, artifacts, component, note, created_by,
+                     xray_strategy, xray_drain_timeout_seconds)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
           RETURNING id",
     )
     .bind(&idempotency_key)
@@ -445,6 +597,8 @@ pub async fn create_binary_release(
     .bind(component.as_str())
     .bind(&note)
     .bind(actor.operator_id())
+    .bind(xray_strategy.map(release_strategy_name))
+    .bind(xray_drain_timeout_secs.map(i64::from))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -466,7 +620,11 @@ pub async fn create_binary_release(
         "created",
         None,
         Some(actor.operator_id()),
-        serde_json::json!({ "targets": nodes.len() }),
+        serde_json::json!({
+            "targets": nodes.len(),
+            "xray_strategy": xray_strategy.map(release_strategy_name),
+            "xray_drain_timeout_secs": xray_drain_timeout_secs,
+        }),
     )
     .await?;
     sqlx::query("INSERT INTO binary_release_attempts (release_id, node_id, attempt) SELECT release_id, node_id, attempt FROM binary_release_targets WHERE release_id = $1")
@@ -573,16 +731,32 @@ pub async fn retry_binary_release_target(
     let mut tx = pool.begin().await?;
     let row = lock_release(&mut tx, component, release_id).await?;
     ensure_actionable_release(&row, release_id, available_build_id)?;
+    let strategy = release_strategy(
+        row.try_get::<Option<String>, _>("xray_strategy")?
+            .as_deref(),
+    )?;
+    let execution_timeout_minutes = execution_timeout_minutes(component, strategy);
+    let block_active_handoff = blocks_retry_while_handoff_is_reported(component, strategy);
     let result = sqlx::query(
-        "UPDATE binary_release_targets
+        "UPDATE binary_release_targets AS target
             SET status = 'pending', attempt = attempt + 1, error = NULL,
                 dispatched_at = NULL, finished_at = NULL,
                 reported_performed_update = NULL, reported_service_enabled = NULL,
                 reported_installed_sha256 = NULL,
-                reported_running_sha256 = NULL, verification = NULL,
+                reported_running_sha256 = NULL, reported_forced_retirement = NULL,
+                verification = NULL,
                 arch = CASE WHEN status = 'unsupported' THEN NULL ELSE arch END,
                 desired_sha256 = CASE WHEN status = 'unsupported' THEN NULL ELSE desired_sha256 END
           WHERE release_id = $1 AND node_id = $2 AND attempt < 32
+            AND NOT (
+                $4
+                AND EXISTS (
+                    SELECT 1 FROM node_agent_state AS state
+                     WHERE state.node_id = target.node_id
+                       AND state.xray_upgrade->>'release_id' = target.release_id::text
+                       AND state.xray_upgrade->>'attempt' = target.attempt::text
+                )
+            )
             AND (
                 status IN ('unverified', 'failed-recovered', 'failed-dirty', 'unsupported')
                 OR (
@@ -593,17 +767,37 @@ pub async fn retry_binary_release_target(
     )
     .bind(release_id)
     .bind(node_id)
-    .bind(DISPATCH_LEASE_MINUTES)
+    .bind(execution_timeout_minutes)
+    .bind(block_active_handoff)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {
+        let handoff_still_reported = block_active_handoff
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                    SELECT 1 FROM binary_release_targets AS target
+                    JOIN node_agent_state AS state ON state.node_id = target.node_id
+                    WHERE target.release_id = $1 AND target.node_id = $2
+                      AND state.xray_upgrade->>'release_id' = target.release_id::text
+                      AND state.xray_upgrade->>'attempt' = target.attempt::text
+                )",
+            )
+            .bind(release_id)
+            .bind(node_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if handoff_still_reported {
+            return Err(StoreError::Conflict(format!(
+                "binary release target {release_id}/{node_id} still reports the active handoff attempt; wait for its terminal report or explicitly stop it before retrying"
+            )));
+        }
         return Err(StoreError::Conflict(format!(
-            "binary release target {release_id}/{node_id} is not retryable; a dispatch lease must be at least {DISPATCH_LEASE_MINUTES} minutes old"
+            "binary release target {release_id}/{node_id} is not retryable; its {execution_timeout_minutes}-minute overall execution timeout has not elapsed"
         )));
     }
     sqlx::query(
         "UPDATE binary_release_attempts SET status = 'unverified', finished_at = now(),
-        error = COALESCE(error, 'execution lease expired; superseded by an operator retry')
+        error = COALESCE(error, 'overall execution timeout elapsed; superseded by an operator retry')
         WHERE release_id = $1 AND node_id = $2 AND status = 'dispatched'",
     )
     .bind(release_id)
@@ -659,6 +853,7 @@ pub async fn claim_binary_release(
         .await?;
     let Some(row) = sqlx::query(
         "SELECT r.id, r.build_id, r.version, r.artifacts,
+                r.xray_strategy, r.xray_drain_timeout_seconds,
                 t.status, t.attempt, t.before_sha256, t.desired_sha256, t.arch
            FROM binary_releases r
            JOIN binary_release_targets t ON t.release_id = r.id
@@ -731,6 +926,21 @@ pub async fn claim_binary_release(
         version: row.try_get("version")?,
         sha256: artifact.sha256.clone(),
         previous_sha256: row.try_get("before_sha256")?,
+        strategy: match component {
+            BinaryComponent::Agent => XrayReleaseStrategy::Restart,
+            BinaryComponent::Xray => release_strategy(
+                row.try_get::<Option<String>, _>("xray_strategy")?
+                    .as_deref(),
+            )?
+            // Releases created before the strategy migration used the destructive updater.
+            .unwrap_or(XrayReleaseStrategy::Restart),
+        },
+        drain_timeout_secs: row
+            .try_get::<Option<i32>, _>("xray_drain_timeout_seconds")?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| invalid_number("xray_drain_timeout_seconds"))
+            })
+            .transpose()?,
     };
     tx.commit().await?;
     Ok(Some(assignment))
@@ -761,29 +971,40 @@ enum ExecutionReport<'a> {
 }
 
 async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>) -> Result<bool> {
-    let (component, release_id, attempt, installed, running, performed, service_enabled, error) =
-        match &report {
-            ExecutionReport::Agent(r) => (
-                BinaryComponent::Agent,
-                r.release_id,
-                r.attempt,
-                r.installed_sha256.as_deref(),
-                r.running_sha256.as_deref(),
-                r.performed_update,
-                None,
-                r.error.clone(),
-            ),
-            ExecutionReport::Xray(r) => (
-                BinaryComponent::Xray,
-                r.release_id,
-                r.attempt,
-                r.installed_sha256.as_deref(),
-                r.running_sha256.as_deref(),
-                r.performed_update,
-                Some(r.xray_enabled),
-                r.error.clone(),
-            ),
-        };
+    let (
+        component,
+        release_id,
+        attempt,
+        installed,
+        running,
+        performed,
+        service_enabled,
+        forced_retirement,
+        error,
+    ) = match &report {
+        ExecutionReport::Agent(r) => (
+            BinaryComponent::Agent,
+            r.release_id,
+            r.attempt,
+            r.installed_sha256.as_deref(),
+            r.running_sha256.as_deref(),
+            r.performed_update,
+            None,
+            false,
+            r.error.clone(),
+        ),
+        ExecutionReport::Xray(r) => (
+            BinaryComponent::Xray,
+            r.release_id,
+            r.attempt,
+            r.installed_sha256.as_deref(),
+            r.running_sha256.as_deref(),
+            r.performed_update,
+            Some(r.xray_enabled),
+            r.forced_retirement,
+            r.error.clone(),
+        ),
+    };
     if release_id <= 0
         || attempt == 0
         || attempt > MAX_ATTEMPTS
@@ -799,9 +1020,25 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
     let mut error = normalize_text(error, MAX_ERROR_CHARS, "binary release error")?;
     let mut tx = pool.begin().await?;
     let release = lock_release(&mut tx, component, release_id).await?;
+    if let ExecutionReport::Xray(xray) = &report {
+        let approved = release_strategy(
+            release
+                .try_get::<Option<String>, _>("xray_strategy")?
+                .as_deref(),
+        )?
+        .unwrap_or(XrayReleaseStrategy::Restart);
+        if xray.strategy != approved
+            || (xray.forced_retirement && approved != XrayReleaseStrategy::HandoffForce)
+        {
+            return Err(StoreError::InvalidData(
+                "Xray release report does not match the approved execution strategy".to_owned(),
+            ));
+        }
+    }
     let row = sqlx::query(
         "SELECT t.status, t.attempt, t.before_sha256, t.desired_sha256,
-                a.receipt_capable, t.dispatched_at
+                a.receipt_capable, a.error AS attempt_error,
+                a.evidence AS attempt_evidence, t.dispatched_at
            FROM binary_release_targets t JOIN binary_release_attempts a
              ON (a.release_id, a.node_id, a.attempt) = (t.release_id, t.node_id, t.attempt)
           WHERE t.release_id = $1 AND t.node_id = $2 FOR UPDATE OF t, a",
@@ -825,11 +1062,17 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
         && release.try_get::<String, _>("status")? == "canceled"
         && existing == "canceled"
         && desired.is_some();
+    let recovering_after_dirty = active
+        && existing == "failed-dirty"
+        && matches!(
+            &report,
+            ExecutionReport::Xray(xray) if xray.outcome == XrayReleaseOutcome::Succeeded
+        );
     if !active && !late {
         tx.commit().await?;
         return Ok(false);
     }
-    if active && !matches!(existing.as_str(), "pending" | "dispatched") {
+    if active && !matches!(existing.as_str(), "pending" | "dispatched") && !recovering_after_dirty {
         tx.commit().await?;
         return Ok(true);
     }
@@ -874,16 +1117,14 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
                         "Agent has not restarted into the approved bytes".to_owned(),
                     ));
                 }
-                // Both facts must have arrived after dispatch, under this node's authenticated
-                // identity. A pre-restart response or a stale runtime report cannot settle work.
+                // Runtime identity must have arrived after dispatch under this node's authenticated
+                // identity. Desired-state polling is deliberately paused while an Xray generation
+                // drains, but Agent self-update and runtime reporting continue independently.
                 let healthy = sqlx::query_scalar::<_, bool>(
                     "SELECT COALESCE(
-                        regexp_replace(s.agent_version, '^brocade-agent/', '') = $3
-                        AND s.runtime_versions->>'agent' = $3
+                        s.runtime_versions->>'agent' = $3
                         AND s.agent_protocol_version >= $4
-                        AND s.last_poll_at >= t.dispatched_at
                         AND s.runtime_reported_at >= t.dispatched_at
-                        AND s.last_poll_at >= now() - interval '90 seconds'
                         AND s.runtime_reported_at >= now() - interval '2 minutes', FALSE)
                      FROM node_agent_state s JOIN binary_release_targets t ON t.node_id = s.node_id
                      WHERE t.release_id = $1 AND t.node_id = $2",
@@ -921,11 +1162,34 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
         },
     };
     let evidence = serde_json::to_value(&report)?;
+    if recovering_after_dirty && status != "succeeded" {
+        return Err(StoreError::InvalidData(
+            "dirty Xray recovery did not prove the approved running bytes".to_owned(),
+        ));
+    }
+    if recovering_after_dirty {
+        let previous_error: Option<String> = row.try_get("attempt_error")?;
+        let previous_evidence: serde_json::Value = row.try_get("attempt_evidence")?;
+        insert_event(
+            &mut tx,
+            release_id,
+            "target-recovered-after-dirty",
+            Some(node_id),
+            None,
+            serde_json::json!({
+                "attempt": attempt,
+                "previous_status": "failed-dirty",
+                "previous_error": previous_error,
+                "previous_evidence": previous_evidence,
+            }),
+        )
+        .await?;
+    }
     sqlx::query(
         "UPDATE binary_release_targets SET status = $3, error = $4,
              reported_performed_update = $5, reported_service_enabled = $6,
              reported_installed_sha256 = $7, reported_running_sha256 = $8,
-             verification = $9, finished_at = now()
+             reported_forced_retirement = $9, verification = $10, finished_at = now()
          WHERE release_id = $1 AND node_id = $2",
     )
     .bind(release_id)
@@ -936,6 +1200,7 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
     .bind(service_enabled)
     .bind(installed)
     .bind(running)
+    .bind(forced_retirement)
     .bind(verification)
     .execute(&mut *tx)
     .await?;
@@ -960,7 +1225,7 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
             "SELECT EXISTS (SELECT 1 FROM binary_release_targets WHERE release_id = $1 AND status <> 'succeeded')"
         ).bind(release_id).fetch_one(&mut *tx).await?;
         if !remaining {
-            sqlx::query("UPDATE binary_releases SET status = 'succeeded', finished_at = now() WHERE id = $1")
+            sqlx::query("UPDATE binary_releases SET status = 'succeeded', halted_at = NULL, finished_at = now() WHERE id = $1")
                 .bind(release_id).execute(&mut *tx).await?;
             insert_event(
                 &mut tx,
@@ -992,6 +1257,7 @@ async fn load_binary_release(
 ) -> Result<BinaryRelease> {
     let row = sqlx::query(
         "SELECT id, component, build_id, version, artifacts, status, active, note,
+                xray_strategy, xray_drain_timeout_seconds,
                 created_at::text AS created_at, created_by,
                 halted_at::text AS halted_at, finished_at::text AS finished_at
            FROM binary_releases WHERE id = $1 AND component = $2",
@@ -1001,22 +1267,54 @@ async fn load_binary_release(
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| StoreError::NotFound(format!("binary release {id}")))?;
+    let component = BinaryComponent::parse(row.try_get::<String, _>("component")?.as_str())?;
+    let strategy = release_strategy(
+        row.try_get::<Option<String>, _>("xray_strategy")?
+            .as_deref(),
+    )?;
+    let execution_timeout_minutes = execution_timeout_minutes(component, strategy);
+    let block_active_handoff = blocks_retry_while_handoff_is_reported(component, strategy);
     let target_rows = sqlx::query(
-        "SELECT node_id, status, attempt, before_sha256, desired_sha256, arch, error, verification,
+        "SELECT target.node_id, target.status, target.attempt, target.before_sha256,
+                target.desired_sha256, target.arch, target.error, target.verification,
                 reported_performed_update, reported_service_enabled,
                 reported_installed_sha256, reported_running_sha256,
-                (attempt < 32 AND (
-                    status IN ('unverified', 'failed-recovered', 'failed-dirty', 'unsupported')
+                reported_forced_retirement,
+                EXISTS (
+                    SELECT 1 FROM binary_release_events AS event
+                     WHERE event.release_id = target.release_id
+                       AND event.node_id = target.node_id
+                       AND event.kind = 'target-recovered-after-dirty'
+                       AND event.detail @> jsonb_build_object('attempt', target.attempt)
+                ) AS recovered_after_dirty,
+                CASE
+                    WHEN dispatched_at IS NULL THEN NULL
+                    ELSE (dispatched_at + make_interval(mins => $2))::text
+                END AS execution_deadline_at,
+                (status = 'dispatched'
+                    AND dispatched_at <= now() - make_interval(mins => $2)
+                ) AS execution_timed_out,
+                (target.attempt < 32 AND NOT (
+                    $3
+                    AND EXISTS (
+                        SELECT 1 FROM node_agent_state AS state
+                         WHERE state.node_id = target.node_id
+                           AND state.xray_upgrade->>'release_id' = target.release_id::text
+                           AND state.xray_upgrade->>'attempt' = target.attempt::text
+                    )
+                ) AND (
+                    target.status IN ('unverified', 'failed-recovered', 'failed-dirty', 'unsupported')
                     OR (
-                        status = 'dispatched'
+                        target.status = 'dispatched'
                         AND dispatched_at <= now() - make_interval(mins => $2)
                     )
                 )) AS retryable,
                 dispatched_at::text AS dispatched_at, finished_at::text AS finished_at
-           FROM binary_release_targets WHERE release_id = $1 ORDER BY node_id",
+           FROM binary_release_targets AS target WHERE target.release_id = $1 ORDER BY target.node_id",
     )
     .bind(id)
-    .bind(DISPATCH_LEASE_MINUTES)
+    .bind(execution_timeout_minutes)
+    .bind(block_active_handoff)
     .fetch_all(pool)
     .await?;
     let event_rows = if include_events {
@@ -1037,13 +1335,20 @@ async fn load_binary_release(
     };
     Ok(BinaryRelease {
         id: row.try_get("id")?,
-        component: BinaryComponent::parse(row.try_get::<String, _>("component")?.as_str())?,
+        component,
         build_id: row.try_get("build_id")?,
         version: row.try_get("version")?,
         artifacts: parse_artifacts(row.try_get("artifacts")?)?,
         status: BinaryReleaseStatus::parse(row.try_get::<String, _>("status")?.as_str())?,
         active: row.try_get("active")?,
         note: row.try_get("note")?,
+        xray_strategy: strategy,
+        xray_drain_timeout_secs: row
+            .try_get::<Option<i32>, _>("xray_drain_timeout_seconds")?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| invalid_number("xray_drain_timeout_seconds"))
+            })
+            .transpose()?,
         created_at: row.try_get("created_at")?,
         created_by: row.try_get("created_by")?,
         halted_at: row.try_get("halted_at")?,
@@ -1066,9 +1371,13 @@ async fn load_binary_release(
                     reported_service_enabled: row.try_get("reported_service_enabled")?,
                     reported_installed_sha256: row.try_get("reported_installed_sha256")?,
                     reported_running_sha256: row.try_get("reported_running_sha256")?,
+                    reported_forced_retirement: row.try_get("reported_forced_retirement")?,
+                    recovered_after_dirty: row.try_get("recovered_after_dirty")?,
                     retryable: row.try_get("retryable")?,
                     verification: row.try_get("verification")?,
                     dispatched_at: row.try_get("dispatched_at")?,
+                    execution_deadline_at: row.try_get("execution_deadline_at")?,
+                    execution_timed_out: row.try_get("execution_timed_out")?,
                     finished_at: row.try_get("finished_at")?,
                 })
             })
@@ -1168,9 +1477,14 @@ async fn release_observations(
     nodes: &[String],
 ) -> Result<BTreeMap<String, BinaryReleaseObservation>> {
     let rows = sqlx::query(
-        "SELECT n.id, lifecycle.phase, state.agent_version,
+        "SELECT n.id, lifecycle.phase, state.agent_protocol_version,
+                state.runtime_versions->>'agent' AS agent_running_sha256,
                 state.runtime_versions->>'xray_installed_sha256' AS xray_installed_sha256,
                 state.runtime_versions->>'xray_running_sha256' AS xray_running_sha256,
+                COALESCE(state.runtime_versions->'xray_handoff'->>'state' = 'ready', FALSE)
+                    AS xray_handoff_ready,
+                COALESCE(state.token_last_used_at >= now() - interval '90 seconds', FALSE)
+                    AS contact_fresh,
                 COALESCE(state.last_poll_at >= now() - interval '90 seconds', FALSE)
                     AS poll_fresh,
                 COALESCE(state.runtime_reported_at >= now() - interval '2 minutes', FALSE)
@@ -1195,21 +1509,27 @@ async fn release_observations(
                 "binary release target {node_id} is {phase}, not active"
             )));
         }
-        if !row.try_get::<bool, _>("poll_fresh")? {
-            return Err(StoreError::InvalidData(format!(
-                "node {node_id} has not polled desired state in the last 90 seconds"
-            )));
+        match component {
+            BinaryComponent::Agent if !row.try_get::<bool, _>("contact_fresh")? => {
+                return Err(StoreError::InvalidData(format!(
+                    "node {node_id} has not authenticated in the last 90 seconds"
+                )));
+            }
+            BinaryComponent::Xray if !row.try_get::<bool, _>("poll_fresh")? => {
+                return Err(StoreError::InvalidData(format!(
+                    "node {node_id} has not polled desired state in the last 90 seconds"
+                )));
+            }
+            _ => {}
         }
-        if component == BinaryComponent::Xray && !row.try_get::<bool, _>("runtime_fresh")? {
+        if !row.try_get::<bool, _>("runtime_fresh")? {
             return Err(StoreError::InvalidData(format!(
                 "node {node_id} has not reported runtime state in the last 2 minutes"
             )));
         }
         let sha: Option<String> = match component {
             BinaryComponent::Xray => row.try_get("xray_installed_sha256")?,
-            BinaryComponent::Agent => row
-                .try_get::<Option<String>, _>("agent_version")?
-                .map(|s| s.strip_prefix("brocade-agent/").unwrap_or(&s).to_owned()),
+            BinaryComponent::Agent => row.try_get("agent_running_sha256")?,
         };
         let sha = sha.filter(|sha| valid_sha256(sha)).ok_or_else(|| {
             StoreError::InvalidData(format!(
@@ -1233,6 +1553,13 @@ async fn release_observations(
             BinaryReleaseObservation {
                 installed_sha256: sha,
                 running_sha256: running,
+                agent_protocol_version: row
+                    .try_get::<Option<i32>, _>("agent_protocol_version")?
+                    .map(|value| {
+                        u32::try_from(value).map_err(|_| invalid_number("agent_protocol_version"))
+                    })
+                    .transpose()?,
+                xray_handoff_ready: row.try_get("xray_handoff_ready")?,
             },
         );
     }
@@ -1260,7 +1587,7 @@ async fn lock_release(
         .execute(&mut **tx)
         .await?;
     sqlx::query(
-        "SELECT build_id, status, active
+        "SELECT build_id, status, active, xray_strategy, xray_drain_timeout_seconds
            FROM binary_releases WHERE id = $1 AND component = $2 FOR UPDATE",
     )
     .bind(release_id)

@@ -266,16 +266,15 @@ export function MuxObservationCard({
   // 也不应以问号形式铺满整卡；保留卡片位置，只表达当前正在取得首个有效快照。
   if (warming) {
     return (
-      <div className="panel ov-card ov-mux-card" aria-label="Mux 连接复用">
-        <header>
+      <section className="panel config-panel ov-card ov-mux-card" aria-label="Mux 连接复用">
+        <header className="realtime-panel-header">
           <PanelTitle of="outbound">Mux 连接复用</PanelTitle>
-          <span className="sp" />
           <span className="hint">每秒采样 · 实时计算</span>
         </header>
         <p className="rt-dx" role="status">
           正在获取实时状态…
         </p>
-      </div>
+      </section>
     );
   }
 
@@ -312,10 +311,9 @@ export function MuxObservationCard({
   );
 
   return (
-    <div className="panel ov-card ov-mux-card" aria-label="Mux 连接复用">
-      <header>
+    <section className="panel config-panel ov-card ov-mux-card" aria-label="Mux 连接复用">
+      <header className="realtime-panel-header">
         <PanelTitle of="outbound">Mux 连接复用</PanelTitle>
-        <span className="sp" />
         <span className="hint">每秒采样 · {wholeSecondAge(arrivedAge)} 前 · 实时计算</span>
       </header>
 
@@ -357,7 +355,7 @@ export function MuxObservationCard({
         <summary>状态事件 · 最近 {Math.min(report.events.length, SHOWN_EVENTS)} 条</summary>
         <EventLog report={report} nodeName={nodeName} />
       </details>
-    </div>
+    </section>
   );
 }
 

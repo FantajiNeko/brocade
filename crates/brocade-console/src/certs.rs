@@ -614,7 +614,12 @@ pub fn spawn(store: PgStore) -> Arc<tokio::sync::Notify> {
                     }
                     prune_ticks = prune_ticks.wrapping_add(1);
                     if prune_ticks.is_multiple_of(24) {
-                        if let Err(error) = store.prune_certificate_scans().await {
+                        let result = async {
+                            let schedule = store.retention_schedule().await?;
+                            store.prune_configured_certificate_scans(&schedule).await
+                        }
+                        .await;
+                        if let Err(error) = result {
                             eprintln!("证书任务：历史清理失败：{error}");
                         }
                     }

@@ -104,6 +104,7 @@ pub async fn console_initial_data(
     Ok(ConsoleInitialData {
         node_count,
         chain_group_count,
+        onboarding: crate::onboarding::status(pool, actor).await?,
     })
 }
 
@@ -240,6 +241,7 @@ pub async fn list_users(
     let rows = if actor.is_system_admin() {
         sqlx::query(
             "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                    traffic_accounting_mode,
                     EXISTS (
                         SELECT 1 FROM admin_operators o
                         WHERE o.role = 'user'
@@ -263,6 +265,7 @@ pub async fn list_users(
         actor.require_tenant_access(tenant_id, "user")?;
         sqlx::query(
             "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                    traffic_accounting_mode,
                     EXISTS (
                         SELECT 1 FROM admin_operators o
                         WHERE o.role = 'user'
@@ -289,6 +292,7 @@ pub async fn list_users(
             .ok_or_else(|| StoreError::Forbidden("admin context has no tenant_scope".to_owned()))?;
         sqlx::query(
             "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                    traffic_accounting_mode,
                     EXISTS (
                         SELECT 1 FROM admin_operators o
                         WHERE o.role = 'user'

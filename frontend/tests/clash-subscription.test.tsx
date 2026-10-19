@@ -83,6 +83,9 @@ const artifact = (content: string) =>
     redacted: false,
   });
 
+// 「节点」页签并入网络拨测，挂载时读取本机拨测能力；拨测本身见 grant-probe.test.tsx，这里关掉。
+const probeOff = () => jsonResponse({ available: false, version: null, reason: '测试中不发起拨测', concurrency: 30 });
+
 const renderViewer = (kind: 'uri' | 'clash', selfService = false) => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   const view = render(
@@ -365,6 +368,7 @@ describe('subscription and node dialog', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const path = String(input);
         if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+        if (path === '/grant-probes/capability') return probeOff();
         if (path.endsWith('/clash-subscription')) return jsonResponse(subscriptionInfo());
         return artifact(uriText);
       }),
@@ -388,6 +392,7 @@ describe('subscription and node dialog', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+      if (path === '/grant-probes/capability') return probeOff();
       if (path.endsWith('/clash-subscription')) return jsonResponse(subscriptionInfo());
       return artifact(uriText);
     });
@@ -420,6 +425,7 @@ describe('subscription and node dialog', () => {
       vi.fn(async (input: RequestInfo | URL) => {
         const path = String(input);
         if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+        if (path === '/grant-probes/capability') return probeOff();
         if (path.endsWith('/clash-subscription')) return jsonResponse(subscriptionInfo());
         return artifact(uriText);
       }),
@@ -448,6 +454,7 @@ describe('subscription and node dialog', () => {
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
         if (String(input) === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+        if (String(input) === '/grant-probes/capability') return probeOff();
         return artifact(hoppingHy2Text);
       }),
     );
@@ -471,6 +478,7 @@ describe('subscription and node dialog', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+      if (path === '/grant-probes/capability') return probeOff();
       return artifact(path.includes('insecure=true') ? `${selfSignedLink}\n` : uriText);
     });
     vi.stubGlobal('fetch', fetchMock);

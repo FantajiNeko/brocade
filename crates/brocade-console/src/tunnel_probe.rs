@@ -12,7 +12,7 @@ use brocade_probe::{
 };
 use brocade_store::{
     ClaimedTunnelProbe, PgStore, TunnelProbeCompletion, TunnelProbeJobStatus, TunnelProbePhase,
-    TunnelProbeResultStatus, TUNNEL_PROBE_RETENTION_DAYS,
+    TunnelProbeResultStatus,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Semaphore};
@@ -74,11 +74,7 @@ pub fn spawn(store: PgStore) {
             }
             dispatch_available(&store, &owner, &local, &xray_binary, &runtime_dir).await;
             if tick_count.is_multiple_of(PRUNE_EVERY_SCHEDULER_TICKS) {
-                match store.prune_tunnel_probes(TUNNEL_PROBE_RETENTION_DAYS).await {
-                    Ok(0) => {}
-                    Ok(rows) => eprintln!("tunnel probe: pruned {rows} expired runs"),
-                    Err(error) => eprintln!("tunnel probe: prune failed: {error}"),
-                }
+                prune_history(&store).await;
             }
         }
     });
@@ -111,12 +107,23 @@ fn spawn_maintenance(store: PgStore) {
                 }
             }
             if tick_count.is_multiple_of(PRUNE_EVERY_MAINTENANCE_TICKS) {
-                if let Err(error) = store.prune_tunnel_probes(TUNNEL_PROBE_RETENTION_DAYS).await {
-                    eprintln!("tunnel probe: prune failed: {error}");
-                }
+                prune_history(&store).await;
             }
         }
     });
+}
+
+async fn prune_history(store: &PgStore) {
+    let result = async {
+        let schedule = store.retention_schedule().await?;
+        store.prune_configured_tunnel_probes(&schedule).await
+    }
+    .await;
+    match result {
+        Ok(0) => {}
+        Ok(rows) => eprintln!("tunnel probe: pruned {rows} expired runs"),
+        Err(error) => eprintln!("tunnel probe: prune failed: {error}"),
+    }
 }
 
 async fn dispatch_available(

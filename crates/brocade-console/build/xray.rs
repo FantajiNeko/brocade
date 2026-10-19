@@ -86,17 +86,50 @@ impl Recipe {
     }
 
     pub fn check_toolchain(&self, go: &Path, source: &Path) -> Result<()> {
+        self.with_toolchain(go, source).map(drop)
+    }
+
+    fn with_toolchain(&self, go: &Path, source: &Path) -> Result<Self> {
         let output = run(self.command(go, source).args(["env", "GOVERSION"]))?;
         let actual = std::str::from_utf8(&output)?.trim();
-        if actual != self.go_version {
-            return Err(format!(
-                "Xray requires exactly {}, found {actual}; install the pinned compiler or set BROCADE_GO",
+        let required = go_release_version(&self.go_version).ok_or_else(|| {
+            format!(
+                "invalid pinned Xray Go version {}; expected go<major>.<minor>.<patch>",
                 self.go_version
+            )
+        })?;
+        let actual_version = go_release_version(actual);
+        if actual_version.map(|version| (version.0, version.1)) != Some((required.0, required.1)) {
+            return Err(format!(
+                "Xray requires Go {}.{}.x, found {actual}; install a compiler from the pinned release line or set BROCADE_GO",
+                required.0, required.1
             )
             .into());
         }
-        Ok(())
+        if actual_version.is_some_and(|version| version < required) {
+            return Err(format!(
+                "Xray requires Go {}.{}.{} or newer on the {}.{}.x release line, found {actual}; install a patched compiler or set BROCADE_GO",
+                required.0, required.1, required.2, required.0, required.1
+            )
+            .into());
+        }
+        let mut resolved = self.clone();
+        // Patch releases are compatible for selection, but remain part of the exact build
+        // identity so manifests and reproducibility evidence never misstate the compiler used.
+        resolved.go_version = actual.to_owned();
+        Ok(resolved)
     }
+}
+
+fn go_release_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.strip_prefix("go")?.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -343,13 +376,13 @@ pub fn prepare(
     ledger_dir: &Path,
     prebuilt: Option<&Path>,
 ) -> Result<Manifest> {
-    recipe.check_toolchain(go, source)?;
-    let before = inputs(go, source, recipe)?;
+    let recipe = recipe.with_toolchain(go, source)?;
+    let before = inputs(go, source, &recipe)?;
     let scratch = tempfile::tempdir_in(out_dir)?;
     let (bytes, record) = if let Some(path) = prebuilt {
         read_override(path, &before)?
     } else {
-        let bytes = compile(go, source, recipe, &scratch.path().join("xray"), false)?;
+        let bytes = compile(go, source, &recipe, &scratch.path().join("xray"), false)?;
         let record = manifest(&before, &bytes)?;
         (bytes, record)
     };
@@ -359,7 +392,13 @@ pub fn prepare(
             "cargo:warning=Xray {}: verifying new build inputs with an independent Go cache",
             recipe.arch
         );
-        let rebuilt = compile(go, source, recipe, &scratch.path().join("xray-check"), true)?;
+        let rebuilt = compile(
+            go,
+            source,
+            &recipe,
+            &scratch.path().join("xray-check"),
+            true,
+        )?;
         if manifest(&before, &rebuilt)? != record {
             return Err(
                 "Xray independent rebuild disagrees with the candidate; refusing unverified bytes"
@@ -367,7 +406,7 @@ pub fn prepare(
             );
         }
     }
-    if before != inputs(go, source, recipe)? {
+    if before != inputs(go, source, &recipe)? {
         return Err("Xray inputs changed during the build; retry with a stable source tree".into());
     }
     // Recheck under the lock: another process may have registered these inputs while we compiled.
@@ -643,6 +682,11 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_go(source: &Path) -> PathBuf {
+        fake_go_with_version(source, &format!("go{}", GO_VERSION.trim()))
+    }
+
+    #[cfg(unix)]
+    fn fake_go_with_version(source: &Path, version: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let go = source.join("go");
         fs::write(source.join("go.mod"), "module fixture\n").unwrap();
@@ -655,7 +699,7 @@ mod tests {
                 r#"#!/bin/sh
 set -eu
 case "$1" in
-  env) printf '%s\n' 'go{}';;
+  env) printf '%s\n' '{}';;
   list)
     case " $* " in *' -buildvcs=false '*) ;; *) exit 91;; esac
     printf '{{"Dir":"%s","ImportPath":"fixture","GoFiles":["main.go"]}}' "$PWD";;
@@ -669,7 +713,7 @@ case "$1" in
   *) exit 1;;
 esac
 "#,
-                GO_VERSION.trim()
+                version
             ),
         )
         .unwrap();
@@ -712,7 +756,46 @@ esac
             .check_toolchain(&go, source)
             .unwrap_err()
             .to_string()
-            .contains("requires exactly"));
+            .contains("requires Go 0.0.x"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn toolchain_accepts_patch_updates_but_rejects_other_release_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path();
+        let required = go_release_version(&recipe().go_version).unwrap();
+        let compatible = format!("go{}.{}.999", required.0, required.1);
+        let go = fake_go_with_version(source, &compatible);
+        assert_eq!(
+            recipe().with_toolchain(&go, source).unwrap().go_version,
+            compatible
+        );
+
+        if required.2 > 0 {
+            fake_go_with_version(
+                source,
+                &format!("go{}.{}.{}", required.0, required.1, required.2 - 1),
+            );
+            assert!(recipe()
+                .check_toolchain(&go, source)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!(
+                    "requires Go {}.{}.{} or newer",
+                    required.0, required.1, required.2
+                )));
+        }
+
+        fake_go_with_version(source, &format!("go{}.{}.0", required.0, required.1 + 1));
+        assert!(recipe()
+            .check_toolchain(&go, source)
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("requires Go {}.{}.x", required.0, required.1)));
+
+        fake_go_with_version(source, "devel go-next-abcdef");
+        assert!(recipe().check_toolchain(&go, source).is_err());
     }
 
     #[test]

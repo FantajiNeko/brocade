@@ -27,7 +27,6 @@ vi.mock('echarts/components', () => ({
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 let TunnelProbePanel: typeof import('../src/tunnel-probe').TunnelProbePanel;
-let TunnelProbeSettingsSection: typeof import('../src/tunnel-probe').TunnelProbeSettingsSection;
 let tunnelProbeFailurePeriods: typeof import('../src/tunnel-probe-chart').tunnelProbeFailurePeriods;
 let tunnelProbeGapSecs: typeof import('../src/tunnel-probe-chart').tunnelProbeGapSecs;
 let draft: typeof import('../src/draft').draft;
@@ -40,7 +39,7 @@ beforeAll(async () => {
       disconnect() {}
     },
   );
-  ({ TunnelProbePanel, TunnelProbeSettingsSection } = await import('../src/tunnel-probe'));
+  ({ TunnelProbePanel } = await import('../src/tunnel-probe'));
   ({ tunnelProbeFailurePeriods, tunnelProbeGapSecs } = await import('../src/tunnel-probe-chart'));
   ({ draft } = await import('../src/draft'));
 });
@@ -414,45 +413,5 @@ describe('Console tunnel probes', () => {
         expect.objectContaining({ method: 'POST', body: '{"source":"draft","ops":[]}' }),
       ),
     );
-  });
-
-  it('lists only Console-supported tunnels in Settings', async () => {
-    const list: TunnelProbeList = {
-      ...inventory,
-      items: [
-        view.item,
-        {
-          ...view.item,
-          outbound_id: 'warp-8f3a-2d71',
-          name: 'Cloudflare WARP',
-          protocol: 'warp',
-          supported: false,
-          unsupported_reason: '需要独立的 Console 身份',
-          health: 'unknown',
-          health_reason: null,
-          policy: null,
-          latest_run: null,
-        },
-      ],
-    };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === '/tunnel-probes/capability') return jsonResponse(capability);
-      if (init?.method === 'PUT') return jsonResponse({ ...view.item.policy, enabled: false });
-      return jsonResponse(list);
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    const screen = render(<TunnelProbeSettingsSection editable />, { wrapper: wrapper() });
-
-    expect(await screen.findByText('隧道定时监测')).toBeTruthy();
-    const vendor = (await screen.findByRole('checkbox', {
-      name: '供应商出口 定时监测',
-    })) as HTMLInputElement;
-    expect(vendor.checked).toBe(true);
-    expect(screen.queryByRole('checkbox', { name: 'Cloudflare WARP 定时监测' })).toBeNull();
-    fireEvent.click(vendor);
-    await vi.waitFor(() => {
-      const put = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT');
-      expect(JSON.parse(String(put?.[1]?.body))).toEqual({ enabled: false, interval_secs: 300, timeout_secs: 10 });
-    });
   });
 });

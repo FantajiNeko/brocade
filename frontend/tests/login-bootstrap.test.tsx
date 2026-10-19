@@ -53,7 +53,7 @@ describe('系统初始化默认身份', () => {
     expect(password.autocomplete).toBe('current-password');
   });
 
-  it('以 root 初始化后直接进入控制台，zero 不设置登录密码', async () => {
+  it('以 root 初始化后进入入门向导，不预置网络用户', async () => {
     const onInitialized = vi.fn();
     let initBody: Record<string, unknown> | null = null;
     let initAuthorization: string | null = null;
@@ -73,7 +73,7 @@ describe('系统初始化默认身份', () => {
       if (path === '/bootstrap') {
         return jsonResponse({
           who: { operator_id: 'root', role: 'system-admin', tenant_scope: null, token_prefix: null },
-          initial: { node_count: 2, chain_group_count: [['app-a1b2', 3]] },
+          initial: { node_count: 0, chain_group_count: [], onboarding: 'active' },
         });
       }
       throw new Error(`unexpected request ${path}`);
@@ -89,7 +89,7 @@ describe('系统初始化默认身份', () => {
     expect(bootstrapToken.classList.contains('config-secret-input')).toBe(true);
     expect(password.type).toBe('password');
     expect(password.autocomplete).toBe('new-password');
-    expect(view.getByText('面板支持多用户统计；初始化时会预置使用者 zero，默认不开放登录。')).toBeTruthy();
+    expect(view.getByText('先创建系统管理员；登录后由入门向导纳管首台机器并创建第一个用户。')).toBeTruthy();
     const submit = view.getByRole('button', { name: '创建管理员' }) as HTMLButtonElement;
     fireEvent.change(view.getByLabelText('密码'), { target: { value: 'root-password' } });
     expect(submit.disabled).toBe(true);
@@ -112,7 +112,7 @@ describe('系统初始化默认身份', () => {
     expect(view.queryByText(/租户/)).toBeNull();
     expect(onInitialized).toHaveBeenCalledWith({
       who: { operator_id: 'root', role: 'system-admin', tenant_scope: null, token_prefix: null },
-      initial: { node_count: 2, chain_group_count: [['app-a1b2', 3]] },
+      initial: { node_count: 0, chain_group_count: [], onboarding: 'active' },
     });
   });
 

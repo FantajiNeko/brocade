@@ -40,6 +40,7 @@ pub struct ConsoleSnapshot {
 pub struct ConsoleInitialData {
     pub node_count: u64,
     pub chain_group_count: Vec<(String, u64)>,
+    pub onboarding: crate::OnboardingStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,10 +115,17 @@ pub struct NodeAgentStateItem {
     pub tenant_id: String,
     pub name: String,
     pub public_ipv4: Option<String>,
-    /// ISO alpha-2 country derived by the control plane from `public_ipv4` and its cached
-    /// geoip.dat. It is response decoration, not model state, so the store initializes it empty.
+    /// Effective ISO alpha-2 country shown by the Console. A manual override wins over the
+    /// detected value. It is response decoration, not model state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ipv4_country: Option<String>,
+    /// Automatic GeoIP answer retained beside the effective value so the editor can explain what
+    /// restoring automatic detection will display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ipv4_country_detected: Option<String>,
+    /// Operator-selected correction. `None` means the effective country follows GeoIP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_ipv4_country_override: Option<String>,
     pub public_ipv6: Option<String>,
     pub public_ipv4_nat: bool,
     pub public_ipv6_nat: bool,
@@ -152,9 +160,12 @@ pub struct NodeAgentStateItem {
     /// The selected machine has produced no accepted catalogue-probe samples for thirty minutes.
     #[serde(default)]
     pub vpngate_probe_data_stale: bool,
-    /// Whether this machine may collect the upstream catalogue and lease globally deduplicated
-    /// three-provider exit-IP intelligence jobs. Unlike catalogue probing, neither requires
-    /// OpenVPN.
+    /// Whether this machine may collect the upstream catalogue. Unlike catalogue probing, this
+    /// task does not require OpenVPN.
+    #[serde(default)]
+    pub vpngate_catalog_enabled: bool,
+    /// Whether this machine may lease globally deduplicated three-provider exit-IP intelligence
+    /// jobs. This task does not require OpenVPN.
     #[serde(default)]
     pub vpngate_intelligence_enabled: bool,
     /// Runtime observations. `None` means this machine has never reported, which must stay
@@ -162,6 +173,10 @@ pub struct NodeAgentStateItem {
     /// zero": the UI shows an em dash, not 0, or the machine most worth worrying about displays
     /// as the healthiest.
     pub runtime_versions: Option<serde_json::Value>,
+    /// Temporary two-generation Xray process observation. Present only while an Xray release
+    /// attempt is executing; terminal runtime reports clear it.
+    #[serde(default)]
+    pub xray_upgrade: Option<serde_json::Value>,
     pub spool_backlog: Option<serde_json::Value>,
     pub last_local_reconcile: Option<serde_json::Value>,
     pub wireguard_health: Option<serde_json::Value>,
@@ -243,6 +258,19 @@ pub struct NodeAgentStateItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateNodeRegionRequest {
+    /// Uppercase ISO alpha-2 code after normalization. `null` restores automatic GeoIP detection.
+    pub country_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRegionOverride {
+    pub node_id: String,
+    pub country_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactIndex {
     pub revision: u64,
     pub artifacts: Vec<ArtifactIndexEntry>,
@@ -300,6 +328,7 @@ pub struct UserListItem {
     pub uuid: String,
     pub status: String,
     pub account_type: UserAccountType,
+    pub traffic_accounting_mode: UserTrafficAccountingMode,
     pub login_enabled: bool,
     pub direct_login_enabled: bool,
     pub created_at: String,
@@ -318,6 +347,29 @@ impl UserAccountType {
         match self {
             Self::Formal => "formal",
             Self::Test => "test",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserTrafficAccountingMode {
+    Single,
+    Double,
+}
+
+impl UserTrafficAccountingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Double => "double",
+        }
+    }
+
+    pub fn multiplier(self) -> u64 {
+        match self {
+            Self::Single => 1,
+            Self::Double => 2,
         }
     }
 }
@@ -476,6 +528,8 @@ pub struct UpdateUserStatusRequest {
 #[serde(deny_unknown_fields)]
 pub struct UpdateUserProfileRequest {
     pub account_type: UserAccountType,
+    #[serde(default)]
+    pub traffic_accounting_mode: Option<UserTrafficAccountingMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

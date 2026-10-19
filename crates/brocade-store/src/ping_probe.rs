@@ -41,9 +41,12 @@ const LATEST_NODE_SAMPLES_SQL: &str =
       ORDER BY requested_node.node_id, requested.target, requested.family";
 
 const MAX_CLOCK_SKEW_SECS: i64 = 600;
-const MAX_TARGETS: usize = 32;
-/// One sample per configured family: at most two per target.
-const MAX_SAMPLES: usize = MAX_TARGETS * 2;
+const MAX_TARGETS: usize = 6;
+// Previously saved lists and in-flight Agent reports may still contain up to 32 targets. Keep
+// them readable so operators can reduce the list; every new settings write is limited to six.
+const LEGACY_MAX_TARGETS: usize = 32;
+/// One sample per configured family: at most two per target, including legacy reports.
+const MAX_SAMPLES: usize = LEGACY_MAX_TARGETS * 2;
 const MIN_INTERVAL_SECS: u32 = 5;
 const MAX_INTERVAL_SECS: u32 = 86_400;
 const MIN_TIMEOUT_MS: u32 = 1;
@@ -127,7 +130,7 @@ pub async fn load_settings(pool: &PgPool) -> Result<PingProbeSettings> {
             |_| StoreError::InvalidData("negative PING probe timeout in database".into()),
         )?,
     };
-    validate_settings(&settings)?;
+    validate_settings_with_target_limit(&settings, LEGACY_MAX_TARGETS)?;
     Ok(settings)
 }
 
@@ -338,7 +341,11 @@ pub async fn record_report(
 /// scan per Agent report even though almost every scan deleted nothing. An hourly pass keeps the
 /// same retention boundary while removing that work from the ingestion transaction.
 pub async fn prune_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
+    prune_samples_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_samples_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let started = std::time::Instant::now();
     let mut deleted = 0;
     // Independent small transactions release row locks and pool capacity between batches. The
@@ -351,12 +358,12 @@ pub async fn prune_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
         let count = sqlx::query(
             "WITH expired AS (
                 SELECT ctid FROM node_ping_probe_samples
-                 WHERE probed_at < now() - make_interval(days => $1)
+                 WHERE probed_at < now() - make_interval(secs => $1::double precision)
                  ORDER BY probed_at LIMIT 10000 FOR UPDATE SKIP LOCKED
              ) DELETE FROM node_ping_probe_samples sample USING expired
                 WHERE sample.ctid = expired.ctid",
         )
-        .bind(retain_days)
+        .bind(retain_secs)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -745,6 +752,13 @@ fn endpoint_error_text(kind: PingProbeKind, error: PingEndpointError) -> &'stati
 }
 
 fn validate_settings(settings: &PingProbeSettings) -> Result<()> {
+    validate_settings_with_target_limit(settings, MAX_TARGETS)
+}
+
+fn validate_settings_with_target_limit(
+    settings: &PingProbeSettings,
+    max_targets: usize,
+) -> Result<()> {
     if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&settings.interval_secs) {
         return Err(StoreError::InvalidData(format!(
             "PING 探测间隔必须为 {MIN_INTERVAL_SECS}–{MAX_INTERVAL_SECS} 秒"
@@ -755,9 +769,9 @@ fn validate_settings(settings: &PingProbeSettings) -> Result<()> {
             "PING 超时必须为 {MIN_TIMEOUT_MS}–{MAX_TIMEOUT_MS} 毫秒"
         )));
     }
-    if settings.targets.len() > MAX_TARGETS {
+    if settings.targets.len() > max_targets {
         return Err(StoreError::InvalidData(format!(
-            "PING 探测目标不能超过 {MAX_TARGETS} 个"
+            "PING 探测目标不能超过 {max_targets} 个"
         )));
     }
     let mut series = BTreeSet::new();
@@ -826,6 +840,24 @@ mod tests {
             interval_secs: 60,
             timeout_ms: 420,
         }
+    }
+
+    #[test]
+    fn settings_writes_allow_six_targets_and_legacy_reads_remain_bounded() {
+        let mut settings = settings(
+            (1..=6)
+                .map(|index| target(PingProbeKind::Icmp, Some(&format!("192.0.2.{index}")), None))
+                .collect(),
+        );
+        assert!(validate_settings(&settings).is_ok());
+        settings
+            .targets
+            .push(target(PingProbeKind::Icmp, Some("192.0.2.7"), None));
+        assert!(validate_settings(&settings)
+            .unwrap_err()
+            .to_string()
+            .contains("6 个"));
+        assert!(validate_settings_with_target_limit(&settings, LEGACY_MAX_TARGETS).is_ok());
     }
 
     #[test]

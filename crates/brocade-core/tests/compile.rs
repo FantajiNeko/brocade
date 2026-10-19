@@ -3,14 +3,28 @@ use std::net::{IpAddr, Ipv4Addr};
 use brocade_core::{
     compile::compile,
     model::{
-        Accept, Action, AppView, Chain, DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy,
-        EgressDnsFallback, EgressDnsResolution, EgressDnsTransport, Front, FrontStrategy, Grant,
-        HopDial, HopIn, HopPool, Ingress, IngressGuard, IngressWires, ModelSnapshot, Node,
-        NodeEgressDnsPolicy, Rule, Step, Transport, User, WireGuardKeys,
+        Accept, Action, AppView, Chain, CnSourceBlock, DestMatch, Dns, DomainStrategy,
+        EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution, EgressDnsTransport,
+        Front, FrontStrategy, Grant, HopDial, HopIn, HopPool, Ingress, IngressGuard, IngressWires,
+        ModelSnapshot, Node, NodeEgressDnsPolicy, Rule, Step, Transport, User, WireGuardKeys,
     },
     Level,
 };
 use ipnet::Ipv4Net;
+
+#[test]
+fn historical_ingress_guard_defaults_cn_source_block_to_off() {
+    let guard: IngressGuard = serde_json::from_value(serde_json::json!({
+        "no_private": true,
+        "no_bittorrent": true,
+        "no_mail": true,
+        "no_udp_amplification": true,
+        "tcp_and_quic_only": false
+    }))
+    .unwrap();
+
+    assert_eq!(guard.cn_source_block, CnSourceBlock::Off);
+}
 
 #[test]
 fn compile_output_projects_only_when_publishable() {
@@ -39,6 +53,11 @@ fn compile_output_projects_only_when_publishable() {
 
     let node_plan = output.project_node("hk").unwrap();
     assert!(node_plan.xray.is_some());
+    assert_eq!(
+        output.project_grants("hk").unwrap(),
+        Some(node_plan.grant_sync)
+    );
+    assert_eq!(output.project_grants("absent").unwrap(), None);
 
     let user_plan = output.project_user("platform.acme", "alice").unwrap();
     assert_eq!(user_plan.entries.len(), 2);
@@ -64,6 +83,7 @@ fn compile_output_blocks_publish_on_errors() {
     let blocked = output.project_node("hk").unwrap_err();
     assert_eq!(blocked.summary, output.summary);
     assert_eq!(blocked.diagnostics, output.diagnostics);
+    assert_eq!(output.project_grants("hk").unwrap_err(), blocked);
 }
 
 #[test]

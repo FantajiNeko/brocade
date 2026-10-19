@@ -624,7 +624,6 @@ it('keeps VPN Gate in one page with country selection and real node evidence', (
   fireEvent.click(screen.getByRole('tab', { name: '目录采集' }));
   expect(screen.getByRole('heading', { name: 'VPN Gate 目录同步' })).toBeTruthy();
   expect(screen.getByRole('heading', { name: '拨测机器' })).toBeTruthy();
-  expect(screen.getByText(/上游目录采集 Agent 在设置「情报任务」中统一选择/)).toBeTruthy();
   expect(screen.getByText(/与设置中的情报执行 Agent 独立/)).toBeTruthy();
   const probeMeta = document.querySelector('.vpngate-probe-section .cg-meta');
   expect(probeMeta?.textContent).toContain('参与 1 台');
@@ -636,6 +635,19 @@ it('keeps VPN Gate in one page with country selection and real node evidence', (
   expect(screen.getByText(/sg-edge · 未安装或无法执行 OpenVPN/)).toBeTruthy();
   expect((screen.getByRole('combobox', { name: '香港接入 的目录拨测并发数' }) as HTMLSelectElement).value).toBe('16');
   expect(screen.queryByText(/线程/)).toBeNull();
+});
+
+it('shows the global pause in collection view without offering a second switch', () => {
+  mount({ ...overview, status: { ...overview.status, enabled: false } });
+
+  const sync = screen.getByRole('button', { name: '立即同步' });
+  expect(sync.hasAttribute('disabled')).toBe(true);
+  expect(sync.getAttribute('title')).toBe('请先在配置中开启 VPN Gate');
+  fireEvent.click(screen.getByRole('tab', { name: '目录采集' }));
+  expect(screen.getByText('VPN Gate 已关闭')).toBeTruthy();
+  expect(screen.getByText(/已发布 Chain 不受影响/)).toBeTruthy();
+  expect(screen.queryByLabelText('VPN Gate 自动同步')).toBeNull();
+  expect(screen.getByText('整体开关在“配置 → VPN Gate”中管理')).toBeTruthy();
 });
 
 it('shows the catalogue while the model snapshot is still loading', () => {

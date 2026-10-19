@@ -21,7 +21,7 @@ class Events {
   }
 }
 beforeEach(() => {
-  vi.useFakeTimers();
+  vi.useFakeTimers({ now: 1_760_000_000_000 });
   vi.stubGlobal('EventSource', Events);
 });
 afterEach(() => {

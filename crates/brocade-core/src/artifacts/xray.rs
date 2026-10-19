@@ -544,11 +544,10 @@ pub enum XrayOutbound {
     },
 }
 
-/// Omitting `ipsBlocked` uses Xray's protocol-dependent default; it does not protect dokodemo.
+/// Freedom allows every target by default. Blocking is always an explicit outbound policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XrayFreedomAddressPolicy {
     Default,
-    AllowPrivate,
     BlockPrivate,
 }
 
@@ -680,6 +679,15 @@ fn stamp_rule_tags(rules: &mut [XrayRoutingRule]) {
         for ip in &rule.condition.ip {
             field(&mut hasher, ip.as_bytes());
         }
+        // Preserve the generation of every pre-source-policy table. The marker makes the new
+        // field unambiguous when it is present without inserting a zero into every old digest.
+        if !rule.condition.source_ip.is_empty() {
+            field(&mut hasher, b"sourceIP");
+            hasher.update((rule.condition.source_ip.len() as u64).to_le_bytes());
+            for ip in &rule.condition.source_ip {
+                field(&mut hasher, ip.as_bytes());
+            }
+        }
         field(
             &mut hasher,
             rule.condition.port.as_deref().unwrap_or("").as_bytes(),
@@ -710,6 +718,8 @@ fn stamp_rule_tags(rules: &mut [XrayRoutingRule]) {
 pub struct XrayMatchCondition {
     pub domain: Vec<String>,
     pub ip: Vec<String>,
+    /// Remote peer address as observed by Xray. `ip` above is the requested destination.
+    pub source_ip: Vec<String>,
     pub port: Option<String>,
     pub network: Option<String>,
     /// What the sniffer decided the connection speaks. Empty on every rule that does not ask.
@@ -768,7 +778,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
         // Dynamic forwarding listeners share this default outbound, so the data plane cannot
         // express a different address policy per entitlement. The Store is the policy owner: it
         // admits private literals only when that user/node entitlement explicitly allows them.
-        address_policy: XrayFreedomAddressPolicy::AllowPrivate,
+        address_policy: XrayFreedomAddressPolicy::Default,
     }];
     // The mirror of the above for the bridge end: which dialling outbound carries the
     // tunnel, and under which tag its virtual inbound appears.
@@ -955,7 +965,11 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             rule_tag: String::new(),
             inbound_tags,
             users,
-            condition: match_condition(&rule.dest_match),
+            condition: {
+                let mut condition = match_condition(&rule.dest_match);
+                condition.source_ip = rule.source_ips.clone();
+                condition
+            },
             outbound_tag: rule.outbound_tag.clone(),
             balancer_tag: None,
         }
@@ -1436,7 +1450,7 @@ fn egress_outbound(outbound: &XrayEgressOutboundPlan, strategy: DomainStrategy) 
         // The ingress guard is the single policy owner. In particular, a request that
         // passed an ingress with `no_private = false` must not be denied later merely
         // because a relay hop changed the immediate inbound identity to VLESS.
-        address_policy: XrayFreedomAddressPolicy::AllowPrivate,
+        address_policy: XrayFreedomAddressPolicy::Default,
     }
 }
 

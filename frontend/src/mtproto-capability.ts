@@ -1,5 +1,7 @@
 import type { NodeAgentStateItem } from './api';
 
+export const MTPROTO_DESCRIPTION = 'Telegram MTProto 代理。';
+
 export interface MtprotoNodeEligibility {
   eligible: boolean;
   reason: string | null;

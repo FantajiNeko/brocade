@@ -212,4 +212,76 @@ describe('二进制发布共用视图', () => {
     expect((screen.getByLabelText('升级 旧标识机器') as HTMLInputElement).disabled).toBe(true);
     expect(screen.getByText('还没有上报有效的 Agent 摘要')).toBeTruthy();
   });
+
+  it('历史记录明确区分强制退役成功和异常后自动恢复', async () => {
+    const release = {
+      id: 11,
+      component: 'xray',
+      build_id: digest,
+      version: '26.10.1',
+      status: 'succeeded',
+      created_by: 'admin',
+      created_at: '2026-10-16T00:00:00Z',
+      succeeded_count: 2,
+      target_count: 2,
+      problem_count: 0,
+      note: null,
+      targets: [
+        {
+          node_id: 'force-node',
+          status: 'succeeded',
+          attempt: 1,
+          before_sha256: digest,
+          desired_sha256: 'b'.repeat(64),
+          verification: 'receipt',
+          error: null,
+          reported_forced_retirement: true,
+          recovered_after_dirty: false,
+        },
+        {
+          node_id: 'recovered-node',
+          status: 'succeeded',
+          attempt: 1,
+          before_sha256: digest,
+          desired_sha256: 'b'.repeat(64),
+          verification: 'receipt',
+          error: null,
+          reported_forced_retirement: false,
+          recovered_after_dirty: true,
+        },
+      ],
+      events: [
+        {
+          id: 1,
+          kind: 'target-recovered-after-dirty',
+          node_id: 'recovered-node',
+          actor: null,
+          detail: { attempt: 1, previous_error: '动态转发恢复仍在重试' },
+          created_at: '2026-10-16T00:01:00Z',
+        },
+      ],
+      next_event_before_id: null,
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === '/binary-releases/xray/history') return json({ items: [release], next_before_id: null });
+        if (path === '/binary-releases/xray/11') return json(release);
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+    render(
+      <QueryClientProvider client={client()}>
+        <BinaryReleaseHistory component="xray" latestId={11} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '发布历史' }));
+    fireEvent.click(await screen.findByRole('button', { name: /#11/ }));
+    expect(await screen.findByRole('button', { name: /force-node · 强制退役完成/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /recovered-node · 自动恢复完成/ })).toBeTruthy();
+    expect(screen.getByText(/异常后自动恢复完成 · recovered-node/)).toBeTruthy();
+    expect(screen.getByText('恢复前异常：动态转发恢复仍在重试')).toBeTruthy();
+  });
 });

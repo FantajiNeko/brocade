@@ -41,13 +41,18 @@ test('桌面普通页面顶栏随唯一的工作区滚动容器滚动', () => {
   assert.match(shell, /<div className=\{`fg-desk\$\{nav === 'topo' \? ' is-topo' : ''\}`\}>\s*<TopBar/);
   assert.equal((shell.match(/<TopBar/g) ?? []).length, 1);
   assert.match(styles, /\.fg-desk\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*overflow:\s*auto;/s);
-  assert.match(styles, /\.fg-desk\s*\{[^}]*background:\s*var\(--surface\);/s);
+  assert.match(styles, /\.fg-desk\s*\{[^}]*background:\s*transparent;/s);
   assert.doesNotMatch(styles, /\.fg-desk\s*\{[^}]*background-image:/s);
   assert.match(styles, /\.fg-desk\.is-topo\s*\{[^}]*overflow:\s*hidden;/s);
   assert.match(styles, /\.fg-desk > \.fg-view\s*\{[^}]*position:\s*relative;[^}]*flex:\s*1 0 auto;/s);
   assert.match(
     styles,
-    /#stage,\s*\.topo-deck,\s*\.loading-skeleton-canvas,\s*\.fg-desk > \.fg-view\s*\{[^}]*isolation:\s*isolate;[^}]*background-color:\s*var\(--ground\);/s,
+    /#stage,\s*\.topo-deck,\s*\.loading-skeleton-canvas\s*\{[^}]*isolation:\s*isolate;[^}]*background-color:\s*var\(--ground\);/s,
+  );
+  assert.match(styles, /body:has\(\.forge\)\s*\{\s*isolation:\s*isolate;/);
+  assert.match(
+    styles,
+    /body:has\(\.forge\)::before\s*\{\s*position:\s*sticky;[^}]*height:\s*100dvh;[^}]*margin-bottom:\s*-100dvh;[^}]*background-color:\s*var\(--ground\);/s,
   );
   assert.doesNotMatch(styles, /\.fg-top\s*\{[^}]*position:\s*(?:fixed|sticky)/s);
   assert.doesNotMatch(styles, /\.fg-top::before/);
@@ -63,6 +68,8 @@ test('机器详情页签实现完整的键盘和 ARIA 关系', () => {
   assert.equal((nodes.match(/aria-controls=\{panelId\(/g) ?? []).length, 3);
   assert.equal((nodes.match(/role="tabpanel"/g) ?? []).length, 4);
   assert.equal((nodes.match(/aria-labelledby=\{tabId\(/g) ?? []).length, 3);
+  assert.match(nodes, /const tabs: NodeTab\[\] = \['observed', 'config', 'chains'\]/);
+  assert.doesNotMatch(nodes, /showsTrafficTab|NodeTrafficTab|nd-tab-traffic|tabId\('traffic'\)/);
   assert.match(nodes, /function NodeDetailTabState[\s\S]*?role="tabpanel"[\s\S]*?aria-labelledby=\{tabId\}/);
   assert.match(nodes, /event\.key === 'ArrowRight' \|\| event\.key === 'ArrowDown'/);
   assert.match(nodes, /event\.key === 'ArrowLeft' \|\| event\.key === 'ArrowUp'/);

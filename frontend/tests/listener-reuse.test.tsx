@@ -29,6 +29,7 @@ const ingress = (id: string, owner: string, node: string): SnapshotIngress => ({
     no_mail: true,
     no_udp_amplification: true,
     tcp_and_quic_only: false,
+    cn_source_block: 'off',
   },
   identity: { public_key: 'public', short_ids: ['0123abcd'] },
   wires: { vless: { kind: 'vless-reality' } },

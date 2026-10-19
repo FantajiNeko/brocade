@@ -1,17 +1,37 @@
-import { useId, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+  ApiError,
+  cancelGrantProbe,
   fetchArtifactContent,
   fetchClashSubscription,
+  fetchGrantProbeCapability,
+  fetchGrantProbeJob,
   fetchMyArtifact,
   fetchMyClashSubscription,
   fetchRevisions,
+  fetchUserGrantProbePlan,
+  grantProbeEventsUrl,
   issueClashHaitunSubscription,
   revokeClashHaitunSubscription,
+  startUserGrantProbe,
   type ArtifactFamily,
   type ArtifactProtocol,
   type ClashSubscriptionInfo,
+  type GrantProbeItemStatus,
+  type GrantProbeJob,
+  type GrantProbeJobItem,
+  type GrantProbePlanItem,
 } from '../api';
+import { GRANT_REFRESH_MS, GRANT_REFRESH_WINDOW_MS, useGrantEdits } from '../grant-edits';
 import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
 import { CopyButton, copyStateIcon } from '../ui/copy-button';
 import { DialogClose, DialogLayer } from '../ui/dialog';
@@ -53,7 +73,7 @@ interface TabPanelProps {
 
 /* 订阅与节点共用一个弹窗：标题栏切换「订阅 / 节点」，协议与地址族筛选两个页签共用。
  * 两边的内容都由服务端按筛选条件生成：订阅是带 family / protocol 参数的地址，节点是同一条件下的
- * uri.txt。浏览器只把 uri.txt 解析成列表用于展示，不自行过滤条目。
+ * uri.txt。浏览器只把 uri.txt 解析成列表用于展示，不自行过滤条目。「节点」页签并入人工网络拨测。
  * 窄屏（与 useNarrow 同一断点）弹窗贴底成为面板，筛选换成一行两个下拉。 */
 export function SubscriptionViewer({
   tenant,
@@ -61,6 +81,7 @@ export function SubscriptionViewer({
   kind,
   selfService = false,
   identity,
+  onProbePassed,
   onClose,
 }: {
   tenant: string;
@@ -68,6 +89,7 @@ export function SubscriptionViewer({
   kind: SubscriptionKind;
   selfService?: boolean;
   identity?: ReactNode;
+  onProbePassed?: (result: { probeId: string; itemId: string }) => void;
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<SubscriptionKind>(kind);
@@ -181,6 +203,7 @@ export function SubscriptionViewer({
             allowInsecure={allowInsecure}
             onAllowInsecure={setAllowInsecure}
             onUseSubscription={() => setTab('clash')}
+            onProbePassed={onProbePassed}
             panel={panel}
           />
         )}
@@ -436,6 +459,8 @@ const NODE_PROTOCOL_LABEL: Record<NodeProtocol, string> = {
 
 const NODE_FAMILY_LABEL: Record<NodeFamily, string> = { ipv4: 'IPv4', ipv6: 'IPv6' };
 
+type CssVars = CSSProperties & Record<`--${string}`, string>;
+
 function NodeLinks({
   tenant,
   user,
@@ -445,6 +470,7 @@ function NodeLinks({
   allowInsecure,
   onAllowInsecure,
   onUseSubscription,
+  onProbePassed,
   panel,
 }: {
   tenant: string;
@@ -455,6 +481,7 @@ function NodeLinks({
   allowInsecure: boolean;
   onAllowInsecure: (allow: boolean) => void;
   onUseSubscription: () => void;
+  onProbePassed?: (result: { probeId: string; itemId: string }) => void;
   panel: TabPanelProps;
 }) {
   const [view, setView] = useState<'list' | 'raw'>('list');
@@ -481,8 +508,19 @@ function NodeLinks({
           ),
     enabled: !!revision,
   });
+  const probe = useUserGrantProbe(tenant, user);
+  const reportedPassed = useRef<string | null>(null);
+  const passedItem = probe.job?.items.find(item => item.status === 'passed');
+  useEffect(() => {
+    if (!probe.job || !passedItem || !onProbePassed) return;
+    const key = `${probe.job.id}:${passedItem.id}`;
+    if (reportedPassed.current === key) return;
+    reportedPassed.current = key;
+    onProbePassed({ probeId: probe.job.id, itemId: passedItem.id });
+  }, [onProbePassed, passedItem, probe.job]);
 
-  if (!revision || content.isPending || content.error) {
+  // 拨测状态与节点一起揭示：先出列表、后补状态灯会让每个地址横移一次。
+  if (!revision || content.isPending || content.error || probe.pending) {
     return (
       <div className="sub-dialog-body" {...panel}>
         {content.error ? <ErrorBox error={content.error} /> : <Loading variant="code" />}
@@ -496,6 +534,64 @@ function NodeLinks({
   const slots: NodeFamily[] = family === 'both' ? ['ipv4', 'ipv6'] : [family === 'v4' ? 'ipv4' : 'ipv6'];
   const insecureCount = allowInsecure ? listing.links.filter(link => link.insecure).length : 0;
   const lines = text ? text.replace(/\n$/, '').split('\n') : [];
+
+  // 拨测、进度与重试只作用于列出的节点：没有分享链接的条目（带前置代理、VLESS 自签，见说明）
+  // 与筛选掉的条目都不在其中，所见即所测。
+  const probeOf = probe.ready ? pairProbeItems(listing.links, probe.items) : new Map<NodeLink, ProbeItem>();
+  const listed = listing.links.flatMap(link => probeOf.get(link) ?? []);
+  const listedIds = new Set(listed.map(item => item.id));
+  const job = probe.job;
+  const running = job?.status === 'running';
+  const jobItems = job?.items.filter(item => listedIds.has(item.id)) ?? [];
+  const failedIds = jobItems.filter(item => item.status === 'failed').map(item => item.id);
+  const count = (status: GrantProbeItemStatus) => jobItems.filter(item => item.status === status).length;
+  const complete = jobItems.length - count('waiting') - count('running');
+  const progress: CssVars = {
+    '--progress': `${jobItems.length ? Math.round((complete / jobItems.length) * 100) : 0}%`,
+  };
+  // 空列表表示服务端计划中的全部项；列出的少于计划时改为显式列出。
+  const allIds = listed.length < probe.items.length ? listed.map(item => item.id) : [];
+  // 单组拨测：本轮只含这一组的条目时，这一组的按钮也铺进度。
+  const groupRunning = (ids: string[]) =>
+    job?.status === 'running' && job.items.length === ids.length && job.items.every(item => ids.includes(item.id));
+  // 取消与作废（Serving 已变化）要说明原因；正常结束的总结与计数重复，只放在提示里。
+  const jobNote = job && (job.status === 'canceled' || job.status === 'superseded') ? job.message : null;
+  const probeIssue = probe.unavailable
+    ? { text: `拨测不可用：${probe.unavailable}`, bad: false }
+    : probe.error
+      ? {
+          text: `拨测出错：${probe.error instanceof Error ? probe.error.message : '暂时无法读取 Serving 授权'}`,
+          bad: true,
+        }
+      : null;
+
+  const groupProbe = (group: NodeGroup) => {
+    const items = group.rows.flatMap(row =>
+      slots.flatMap(slot => {
+        const link = row.links[slot];
+        return (link && probeOf.get(link)) ?? [];
+      }),
+    );
+    if (items.length === 0) return null;
+    const ids = items.map(item => item.id);
+    const result = probeResult(items);
+    const active = groupRunning(ids);
+    return (
+      <span className="node-group-probe">
+        {result && <span className={`node-group-result${result.bad ? ' bad' : ''}`}>{result.text}</span>}
+        <button
+          type="button"
+          className={`btn node-group-run${active ? ' node-probe-progress' : ''}`}
+          style={active ? progress : undefined}
+          aria-label={`拨测 ${group.name}`}
+          disabled={probe.busy}
+          onClick={() => probe.start(ids)}
+        >
+          {result?.bad ? '重试' : '拨测'}
+        </button>
+      </span>
+    );
+  };
 
   return (
     <>
@@ -527,10 +623,32 @@ function NodeLinks({
               </>
             )}
           </CopyButton>
+          {failedIds.length > 0 && (
+            <button
+              type="button"
+              className="btn node-probe-retry"
+              disabled={probe.busy}
+              onClick={() => probe.start(failedIds)}
+            >
+              重试失败项
+            </button>
+          )}
+          <button
+            type="button"
+            className={`btn node-probe-all${running ? ' node-probe-progress' : ' primary'}`}
+            style={running ? progress : undefined}
+            title={`使用 ${user} 当前生效的真实用户凭据从公网验证列出的节点；只检查本次授权是否可用，不代替周期健康观测`}
+            disabled={running ? probe.cancelling : !probe.ready || probe.busy || listed.length === 0}
+            onClick={() => (running ? probe.cancel() : probe.start(allIds))}
+          >
+            <Icon of="diag" size={13} />
+            {running ? '取消拨测' : probe.starting ? '创建中…' : '拨测全部'}
+          </button>
         </div>
         <NodeNotes
           notes={listing.notes}
           insecureCount={insecureCount}
+          probeIssue={probeIssue}
           onAllowInsecure={onAllowInsecure}
           onUseSubscription={onUseSubscription}
         />
@@ -542,12 +660,24 @@ function NodeLinks({
         ) : groups.length === 0 ? (
           <div className="node-empty">没有符合当前协议与地址族的节点</div>
         ) : (
-          <NodeMatrix groups={groups} slots={slots} />
+          <NodeMatrix
+            groups={groups}
+            slots={slots}
+            probeOf={probeOf.size > 0 ? probeOf : null}
+            groupProbe={probeOf.size > 0 ? groupProbe : undefined}
+          />
         )}
       </div>
       <footer className="sub-dialog-foot">
         <span>修订 {content.data.revision}</span>
         <span>更换 UUID 后全部节点链接失效</span>
+        {probe.ready && <span title="每项拨测会产生极小真实流量">拨测使用真实凭据，流量计入该用户用量</span>}
+        {job && jobItems.length > 0 && (
+          <span className="node-probe-tally" title={job.message ?? undefined}>
+            {jobNote && <b>{jobNote}</b>}
+            {`通过 ${count('passed')} · 运行 ${count('running')} · 等待 ${count('waiting')} · 失败 ${failedIds.length}`}
+          </span>
+        )}
       </footer>
     </>
   );
@@ -557,21 +687,29 @@ function NodeLinks({
 // 这个弹窗默认列出自签节点，用户改为不列出后，原句的「默认隐藏」与弹窗的默认相反，改写为当前状态。
 const HIDDEN_SELF_SIGNED = /^以下自签证书地址默认隐藏[^：]*：(.+)$/;
 
-/* 列表之前的说明：已列出的自签节点、未列出的条目及原因，各带一个就地操作。 */
+/* 列表之前的说明：拨测不可用或出错的原因、已列出的自签节点、未列出的条目及原因，后两者各带一个就地操作。 */
 function NodeNotes({
   notes,
   insecureCount,
+  probeIssue,
   onAllowInsecure,
   onUseSubscription,
 }: {
   notes: string[];
   insecureCount: number;
+  probeIssue: { text: string; bad: boolean } | null;
   onAllowInsecure: (allow: boolean) => void;
   onUseSubscription: () => void;
 }) {
-  if (notes.length === 0 && insecureCount === 0) return null;
+  if (notes.length === 0 && insecureCount === 0 && !probeIssue) return null;
   return (
     <div className="node-notes">
+      {probeIssue && (
+        <p className={probeIssue.bad ? 'bad' : undefined}>
+          <Icon of="diag" size={13} className="node-note-icon" />
+          <span className="node-note-text">{probeIssue.text}</span>
+        </p>
+      )}
       {insecureCount > 0 && (
         <p>
           <Icon of="info" size={13} className="node-note-icon" />
@@ -608,8 +746,18 @@ function NodeNotes({
 }
 
 /* 一条链一组；一种协议一行，IPv4 / IPv6 各一列，地址本身就是复制按钮，缺少的地址族画「—」。
- * 只选一个地址族时只剩一列。 */
-function NodeMatrix({ groups, slots }: { groups: NodeGroup[]; slots: NodeFamily[] }) {
+ * 只选一个地址族时只剩一列。有拨测计划时组头右侧是这一组的结果与「拨测」，地址前是状态灯。 */
+function NodeMatrix({
+  groups,
+  slots,
+  probeOf,
+  groupProbe,
+}: {
+  groups: NodeGroup[];
+  slots: NodeFamily[];
+  probeOf: Map<NodeLink, ProbeItem> | null;
+  groupProbe?: (group: NodeGroup) => ReactNode;
+}) {
   return (
     <div className={`node-matrix${slots.length === 1 ? ' single' : ''}`}>
       <div className="node-matrix-head" aria-hidden="true">
@@ -623,6 +771,7 @@ function NodeMatrix({ groups, slots }: { groups: NodeGroup[]; slots: NodeFamily[
           <div className="node-group-head">
             <RegionFlag code={group.region} />
             <b>{group.name}</b>
+            {groupProbe?.(group)}
           </div>
           {group.rows.map(row => (
             <div className="node-row" key={row.key}>
@@ -631,9 +780,17 @@ function NodeMatrix({ groups, slots }: { groups: NodeGroup[]; slots: NodeFamily[
                 <span>{row.stack}</span>
                 {row.insecure && <em>insecure</em>}
               </span>
-              {slots.map(slot => (
-                <NodeAddress key={slot} link={row.links[slot]} family={slot} />
-              ))}
+              {slots.map(slot => {
+                const link = row.links[slot];
+                return (
+                  <NodeAddress
+                    key={slot}
+                    link={link}
+                    family={slot}
+                    probe={probeOf && link ? (probeOf.get(link) ?? null) : undefined}
+                  />
+                );
+              })}
             </div>
           ))}
         </section>
@@ -642,7 +799,26 @@ function NodeMatrix({ groups, slots }: { groups: NodeGroup[]; slots: NodeFamily[
   );
 }
 
-function NodeAddress({ link, family }: { link: NodeLink | undefined; family: NodeFamily }) {
+const PROBE_LAMP: Record<GrantProbeItemStatus | 'idle', string> = {
+  idle: 'idle',
+  waiting: 'defer',
+  running: 'run',
+  passed: 'ok',
+  failed: 'err',
+  canceled: 'idle',
+};
+
+/* 地址格。probe 为 undefined 表示这一页没有拨测（不留状态灯位置）；为 null 表示有拨测但这条链接不是拨测项
+ * （MTProxy、无法按名称对上的条目），留出同宽的空位让同列地址对齐。失败原因写在地址下方：触屏没有悬停提示。 */
+function NodeAddress({
+  link,
+  family,
+  probe,
+}: {
+  link: NodeLink | undefined;
+  family: NodeFamily;
+  probe?: ProbeItem | null;
+}) {
   if (!link) {
     return (
       <span className="node-copy-gap" aria-hidden="true">
@@ -653,25 +829,242 @@ function NodeAddress({ link, family }: { link: NodeLink | undefined; family: Nod
   const familyLabel = NODE_FAMILY_LABEL[family];
   // 主机与端口分开排：长 IPv6 只截主机部分，端口始终可见。
   const [, host, port = ''] = /^(.*?)(:\d+(?:-\d+)?)?$/.exec(link.endpoint) ?? [link.endpoint, link.endpoint];
+  const status = probe ? probeStatusText(probe) : '';
+  const failure = probe?.status === 'failed' ? probe.detail || '失败' : null;
   return (
     <CopyButton
-      className="node-copy"
+      className={`node-copy${probe?.status ? ` is-${probe.status}` : ''}${failure ? ' has-note' : ''}`}
       text={link.uri}
       aria-label={`复制 ${link.name}（${familyLabel}）`}
-      title={`${link.endpoint} · 复制分享链接`}
+      aria-description={probe ? `拨测：${status}` : undefined}
+      title={`${link.endpoint} · 复制分享链接${probe ? `\n拨测：${status}` : ''}`}
     >
       {state => (
         <>
           <i className="node-copy-family">{familyLabel}</i>
+          {probe !== undefined && (
+            <span
+              className={`node-copy-lamp${probe ? ` cg-lamp ${PROBE_LAMP[probe.status ?? 'idle']}` : ''}`}
+              aria-hidden="true"
+            />
+          )}
           <span className="node-copy-endpoint">
-            <span className="node-copy-host">{host}</span>
-            <span className="node-copy-port">{port}</span>
+            <span className="node-copy-address">
+              <span className="node-copy-host">{host}</span>
+              <span className="node-copy-port">{port}</span>
+            </span>
+            {failure && <span className="node-copy-note">{failure}</span>}
           </span>
           <Icon of={copyStateIcon(state)} size={13} className="node-copy-icon" />
         </>
       )}
     </CopyButton>
   );
+}
+
+/* ── 网络拨测 ──
+ * 人工网络拨测与周期 E2E 有意分开：此处用真实用户凭据，回答“alice 现在能不能从这个授权入口走通”；
+ * 周期 E2E 用专用 probe 身份，回答线路总体是否健康。拨测只给状态：拨测从控制台所在地发起，首字节时延
+ * 反映的是控制台到节点的距离，不代表用户自己的线路，放在这里会被读成线路快慢，因此不显示。 */
+
+type ProbeItem = GrantProbePlanItem & Partial<Pick<GrantProbeJobItem, 'status' | 'detail'>>;
+
+const GRANT_PROBE_POLL_MS = 1_000;
+
+const probeJobKey = (tenant: string, user: string) => ['user-grant-probe-job', tenant, user] as const;
+
+/**
+ * 一个用户的拨测计划与最近一轮任务。任务只存在 Console 内存里；浏览器把最近一轮放进查询缓存（不发请求，
+ * 只由启动、取消、SSE 与轮询写入），关掉弹窗或切到「订阅」页签再回来仍能看到本轮结果，运行中的任务
+ * 重新订阅；没有页面观察时按查询缓存的回收时间丢弃。
+ */
+function useUserGrantProbe(tenant: string, user: string) {
+  const qc = useQueryClient();
+  const edits = useGrantEdits();
+  const latestEdit = edits.reduce(
+    (latest, edit) =>
+      edit.write?.tenant_id === tenant && edit.write.user_id === user ? Math.max(latest, edit.submittedAt) : latest,
+    0,
+  );
+  const capability = useQuery({
+    queryKey: ['grant-probe-capability'],
+    queryFn: fetchGrantProbeCapability,
+    staleTime: 60_000,
+  });
+  const plan = useQuery({
+    queryKey: ['grant-probe-plan', tenant, user],
+    queryFn: async () => {
+      try {
+        return await fetchUserGrantProbePlan(tenant, user);
+      } catch (error) {
+        // Revoking the last Serving grant returns 404. Cache an explicit empty plan so an older
+        // successful result (or completed probe job) cannot keep advertising a removed entry.
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      }
+    },
+    // 本机没有可用的拨测 Xray 时不读计划：计划只用来发起拨测和对位结果。
+    enabled: capability.data?.available === true,
+    retry: false,
+    // Head changes precede Serving. Refresh only this user's recently edited plan, and stop
+    // after a bounded window even when a node is offline or an order is halted.
+    refetchInterval: () =>
+      latestEdit > 0 && Date.now() < latestEdit + GRANT_REFRESH_WINDOW_MS ? GRANT_REFRESH_MS : false,
+  });
+  const jobKey = probeJobKey(tenant, user);
+  const job =
+    useQuery({
+      queryKey: jobKey,
+      queryFn: () => qc.getQueryData<GrantProbeJob | null>(jobKey) ?? null,
+      enabled: false,
+      staleTime: Infinity,
+    }).data ?? null;
+  const activeJobId = job?.id;
+  const activeJobStatus = job?.status;
+
+  useEffect(() => {
+    if (!activeJobId || activeJobStatus !== 'running') return;
+    const key = probeJobKey(tenant, user);
+    let closed = false;
+    let polling = false;
+    const events = new EventSource(grantProbeEventsUrl(activeJobId), { withCredentials: true });
+    const update = (event: Event) => {
+      try {
+        qc.setQueryData(key, JSON.parse((event as MessageEvent<string>).data) as GrantProbeJob);
+      } catch {
+        /* A malformed frame is ignored; the next snapshot is complete and catches up. */
+      }
+    };
+    const poll = () => {
+      if (closed || polling) return;
+      polling = true;
+      void fetchGrantProbeJob(activeJobId).then(
+        snapshot => {
+          if (!closed) qc.setQueryData(key, snapshot);
+          polling = false;
+        },
+        error => {
+          polling = false;
+          if (closed || !(error instanceof ApiError) || error.status !== 404) return;
+          // Jobs are intentionally memory-only. A Console restart forgets them; without this
+          // terminal projection an already open browser would retain "running" forever.
+          qc.setQueryData<GrantProbeJob | null>(key, current => {
+            if (!current || current.id !== activeJobId || current.status !== 'running') return current;
+            return {
+              ...current,
+              status: 'canceled',
+              message: '拨测任务已失效，请重新发起',
+              finished_at_unix_secs: Math.floor(Date.now() / 1_000),
+              items: current.items.map(item =>
+                item.status === 'waiting' || item.status === 'running'
+                  ? { ...item, status: 'canceled', ttfb_ms: null, detail: null }
+                  : item,
+              ),
+            };
+          });
+        },
+      );
+    };
+    events.addEventListener('snapshot', update);
+    events.onerror = poll;
+    // SSE is the fast path. Polling is a bounded fallback for proxies that buffer an event or a
+    // browser that silently loses the stream without firing a useful error.
+    const timer = window.setInterval(poll, GRANT_PROBE_POLL_MS);
+    return () => {
+      closed = true;
+      window.clearInterval(timer);
+      events.close();
+    };
+  }, [activeJobId, activeJobStatus, qc, tenant, user]);
+
+  const start = useMutation({
+    mutationFn: (ids: string[]) => startUserGrantProbe(tenant, user, ids),
+    onSuccess: response => qc.setQueryData(jobKey, response.job),
+  });
+  const cancel = useMutation({
+    mutationFn: (id: string) => cancelGrantProbe(id),
+    onSuccess: snapshot => qc.setQueryData(jobKey, snapshot),
+  });
+
+  useEffect(() => {
+    if (!activeJobStatus || activeJobStatus === 'running') return;
+    void qc.invalidateQueries({ queryKey: ['grant-probe-plan', tenant, user] });
+  }, [activeJobStatus, qc, tenant, user]);
+
+  // A group probe returns only the selected items. Keep the complete frozen plan and project the
+  // current job state over it; otherwise every unrelated node loses its result while one group runs.
+  const jobItems = new Map(job?.items.map(item => [item.id, item]) ?? []);
+  const items: ProbeItem[] = (plan.data === null ? [] : (plan.data?.items ?? job?.items ?? [])).map(item => ({
+    ...item,
+    ...jobItems.get(item.id),
+  }));
+  return {
+    pending: capability.isPending || (capability.data?.available === true && plan.isPending),
+    /** 可以发起拨测：本机拨测组件可用，且读到了当前 Serving 计划。 */
+    ready: capability.data?.available === true && plan.isSuccess,
+    unavailable:
+      capability.data && !capability.data.available ? capability.data.reason || 'Console 拨测组件不可用' : null,
+    error: capability.error ?? plan.error ?? start.error ?? cancel.error,
+    items,
+    job,
+    busy: job?.status === 'running' || start.isPending || cancel.isPending,
+    starting: start.isPending,
+    cancelling: cancel.isPending,
+    start: (ids: string[]) => start.mutate(ids),
+    cancel: () => {
+      if (job) cancel.mutate(job.id);
+    },
+  };
+}
+
+const probeStatusText = (item: ProbeItem) => {
+  switch (item.status) {
+    case 'waiting':
+      return '等待';
+    case 'running':
+      return '连接中…';
+    case 'passed':
+      return '通过';
+    case 'failed':
+      return item.detail ? `失败（${item.detail}）` : '失败';
+    case 'canceled':
+      return '已取消';
+    default:
+      return '尚未验证';
+  }
+};
+
+/* 一组（一条链）的结果：拨测前不写，之后「拨测中」「全部通过」「通过 x / y」「失败 N」。 */
+function probeResult(items: ProbeItem[]): { text: string; bad: boolean } | null {
+  if (items.some(item => item.status === 'waiting' || item.status === 'running')) return { text: '拨测中', bad: false };
+  const failed = items.filter(item => item.status === 'failed').length;
+  if (failed > 0) return { text: `失败 ${failed}`, bad: true };
+  const passed = items.filter(item => item.status === 'passed').length;
+  if (passed === 0) return null;
+  return { text: passed === items.length ? '全部通过' : `通过 ${passed} / ${items.length}`, bad: false };
+}
+
+/**
+ * 拨测条目与节点链接取自同一组用户条目、顺序相同，但链接里没有接入点 ID，只能按名称对位。拨测条目的名称带
+ * 地区旗前缀（core/physical/user.rs），链接解析时已去掉。同一链路的多个接入点名称相同，按出现顺序配对；
+ * 同名的条目数与链接数不一致（有条目被 uri.txt 跳过）时无法确定对应关系，这些链接不给拨测状态，
+ * 免得把别的入口的结果显示在这里。筛选只会整名去掉链接，按名称对位不受影响。
+ */
+function pairProbeItems(links: readonly NodeLink[], items: readonly ProbeItem[]): Map<NodeLink, ProbeItem> {
+  const itemsByName = new Map<string, ProbeItem[]>();
+  for (const item of items) {
+    const name = splitRegion(item.name).label;
+    itemsByName.set(name, [...(itemsByName.get(name) ?? []), item]);
+  }
+  const linksByName = new Map<string, NodeLink[]>();
+  for (const link of links) linksByName.set(link.name, [...(linksByName.get(link.name) ?? []), link]);
+  const paired = new Map<NodeLink, ProbeItem>();
+  for (const [name, named] of linksByName) {
+    const candidates = itemsByName.get(name);
+    if (candidates?.length !== named.length) continue;
+    named.forEach((link, index) => paired.set(link, candidates[index]));
+  }
+  return paired;
 }
 
 /* ── 节点链接解析 ──

@@ -12,28 +12,38 @@ import { useSyncExternalStore } from 'react';
 
 let now = Date.now();
 const listeners = new Set<() => void>();
-let timer: ReturnType<typeof setInterval> | null = null;
+let timer: ReturnType<typeof setTimeout> | null = null;
 
-function subscribe(listener: () => void): () => void {
+function tick() {
+  now = Date.now();
+  for (const fn of listeners) fn();
+  if (listeners.size > 0) schedule();
+}
+
+function schedule() {
+  // Align every surface to the same wall-clock second; a delayed/background callback skips
+  // missed beats instead of replaying them or shifting each component's phase.
+  timer = setTimeout(tick, 1_000 - (Date.now() % 1_000));
+}
+
+export function subscribeClock(listener: () => void): () => void {
   listeners.add(listener);
   if (timer === null) {
-    timer = setInterval(() => {
-      now = Date.now();
-      for (const fn of listeners) fn();
-    }, 1000);
+    now = Date.now();
+    schedule();
   }
   return () => {
     listeners.delete(listener);
     if (listeners.size === 0 && timer !== null) {
-      clearInterval(timer);
+      clearTimeout(timer);
       timer = null;
     }
   };
 }
 
-const snapshot = () => now;
+export const clockSnapshot = () => now;
 
 /** 每秒更新一次的当前时间。用它计算相对时间，数值会自动更新。 */
 export function useNow(): number {
-  return useSyncExternalStore(subscribe, snapshot, snapshot);
+  return useSyncExternalStore(subscribeClock, clockSnapshot, clockSnapshot);
 }

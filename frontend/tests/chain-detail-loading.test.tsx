@@ -29,6 +29,7 @@ const app: SnapshotApp = {
         no_mail: true,
         no_udp_amplification: true,
         tcp_and_quic_only: false,
+        cn_source_block: 'off',
       },
       identity: { public_key: 'public-key', short_ids: ['0123456789abcdef'] },
       wires: { vless: { kind: 'vless-reality' } },
@@ -283,7 +284,20 @@ describe('入站机器迁移', () => {
 });
 
 describe('链详情统一等待首屏依赖', () => {
-  it.each(['settings-last', 'compile-last'])('协议与规则一起出现，整段等待不重挂骨架：%s', async order => {
+  it('复用机器详情连续纸，并按接入、协议、规则顺序直接展开', async () => {
+    const { mount } = setup();
+    const view = mount();
+    await view.findByRole('heading', { name: '入站' });
+    const page = view.container.querySelector('.chain-detailpage');
+    expect(page?.classList.contains('nd-sheet')).toBe(true);
+    expect(page?.querySelector(':scope > .nd-paper > .nd-page-head')).toBeTruthy();
+    expect(view.queryByRole('tablist')).toBeNull();
+    expect(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' })).toBeTruthy();
+    expect(view.getByText('链路规则')).toBeTruthy();
+    expect(view.getByRole('button', { name: /entry入口/ })).toBeTruthy();
+  });
+
+  it.each(['settings-last', 'compile-last'])('协议与规则依赖一起就绪，整段等待不重挂骨架：%s', async order => {
     const { fetcher, mount, hold, finish } = setup();
     hold('/settings');
     hold('/revisions?limit=50');
@@ -308,8 +322,8 @@ describe('链详情统一等待首屏依赖', () => {
 
     await waitFor(() => expect(view.queryByRole('status')).toBeNull());
     expect(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' })).toBeTruthy();
-    expect(view.getByText('链路规则')).toBeTruthy();
     expect(view.getByRole('option', { name: '全局站点 site.example' })).toBeTruthy();
+    expect(view.getByText('链路规则')).toBeTruthy();
     expect(view.container.querySelector('.chain-rule-node-head')).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: /entry入口/ }));
     expect(view.container.querySelector('.rule-editor')).toBeTruthy();
@@ -419,5 +433,78 @@ describe('链详情统一等待首屏依赖', () => {
     expect(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' })).toBe(protocol);
     expect(view.getByRole('textbox', { name: '链名' })).toBe(input);
     expect((input as HTMLInputElement).value).toBe('未保存的名称');
+  });
+
+  it.each(['success', 'error'] as const)('提交切换修订时保留页面、展开状态和输入：%s', async result => {
+    const { client, fetcher, mount, hold, finish } = setup();
+    const view = mount();
+    await view.findByText('链路规则');
+    fireEvent.click(view.getByRole('button', { name: '测试线路' }));
+    const input = view.getByRole('textbox', { name: '链名' }) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '继续编辑的名称' } });
+    fireEvent.click(view.getByRole('button', { name: /entry入口/ }));
+    const page = view.container.querySelector('.chain-detailpage');
+    const editor = view.container.querySelector('.rule-editor')!;
+    fireEvent.click(within(editor as HTMLElement).getByRole('button', { name: '＋ 加一条' }));
+    const saveRules = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
+    await waitFor(() => expect(saveRules.disabled).toBe(false));
+    const protocol = view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' });
+    const port = view.getByRole('textbox', { name: 'VLESS · TLS / REALITY 监听端口', hidden: true });
+    const assertPreserved = () => {
+      expect(view.container.querySelector('.chain-detailpage')).toBe(page);
+      expect(view.container.querySelector('.rule-editor')).toBe(editor);
+      expect(view.getByRole('textbox', { name: '链名' })).toBe(input);
+      expect(input.value).toBe('继续编辑的名称');
+      expect(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' })).toBe(protocol);
+      expect(view.getByRole('textbox', { name: 'VLESS · TLS / REALITY 监听端口', hidden: true })).toBe(port);
+      expect(view.getByRole('button', { name: /entry入口/ }).getAttribute('aria-expanded')).toBe('true');
+    };
+    hold('/compile/8');
+    act(() => client.setQueryData(['revisions'], { current_revision: 8, revisions: [] }));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledWith('/compile/8', expect.anything()));
+    assertPreserved();
+    expect(protocol.matches(':disabled')).toBe(true);
+    expect(port.matches(':disabled')).toBe(true);
+    expect(editor.closest('fieldset[disabled]')).toBeTruthy();
+    expect(saveRules.disabled).toBe(true);
+    fireEvent.click(saveRules);
+    expect(draft.ops()).toEqual([]);
+
+    // The snapshot can arrive before compilation. Show the new stored value in place,
+    // while retaining unrelated edits and keeping port-dependent operations blocked.
+    act(() =>
+      client.setQueryData(['snapshot'], {
+        ...snapshot,
+        snapshot: {
+          ...snapshot.snapshot,
+          revision: 8,
+          apps: [{ ...app, ingresses: [{ ...app.ingresses[0], port: 8443 }] }],
+        },
+      }),
+    );
+    await waitFor(() => expect((port as HTMLInputElement).value).toBe('8443'));
+    assertPreserved();
+    expect(saveRules.disabled).toBe(true);
+
+    await finish(
+      '/compile/8',
+      result === 'success'
+        ? Response.json({ ...compiled, revision: 8 })
+        : Response.json({ error: '新修订读取失败' }, { status: 503 }),
+    );
+    assertPreserved();
+    if (result === 'error') {
+      await waitFor(() => expect(view.queryAllByText('新修订读取失败').length).toBeGreaterThan(0));
+      expect(protocol.matches(':disabled')).toBe(true);
+      act(() => client.setQueryData(['compile', 8], { ...compiled, revision: 8 }));
+      await waitFor(() => expect(protocol.matches(':disabled')).toBe(false));
+      assertPreserved();
+    } else {
+      await waitFor(() => expect(protocol.matches(':disabled')).toBe(false));
+    }
+    await waitFor(() => {
+      expect(port.matches(':disabled')).toBe(false);
+      expect(saveRules.disabled).toBe(false);
+    });
   });
 });

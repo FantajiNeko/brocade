@@ -23,8 +23,9 @@ test('流量条由机队 SSE 驱动秒级读数，历史兜底只读取每台机
   assert.match(traffic, /FLEET_TRAFFIC_REFETCH_MS = 30_000/);
   assert.match(traffic, /fetchNodeNicListWindows\(FLEET_TRAFFIC_WINDOWS\)/);
   assert.match(traffic, /new EventSource\('\/realtime\/nodes\/events'/);
-  assert.match(traffic, /FLEET_REALTIME_DISPLAY_MS = 1_000/);
-  assert.match(traffic, /setInterval\([\s\S]*?new Map\(pendingNodes\)[\s\S]*?FLEET_REALTIME_DISPLAY_MS/);
+  assert.match(traffic, /useMetricValue\(\s*nodes,\s*'fleet'/);
+  assert.match(traffic, /useNow\(\)/);
+  assert.doesNotMatch(traffic, /setInterval\(/);
   assert.match(traffic, /rx_bytes_per_sec \* 8/);
   assert.match(traffic, /tx_bytes_per_sec \* 8/);
   assert.doesNotMatch(traffic, /峰值|近 1 小时/);

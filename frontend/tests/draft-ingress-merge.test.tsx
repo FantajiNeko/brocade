@@ -30,6 +30,7 @@ const base = {
     no_mail: true,
     no_udp_amplification: true,
     tcp_and_quic_only: false,
+    cn_source_block: 'off' as const,
   },
 };
 

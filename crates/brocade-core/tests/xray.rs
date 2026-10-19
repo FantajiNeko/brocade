@@ -9,18 +9,18 @@ use brocade_core::{
         system::compile_system,
     },
     model::{
-        Accept, Action, AnyTls, AnyTlsMasquerade, AppView, CertificateTrack, Chain, DestMatch, Dns,
-        DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback, EgressDnsResolution,
-        EgressDnsTransport, ExternalOutbound, ExternalOutboundProtocol, ExternalOutboundSecurity,
-        ExternalVlessGrpc, ExternalVlessGrpcMode, ExternalVlessHttp, ExternalVlessHttpUpgrade,
-        ExternalVlessKcp, ExternalVlessTransport, ExternalVlessWebsocket, ExternalVlessXhttp,
-        ExternalVlessXhttpDownload, ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn,
-        HopMux, HopPool, HopWire, Hysteria2, HysteriaBandwidth, HysteriaCongestion,
-        HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily, ModelSettings,
-        ModelSnapshot, MtProto, Network, Node, NodeEgressDnsPolicy, OverlaySettings, Reality,
-        RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySite, RealityXhttp,
-        Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp, XhttpMode, XhttpTuning,
-        XhttpXmuxRange,
+        Accept, Action, AnyTls, AnyTlsMasquerade, AppView, CertificateTrack, Chain, CnSourceBlock,
+        DestMatch, Dns, DomainStrategy, EgressDnsAddressStrategy, EgressDnsFallback,
+        EgressDnsResolution, EgressDnsTransport, ExternalOutbound, ExternalOutboundProtocol,
+        ExternalOutboundSecurity, ExternalVlessGrpc, ExternalVlessGrpcMode, ExternalVlessHttp,
+        ExternalVlessHttpUpgrade, ExternalVlessKcp, ExternalVlessTransport, ExternalVlessWebsocket,
+        ExternalVlessXhttp, ExternalVlessXhttpDownload, ExternalWarpBinding, Grant, HopDial,
+        HopEncryption, HopIn, HopMux, HopPool, HopWire, Hysteria2, HysteriaBandwidth,
+        HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress, IngressWires, IpFamily,
+        ModelSettings, ModelSnapshot, MtProto, Network, Node, NodeEgressDnsPolicy, OverlaySettings,
+        Reality, RealityClientPolicy, RealityFallbackLimits, RealityFallbackMode, RealitySite,
+        RealityXhttp, Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp, XhttpMode,
+        XhttpTuning, XhttpXmuxRange,
     },
     physical::node::{project_node, reality_fallback_limits},
     Level,
@@ -1691,6 +1691,51 @@ fn an_ingress_guard_also_covers_its_hysteria2_inbound() {
                 .is_some_and(|tags| tags.iter().any(|tag| tag == "in:app/i:hy2"))
     });
     assert!(blocks_hy2, "guard 未覆盖 hy2 入站: {rules:#?}");
+}
+
+#[test]
+fn cn_source_guard_emits_the_selected_address_families() {
+    for (policy, expected) in [
+        (CnSourceBlock::Ipv4, serde_json::json!(["geoip:cn@ipv4"])),
+        (CnSourceBlock::Ipv4AndIpv6, serde_json::json!(["geoip:cn"])),
+    ] {
+        let doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
+        let mut face = ingress("i", "c", "hk");
+        face.guard = brocade_core::model::IngressGuard {
+            cn_source_block: policy,
+            ..brocade_core::model::IngressGuard::OPEN
+        };
+        let app = AppView {
+            id: "app".to_owned(),
+            label: "应用".to_owned(),
+            chains: vec![chain("c")],
+            ingresses: vec![face],
+            fronts: Vec::new(),
+            steps: vec![step("c", "hk", vec![any_egress()], None)],
+            grants: Vec::new(),
+        };
+
+        let mut diagnostics = Vec::new();
+        let sys = compile_system(&doc, &mut diagnostics);
+        let app_ir = compile_hops(
+            compile_app(&doc, &app, &mut diagnostics),
+            &sys,
+            &mut diagnostics,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+        let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+        let rule = value["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| !rule["sourceIP"].is_null())
+            .unwrap_or_else(|| panic!("没有生成 CN 来源阻断规则: {value:#?}"));
+        assert_eq!(rule["sourceIP"], expected);
+        assert_eq!(rule["inboundTag"], serde_json::json!(["in:app/i"]));
+        assert_eq!(rule["outboundTag"], "out:block");
+        assert_eq!(outbound(&value, "out:block")["protocol"], "blackhole");
+    }
 }
 
 #[test]

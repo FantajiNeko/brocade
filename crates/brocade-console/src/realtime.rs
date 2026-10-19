@@ -431,6 +431,18 @@ impl RealtimeService {
             .await
     }
 
+    /// The fleet traffic page needs every active user rate, but none of the comparatively heavy
+    /// worker diagnostics. Forwarding ownership remains machine-local so an Agent can attribute
+    /// those counters without receiving another machine's rule ids.
+    pub async fn subscribe_fleet_traffic(
+        &self,
+        nodes: impl IntoIterator<Item = String>,
+        forwarding: HashMap<String, Vec<RealtimeForwardingTarget>>,
+    ) -> RealtimeSubscription {
+        self.subscribe_with_demand(nodes, false, true, HashMap::new(), forwarding)
+            .await
+    }
+
     /// Subscribe to exact compiled grant labels across several machines. Diagnostics stay off and
     /// the browser response is filtered again by the HTTP layer, so concurrent user pages share
     /// one Agent sample without learning one another's identities.
@@ -963,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fleet_and_node_leases_request_only_the_diagnostics_they_consume() {
+    async fn fleet_header_detail_and_node_leases_request_only_the_data_they_consume() {
         let service = RealtimeService::with_stop_grace(
             RealtimeTelemetryPolicy::default(),
             Duration::from_millis(1),
@@ -972,6 +984,29 @@ mod tests {
         assert_eq!(current(&mut agent.commands), AgentRealtimeCommand::Stop);
 
         let fleet = service.subscribe_nic(["n1".to_owned()]).await;
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: None,
+            }
+        );
+
+        let fleet_traffic = service
+            .subscribe_fleet_traffic(["n1".to_owned()], HashMap::new())
+            .await;
+        assert_eq!(
+            next(&mut agent.commands).await,
+            AgentRealtimeCommand::Start {
+                interval_millis: 1000,
+                diagnostics: false,
+                user_traffic: Some(RealtimeUserTrafficSelector::All {
+                    forwarding: Vec::new()
+                }),
+            }
+        );
+        drop(fleet_traffic);
         assert_eq!(
             next(&mut agent.commands).await,
             AgentRealtimeCommand::Start {

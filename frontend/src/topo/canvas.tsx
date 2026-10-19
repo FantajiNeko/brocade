@@ -1,3 +1,4 @@
+import { useMetricQuery } from '../ui/metric-cadence';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -70,13 +71,13 @@ export function TopoCanvas() {
   // 每一跳的字节数：chain_samples 一行对应一条（链 × 接收方）。
   // 它是明细接口且按行数截断，因此覆盖的是最近一段时间而非整月——
   // 下方的统计口径说明即指该点。
-  const usage = useQuery({
+  const usage = useMetricQuery({
     queryKey: ['usage-chain'],
     queryFn: () => fetchUsage({ limit: '400' }),
     refetchInterval: 30_000,
   });
   /* 机器的本月总量和当前速率。该接口使用的才是月度口径。 */
-  const series = useQuery({
+  const series = useMetricQuery({
     queryKey: ['usage-node-series'],
     queryFn: () => fetchUsageNodeSeries(),
     refetchInterval: 30_000,

@@ -1,3 +1,4 @@
+import { useMetricValue } from '../ui/metric-cadence';
 /** 遥测：LOAD 卡、逐跳链路表，以及它们的判定逻辑。
  *
  * 沿用两条既有规则（均记录在 nodes.tsx 中）：
@@ -10,7 +11,7 @@
 import { Fragment, memo, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useQueries } from '@tanstack/react-query';
 import * as echarts from 'echarts/core';
-import { LineChart } from 'echarts/charts';
+import * as ChartTypes from 'echarts/charts';
 import { GridComponent, MarkLineComponent, TooltipComponent } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 import { bytes } from '../ui/format';
@@ -62,7 +63,7 @@ import { fetchNodeLoadMetrics } from '../api';
 
 // 与 node-observation-charts.tsx 共用同一套注册；echarts.use 对重复注册幂等，
 // 但本模块独立使用 echarts，需要自己声明所依赖的组件。
-echarts.use([LineChart, GridComponent, MarkLineComponent, TooltipComponent, CanvasRenderer]);
+echarts.use([ChartTypes.LineChart, GridComponent, MarkLineComponent, TooltipComponent, CanvasRenderer]);
 
 /** canvas 里字体要给具体栈，不能写 var(--mono)。 */
 const TP_MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -571,7 +572,8 @@ function congestionFindings(r: NodeLoadView): Finding[] {
  * 位于观测主栏首位：监控页先回答当前资源是否充足，再向下解释 agent、运行时和配置状态。
  * 卡片底部的进程表是主要内容而非附加信息——只有该部分能区分机器整体负载高和本系统
  * 进程负载高，而机器出现问题时首先会怀疑本系统部署的这几个进程。 */
-/** 双序列吞吐曲线（echarts）。NETWORK（网卡，按方向）与 XRAY（承载，按角色）共用这一个组件：
+/** 双序列吞吐图（echarts），默认折线，机器用量按采样窗口展示柱状图。
+ * NETWORK（网卡，按方向）与 XRAY（承载，按角色）共用这一个组件：
  * 两者口径不同、绝不能合并进一张图。用户打开观测页的「同组图表联动」后才传入 group，
  * 用 `echarts.connect(group)` 同步十字线与 Tooltip；默认各图独立。
  *
@@ -582,6 +584,7 @@ function congestionFindings(r: NodeLoadView): Finding[] {
  * - 缺口（has_gap / null）断开不连接。 */
 
 export function ThroughputChart({
+  presentation = 'line',
   timesUnixSecs,
   windowStartsUnixSecs,
   rangeStartUnixSecs,
@@ -596,6 +599,7 @@ export function ThroughputChart({
   thirdWindowStartsUnixSecs,
   group,
 }: {
+  presentation?: 'line' | 'bar';
   /** 每个速率点对应的真实窗口结束时间。 */
   timesUnixSecs: number[];
   /** Measured windows distinguish missing reports from a legitimate change of sample duration. */
@@ -631,6 +635,7 @@ export function ThroughputChart({
   useEffect(() => {
     const el = elRef.current;
     if (!el) return;
+    if (presentation === 'bar') echarts.use([ChartTypes.BarChart]);
     const chart = echarts.init(el, null, { renderer: 'canvas' });
     if (group) chart.group = group;
     chartRef.current = chart;
@@ -641,13 +646,14 @@ export function ThroughputChart({
       chart.dispose();
       chartRef.current = null;
     };
-  }, [group]);
+  }, [group, presentation]);
 
   // 数据或主题变化时重设 option。数据角色色从 :root 的 CSS 令牌读。
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart || !enteredViewport) return;
     const sig = JSON.stringify([
+      presentation,
       timesUnixSecs,
       windowStartsUnixSecs,
       rangeStartUnixSecs,
@@ -696,15 +702,19 @@ export function ThroughputChart({
       starts = windowStartsUnixSecs,
     ) => ({
       name,
-      type: 'line' as const,
-      symbol: 'circle',
-      symbolSize: 5,
-      showSymbol: false,
-      smooth: false,
-      connectNulls: false,
-      lineStyle: observeSeriesLine(color),
-      areaStyle: observeAreaStyle(color, themeName, { count: third ? 3 : 2, paper: cv('--card') }),
-      itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
+      type: presentation,
+      ...(presentation === 'bar'
+        ? { barMaxWidth: 8, barGap: '20%', itemStyle: { color } }
+        : {
+            symbol: 'circle',
+            symbolSize: 5,
+            showSymbol: false,
+            smooth: false,
+            connectNulls: false,
+            lineStyle: observeSeriesLine(color),
+            areaStyle: observeAreaStyle(color, themeName, { count: third ? 3 : 2, paper: cv('--card') }),
+            itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
+          }),
       data: observeSeriesData(times, data, { windowStartsUnixSecs: starts }),
     });
 
@@ -771,6 +781,7 @@ export function ThroughputChart({
     // connect 按组联动所有已建实例；任一图重设 option 后重连一次，保证最新成员都在组内。
     if (group) echarts.connect(group);
   }, [
+    presentation,
     enteredViewport,
     group,
     paletteKey,
@@ -789,7 +800,14 @@ export function ThroughputChart({
     thirdWindowStartsUnixSecs,
   ]);
 
-  return <ObserveBrushPlot className="ndtp-ec" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />;
+  return (
+    <ObserveBrushPlot
+      className={`ndtp-ec${presentation === 'bar' ? ' ndtp-bars' : ''}`}
+      hostRef={elRef}
+      chartRef={chartRef}
+      extentRef={extentRef}
+    />
+  );
 }
 
 type HistoryLine = {
@@ -1470,10 +1488,15 @@ function DeepMetricHistory({
       refetchInterval: live ? 10_000 : false,
     })),
   });
-  const readyViews = queries.flatMap(query => (query.data ? [query.data] : []));
-  const batchStates = queries.map(query => ({
-    ready: Boolean(query.data),
-    loading: !query.data && query.isFetching,
+  const latestViews = queries.map(query => query.data);
+  const displayedViews = useMetricValue(
+    latestViews.some(Boolean) ? latestViews : undefined,
+    JSON.stringify([report.node_id, observationRangeKey, detail]),
+  );
+  const readyViews = displayedViews?.flatMap(view => (view ? [view] : [])) ?? [];
+  const batchStates = queries.map((query, index) => ({
+    ready: Boolean(displayedViews?.[index]),
+    loading: !displayedViews?.[index] && Boolean(query.isFetching || query.data),
   }));
   const metricStates = plan.groupBatchIndices.map(batch => batchStates[batch] ?? READY_METRIC_GROUP);
   const merged = mergeMetricViews(readyViews);

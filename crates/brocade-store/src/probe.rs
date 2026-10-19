@@ -521,8 +521,7 @@ pub async fn link_health_view(pool: &PgPool, actor: &AdminContext) -> Result<Vec
 /// The chain card compares the same six-hour window as the machine card. Retention is time based,
 /// not count based: the probe interval is configurable, so "20 samples" can mean five minutes or
 /// more than a day and cannot honestly label a time axis.
-const SAMPLE_WINDOW_SECS: i64 = 6 * 60 * 60;
-
+///
 /// One chain's latest end-to-end probe result, plus the recent series of timings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2eProbeItem {
@@ -839,19 +838,6 @@ pub async fn record_e2e_probe(
         .execute(&mut *tx)
         .await?;
 
-        // Trim by age rather than row count. ProbeSettings::interval_secs is configurable, so a
-        // count cannot describe six hours. Trimming on the write side avoids a scheduled cleanup
-        // job while bounding the fastest allowed cadence to about 1,440 rows per active chain.
-        sqlx::query(
-            "DELETE FROM e2e_probe_samples
-             WHERE chain_id = $1
-               AND probed_at < CURRENT_TIMESTAMP - make_interval(secs => $2::double precision)",
-        )
-        .bind(&chain.chain_id)
-        .bind(SAMPLE_WINDOW_SECS)
-        .execute(&mut *tx)
-        .await?;
-
         accepted += 1;
     }
 
@@ -865,6 +851,21 @@ pub async fn record_e2e_probe(
     })
 }
 
+pub(crate) async fn prune_e2e_samples_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
+    Ok(sqlx::query(
+        "DELETE FROM e2e_probe_samples WHERE ctid IN (
+             SELECT ctid FROM e2e_probe_samples
+              WHERE probed_at < now() - make_interval(secs => $1::double precision)
+              ORDER BY probed_at LIMIT 10000
+         )",
+    )
+    .bind(retain_secs)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 // This family is partitioned by tenant, unlike MTU and link liveness: those two are properties
 // of the backbone (one global network), whereas a chain belongs to a tenant. A tenant
 // administrator sees whether their own chains work and not anyone else's.
@@ -872,6 +873,8 @@ pub async fn e2e_probe_view(
     pool: &PgPool,
     actor: &crate::AdminContext,
 ) -> Result<Vec<E2eProbeItem>> {
+    let sample_window_secs =
+        i64::from(crate::retention::ttl_hours(pool, "e2e_probe_samples").await?) * 3_600;
     let tenant_scope = actor.tenant_scope();
     let tenant_pattern = actor.tenant_scope_like_pattern();
 
@@ -919,7 +922,7 @@ pub async fn e2e_probe_view(
     )
     .bind(tenant_scope)
     .bind(&tenant_pattern)
-    .bind(SAMPLE_WINDOW_SECS)
+    .bind(sample_window_secs)
     .fetch_all(pool)
     .await?;
     let mut samples: std::collections::BTreeMap<String, E2eProbeSampleSeries> = Default::default();

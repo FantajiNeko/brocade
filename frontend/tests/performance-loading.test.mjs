@@ -68,8 +68,8 @@ test('代码分包与首次 API 请求共用一个持续加载边界', () => {
 });
 
 test('机器详情先显示真实框架，各观测面板在自己的位置渐进读取', () => {
-  assert.match(nodes, /const initialUsage = useQuery\(/);
-  assert.match(nodes, /const initialPing = useQuery\(/);
+  assert.match(nodes, /const initialUsage = useMetricQuery\(/);
+  assert.match(nodes, /const initialPing = useMetricQuery\(/);
   assert.match(nodes, /const observationModules = useNodeObservationModules\(\)/);
   assert.match(
     nodes,
@@ -128,7 +128,7 @@ test('机器详情首屏剥离深度对象，深度图立即挂载并按十项�
   assert.match(telemetry, /function planMetricBatches/);
   assert.match(telemetry, /fetchNodeLoadMetrics\(/);
   assert.match(telemetry, /queries: plan\.batches\.map/);
-  assert.match(telemetry, /const readyViews = queries\.flatMap/);
+  assert.match(telemetry, /const readyViews = displayedViews\?\.flatMap/);
   assert.match(telemetry, /const metricStates = plan\.groupBatchIndices\.map/);
   assert.doesNotMatch(telemetry, /loadedBatches/);
   assert.match(telemetry, /const sampledSeries = downsampleKpiSeries\(series, valueOf\)/);

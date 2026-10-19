@@ -137,12 +137,25 @@ describe('fleet traffic meter', () => {
       });
     });
 
-    expect(screen.queryByLabelText('接收 200 Mbit/s')).toBeNull();
+    // The first reading is immediate; subsequent metric-only arrivals share the global beat.
+    expect(screen.getByLabelText('接收 200 Mbit/s')).toBeTruthy();
+    act(() =>
+      Events.current.send('sample', {
+        node_id: 'tokyo',
+        received_at_unix_millis: now,
+        sample: { rx_bytes_per_sec: 30_000_000, tx_bytes_per_sec: 10_000_000, has_gap: false },
+      }),
+    );
+    expect(screen.queryByLabelText('接收 240 Mbit/s')).toBeNull();
     await act(async () => {
       await new Promise(resolve => setTimeout(resolve, 1_050));
     });
-    expect(screen.getByLabelText('接收 200 Mbit/s')).toBeTruthy();
+    expect(screen.getByLabelText('接收 240 Mbit/s')).toBeTruthy();
     expect(screen.getByLabelText('发送 80.0 Mbit/s')).toBeTruthy();
+    act(() => Events.current.send('reset', {}));
+    expect(screen.getByLabelText('接收 240 Mbit/s')).toBeTruthy();
+    act(() => Events.current.onerror?.());
+    expect(screen.getByLabelText('接收 240 Mbit/s')).toBeTruthy();
     expect(screen.queryByText(/峰值|近 1 小时/)).toBeNull();
   });
 });

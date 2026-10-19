@@ -1,10 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { mergeNodeRealtimeEvent, type NodeRealtimeEvent } from '../src/node-realtime';
+import { olderRealtimeEvent } from '../src/realtime-order';
 
 const event = (sample: NodeRealtimeEvent['sample']): NodeRealtimeEvent => ({
   node_id: 'n1',
   received_at_unix_millis: 2_000,
   sample,
+});
+
+it('rejects late receipts and tied older sequences, but accepts a restarted Agent sequence after reconnect', () => {
+  const frame = (received: number, sequence: number) => ({ received_at_unix_millis: received, sample: { sequence } });
+  expect(olderRealtimeEvent(frame(999, 20), frame(1000, 10))).toBe(true);
+  expect(olderRealtimeEvent(frame(1000, 9), frame(1000, 10))).toBe(true);
+  expect(olderRealtimeEvent(frame(1000, 11), frame(1000, 10))).toBe(false);
+  expect(olderRealtimeEvent(frame(1001, 1), frame(1000, 10))).toBe(false);
 });
 
 describe('realtime diagnostics deltas', () => {

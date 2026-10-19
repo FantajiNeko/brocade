@@ -1,3 +1,5 @@
+import { useMetricQuery } from '../ui/metric-cadence';
+import { useInitialReady } from '../ui/use-initial-ready';
 import {
   createContext,
   useCallback,
@@ -25,6 +27,7 @@ import {
   fetchSnapshot,
   fetchSettings,
   ingressUpsertBody,
+  type CnSourceBlock,
   type IngressGuard,
   type Transport,
   type TransportKind,
@@ -113,7 +116,7 @@ import {
 } from './rules';
 import { freePortAcross, freeSpanAcross, occupiedPorts, portClash, spanClash } from './ports';
 import { ingressPortMigrationConfirmation, planIngressPortMigration } from './ingress-port-migration';
-import { mtprotoNodeEligibility } from '../mtproto-capability';
+import { MTPROTO_DESCRIPTION, mtprotoNodeEligibility } from '../mtproto-capability';
 
 /* Hysteria 2 的端口从此值起分配，跳转区间的默认长度同此。与 model.rs 的
  * HYSTERIA2_PORT_BASE / DEFAULT_HYSTERIA2_HOP_SPAN 保持一致——两处不一致不会报错，
@@ -299,6 +302,38 @@ const userKeysOf = (a: SnapshotApp, chainId: string) =>
       .filter(g => (a.ingresses ?? []).some(x => x.chain === chainId && x.id === g.ingress))
       .map(g => `${g.tenant}/${g.user}`),
   );
+
+type ChainAttentionTone = 'ok' | 'warn' | 'bad' | 'idle';
+
+/** 列表卡和详情页头共用同一条状态判定，避免同一条链在两个入口显示成不同颜色。 */
+function chainAttentionTone(
+  disabled: boolean,
+  ingress: SnapshotIngress | null,
+  probe: E2eProbeItem | undefined,
+  users: number,
+): ChainAttentionTone {
+  if (disabled || !ingress) return 'bad';
+  const probeTone = toneOf(probe);
+  if (probeTone === 'down') return 'bad';
+  if (probeTone === 'odd' || probeTone === 'slow') return 'warn';
+  if (probeTone === 'none' || users === 0) return 'idle';
+  return 'ok';
+}
+
+function chainAttentionTitle(
+  disabled: boolean,
+  ingress: SnapshotIngress | null,
+  probe: E2eProbeItem | undefined,
+  users: number,
+): string {
+  if (disabled) return '含退役机器，整链停用';
+  if (!ingress) return '缺接入面：没有入口，这条链无法接入';
+  const probeTone = toneOf(probe);
+  if (probeTone !== 'ok' && probeTone !== 'none') return toneTitle(probe);
+  if (!probe) return '还没探过这条链';
+  if (users === 0) return '通，但还没有人被授权';
+  return `${users} 人在用`;
+}
 
 // 删除控件。两处使用：项目列表中删除整条链、规则树中将机器移出链。
 // 两处执行的是同一操作——向草稿推入一条删除——因此使用相同的样式和反馈。
@@ -820,6 +855,11 @@ export function IngressPortEditor({
     queryFn: () => fetchCompileView(current!),
     enabled: !!current,
   });
+  const dependencyPending =
+    snapshot.isPending || nodeList.isPending || revisions.isPending || (current != null && compiled.isPending);
+  const dependencyError = snapshot.error ?? nodeList.error ?? revisions.error ?? compiled.error;
+  const editingReady = !dependencyPending && !dependencyError;
+  const revealed = useInitialReady(!editable || editingReady, `${appId}/${ingress.id}`);
   const taken = useMemo(
     () =>
       occupiedPorts(
@@ -850,7 +890,7 @@ export function IngressPortEditor({
   const inPanel = usePanelEntry(
     'port',
     dirty,
-    { apply: body => ({ ...body, port: parsed }), reset: () => setDraftPort(null) },
+    { blocked: !editingReady, apply: body => ({ ...body, port: parsed }), reset: () => setDraftPort(null) },
     parsed,
   );
   useUnsavedChanges(dirty && !inPanel, '接入端口');
@@ -869,13 +909,10 @@ export function IngressPortEditor({
     },
   });
 
-  if (
-    editable &&
-    (snapshot.isPending || nodeList.isPending || revisions.isPending || (current != null && compiled.isPending))
-  )
+  if (!revealed) {
+    if (dependencyError) return <ErrorBox error={dependencyError} />;
     return <Loading variant="control" />;
-  const dependencyError = snapshot.error ?? nodeList.error ?? revisions.error ?? compiled.error;
-  if (editable && dependencyError) return <ErrorBox error={dependencyError} />;
+  }
 
   return (
     <div className="toolbar" style={{ margin: 0, gap: 6 }}>
@@ -892,7 +929,7 @@ export function IngressPortEditor({
         style={{ width: 86 }}
         value={value}
         inputMode="numeric"
-        disabled={!editable}
+        disabled={!editable || !editingReady}
         aria-label="VLESS · TLS / REALITY 监听端口"
         onChange={e => setDraftPort(e.target.value)}
       />
@@ -901,7 +938,7 @@ export function IngressPortEditor({
           {!inPanel && (
             <button
               className="btn"
-              disabled={!dirty || save.isPending}
+              disabled={!dirty || !editingReady || save.isPending}
               onClick={() => save.mutate()}
               title={valid ? (clash ?? '') : '端口必须是 1-65535'}
             >
@@ -920,6 +957,7 @@ export function IngressPortEditor({
           )}
         </>
       )}
+      {editable && dependencyError && <ErrorBox error={dependencyError} />}
       {save.error && <ErrorBox error={save.error} />}
     </div>
   );
@@ -1270,9 +1308,9 @@ function FallbackRateFields({
  * 它与 Fallback 限速配套：后者限制未授权请求的速率，前者限制其可达范围。 */
 /* ── 接入面的安全策略 ──
  *
- * 五个开关，右侧是它们编译产生的规则表。规则表不是装饰：这些限制必须排在该链**自身规则之前**
+ * 五个开关和一项来源策略，右侧是它们编译产生的规则表。规则表不是装饰：这些限制必须排在该链**自身规则之前**
  * 才生效——链的最后一条通常是 `任意 → 落地`，它匹配所有请求，而 xray 使用第一条匹配的规则。
- * 排在其后的限制不会被触发，而界面上五个开关仍显示为启用。将顺序呈现出来是使该问题可见的方式。
+ * 排在其后的限制不会被触发，而界面上策略仍显示为启用。将顺序呈现出来是使该问题可见的方式。
  *
  * 保存使用整表覆盖的 upsert，与修改端口、迁移机器为同一入口，因此产生修订并随发布下发。 */
 export function IngressGuardBlock({
@@ -1285,7 +1323,7 @@ export function IngressGuardBlock({
   editable: boolean;
 }) {
   const qc = useQueryClient();
-  const stored = ingress.guard;
+  const stored = { ...ingress.guard, cn_source_block: ingress.guard.cn_source_block ?? 'off' };
   const [draft, setDraft] = useState<IngressGuard | null>(null);
   const form = draft ?? stored;
   const dirty = (Object.keys(stored) as (keyof IngressGuard)[]).some(key => form[key] !== stored[key]);
@@ -1302,43 +1340,45 @@ export function IngressGuardBlock({
       qc.invalidateQueries({ queryKey: ['compile'] });
     },
   });
-  const set = (key: keyof IngressGuard, value: boolean) => setDraft({ ...form, [key]: value });
+  type BooleanGuardKey = Exclude<keyof IngressGuard, 'cn_source_block'>;
+  const set = (key: BooleanGuardKey, value: boolean) => setDraft({ ...form, [key]: value });
 
-  const SWITCHES: { key: keyof IngressGuard; name: string; why: string; expr: string; danger?: boolean }[] = [
+  const SWITCHES: { key: BooleanGuardKey; name: string; why: string; expr: string; danger?: boolean }[] = [
     {
       key: 'no_private',
       name: '禁止访问内网与节点网络',
-      why: '阻止访问机器出口内网和节点的 WireGuard 内网。',
+      why: '禁止访问私有地址及节点 WireGuard 网段。',
       expr: 'geoip:private + 节点网段',
     },
     {
       key: 'no_bittorrent',
       name: '禁止 BT 下载',
-      why: '按协议识别，加密 BT 与 DHT 仍可绕过。',
+      why: '基于协议嗅探阻断 BitTorrent 流量；加密流量及 DHT 可能无法识别。',
       expr: 'protocol:bittorrent',
     },
     {
       key: 'no_mail',
       name: '禁止邮件端口',
-      why: '防止垃圾邮件导致 IP 进入黑名单。',
+      why: '阻断 SMTP 常用端口：25、465、587。',
       expr: 'port:25,465,587',
     },
     {
       key: 'no_udp_amplification',
       name: '禁止 UDP 放大端口',
-      why: '防止反射放大攻击。',
+      why: '阻断发往 19、123、161、389、1900、11211 端口的 UDP 流量，降低反射放大风险。',
       expr: 'udp:19,123,161,389,1900,11211',
     },
     {
       key: 'tcp_and_quic_only',
       name: '只放行 TCP 与 UDP/443',
-      why: '最严格，游戏、语音、自建 UDP 服务会中断。',
+      why: '阻断目标端口非 443 的 UDP 流量，可能影响游戏、语音及自建 UDP 服务。',
       danger: true,
       expr: 'udp port ≠ 443',
     },
   ];
 
-  const enabledCount = SWITCHES.filter(row => form[row.key]).length;
+  const enabledCount = SWITCHES.filter(row => form[row.key]).length + (form.cn_source_block === 'off' ? 0 : 1);
+  const setCnSourceBlock = (value: CnSourceBlock) => setDraft({ ...form, cn_source_block: value });
   const [expanded, setExpanded] = useState(false);
 
   return (
@@ -1350,7 +1390,7 @@ export function IngressGuardBlock({
       <summary>
         <PanelTitle of="security">安全策略</PanelTitle>
         <span className="config-disclosure-summary">
-          {enabledCount === 0 ? '未启用限制' : `已启用 ${enabledCount} / ${SWITCHES.length} 项`}
+          {enabledCount === 0 ? '未启用限制' : `已启用 ${enabledCount} / ${SWITCHES.length + 1} 项`}
         </span>
         <span className="sp" />
         {dirty && <span className="st st-warn">未保存</span>}
@@ -1358,19 +1398,51 @@ export function IngressGuardBlock({
       </summary>
       <div className="guard-switches">
         {SWITCHES.map(row => (
-          <label key={row.key} className={form[row.key] ? 'guard-row on' : 'guard-row'}>
+          <label
+            key={row.key}
+            className={`guard-row switch${row.danger ? ' guard-row-wide' : ''}${form[row.key] ? ' on' : ''}`}
+          >
+            <span className="guard-copy">
+              <b className={row.danger && form[row.key] ? 'bad' : undefined}>{row.name}</b>
+              <span className="note" id={`${ingress.id}-${row.key}-note`}>
+                {row.why}
+              </span>
+            </span>
             <input
               type="checkbox"
+              role="switch"
+              aria-label={row.name}
+              aria-describedby={`${ingress.id}-${row.key}-note`}
               checked={form[row.key]}
               disabled={!editable || save.isPending}
               onChange={event => set(row.key, event.target.checked)}
             />
-            <span>
-              <b className={row.danger && form[row.key] ? 'bad' : undefined}>{row.name}</b>
-              <span className="note">{row.why}</span>
+            <span className="switch-ui" aria-hidden="true">
+              <span />
             </span>
           </label>
         ))}
+        <div
+          className={form.cn_source_block === 'off' ? 'guard-row guard-row-policy' : 'guard-row guard-row-policy on'}
+        >
+          <span className="guard-copy">
+            <b>阻断 CN 来源 IP</b>
+            <span className="note">根据 GeoIP 数据库匹配 CN 来源地址，按所选地址族阻断连接。</span>
+          </span>
+          <SegmentedControl<CnSourceBlock>
+            className="guard-source-modes"
+            ariaLabel="阻断 CN 来源 IP"
+            value={form.cn_source_block}
+            options={[
+              { value: 'off', label: '不阻断' },
+              { value: 'ipv4', label: '仅 IPv4' },
+              { value: 'ipv4-and-ipv6', label: 'IPv4 + IPv6' },
+            ]}
+            disabled={!editable || save.isPending}
+            onChange={setCnSourceBlock}
+          />
+          <p className="note guard-policy-note">经上游代理接入且未保留真实源 IP 时，按代理 IP 判定。</p>
+        </div>
       </div>
 
       {dirty && (
@@ -2075,7 +2147,7 @@ export function IngressStreamRow({
   ingress,
   certificateName,
   certificateTrack,
-  editable,
+  editable: permitted,
   section,
   vlessEnabled,
   anytlsEnabled,
@@ -2128,6 +2200,18 @@ export function IngressStreamRow({
     queryFn: () => fetchCompileView(streamRevisions.data!.current_revision!),
     enabled: !!streamRevisions.data?.current_revision,
   });
+  // 自动端口要同时看全局起点、快照、机器和编译后的系统监听。可编辑视角下缺一项都不能
+  // 继续给出“空闲端口”；只读视角不做端口分配，仍可查看快照中的实际值。
+  const dependencyPending =
+    portSettings.isPending ||
+    streamSnapshot.isPending ||
+    streamNodes.isPending ||
+    streamRevisions.isPending ||
+    (streamRevisions.data?.current_revision != null && streamCompiled.isPending);
+  const dependencyError =
+    portSettings.error ?? streamSnapshot.error ?? streamNodes.error ?? streamRevisions.error ?? streamCompiled.error;
+  const editable = permitted && !dependencyPending && !dependencyError;
+  const revealed = useInitialReady(!permitted || editable, `${appId}/${ingress.id}/${section}`);
   const mtprotoNode = streamNodes.data?.nodes.find(node => node.node_id === ingress.node);
   const mtprotoUnavailable = streamNodes.isPending
     ? '正在读取机器公网地址'
@@ -2571,7 +2655,7 @@ export function IngressStreamRow({
     'vless-xhttp',
     dirty,
     {
-      blocked: on && (pathBad || xmuxBad || tuningBad || downloadBad),
+      blocked: !editable || (on && (pathBad || xmuxBad || tuningBad || downloadBad)),
       apply: body => ({
         ...body,
         wires: { ...body.wires!, vless: vlessForSave() },
@@ -2634,7 +2718,7 @@ export function IngressStreamRow({
     'hy2',
     hy2Dirty,
     {
-      blocked: hy2Bad,
+      blocked: !editable || hy2Bad,
       apply: body => ({ ...body, wires: { ...body.wires!, hysteria2: hy2Value } }),
       reset: () => setDraftHy2(null),
     },
@@ -2722,7 +2806,7 @@ export function IngressStreamRow({
     'anytls',
     anytlsDirty,
     {
-      blocked: anytlsBad,
+      blocked: !editable || anytlsBad,
       apply: body => ({ ...body, wires: { ...body.wires!, anytls: anytlsForSave } }),
       reset: () => {
         setDraftAnyTls(null);
@@ -2759,7 +2843,7 @@ export function IngressStreamRow({
     'mtproto',
     mtprotoDirty,
     {
-      blocked: mtprotoPortBad,
+      blocked: !editable || mtprotoPortBad,
       apply: body => ({ ...body, wires: { ...body.wires!, mtproto: { port: mtprotoPort } } }),
       reset: () => setDraftMtProtoPort(null),
     },
@@ -2775,21 +2859,9 @@ export function IngressStreamRow({
     return updateAnyTlsMasquerade({ kind: 'string', content: '', headers, status_code: 200 });
   };
 
-  // 自动端口要同时看全局起点、快照、机器和编译后的系统监听。可编辑视角下缺一项都不能
-  // 继续给出“空闲端口”；只读视角不做端口分配，仍可查看快照中的实际值。
-  const dependencyPending =
-    portSettings.isPending ||
-    streamSnapshot.isPending ||
-    streamNodes.isPending ||
-    streamRevisions.isPending ||
-    (streamRevisions.data?.current_revision != null && streamCompiled.isPending);
-  const dependencyError =
-    portSettings.error ?? streamSnapshot.error ?? streamNodes.error ?? streamRevisions.error ?? streamCompiled.error;
-  if (editable && dependencyPending) {
+  if (!revealed) {
+    if (dependencyError) return section === 'protocols' ? <ErrorBox error={dependencyError} /> : null;
     return section === 'protocols' ? <Loading variant="rows" /> : null;
-  }
-  if (editable && dependencyError) {
-    return section === 'protocols' ? <ErrorBox error={dependencyError} /> : null;
   }
 
   /* 端口归属协议栈：落点只表示由哪台机器接收，使用哪个端口由各线路自行决定。
@@ -2797,7 +2869,7 @@ export function IngressStreamRow({
   if (section === 'protocols') {
     return (
       <>
-        <div className="protocol-picker">
+        <div className="protocol-picker" aria-busy={permitted && dependencyPending}>
           <label className={vlessOn ? 'protocol-choice on' : 'protocol-choice'}>
             <input
               type="checkbox"
@@ -2890,7 +2962,7 @@ export function IngressStreamRow({
                 MTProxy
               </b>
               <span className={mtprotoUnavailable ? 'note bad' : 'note'}>
-                {mtprotoUnavailable ?? 'Telegram MTProto 代理；出口地址参与中继握手，要求网卡直配公网 IPv4。'}
+                {mtprotoUnavailable ?? MTPROTO_DESCRIPTION}
               </span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
@@ -2898,6 +2970,7 @@ export function IngressStreamRow({
             </span>
           </label>
         </div>
+        {permitted && dependencyError && <ErrorBox error={dependencyError} />}
         {save.error && <ErrorBox error={save.error} />}
       </>
     );
@@ -4161,9 +4234,18 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const nodeList = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   // 探测结果使用独立查询，不与 snapshot 合并：它的更新频率远高于模型（一分钟一轮），
   // 合并后每轮探测都会导致整棵模型树重新渲染。
-  const probes = useQuery({
+  const probes = useMetricQuery({
     queryKey: ['e2e-probes'],
     queryFn: () => fetchE2eProbes(),
+    metricFacts: data =>
+      data.chains.map(probe => [
+        probe.app_id,
+        probe.chain_id,
+        probe.status,
+        probe.exit_ip,
+        probe.exit_verdict,
+        probe.detail,
+      ]),
     // This request is independent of the model and machine summaries. Starting all three together
     // avoids adding their network latency in series; React Query still shares one cached series
     // with the detail and link pages.
@@ -4599,28 +4681,14 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   // 卡片颜色表示是否需要处理，而不是“有没有流量”。模型事实优先于探测结果：含退役成员或
   // 缺接入面时即使上一轮探测仍为成功，当前草稿中的链也已经不可用。模型正常后再看端到端
   // 探测；没有用户或尚未探测保持中性，它们都不等同于故障。
-  const chainTone = (r: (typeof rows)[number]): 'ok' | 'warn' | 'bad' | 'idle' => {
-    if (r.disabled || !r.ingress) return 'bad';
-    const probeTone = toneOf(probeOf.get(r.chain.id));
-    if (probeTone === 'down') return 'bad';
-    if (probeTone === 'odd' || probeTone === 'slow') return 'warn';
-    if (probeTone === 'none' || r.users === 0) return 'idle';
-    return 'ok';
-  };
-  const chainToneTitle = (r: (typeof rows)[number]) => {
-    if (r.disabled) return '含退役机器，整链停用';
-    if (!r.ingress) return '缺接入面：没有入口，这条链无法接入';
-    const probe = probeOf.get(r.chain.id);
-    const probeTone = toneOf(probe);
-    if (probeTone !== 'ok' && probeTone !== 'none') return toneTitle(probe);
-    if (!probe) return '还没探过这条链';
-    if (r.users === 0) return '通，但还没有人被授权';
-    return `${r.users} 人在用`;
-  };
+  const chainTone = (r: (typeof rows)[number]) =>
+    chainAttentionTone(r.disabled, r.ingress, probeOf.get(r.chain.id), r.users);
+  const chainToneTitle = (r: (typeof rows)[number]) =>
+    chainAttentionTitle(r.disabled, r.ingress, probeOf.get(r.chain.id), r.users);
 
   return (
     <div className="cardpage chain-cardpage">
-      <section className="panel titled chain-list-panel">
+      <section className="panel titled chain-list-panel" data-page-title="true">
         {/* 主操作与机器页保持同一位置。按钮不按角色隐藏，只按角色禁用：此前整组包在
           `owner &&` 里，readonly 和 public 看到的线路页标题栏右端是空的，而机器页和
           用户页是灰按钮，同一个台面上三页的标题栏各一种形态。 */}
@@ -4984,9 +5052,8 @@ function ChainPath({
   );
 }
 
-// 链的标识信息：出口地区旗、名称、id、租户。它们位于标题中，样式与其他位置的标题一致
-//（`.chain-hd`，机器详情和建链向导使用同一样式）：旗帜只作只读前缀，名称使用大号字，
-// 其后是灰色的 id。
+// 链的标识信息与机器详情共用 `.nd-page-identity`：方形地区旗、状态角灯、名称和 id
+// 组成连续纸页头。旗帜只作只读前缀，名称仍可就地编辑。
 //
 // 此前左栏有一块「身份」。而标题中已显示名称和 id，重复显示会削弱标题的作用；
 // 更主要的问题是左栏因此只剩三行只读文本，右栏有九个字段，
@@ -5000,7 +5067,19 @@ function ChainPath({
 // id 只显示：`chains.id` 是全局主键，修改 id 不是重命名而是将该链连同规则表迁移到其他
 // 项目下（论证见 ports.ts），提供输入框会使该迁移易于误触发。租户同样只显示，但必须
 // 显示——见下面保存部分的说明：它是该操作中最易写错的字段。
-export function ChainTitle({ appId, chain, editable }: { appId: string; chain: SnapshotChain; editable: boolean }) {
+export function ChainTitle({
+  appId,
+  chain,
+  editable,
+  statusTone,
+  statusLabel,
+}: {
+  appId: string;
+  chain: SnapshotChain;
+  editable: boolean;
+  statusTone?: ChainAttentionTone;
+  statusLabel?: string;
+}) {
   const qc = useQueryClient();
   /* null 表示未处于编辑状态。进入编辑时以当前名称为初值，显示值均实时计算。 */
   const [draft, setDraft] = useState<string | null>(null);
@@ -5044,64 +5123,68 @@ export function ChainTitle({ appId, chain, editable }: { appId: string; chain: S
     save.mutate(next);
   };
 
+  const hasRegion = SUBSCRIPTION_COUNTRY_CODE_SET.has(chain.subscription_country?.trim().toUpperCase() ?? '');
+  const lampClass = statusTone && statusTone !== 'ok' ? ` ${statusTone}` : '';
+
   return (
-    <>
-      <div className="chain-hd">
-        <RegionFlag code={chain.subscription_country} />
-        {editable && draft !== null ? (
-          <input
-            className="f chain-rename"
-            autoFocus
-            value={draft}
-            aria-label="链名"
-            disabled={save.isPending}
-            onChange={e => setDraft(e.target.value)}
-            onBlur={commit}
-            /* 回车不直接保存：交由 blur 走同一条路径，避免两条路径各自实现收尾逻辑 */
-            onKeyDown={e => {
-              if (e.key === 'Enter') e.currentTarget.blur();
-              if (e.key === 'Escape') {
-                escaped.current = true;
-                e.currentTarget.blur();
-              }
-            }}
-          />
-        ) : (
-          /* 未设置名称的链回退到 id，与列表和其他位置的标题行规则一致 */
-          <b
-            role={editable ? 'button' : undefined}
-            tabIndex={editable ? 0 : undefined}
-            title={editable ? '点一下改名。只改显示的名字，订阅链接、UUID、授权、编译产物一个字节都不动' : undefined}
-            onClick={editable ? () => setDraft(chain.name) : undefined}
-            onKeyDown={
-              editable
-                ? e => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      setDraft(chain.name);
-                    }
-                  }
-                : undefined
-            }
-          >
-            {chain.name || chain.id}
-          </b>
+    <div className="nd-page-identity chain-detail-identity">
+      <span className={`nd-idplate${hasRegion ? '' : ' empty'}`}>
+        <span className="nd-idplate-clip">
+          {hasRegion ? <RegionFlag code={chain.subscription_country} square /> : <Icon of="chains" size={15} />}
+        </span>
+        {statusTone && (
+          <span className={`node-lamp${lampClass}`} role="img" aria-label={statusLabel} title={statusLabel} />
         )}
+      </span>
+      <div className="nd-ident-text">
+        <div className="nd-ident-row">
+          {editable && draft !== null ? (
+            <input
+              className="f chain-rename"
+              autoFocus
+              value={draft}
+              aria-label="链名"
+              disabled={save.isPending}
+              onChange={e => setDraft(e.target.value)}
+              onBlur={commit}
+              /* 回车不直接保存：交由 blur 走同一条路径，避免两条路径各自实现收尾逻辑 */
+              onKeyDown={e => {
+                if (e.key === 'Enter') e.currentTarget.blur();
+                if (e.key === 'Escape') {
+                  escaped.current = true;
+                  e.currentTarget.blur();
+                }
+              }}
+            />
+          ) : (
+            <h1 className="nd-id nd-name">
+              {editable ? (
+                <button
+                  type="button"
+                  title="点一下改名。只改显示的名字，订阅链接、UUID、授权、编译产物一个字节都不动"
+                  onClick={() => setDraft(chain.name)}
+                >
+                  {chain.name || chain.id}
+                </button>
+              ) : (
+                chain.name || chain.id
+              )}
+            </h1>
+          )}
+        </div>
         {/* 不可修改的原因写入 title——只读角色本身无法修改任何内容，单独为该项添加说明
             会使其看起来比其他项限制更严。 */}
-        <span className="subid mono" title={editable ? '链 ID 改不了：它是全局主键，换 id 是搬家不是改名' : undefined}>
+        <span
+          className="nd-ident-meta"
+          title={editable ? '链 ID 改不了：它是全局主键，换 id 是搬家不是改名' : undefined}
+        >
           {appId} / {chain.id}
+          {save.isPending ? ' · 保存中…' : ''}
         </span>
-        {save.isPending && <span className="subid">保存中…</span>}
+        {draft !== null && <span className="chain-rename-tip">回车或点击别处保存，Esc 撤销</span>}
+        {save.error && <ErrorBox error={save.error} />}
       </div>
-      {/* 只在编辑状态下显示退出方式。非编辑状态下该说明不提供信息，且占用首屏空间。 */}
-      {draft !== null && (
-        <div className="note chain-rename-tip">
-          <span>回车或点击别处保存，Esc 撤销</span>
-        </div>
-      )}
-      {save.error && <ErrorBox error={save.error} />}
-    </>
+    </div>
   );
 }
 
@@ -5207,13 +5290,21 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     queryFn: () => fetchCompileView(current!),
     enabled: !!current,
   });
-  const probes = useQuery({
+  const probes = useMetricQuery({
     queryKey: ['e2e-probes'],
     queryFn: () => fetchE2eProbes(),
+    metricFacts: data =>
+      data.chains.map(probe => [
+        probe.app_id,
+        probe.chain_id,
+        probe.status,
+        probe.exit_ip,
+        probe.exit_verdict,
+        probe.detail,
+      ]),
     refetchInterval: 60_000,
   });
   const nameOf = useNodeNames();
-
   const a = snapshot.data?.snapshot.apps.find(x => x.id === app);
   const c = a?.chains?.find(x => x.id === chain);
   const ingress = (a?.ingresses ?? []).find(x => x.chain === chain) ?? null;
@@ -5281,21 +5372,21 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
     },
   });
 
-  const initialDependencyError =
-    (settingsReadable && !settings.data && settings.error) ||
-    (!revisions.data && revisions.error) ||
-    (current != null && !compiled.data && compiled.error);
-  if (initialDependencyError) return <ErrorBox error={initialDependencyError} />;
-  if (
+  const dependencyError =
+    snapshot.error ?? nodes.error ?? (settingsReadable ? settings.error : null) ?? revisions.error ?? compiled.error;
+  const dependencyPending =
     snapshot.isPending ||
     nodes.isPending ||
     (settingsReadable && settings.isPending) ||
     revisions.isPending ||
     (current != null && compiled.isPending) ||
-    probes.isPending
-  )
+    probes.isPending;
+  const revealed = useInitialReady(!dependencyPending && !dependencyError, `${app}/${chain}`);
+  const portDependenciesReady = !dependencyPending && !dependencyError;
+  if (!revealed) {
+    if (dependencyError) return <ErrorBox error={dependencyError} />;
     return <Loading variant="chain-detail" />;
-  if (snapshot.error || nodes.error) return <ErrorBox error={snapshot.error ?? nodes.error} />;
+  }
   if (!a || !c) return <ErrorBox error={new Error(`没有这条链：${app}/${chain}`)} />;
 
   const spine = chainSpine(a, c.id);
@@ -5309,8 +5400,11 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   // 其规则无法再访问。
   const chainSteps = (a.steps ?? []).filter(s => s.chain === chain);
   const probe = byChain(probes.data?.chains).get(chain);
+  const users = userKeysOf(a, c.id).size;
+  const attentionTone = chainAttentionTone(disabled, ingress, probe, users);
+  const attentionTitle = chainAttentionTitle(disabled, ingress, probe, users);
   const requestIngressMove = (toNode: string) => {
-    if (!ingress || !toNode || toNode === ingress.node || moveIngress.isPending) return false;
+    if (!portDependenciesReady || !ingress || !toNode || toNode === ingress.node || moveIngress.isPending) return false;
     setMoveIngressPlanError(null);
     try {
       const tcpTaken = occupiedPorts(
@@ -5351,203 +5445,225 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   };
 
   return (
-    // 线路详情自己拥有唯一一张页面纸，不再依赖工作区额外包一层通用纸。亮色下这张纸
-    // 压到台面档，配置卡才比它所落的面亮一档（论证见 styles.css 末尾「亮色详情页」一节）。
-    <div className="fg-sheet chain-detailpage">
-      {/* 「主干」一节已移除：主干由规则表派生（chainSpine 沿 any→Forward 遍历得出），
-          而规则树本身按跳排列，两者表达同一内容。添加一跳和重排都在规则表中完成
-          （修改转发目标即为重排），删除收入规则树每行的 hover 状态。 */}
-      <ChainTitle appId={app} chain={c} editable={editable} />
+    // 与机器详情共用连续纸：身份和全部配置属于同一表面，按阅读顺序直接展开。
+    <div className="nd-sheet nd-page chain-detailpage" aria-busy={dependencyPending}>
+      <div className="fg-sheet nd-paper">
+        <header className="nd-page-head chain-detail-head">
+          <ChainTitle
+            appId={app}
+            chain={c}
+            editable={editable}
+            statusTone={attentionTone}
+            statusLabel={attentionTitle}
+          />
+        </header>
+        <div className="nd-paper-body chain-detail-body">
+          {/* 「主干」一节已移除：主干由规则表派生（chainSpine 沿 any→Forward 遍历得出），
+              而规则树本身按跳排列，两者表达同一内容。添加一跳和重排都在规则表中完成
+              （修改转发目标即为重排），删除收入规则树每行的 hover 状态。 */}
+          {dependencyError && <ErrorBox error={dependencyError} />}
 
-      {/* 两列，按「用户连接到何处」和「隧道的协议配置」划分。
-          左栏：结论 + 落点（由哪台机器接收）+ 订阅投影（客户端连接的地址）。
-          右栏：协议栈（协议 / 传输安全 / 传输层，以及其下的相关参数）。
-
-          此前的划分是「它是什么」和「它的配置」：左栏是状态和标识，右栏是整个接入面。
-          问题不在划分方式，而在两侧的内容量——接入面的字段从两个增加到九个，
-          而左栏始终只有三行只读文本，四倍的差额在「两列底部对齐」规则下形成左栏中间的
-          大片空白。按新的划分，两侧各自表达一项完整内容，内容量也相当。
-
-          异常状态的两块与结论块结构相同（`.blk`），只是固定为红色档：
-          链的当前状态是同一个问题，使用三种形状会增加识别成本。 */}
-      <div className="duo chain-config-grid">
-        <div className="col">
-          {/* 已停用的链不显示探测结论：它未在运行，显示「不通」的结论会造成误解。 */}
-          {disabled ? (
-            <div className="blk tone-err">
-              <div className="blk-hd">这条链已停用</div>
-              <div className="blk-bd">
-                <div className="probe-face">
-                  <span className="probe-lat">
-                    <span className="n">停用</span>
-                  </span>
-                  <span className="probe-say">
-                    <span className="l1">链上有退役机器：{retiredHops.map(nameOf).join('、')}</span>
-                    <span className="l2">
-                      入口不渲染、整链不编译，发布不受影响。把退役机器移出链（或让它复出）后自动恢复。
-                    </span>
-                  </span>
+          {/* 详情保持一组贯穿页面的连续双栏：左栏回答入口在哪里、客户端如何连接以及入口级
+              安全约束；右栏回答启用了哪些协议以及每种协议如何配置。不能把它拆成多个独立
+              双栏区段，否则高大的客户端配置会把第一排撑开，后续协议区又从下一排重新起头，
+              左侧形成与内容关系无关的大片空白。窄宽度下由 `.duo` 按整栏顺序纵向排列。 */}
+          <div className="duo chain-config-grid">
+            <div className="col">
+              {/* 已停用的链不显示探测结论：它未在运行，显示「不通」的结论会造成误解。 */}
+              {disabled ? (
+                <div className="blk tone-err">
+                  <div className="blk-hd">这条链已停用</div>
+                  <div className="blk-bd">
+                    <div className="probe-face">
+                      <span className="probe-lat">
+                        <span className="n">停用</span>
+                      </span>
+                      <span className="probe-say">
+                        <span className="l1">链上有退役机器：{retiredHops.map(nameOf).join('、')}</span>
+                        <span className="l2">
+                          入口不渲染、整链不编译，发布不受影响。把退役机器移出链（或让它复出）后自动恢复。
+                        </span>
+                      </span>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            </div>
-          ) : probes.error ? (
-            <ErrorBox error={probes.error} />
-          ) : (
-            <ProbeBanner item={probe} />
-          )}
+              ) : probes.error ? (
+                <ErrorBox error={probes.error} />
+              ) : (
+                <ProbeBanner item={probe} />
+              )}
 
-          {/* ── 落点 ──
+              {/* ── 落点 ──
             机器和端口是同一项内容的两部分（客户端连接的位置在哪台机器、哪个端口），
             此前它们使用两种形态：端口是标题行右端的输入框，机器是下方单独一行。
             同类内容使用不同形态会增加识别成本。
 
             收入 `.kv` 并采用与设置页相同的布局：左列是项名、右列是控件、说明在控件下方。 */}
-          {ingress && (
-            <ConfigPanel title="入站" icon="ingress">
-              <dl className="kv form2 chain-face">
-                <dt>入站机器</dt>
-                <dd>
-                  {editable ? (
-                    <select
-                      className="f"
-                      value={pendingIngressNode ?? ingress.node}
-                      onChange={e => {
-                        if (!requestIngressMove(e.target.value)) e.currentTarget.value = ingress.node;
-                      }}
-                    >
-                      {(nodes.data?.nodes ?? [])
-                        .filter(n => !n.retired_at)
-                        .map(n => {
-                          const mtproxyBlocked = !!ingress.wires.mtproto && (!n.public_ipv4 || n.public_ipv4_nat);
-                          return (
-                            <option key={n.node_id} value={n.node_id} disabled={mtproxyBlocked}>
-                              {nameOf(n.node_id)}
-                              {mtproxyBlocked ? '（MTProxy 要求网卡直配公网 IPv4）' : ''}
-                            </option>
-                          );
-                        })}
-                    </select>
-                  ) : (
-                    <span>{nameOf(ingress.node)}</span>
-                  )}
-                  {moveIngress.isPending && <span className="note">搬迁中…</span>}
-                </dd>
-                <dt>绑定地址</dt>
-                <dd>
-                  {editable ? (
-                    <div className="toolbar" style={{ margin: 0, gap: 6 }}>
-                      <input
-                        className="f mono"
-                        value={pendingBind ?? ingress.bind}
-                        onChange={e => setPendingBind(e.target.value)}
-                      />
-                      {pendingBind !== null && pendingBind !== ingress.bind && (
-                        <>
-                          <button
-                            className="btn primary"
-                            disabled={saveBind.isPending || !/^\d+\.\d+\.\d+\.\d+$/.test(pendingBind.trim())}
-                            onClick={() => saveBind.mutate(pendingBind.trim())}
-                          >
-                            保存
-                          </button>
-                          <button className="btn" disabled={saveBind.isPending} onClick={() => setPendingBind(null)}>
-                            还原
-                          </button>
-                        </>
+              {ingress && (
+                <ConfigPanel title="入站" icon="ingress">
+                  <dl className="kv form2 chain-face">
+                    <dt>入站机器</dt>
+                    <dd>
+                      {editable ? (
+                        <select
+                          className="f"
+                          value={pendingIngressNode ?? ingress.node}
+                          disabled={!portDependenciesReady || moveIngress.isPending}
+                          onChange={e => {
+                            if (!requestIngressMove(e.target.value)) e.currentTarget.value = ingress.node;
+                          }}
+                        >
+                          {(nodes.data?.nodes ?? [])
+                            .filter(n => !n.retired_at)
+                            .map(n => {
+                              const mtproxyBlocked = !!ingress.wires.mtproto && (!n.public_ipv4 || n.public_ipv4_nat);
+                              return (
+                                <option key={n.node_id} value={n.node_id} disabled={mtproxyBlocked}>
+                                  {nameOf(n.node_id)}
+                                  {mtproxyBlocked ? '（MTProxy 要求网卡直配公网 IPv4）' : ''}
+                                </option>
+                              );
+                            })}
+                        </select>
+                      ) : (
+                        <span>{nameOf(ingress.node)}</span>
                       )}
-                    </div>
-                  ) : (
-                    <span className="mono">{ingress.bind}</span>
-                  )}
-                </dd>
-                {saveBind.error && (
-                  <dd style={{ gridColumn: '1 / -1' }}>
-                    <ErrorBox error={saveBind.error} />
-                  </dd>
-                )}
-              </dl>
-            </ConfigPanel>
-          )}
-
-          {/* ── 订阅投影 ──
-            与落点配套：上一块表示由哪台机器接收，本块表示告知客户端连接的地址。
-            相邻放置才能体现两者的区别——这也是它们同在左栏的原因。 */}
-          {ingress && (
-            <ConfigPanel title="客户端配置" icon="client">
-              <dl className="kv form2 chain-face">
-                <ChainSubscriptionCountryRow appId={app} chain={c} probe={probe} editable={editable} />
-              </dl>
-              <div className="client-projection-groups">
-                {activeProjectionProtocols(ingress).map(protocol => (
-                  <section className="client-projection-group" key={protocol}>
-                    <header>
-                      <b>{projectionProtocolLabel(protocol)}</b>
-                      <span className="mono">
-                        {protocol === 'hysteria2' ? 'UDP' : 'TCP'} {projectionListenPort(ingress, protocol)}
-                      </span>
-                    </header>
-                    <dl className="kv form2 chain-face client-projection-family-grid">
-                      {PROJECTION_FAMILIES.map(family => {
-                        const key = `${protocol}:${family}` as const;
-                        return (
-                          <div className="client-projection-family" key={family}>
-                            <IngressProjectionRow
-                              appId={app}
-                              ingress={ingress}
-                              protocol={protocol}
-                              family={family}
-                              node={nodes.data?.nodes.find(n => n.node_id === ingress.node)}
-                              editable={editable}
-                              onHandle={projectionRegistrars[key]}
-                              saving={saveProjections.isPending}
-                            />
-                          </div>
-                        );
-                      })}
-                    </dl>
-                  </section>
-                ))}
-              </div>
-              {/* 投影的说明只需一次，因此写在面板级而非每行。
+                      {moveIngress.isPending && <span className="note">搬迁中…</span>}
+                    </dd>
+                    <dt>绑定地址</dt>
+                    <dd>
+                      {editable ? (
+                        <div className="toolbar" style={{ margin: 0, gap: 6 }}>
+                          <input
+                            className="f mono"
+                            value={pendingBind ?? ingress.bind}
+                            onChange={e => setPendingBind(e.target.value)}
+                          />
+                          {pendingBind !== null && pendingBind !== ingress.bind && (
+                            <>
+                              <button
+                                className="btn primary"
+                                disabled={saveBind.isPending || !/^\d+\.\d+\.\d+\.\d+$/.test(pendingBind.trim())}
+                                onClick={() => saveBind.mutate(pendingBind.trim())}
+                              >
+                                保存
+                              </button>
+                              <button
+                                className="btn"
+                                disabled={saveBind.isPending}
+                                onClick={() => setPendingBind(null)}
+                              >
+                                还原
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="mono">{ingress.bind}</span>
+                      )}
+                    </dd>
+                    {saveBind.error && (
+                      <dd style={{ gridColumn: '1 / -1' }}>
+                        <ErrorBox error={saveBind.error} />
+                      </dd>
+                    )}
+                  </dl>
+                </ConfigPanel>
+              )}
+              {/* ── 订阅投影 ──
+                    与落点配套：上一块表示由哪台机器接收，本块表示告知客户端连接的地址。 */}
+              {ingress && (
+                <ConfigPanel title="客户端配置" icon="client">
+                  <dl className="kv form2 chain-face">
+                    <ChainSubscriptionCountryRow appId={app} chain={c} probe={probe} editable={editable} />
+                  </dl>
+                  <div className="client-projection-groups">
+                    {activeProjectionProtocols(ingress).map(protocol => (
+                      <section className="client-projection-group" key={protocol}>
+                        <header>
+                          <b>{projectionProtocolLabel(protocol)}</b>
+                          <span className="mono">
+                            {protocol === 'hysteria2' ? 'UDP' : 'TCP'} {projectionListenPort(ingress, protocol)}
+                          </span>
+                        </header>
+                        <dl className="kv form2 chain-face client-projection-family-grid">
+                          {PROJECTION_FAMILIES.map(family => {
+                            const key = `${protocol}:${family}` as const;
+                            return (
+                              <div className="client-projection-family" key={family}>
+                                <IngressProjectionRow
+                                  appId={app}
+                                  ingress={ingress}
+                                  protocol={protocol}
+                                  family={family}
+                                  node={nodes.data?.nodes.find(n => n.node_id === ingress.node)}
+                                  editable={editable}
+                                  onHandle={projectionRegistrars[key]}
+                                  saving={saveProjections.isPending}
+                                />
+                              </div>
+                            );
+                          })}
+                        </dl>
+                      </section>
+                    ))}
+                  </div>
+                  {/* 投影的说明只需一次，因此写在面板级而非每行。
                   此前该说明位于每个地址族的开关下方，只在启用时显示——而最需要该说明的
                   情况正是两个族都关闭、界面上只剩两个「不投影」时。 */}
-              <div className="note" style={{ margin: 0 }}>
-                用于修改客户端入口地址配置。不影响服务端监听。
-              </div>
-              {saveProjections.error && <ErrorBox error={saveProjections.error} />}
-              <div className="toolbar config-panel-savebar">
-                {projDirty && (
-                  <span className="note client-projection-pending">
-                    {Object.values(projHandles).filter(handle => handle.dirty).length} 项更改待保存
-                  </span>
-                )}
-                <span className="sp" />
-                <button
-                  className="btn"
-                  disabled={(!projDirty && !projEditing) || saveProjections.isPending}
-                  onClick={() => Object.values(projHandles).forEach(h => h.reset())}
-                >
-                  还原
-                </button>
-                <button
-                  className="btn primary"
-                  disabled={!editable || !projDirty || projBlocked || saveProjections.isPending}
-                  onClick={() => saveProjections.mutate()}
-                >
-                  {saveProjections.isPending ? '保存中…' : '保存'}
-                </button>
-              </div>
-            </ConfigPanel>
-          )}
+                  <div className="note" style={{ margin: 0 }}>
+                    用于修改客户端入口地址配置。不影响服务端监听。
+                  </div>
+                  {saveProjections.error && <ErrorBox error={saveProjections.error} />}
+                  <div className="toolbar config-panel-savebar">
+                    {projDirty && (
+                      <span className="note client-projection-pending">
+                        {Object.values(projHandles).filter(handle => handle.dirty).length} 项更改待保存
+                      </span>
+                    )}
+                    <span className="sp" />
+                    <button
+                      className="btn"
+                      disabled={(!projDirty && !projEditing) || saveProjections.isPending}
+                      onClick={() => Object.values(projHandles).forEach(h => h.reset())}
+                    >
+                      还原
+                    </button>
+                    <button
+                      className="btn primary"
+                      disabled={!editable || !projDirty || projBlocked || saveProjections.isPending}
+                      onClick={() => saveProjections.mutate()}
+                    >
+                      {saveProjections.isPending ? '保存中…' : '保存'}
+                    </button>
+                  </div>
+                </ConfigPanel>
+              )}
+              {/* 安全策略作用于整个入口，与入站落点和客户端入口地址同属入口级配置。 */}
+              {ingress && <IngressGuardBlock appId={app} ingress={ingress} editable={editable} />}
+            </div>
 
-          {/* 安全策略排在左栏末尾：它作用于整个入口（谁能连、连上之后能到哪儿），
-              与本栏的落点、订阅投影同属「这个入口对外是什么样」；右栏是协议栈的参数。
-              放右栏时它还得排在 VLESS 和 HY2 两块之后，与那两块的层级关系并不成立。 */}
-          {ingress && <IngressGuardBlock appId={app} ingress={ingress} editable={editable} />}
-        </div>
-
-        <div className="col">
-          {/* ── 协议栈 ──
+            <div className="col">
+              {/* 协议开关与协议实例参数留在同一栏，避免一次配置被拆到两排。 */}
+              {ingress && (
+                <ConfigPanel title="协议" icon="protocol">
+                  <IngressStreamRow
+                    appId={app}
+                    ingress={ingress}
+                    certificateName={ingressCertificateName}
+                    certificateTrack={ingressCertificateTrack}
+                    editable={editable}
+                    settingsReadable={settingsReadable}
+                    section="protocols"
+                    onVlessEnabledChange={vlessPanel.preview}
+                    onAnyTlsEnabledChange={anyTlsPanel.preview}
+                    onEncryptionEnabledChange={encryptionPanel.preview}
+                    onHy2EnabledChange={hy2Panel.preview}
+                    onMtProtoEnabledChange={mtprotoPanel.preview}
+                  />
+                </ConfigPanel>
+              )}
+              {/* ── 协议栈 ──
             三层（协议 / 传输安全 / 传输层）排在最前，三行相同形态的下拉框构成一组；
             单独命名的参数（目标站点 / 流控 / Fallback 限速）排在该组之后。
             不缩进、不画线、不加层级编号：本栏本身是一张表，增加形态会增加识别成本。
@@ -5555,203 +5671,192 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             顺序有明确依据——目标站点和流控都属于传输安全，Fallback 限速作用于未通过
             REALITY 校验、进入 fallback 的连接，同样属于传输安全。传输层的参数
             （路径、并发、Host、上行）在 IngressStreamRow 中构成独立的「XHTTP」一行。 */}
-          {ingress ? (
-            <>
-              <ConfigPanel title="协议" icon="protocol">
-                <IngressStreamRow
-                  appId={app}
-                  ingress={ingress}
-                  certificateName={ingressCertificateName}
-                  certificateTrack={ingressCertificateTrack}
-                  editable={editable}
-                  settingsReadable={settingsReadable}
-                  section="protocols"
-                  onVlessEnabledChange={vlessPanel.preview}
-                  onAnyTlsEnabledChange={anyTlsPanel.preview}
-                  onEncryptionEnabledChange={encryptionPanel.preview}
-                  onHy2EnabledChange={hy2Panel.preview}
-                  onMtProtoEnabledChange={mtprotoPanel.preview}
-                />
-              </ConfigPanel>
-              {vlessPanel.visible && (
-                <IngressPanel
-                  key="vless"
-                  appId={app}
-                  ingress={ingress}
-                  title="VLESS · TLS / REALITY"
-                  editable={editable}
-                  panelRef={vlessPanel.panelRef}
-                  collapsible
-                  initiallyExpanded={vlessPanel.newlyAdded}
-                  summary={ingressProtocolPanelSummary(ingress, 'vless')}
-                >
-                  <IngressStreamRow
-                    appId={app}
-                    ingress={ingress}
-                    certificateName={ingressCertificateName}
-                    certificateTrack={ingressCertificateTrack}
-                    editable={editable}
-                    settingsReadable={settingsReadable}
-                    section="vless"
-                    vlessEnabled
-                  />
-                </IngressPanel>
+              {ingress ? (
+                <>
+                  {vlessPanel.visible && (
+                    <IngressPanel
+                      key="vless"
+                      appId={app}
+                      ingress={ingress}
+                      title="VLESS · TLS / REALITY"
+                      editable={editable}
+                      panelRef={vlessPanel.panelRef}
+                      collapsible
+                      initiallyExpanded={vlessPanel.newlyAdded}
+                      summary={ingressProtocolPanelSummary(ingress, 'vless')}
+                    >
+                      <IngressStreamRow
+                        appId={app}
+                        ingress={ingress}
+                        certificateName={ingressCertificateName}
+                        certificateTrack={ingressCertificateTrack}
+                        editable={editable}
+                        settingsReadable={settingsReadable}
+                        section="vless"
+                        vlessEnabled
+                      />
+                    </IngressPanel>
+                  )}
+                  {encryptionPanel.visible && (
+                    <IngressPanel
+                      key="encryption"
+                      appId={app}
+                      ingress={ingress}
+                      title="VLESS · Encryption"
+                      editable={editable}
+                      panelRef={encryptionPanel.panelRef}
+                      collapsible
+                      initiallyExpanded={encryptionPanel.newlyAdded}
+                      summary={ingressProtocolPanelSummary(ingress, 'encryption')}
+                    >
+                      <IngressEncryptionRow ingress={ingress} editable={editable} />
+                    </IngressPanel>
+                  )}
+                  {anyTlsPanel.visible && (
+                    <IngressPanel
+                      key="anytls"
+                      appId={app}
+                      ingress={ingress}
+                      title="AnyTLS"
+                      editable={editable}
+                      panelRef={anyTlsPanel.panelRef}
+                      collapsible
+                      initiallyExpanded={anyTlsPanel.newlyAdded}
+                      summary={ingressProtocolPanelSummary(ingress, 'anytls')}
+                    >
+                      <IngressStreamRow
+                        appId={app}
+                        ingress={ingress}
+                        certificateName={ingressCertificateName}
+                        certificateTrack={ingressCertificateTrack}
+                        editable={editable}
+                        settingsReadable={settingsReadable}
+                        section="anytls"
+                        anytlsEnabled
+                      />
+                    </IngressPanel>
+                  )}
+                  {hy2Panel.visible && (
+                    <IngressPanel
+                      key="hy2"
+                      appId={app}
+                      ingress={ingress}
+                      title="Hysteria 2"
+                      editable={editable}
+                      panelRef={hy2Panel.panelRef}
+                      collapsible
+                      initiallyExpanded={hy2Panel.newlyAdded}
+                      summary={ingressProtocolPanelSummary(ingress, 'hy2')}
+                    >
+                      <IngressStreamRow
+                        appId={app}
+                        ingress={ingress}
+                        certificateName={ingressCertificateName}
+                        certificateTrack={ingressCertificateTrack}
+                        editable={editable}
+                        settingsReadable={settingsReadable}
+                        section="hy2"
+                        hy2Enabled
+                      />
+                    </IngressPanel>
+                  )}
+                  {mtprotoPanel.visible && (
+                    <IngressPanel
+                      key="mtproto"
+                      appId={app}
+                      ingress={ingress}
+                      title="MTProxy"
+                      editable={editable}
+                      panelRef={mtprotoPanel.panelRef}
+                      collapsible
+                      initiallyExpanded={mtprotoPanel.newlyAdded}
+                      summary={ingressProtocolPanelSummary(ingress, 'mtproto')}
+                    >
+                      <IngressStreamRow
+                        appId={app}
+                        ingress={ingress}
+                        editable={editable}
+                        settingsReadable={settingsReadable}
+                        section="mtproto"
+                        mtprotoEnabled
+                      />
+                    </IngressPanel>
+                  )}
+                </>
+              ) : (
+                <ConfigPanel title="没有接入面" icon="warn">
+                  <div className="callout warn" style={{ margin: 0 }}>
+                    编译会报 <span className="mono">chain.no-ingress</span>，发布被挡。
+                    没有接入面就没有入口节点，路径也无从排起。
+                  </div>
+                </ConfigPanel>
               )}
-              {encryptionPanel.visible && (
-                <IngressPanel
-                  key="encryption"
-                  appId={app}
-                  ingress={ingress}
-                  title="VLESS · Encryption"
-                  editable={editable}
-                  panelRef={encryptionPanel.panelRef}
-                  collapsible
-                  initiallyExpanded={encryptionPanel.newlyAdded}
-                  summary={ingressProtocolPanelSummary(ingress, 'encryption')}
-                >
-                  <IngressEncryptionRow ingress={ingress} editable={editable} />
-                </IngressPanel>
-              )}
-              {anyTlsPanel.visible && (
-                <IngressPanel
-                  key="anytls"
-                  appId={app}
-                  ingress={ingress}
-                  title="AnyTLS"
-                  editable={editable}
-                  panelRef={anyTlsPanel.panelRef}
-                  collapsible
-                  initiallyExpanded={anyTlsPanel.newlyAdded}
-                  summary={ingressProtocolPanelSummary(ingress, 'anytls')}
-                >
-                  <IngressStreamRow
-                    appId={app}
-                    ingress={ingress}
-                    certificateName={ingressCertificateName}
-                    certificateTrack={ingressCertificateTrack}
-                    editable={editable}
-                    settingsReadable={settingsReadable}
-                    section="anytls"
-                    anytlsEnabled
-                  />
-                </IngressPanel>
-              )}
-              {hy2Panel.visible && (
-                <IngressPanel
-                  key="hy2"
-                  appId={app}
-                  ingress={ingress}
-                  title="Hysteria 2"
-                  editable={editable}
-                  panelRef={hy2Panel.panelRef}
-                  collapsible
-                  initiallyExpanded={hy2Panel.newlyAdded}
-                  summary={ingressProtocolPanelSummary(ingress, 'hy2')}
-                >
-                  <IngressStreamRow
-                    appId={app}
-                    ingress={ingress}
-                    certificateName={ingressCertificateName}
-                    certificateTrack={ingressCertificateTrack}
-                    editable={editable}
-                    settingsReadable={settingsReadable}
-                    section="hy2"
-                    hy2Enabled
-                  />
-                </IngressPanel>
-              )}
-              {mtprotoPanel.visible && (
-                <IngressPanel
-                  key="mtproto"
-                  appId={app}
-                  ingress={ingress}
-                  title="MTProxy"
-                  editable={editable}
-                  panelRef={mtprotoPanel.panelRef}
-                  collapsible
-                  initiallyExpanded={mtprotoPanel.newlyAdded}
-                  summary={ingressProtocolPanelSummary(ingress, 'mtproto')}
-                >
-                  <IngressStreamRow
-                    appId={app}
-                    ingress={ingress}
-                    editable={editable}
-                    settingsReadable={settingsReadable}
-                    section="mtproto"
-                    mtprotoEnabled
-                  />
-                </IngressPanel>
-              )}
-            </>
-          ) : (
-            <ConfigPanel title="没有接入面" icon="warn">
-              <div className="callout warn" style={{ margin: 0 }}>
-                编译会报 <span className="mono">chain.no-ingress</span>，发布被挡。
-                没有接入面就没有入口节点，路径也无从排起。
-              </div>
-            </ConfigPanel>
+            </div>
+          </div>
+          {(moveIngressPlanError || moveIngress.error) && (
+            <ErrorBox error={moveIngressPlanError ?? moveIngress.error} />
           )}
-        </div>
-      </div>
-      {(moveIngressPlanError || moveIngress.error) && <ErrorBox error={moveIngressPlanError ?? moveIngress.error} />}
-
-      {/* 线路与机器详情使用同一种规则卡：标题、摘要和规则树属于同一块，不再用独立的
-          `h4.sec` 分节线。卡面尺寸与用户页的「网络拨测」一致。 */}
-      <section className="panel config-panel rule-sheet-card node-chain-sheet">
-        <header>
-          <PanelTitle of="chains">链路规则</PanelTitle>
-          <span className="rule-sheet-meta">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳`}</span>
-        </header>
-        {/* 此处不提供「追加一跳」和「改顺序」。这两项操作都在下方的规则表中完成：
+          <section className="chain-detail-section chain-detail-section-rules">
+            {/* 线路与机器详情使用同一种规则卡：标题、摘要和规则树属于同一块，不再用独立的
+                `h4.sec` 分节线。卡面尺寸与用户页的「网络拨测」一致。 */}
+            <section className="panel config-panel rule-sheet-card node-chain-sheet">
+              <header>
+                <PanelTitle of="chains">链路规则</PanelTitle>
+                <span className="rule-sheet-meta">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳`}</span>
+              </header>
+              {/* 此处不提供「追加一跳」和「改顺序」。这两项操作都在下方的规则表中完成：
             转发目标的候选是全部机器，链外的机器标注为「链外」——选中后该机器即成为该链的
             下一跳；将某条规则的转发目标改为另一台机器即为重排。
             主干由规则表派生（chainSpine 沿 any→Forward 遍历得出）。
 
             单独提供「追加一跳」或上移下移相当于为同一操作增加第二个入口，
             且重写整张规则表顺序的保存会覆盖分流规则。 */}
-        {/* 只读角色看到的是同一棵树，而不是权限提示。此前该块整体替换为一行提示，
+              {/* 只读角色看到的是同一棵树，而不是权限提示。此前该块整体替换为一行提示，
           导致 readonly 角色在链详情页无法查看该链的选路配置——而这正是本页的用途。
           禁用由 RuleEditor 的 readOnly 控制。
 
           保存条（RuleDraftScope）只在可编辑时包裹：它是一个「保存到草稿」按钮，
           只读时始终处于禁用状态。 */}
-        {editable ? (
-          <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
-            <div className="node-chain-use chain-tree">
-              <ChainRulesPanel
-                appId={app}
-                chain={c}
-                spine={spine}
-                steps={chainSteps}
-                nodes={nodes.data?.nodes ?? []}
-                selected={ingress?.node ?? spine[0]}
-                settingsReadable={settingsReadable}
-                onRemove={node => {
-                  // 删除 step 即删除成员：steps 的记录是链上成员的唯一数据来源，
-                  // 只修改规则表时该成员在编译产物中仍然存在。上游规则表中指向它的
-                  // forward 保留，可在编辑器中改为其他目标或改为出网。
-                  deleteStep(app, c.id, node);
-                }}
-                showHeader={false}
-              />
-            </div>
-          </RuleDraftScope>
-        ) : (
-          <div className="node-chain-use chain-tree">
-            <ChainRulesPanel
-              appId={app}
-              chain={c}
-              spine={spine}
-              steps={chainSteps}
-              nodes={nodes.data?.nodes ?? []}
-              selected={ingress?.node ?? spine[0]}
-              settingsReadable={settingsReadable}
-              showHeader={false}
-              readOnly
-            />
-          </div>
-        )}
-      </section>
+              {editable ? (
+                <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
+                  <div className="node-chain-use chain-tree">
+                    <ChainRulesPanel
+                      appId={app}
+                      chain={c}
+                      spine={spine}
+                      steps={chainSteps}
+                      nodes={nodes.data?.nodes ?? []}
+                      selected={ingress?.node ?? spine[0]}
+                      settingsReadable={settingsReadable}
+                      onRemove={node => {
+                        // 删除 step 即删除成员：steps 的记录是链上成员的唯一数据来源，
+                        // 只修改规则表时该成员在编译产物中仍然存在。上游规则表中指向它的
+                        // forward 保留，可在编辑器中改为其他目标或改为出网。
+                        deleteStep(app, c.id, node);
+                      }}
+                      showHeader={false}
+                    />
+                  </div>
+                </RuleDraftScope>
+              ) : (
+                <div className="node-chain-use chain-tree">
+                  <ChainRulesPanel
+                    appId={app}
+                    chain={c}
+                    spine={spine}
+                    steps={chainSteps}
+                    nodes={nodes.data?.nodes ?? []}
+                    selected={ingress?.node ?? spine[0]}
+                    settingsReadable={settingsReadable}
+                    showHeader={false}
+                    readOnly
+                  />
+                </div>
+              )}
+            </section>
+          </section>
+        </div>
+      </div>
     </div>
   );
 }
@@ -6247,6 +6352,7 @@ export function ChainRulesPanel({
     (settingsReadable ? settingsForPorts.error : null) ??
     revisionsForPorts.error ??
     compiledForPorts.error;
+  const revealed = useInitialReady(!portDependenciesPending && !portDependenciesError, `${appId}/${chain.id}`);
   const rowOf = new Map(rows.map(row => [row.node, row]));
   const stepOf = (node: string) => steps.find(s => s.node === node) ?? null;
   /* 树中显示机器名称，id 写入 title——名称是日常识别依据 */
@@ -6483,7 +6589,7 @@ export function ChainRulesPanel({
           <span className="hopctl" onClick={e => e.stopPropagation()}>
             {onRemove && row?.spineIndex != null && row.spineIndex > 0 && (
               <DelBtn
-                disabled={blockingReferences.length > 0}
+                disabled={portDependenciesPending || !!portDependenciesError || blockingReferences.length > 0}
                 title={
                   blockingReferences.length > 0
                     ? `无法移除：子树监听仍被 ${blockingReferences
@@ -6564,16 +6670,18 @@ export function ChainRulesPanel({
     );
   };
 
-  // 可编辑态必须等端口起点和占用表完整后再构造 RuleEditor 的共享草稿。否则这里先用
+  // 可编辑态首次必须等端口起点和占用表完整后再构造 RuleEditor 的共享草稿。否则这里先用
   // 20000/空占用表 seed，子组件随后即使拿到真实设置也只会收到已经冻结的默认值。
-  if (portDependenciesPending) return loadingFallback === undefined ? <Loading variant="editor" /> : loadingFallback;
-  if (!readOnly && portDependenciesError) return <ErrorBox error={portDependenciesError} />;
+  if (!revealed && !readOnly) {
+    if (portDependenciesError) return <ErrorBox error={portDependenciesError} />;
+    return loadingFallback === undefined ? <Loading variant="editor" /> : loadingFallback;
+  }
 
   const tree = rootNodes.map(root => renderNode(root, ['入口'], new Set()));
   const orphanTree = rows.flatMap(row => (rendered.has(row.node) ? [] : [renderNode(row.node, ['孤立'], new Set())]));
   return (
     <>
-      {readOnly && portDependenciesError && <ErrorBox error={portDependenciesError} />}
+      {portDependenciesError && <ErrorBox error={portDependenciesError} />}
       {showHeader && (
         <div className="toolbar" style={{ marginTop: 14 }}>
           <b>整条链规则</b>
@@ -6586,7 +6694,7 @@ export function ChainRulesPanel({
           )}
         </div>
       )}
-      <div className="chain-rule-tree">
+      <div className="chain-rule-tree" aria-busy={portDependenciesPending}>
         {tree}
         {orphanTree.length > 0 && (
           <div className="chain-rule-orphans">

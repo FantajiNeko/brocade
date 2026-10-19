@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UserTrafficHistory } from '../src/api';
 import { NodeRealtimeProvider } from '../src/node-realtime';
 import {
   aggregateUserTraffic,
+  fallbackSource,
   hourModel,
   mergeRetained,
   nextListOrder,
@@ -13,6 +14,7 @@ import {
   UserRealtimeTrafficCard,
   type CardRow,
 } from '../src/user-traffic-realtime';
+import { Icon } from '../src/ui/icons';
 
 // This suite verifies card aggregation and source labels; the real canvas is covered by
 // browser checks. Letting the lazy chart import settle between tests makes jsdom timing-dependent.
@@ -71,6 +73,8 @@ const history = (
 });
 
 let served: UserTrafficHistory;
+/** ['nodes'] 查询的回包；为 null 时该请求一直挂起（大多数用例不需要机器名称与地区）。 */
+let servedNodes: { nodes: { node_id: string; name: string; public_ipv4_country: string | null }[] } | null;
 const renderCard = (card: ReactNode) =>
   render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
@@ -78,29 +82,27 @@ const renderCard = (card: ReactNode) =>
     </QueryClientProvider>,
   );
 const settle = () => act(() => vi.advanceTimersByTimeAsync(20));
-const names = (list: HTMLElement) =>
-  within(list)
-    .queryAllByRole('listitem')
-    .map(item => item.querySelector('.rut-name')?.textContent);
+const listItems = (list: HTMLElement) => within(list).queryAllByRole('listitem');
+const names = (list: HTMLElement) => listItems(list).map(item => item.querySelector('.rut-name')?.textContent);
 const item = (list: HTMLElement, name: string) => {
-  const found = within(list)
-    .queryAllByRole('listitem')
-    .find(row => row.querySelector('.rut-name')?.textContent === name);
+  const found = listItems(list).find(row => row.querySelector('.rut-name')?.textContent === name);
   if (!found) throw new Error(`row ${name} is missing`);
   return found;
 };
-const currentDown = (row: HTMLElement) => row.querySelector('.rut-rate.d .rut-rate-text')?.textContent;
+const currentDown = (row: HTMLElement) => row.querySelector('.rut-cur .d')?.textContent;
 
 beforeEach(() => {
   Events.sources = [];
   vi.useFakeTimers({ now: T * 1000 });
   vi.stubGlobal('EventSource', Events);
   served = history({ n1: [] });
+  servedNodes = null;
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       if (path.endsWith('/user-history') || path.endsWith('/realtime/history')) return Response.json(served);
+      if (path.endsWith('/nodes/agent-state') && servedNodes) return Response.json(servedNodes);
       return new Promise<Response>(() => {});
     }),
   );
@@ -340,7 +342,7 @@ describe('realtime user traffic data', () => {
     expect(unknown.get('a')).toMatchObject({ down: 10, up: 1, lastActiveMs: 1_000 });
   });
 
-  it('keeps the name order fixed and reorders by rate only on the chosen cadence', () => {
+  it('keeps numeric positions fixed until the user confirms a reorder', () => {
     const row = (key: string, down: number, hourBytes = 0): CardRow => ({
       key,
       name: key,
@@ -365,8 +367,15 @@ describe('realtime user traffic data', () => {
     expect(byDown.keys).toEqual(['b', 'a']);
     const swapped = [row('b', 1), row('a', 50)];
     expect(nextListOrder(byDown, swapped, 'down', false, 3_000)).toBe(byDown);
-    expect(nextListOrder(byDown, swapped, 'down', true, 9_000)).toBe(byDown);
-    expect(nextListOrder(byDown, swapped, 'down', false, 9_000).keys).toEqual(['a', 'b']);
+    const confirmed = nextListOrder(byDown, swapped, 'down', true, 9_000);
+    expect(confirmed.keys).toEqual(['a', 'b']);
+    expect(nextListOrder(confirmed, swapped, 'down', false, 60_000)).toBe(confirmed);
+
+    const unknown = [row('b', 0), row('a', 0)].map(value => ({ ...value, down: null, up: null }));
+    const waiting = nextListOrder(start, unknown, 'down', false, 0);
+    expect(waiting.keys).toEqual(['a', 'b']);
+    // Loading history before the first live frame must not immediately raise a stale-rank prompt.
+    expect(nextListOrder(waiting, [row('b', 50), row('a', 1)], 'down', false, 1_000).keys).toEqual(['b', 'a']);
   });
 });
 
@@ -387,7 +396,7 @@ describe('machine user traffic card', () => {
     expect(screen.getByText('转发实时待升级 Agent')).toBeTruthy();
     expect(screen.getByRole('region', { name: '当前速率' }).textContent).toContain('—');
   });
-  it('opens with the last hour, keeps idle users and keeps the list when the channel drops', async () => {
+  it('shows the hour as bars without the matrix and retains readings when the channel drops', async () => {
     served = history({ n1: [T - 90, T - 60, T - 30] }, [['n1', 'bob', [[T - 60, 300, 600]]]]);
     renderCard(
       <NodeRealtimeProvider nodeId="n1">
@@ -395,58 +404,58 @@ describe('machine user traffic card', () => {
       </NodeRealtimeProvider>,
     );
     await settle();
-    const list = screen.getByRole('list', { name: '各用户流量' });
-    expect(names(list)).toEqual(['bob']);
-    expect(screen.getByRole('region', { name: '近 1 小时' }).textContent).toContain('900');
-
+    const overview = screen.getByRole('region', { name: '实时流量' });
+    expect(within(overview).getByRole('region', { name: '近 1 小时' }).textContent).toContain('900B');
+    expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.queryByRole('group', { name: '排序' })).toBeNull();
+    expect(screen.queryByRole('searchbox')).toBeNull();
+    const now = screen.getByRole('region', { name: '当前速率' });
     act(() => Events.sources[0].send('sample', event('n1', [rate('alice')])));
-    expect(names(list)).toEqual(['alice', 'bob']);
-    expect(currentDown(item(list, 'alice'))).toBe('16.4Kbit/s');
-    expect(currentDown(item(list, 'bob'))).toBe('0');
-
-    // all 模式不再上报 alice：她的行保留，当前为 0
-    act(() => {
-      vi.advanceTimersByTime(1_000);
-      Events.sources[0].send('sample', event('n1', []));
-    });
-    expect(names(list)).toEqual(['alice', 'bob']);
-    expect(currentDown(item(list, 'alice'))).toBe('0');
-
-    act(() => {
-      vi.advanceTimersByTime(1_000);
-      Events.sources[0].send('sample', event('n1', [rate('alice')]));
-    });
+    expect(now.querySelector('.user-usage-hero-value')?.textContent).toContain('24.6');
+    expect(now.querySelector('.rut-hero-sub')?.textContent).toContain('共 2 位');
+    act(() => vi.advanceTimersByTime(1_000));
     act(() => Events.sources[0].send('status', { node_id: 'n1', connected: false }));
     expect(screen.getByText('实时通道未连接')).toBeTruthy();
     expect(screen.getByText(/当前速率停在/)).toBeTruthy();
-    expect(names(list)).toEqual(['alice', 'bob']);
-    expect(currentDown(item(list, 'alice'))).toBe('16.4Kbit/s');
+    expect(now.querySelector('.user-usage-hero-value')?.textContent).toContain('24.6');
   });
 
-  it('searches and sorts without dropping retained users', async () => {
-    served = history({ n1: [T - 30] }, [['n1', 'carol', [[T - 30, 9_000, 9_000]]]]);
+  it('merges the current ledger by chain without restoring an ingress grid', async () => {
+    const sourceOf = (key: string) => ({ key: key.endsWith('extra') ? 'ingress:c1' : key, name: key, country: null });
     renderCard(
       <NodeRealtimeProvider nodeId="n1">
-        <NodeUserTrafficCard nodeId="n1" />
+        <NodeUserTrafficCard nodeId="n1" sourceOf={sourceOf} />
       </NodeRealtimeProvider>,
     );
     await settle();
-    act(() =>
-      Events.sources[0].send('sample', event('n1', [rate('alice', 'entry', 1, 5_000), rate('bob', 'entry', 1, 50)])),
+    const rates = Array.from({ length: 26 }, (_, i) => rate(`u${String(i).padStart(2, '0')}`, `c${i % 7}`, i + 1, 100));
+    act(() => Events.sources[0].send('sample', event('n1', [...rates, rate('u01', 'extra', 5, 10)])));
+    const chains = screen.getByRole('region', { name: '当前经过的接入链' });
+    expect(within(chains).getAllByRole('listitem')).toHaveLength(6);
+    expect(chains.textContent).toContain('其余 2 条');
+    expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.queryByRole('button', { name: '当前' })).toBeNull();
+  });
+
+  it('marks forwarding sources with the shared icon alongside chain region flags', async () => {
+    renderCard(
+      <NodeRealtimeProvider nodeId="n1">
+        <NodeUserTrafficCard
+          nodeId="n1"
+          sourceOf={key => (key === 'forwarding' ? fallbackSource(key) : { key, name: '日本接入链', country: 'JP' })}
+        />
+      </NodeRealtimeProvider>,
     );
-    const list = screen.getByRole('list', { name: '各用户流量' });
-    expect(names(list)).toEqual(['alice', 'bob', 'carol']);
-
-    fireEvent.click(screen.getByRole('button', { name: '近 1 小时' }));
-    expect(names(list)).toEqual(['carol', 'alice', 'bob']);
-    fireEvent.click(screen.getByRole('button', { name: '下行' }));
-    expect(names(list)).toEqual(['alice', 'bob', 'carol']);
-
-    fireEvent.change(screen.getByRole('searchbox', { name: '搜索用户' }), { target: { value: 'bo' } });
-    expect(names(list)).toEqual(['bob']);
-    expect(screen.getByText('1 / 3')).toBeTruthy();
-    fireEvent.change(screen.getByRole('searchbox', { name: '搜索用户' }), { target: { value: 'zz' } });
-    expect(screen.getByText('没有匹配「zz」的用户')).toBeTruthy();
+    await settle();
+    const forwarded = { ...rate('alice', 'entry', 100, 200), forwarding_rule_id: 42 };
+    act(() => Events.sources[0].send('sample', event('n1', [rate(), forwarded])));
+    const sources = screen.getByRole('region', { name: '当前经过的接入链' });
+    const forwarding = within(sources).getByText('端口转发').closest('.rut-source')!;
+    const expected = render(<Icon of="forwarding" size={13} />).container.querySelector('svg')!.innerHTML;
+    expect(forwarding.querySelector('.traffic-source-icon')?.getAttribute('aria-hidden')).toBe('true');
+    expect(forwarding.querySelector('svg')?.innerHTML).toBe(expected);
+    expect(forwarding.querySelector('.geo-flag')).toBeNull();
+    expect(within(sources).getByRole('img', { name: 'JP 地区旗' })).toBeTruthy();
   });
 
   it('does not present a reset counter baseline as zero traffic', async () => {
@@ -465,9 +474,105 @@ describe('machine user traffic card', () => {
       '—',
     ]);
   });
+
+  it('retains recent machine rates only for warming, not a counter gap or disabled observation', async () => {
+    renderCard(
+      <NodeRealtimeProvider nodeId="n1">
+        <NodeUserTrafficCard nodeId="n1" />
+      </NodeRealtimeProvider>,
+    );
+    await settle();
+    const source = Events.sources[0];
+    act(() => source.send('sample', event()));
+    const now = screen.getByRole('region', { name: '当前速率' });
+    const reading = now.querySelector('.user-usage-hero-value')?.textContent;
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+      source.send('sample', event('n1', [], true, { state: 'warming' }));
+    });
+    expect(screen.getByText('采样恢复中 · 保留最近读数')).toBeTruthy();
+    expect(now.querySelector('.user-usage-hero-value')?.textContent).toBe(reading);
+
+    act(() => source.send('sample', event('n1', [], true, { has_gap: true })));
+    expect(screen.getByText('正在建立速率基线')).toBeTruthy();
+    expect(screen.getByRole('region', { name: '当前速率' }).querySelector('.user-usage-hero-value')?.textContent).toBe(
+      '—',
+    );
+
+    act(() =>
+      source.send('snapshot', {
+        policy: { enabled: false },
+        nodes: [{ ...node('n1'), samples: [event('n1', [], true, { state: 'warming' })] }],
+      }),
+    );
+    expect(screen.getByText('实时观测已关闭')).toBeTruthy();
+    expect(screen.getByRole('region', { name: '当前速率' }).querySelector('.user-usage-hero-value')?.textContent).toBe(
+      '—',
+    );
+  });
 });
 
 describe('user realtime traffic card', () => {
+  it('keeps recent rates through authorization renewal without extending their freshness on warming frames', async () => {
+    renderCard(<UserRealtimeTrafficCard tenantId="platform" userId="alice" nameOf={id => id} />);
+    const source = Events.sources[0];
+    act(() => source.send('snapshot', { policy: { enabled: true }, nodes: [node('n1')] }));
+    await settle();
+    const now = screen.getByRole('region', { name: '当前速率' });
+    const reading = now.querySelector('.user-usage-hero-value')?.textContent;
+    const list = screen.getByRole('list', { name: '各入口机器流量' });
+
+    act(() => source.send('reset', 'authorization_refresh'));
+    expect(source.closed).toBe(true);
+    const renewed = Events.sources[1];
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+      renewed.send('snapshot', {
+        policy: { enabled: true },
+        nodes: [{ ...node('n1'), samples: [event('n1', [], false, { state: 'warming' })] }],
+      });
+    });
+    expect(screen.queryByText('正在建立速率基线')).toBeNull();
+    expect(screen.getByText('采样恢复中 · 保留最近读数')).toBeTruthy();
+    expect(now.querySelector('.user-usage-hero-value')?.textContent).toBe(reading);
+    expect(currentDown(item(list, 'n1'))).toBe('16.4Kbit/s');
+
+    act(() => {
+      vi.advanceTimersByTime(14_000);
+      renewed.send('sample', event('n1', [], false, { state: 'warming' }));
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(screen.getByText('正在建立速率基线')).toBeTruthy();
+    expect(now.querySelector('.user-usage-hero-value')?.textContent).toBe('—');
+
+    act(() => renewed.send('sample', event('n1', [rate('alice', 'entry', 10, 100)])));
+    expect(screen.getByText('实时 · 每秒更新')).toBeTruthy();
+    expect(currentDown(item(list, 'n1'))).toBe('800bit/s');
+  });
+
+  it("does not reuse another user's recent reading while their baseline warms", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const card = (userId: string) => (
+      <QueryClientProvider client={client}>
+        <UserRealtimeTrafficCard tenantId="platform" userId={userId} nameOf={id => id} />
+      </QueryClientProvider>
+    );
+    const view = render(card('alice'));
+    act(() => Events.sources[0].send('snapshot', { policy: { enabled: true }, nodes: [node('n1')] }));
+    await settle();
+    view.rerender(card('bob'));
+    act(() =>
+      Events.sources[1].send('snapshot', {
+        policy: { enabled: true },
+        nodes: [{ ...node('n1'), samples: [event('n1', [], false, { state: 'warming' })] }],
+      }),
+    );
+    expect(screen.getByText('正在建立速率基线')).toBeTruthy();
+    expect(screen.getByRole('region', { name: '当前速率' }).querySelector('.user-usage-hero-value')?.textContent).toBe(
+      '—',
+    );
+  });
+
   it('labels forwarding only on the machine that actually carries it, including idle rules', async () => {
     served = history({ n1: [], n2: [] });
     renderCard(<UserRealtimeTrafficCard tenantId="platform" userId="alice" nameOf={id => id} />);
@@ -492,6 +597,29 @@ describe('user realtime traffic card', () => {
     expect(item(list, 'n2').textContent).toContain('含转发');
   });
 
+  it('marks entry machines with their region flag and keeps the hour chart and four sorts', async () => {
+    servedNodes = {
+      nodes: [
+        { node_id: 'n1', name: '东京 A', public_ipv4_country: 'JP' },
+        { node_id: 'n2', name: 'n2', public_ipv4_country: null },
+      ],
+    };
+    served = history({ n1: [T - 30], n2: [T - 30] }, [['n1', 'alice', [[T - 30, 10, 20]]]]);
+    renderCard(<UserRealtimeTrafficCard tenantId="platform" userId="alice" nameOf={id => id} />);
+    act(() => Events.sources[0].send('snapshot', { policy: { enabled: true }, nodes: [node('n1'), node('n2')] }));
+    await settle();
+    const list = screen.getByRole('list', { name: '各入口机器流量' });
+    expect(within(item(list, 'n1')).getByRole('img', { name: 'JP 地区旗' })).toBeTruthy();
+    // 没有国别的机器与机器详情页头一样不画底板，只占位
+    expect(item(list, 'n2').querySelector('.nd-idplate')).toBeNull();
+    expect(item(list, 'n2').querySelector('.rut-mark-slot')).toBeTruthy();
+    expect(item(list, 'n1').querySelector('.rut-meta')?.textContent).toBe('1 个接入点 · 30 B');
+    // 用户详情上方没有重复的曲线，合计图与四档排序保留
+    expect(screen.getByRole('region', { name: '近 1 小时' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '下行' })).toBeTruthy();
+    expect(screen.queryByRole('searchbox', { name: '搜索机器' })).toBeNull();
+  });
+
   it('sums only the selected user across machines and keeps the last rates when they expire', async () => {
     served = history({ n1: [T - 30], n2: [T - 30] }, [['n1', 'alice', [[T - 30, 10, 20]]]]);
     renderCard(<UserRealtimeTrafficCard tenantId="platform" userId="alice" nameOf={id => `机器 ${id}`} />);
@@ -512,6 +640,50 @@ describe('user realtime traffic card', () => {
     expect(screen.getByText('实时通道未连接')).toBeTruthy();
     expect(names(list)).toEqual(['机器 n1', '机器 n2']);
     expect(currentDown(item(list, '机器 n1'))).toBe('16.4Kbit/s');
+  });
+
+  it('updates a delayed machine independently and never counts retained offline or missing readings as current', async () => {
+    served = history({ n1: [], n2: [] });
+    renderCard(<UserRealtimeTrafficCard tenantId="platform" userId="alice" nameOf={id => id} />);
+    const received = Date.now();
+    const delayed = (down: number, ago: number) => ({
+      ...event('n2', [rate('alice', 'entry', 0, down)], false),
+      received_at_unix_millis: received - ago,
+      // Machine clocks are not a common time axis. Only Console receipt orders observations.
+      sample: {
+        ...event('n2', [rate('alice', 'entry', 0, down)], false).sample,
+        sampled_at_unix_millis: received - 3_600_000,
+      },
+    });
+    act(() =>
+      Events.sources[0].send('snapshot', {
+        policy: { enabled: true },
+        nodes: [node('n1', [rate('alice', 'entry', 0, 1024)]), { ...node('n2'), samples: [delayed(1024, 4000)] }],
+      }),
+    );
+    await settle();
+    const list = screen.getByRole('list', { name: '各入口机器流量' });
+    const panel = screen.getByRole('region', { name: '当前速率' });
+    expect(currentDown(item(list, 'n2'))).toBe('8.19Kbit/s');
+    expect(item(list, 'n2').textContent).toContain('4 秒前收到');
+    act(() => Events.sources[0].send('sample', delayed(2048, 2000)));
+    act(() => vi.advanceTimersByTime(1000));
+    // n1 remains the largest receipt timestamp, but n2's newer rate must still appear.
+    expect(currentDown(item(list, 'n2'))).toBe('16.4Kbit/s');
+    expect(panel.querySelector('.user-usage-hero-value')?.textContent).toContain('24.6');
+    expect(item(list, 'n2').textContent).toContain('3 秒前收到');
+    // A late replay cannot replace n2 with an older high reading.
+    act(() => Events.sources[0].send('sample', delayed(10240, 3000)));
+    act(() => vi.advanceTimersByTime(1000));
+    expect(currentDown(item(list, 'n2'))).toBe('16.4Kbit/s');
+    act(() => Events.sources[0].send('status', { node_id: 'n2', connected: false, active: false }));
+    expect(currentDown(item(list, 'n2'))).toBe('16.4Kbit/s');
+    expect(panel.querySelector('.user-usage-hero-value')?.textContent).toContain('8.19');
+    expect(panel.textContent).toContain('部分速率合计');
+    expect(panel.textContent).toContain('1 / 2 台有读数');
+    act(() => Events.sources[0].send('sample', event('n2', [], false, { has_gap: true })));
+    expect(panel.querySelector('.user-usage-hero-value')?.textContent).toContain('8.19');
+    expect(item(list, 'n2').textContent).toContain('上次读数');
   });
 
   it('distinguishes an old Agent from idle and unsubscribes on navigation', async () => {

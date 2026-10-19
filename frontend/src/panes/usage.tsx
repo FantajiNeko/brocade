@@ -1,11 +1,13 @@
-// 用量页只回答“这个月用了多少”。机器容量预测是独立的管理员工作面，不在这里复用页签。
+// 月度台账与实时流量分为同级页签，共用发布页的连续纸与页头。容量预测保留独立页面。
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { fetchUsageMonthly, type UsageDailyRow, type UsageMonthlySummary } from '../api';
+import { isVisitor, useSession } from '../session';
 import { ErrorBox, Loading } from '../ui/bits';
 import { bytes, shareOf } from '../ui/format';
-import { ListIcon } from '../ui/icons';
+import { Icon } from '../ui/icons';
+import { FleetTrafficTab } from './fleet-traffic';
 
 const monthLabel = (s: string) => `${s.slice(0, 4)} 年 ${parseInt(s.slice(5, 7), 10)} 月`;
 const dayLabel = (s: string) =>
@@ -52,62 +54,129 @@ function controlPlaneToday(now: Date): string {
   return `${part('year')}-${part('month')}-${part('day')}`;
 }
 
-export function UsagePane() {
-  return (
-    <div className="cardpage usage-page">
-      <MonthlyUsagePanel />
-    </div>
-  );
-}
+const USAGE_TABS = [
+  { key: 'realtime', label: '实时', icon: 'observe' },
+  { key: 'monthly', label: '汇总', icon: 'usage' },
+] as const;
+type UsageTab = (typeof USAGE_TABS)[number]['key'];
 
-function MonthlyUsagePanel() {
+export function UsagePane() {
+  const { who } = useSession();
+  const allowMachineDetails = !isVisitor(who);
+  const usageTabs = USAGE_TABS;
+  const [tab, setTab] = useState<UsageTab>('realtime');
   const [monthOffset, setMonthOffset] = useState<0 | -1>(0);
+  const [selectedDayKey, setSelectedDayKey] = useState<string | null>(null);
+  const idBase = useId();
+  const tabId = (key: UsageTab) => `${idBase}-${key}-tab`;
+  const panelId = `${idBase}-panel`;
   const monthly = useQuery({
     queryKey: monthOffset === 0 ? ['usage-monthly'] : ['usage-monthly', monthOffset],
     queryFn: () => fetchUsageMonthly(monthOffset),
+    enabled: tab === 'monthly',
     // Month changes are refreshes inside an already-mounted surface. Keep the current reading in
     // place until the next month is ready so the page title, switch and panel never remount.
     placeholderData: previous => previous,
   });
 
-  if (monthly.isPending) return <Loading variant="usage" />;
+  const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>, from: UsageTab) => {
+    const index = usageTabs.findIndex(item => item.key === from);
+    let next: number | null = null;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % usageTabs.length;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + usageTabs.length) % usageTabs.length;
+    if (event.key === 'Home') next = 0;
+    if (event.key === 'End') next = usageTabs.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    const key = usageTabs[next].key;
+    setTab(key);
+    window.requestAnimationFrame(() => document.getElementById(tabId(key))?.focus());
+  };
+
+  if (tab === 'monthly' && monthly.isPending) return <Loading variant="usage" />;
 
   return (
-    <section
-      className="panel titled usage-summary-panel"
-      data-page-title="true"
-      aria-busy={monthly.isFetching || undefined}
-    >
-      <header>
-        <ListIcon of="usage" />
-        <h4>用量</h4>
-        <span className="sp" />
-        {monthly.isFetching && !monthly.isPending && <span className="usage-refreshing">读取中</span>}
-        <div className="segsw usage-month-tabs" role="group" aria-label="用量月份">
-          <button type="button" aria-pressed={monthOffset === 0} onClick={() => setMonthOffset(0)}>
-            本月
-          </button>
-          <button type="button" aria-pressed={monthOffset === -1} onClick={() => setMonthOffset(-1)}>
-            上月
-          </button>
+    <div className="nd-sheet nd-page usage-page">
+      <div className="fg-sheet nd-paper">
+        <header className="nd-page-head">
+          <div className="nd-page-identity">
+            <span className="cg-plate">
+              <Icon of="usage" size={18} />
+            </span>
+            <h1 className="nd-id nd-name">用量</h1>
+          </div>
+          <div className="nd-tabs" role="tablist" aria-label="用量页签">
+            <div className="nd-tabs-seg">
+              {usageTabs.map(item => (
+                <button
+                  key={item.key}
+                  type="button"
+                  id={tabId(item.key)}
+                  role="tab"
+                  aria-selected={tab === item.key}
+                  aria-controls={panelId}
+                  tabIndex={tab === item.key ? 0 : -1}
+                  onKeyDown={event => moveTab(event, item.key)}
+                  onClick={() => setTab(item.key)}
+                >
+                  <Icon of={item.icon} size={14} className="nd-tab-ic" />
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {tab === 'monthly' && (
+            <div className="nd-tools">
+              {monthly.isFetching && <span className="usage-refreshing">读取中</span>}
+              <div className="segsw usage-month-tabs" role="group" aria-label="用量月份">
+                <button type="button" aria-pressed={monthOffset === 0} onClick={() => setMonthOffset(0)}>
+                  本月
+                </button>
+                <button type="button" aria-pressed={monthOffset === -1} onClick={() => setMonthOffset(-1)}>
+                  上月
+                </button>
+              </div>
+            </div>
+          )}
+        </header>
+        <div
+          className="nd-paper-body usage-tab-body"
+          role="tabpanel"
+          id={panelId}
+          aria-labelledby={tabId(tab)}
+          aria-busy={(tab === 'monthly' && monthly.isFetching) || undefined}
+        >
+          {tab === 'monthly' ? (
+            <>
+              {/* Refresh failures keep the selected month on screen with an explicit error. */}
+              {monthly.error && <ErrorBox error={monthly.error} />}
+              {monthly.data && (
+                <UsageMonth summary={monthly.data} selectedDayKey={selectedDayKey} onSelectDay={setSelectedDayKey} />
+              )}
+            </>
+          ) : (
+            <FleetTrafficTab allowMachineDetails={allowMachineDetails} />
+          )}
         </div>
-      </header>
-
-      {/* A failed refresh keeps the month already on screen; the error explains why it may be stale. */}
-      {monthly.error && <ErrorBox error={monthly.error} />}
-      {monthly.data && <UsageMonth summary={monthly.data} />}
-    </section>
+      </div>
+    </div>
   );
 }
 
-function UsageMonth({ summary }: { summary: UsageMonthlySummary }) {
-  // The ledger's peak day and the chart's columns select the same day, so the selection lives here.
-  const [selectedDayKey, setSelectedDayKey] = useState<string | null>(null);
+function UsageMonth({
+  summary,
+  selectedDayKey,
+  onSelectDay,
+}: {
+  summary: UsageMonthlySummary;
+  selectedDayKey: string | null;
+  onSelectDay: (day: string) => void;
+}) {
   const days = calendarDays(summary);
   return (
     <div className="usage-cockpit">
-      <UsageLedger summary={summary} days={days} onSelectDay={setSelectedDayKey} />
-      <DailyUsageChart summary={summary} days={days} selectedDayKey={selectedDayKey} onSelectDay={setSelectedDayKey} />
+      <UsageLedger summary={summary} days={days} onSelectDay={onSelectDay} />
+      <DailyUsageChart summary={summary} days={days} selectedDayKey={selectedDayKey} onSelectDay={onSelectDay} />
     </div>
   );
 }

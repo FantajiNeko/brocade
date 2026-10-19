@@ -1,5 +1,9 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 import type { VpngateRealtimeReport } from './vpngate-realtime';
+import { useNow } from './ui/clock';
+import { useMetricValue } from './ui/metric-cadence';
+import { realtimeFacts } from './realtime-facts';
+import { olderRealtimeEvent } from './realtime-order';
 
 export interface RealtimeUserTrafficRate {
   tenant_id: string;
@@ -25,6 +29,7 @@ export interface NodeRealtimeEvent {
   node_id?: string;
   received_at_unix_millis: number;
   sample: {
+    sequence?: number;
     /** Heavy worker reports are a lower-frequency delta; absent fields retain the last complete
      * report only when this flag is true. Without the flag, absence authoritatively clears it. */
     diagnostics_unchanged?: boolean;
@@ -35,6 +40,9 @@ export interface NodeRealtimeEvent {
     mux?: unknown;
     vpngate?: VpngateRealtimeReport | null;
     user_traffic?: RealtimeUserTrafficReport | null;
+    rx_bytes_per_sec?: number;
+    tx_bytes_per_sec?: number;
+    has_gap?: boolean;
   };
 }
 
@@ -98,7 +106,8 @@ export function mergeNodeRealtimeEvent(
 
 function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
   const [last, setLast] = useState<{ nodeId: string; event: NodeRealtimeEvent; arrived: number } | null>(null);
-  const [now, setNow] = useState(() => Date.now());
+  const now = useNow();
+  const displayedLast = useMetricValue(last, nodeId ?? '', JSON.stringify(realtimeFacts(last?.event, now)));
   const [connectedNodeId, setConnectedNodeId] = useState<string | null>(null);
   const [enabled, setEnabled] = useState<{ nodeId: string; value: boolean } | null>(null);
   const [observation, setObservation] = useState(() => ({ nodeId, startedAt: Date.now() }));
@@ -115,12 +124,11 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
     let pollAbort: AbortController | undefined;
     let polling = false;
     let stopped = false;
+    let newest: NodeRealtimeEvent | undefined;
     const accept = (event: NodeRealtimeEvent, connected = true) => {
-      setLast(previous => {
-        const previousEvent = previous?.nodeId === nodeId ? previous.event : undefined;
-        const merged = mergeNodeRealtimeEvent(previousEvent, event);
-        return { nodeId, event: merged, arrived: Date.now() };
-      });
+      if (stopped || olderRealtimeEvent(event, newest)) return;
+      newest = mergeNodeRealtimeEvent(newest, event);
+      setLast({ nodeId, event: newest, arrived: Date.now() });
       if (connected) setConnectedNodeId(nodeId);
     };
     const acceptSnapshot = (nodes: NodeRealtimeSnapshot[], policyEnabled = true) => {
@@ -168,6 +176,7 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
       const opened = new EventSource(`/realtime/nodes/${encodeURIComponent(nodeId)}/events`, { withCredentials: true });
       source = opened;
       opened.addEventListener('sample', e => {
+        if (stopped || source !== opened) return;
         try {
           accept(JSON.parse((e as MessageEvent).data));
         } catch {
@@ -175,6 +184,7 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
         }
       });
       opened.addEventListener('snapshot', e => {
+        if (stopped || source !== opened) return;
         try {
           const payload = JSON.parse((e as MessageEvent).data) as {
             nodes: NodeRealtimeSnapshot[];
@@ -186,6 +196,7 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
         }
       });
       opened.addEventListener('status', e => {
+        if (stopped || source !== opened) return;
         try {
           const status = JSON.parse((e as MessageEvent).data) as { node_id?: string; connected?: boolean };
           if (!status.node_id || status.node_id === nodeId) setConnectedNodeId(status.connected ? nodeId : null);
@@ -202,19 +213,17 @@ function useNodeRealtimeSource(nodeId: string | null): NodeRealtimeState {
       };
     };
     open();
-    const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => {
       stopped = true;
       source?.close();
       pollAbort?.abort();
       if (pollTimer) clearTimeout(pollTimer);
-      clearInterval(timer);
     };
   }, [nodeId]);
 
   return {
     nodeId: nodeId ?? '',
-    last: last?.nodeId === nodeId ? last : null,
+    last: displayedLast?.nodeId === nodeId ? displayedLast : null,
     now,
     connected: connectedNodeId === nodeId,
     enabled: enabled?.nodeId === nodeId ? enabled.value : true,

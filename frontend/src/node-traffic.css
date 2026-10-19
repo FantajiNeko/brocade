@@ -1,0 +1,458 @@
+/* ══ 用量中的机器弹层：顶部统计周期，正文为实时 → 流入 → 流出 ══ */
+.node-usage-dialog {
+  display: flex;
+  width: min(1280px, 100%);
+  max-height: calc(100dvh - 40px);
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.node-usage-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 52px;
+  padding: 10px 16px;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--line);
+}
+.node-usage-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.node-usage-identity .geo-flag {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-ctl);
+}
+.node-usage-identity h2 {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+  font: 600 14px/20px var(--sans);
+}
+.node-usage-actions,
+.node-usage-period {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+.node-usage-period-label {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.node-usage-actions > .node-usage-close {
+  flex: none;
+  width: var(--ctl-h);
+  padding: 0;
+}
+.node-usage-body {
+  min-height: 0;
+  padding: 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+@media (max-width: 820px) {
+  .node-usage-header {
+    padding-inline: 12px;
+  }
+  .node-usage-body {
+    padding: 12px;
+  }
+  .node-usage-actions > .node-usage-close {
+    width: 44px;
+    min-height: 44px;
+  }
+}
+@media (max-width: 620px) {
+  .node-usage-period-label {
+    display: none;
+  }
+  .node-usage-period .segsw button {
+    padding-inline: 8px;
+  }
+}
+.nt-details {
+  container: node-traffic / inline-size;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+}
+.nt-details > .panel {
+  margin: 0;
+  min-width: 0;
+}
+.nt-chain {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.nt-chain .geo-flag {
+  width: 16px;
+  height: 11px;
+  border-radius: 2px;
+}
+.nt-chain-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nt-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 2px;
+}
+
+/* ── 流入统计：共用 ── */
+.nti-card {
+  position: relative;
+  container: nti / inline-size;
+}
+.nti-card > header {
+  justify-content: space-between;
+  gap: 12px;
+}
+.nti-body {
+  padding: 12px var(--panel-content-x) 12px;
+}
+.nti-head {
+  margin-bottom: 12px;
+}
+.nti-who {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.nti-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 13px/18px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nti-num {
+  color: var(--ink);
+  font: 500 12.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.nti-pct {
+  color: var(--ink-4);
+  font: 500 11.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.nti-share {
+  color: var(--ink-4);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.nti-more {
+  margin-top: 8px;
+}
+
+/* A · 排行条形 */
+.nti-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin-bottom: 10px;
+}
+.nti-key {
+  display: inline-flex;
+  max-width: 100%;
+  height: 28px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: none;
+  color: var(--ink-2);
+  font: 12px var(--sans);
+  cursor: pointer;
+  transition: opacity 140ms;
+}
+.nti-key b {
+  color: var(--ink);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.nti-key.on {
+  border-color: var(--action);
+  background: var(--action-wash);
+}
+.nti-key.dim {
+  opacity: 0.55;
+}
+.nti-key:focus-visible,
+.nti-bar-btn:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.nti-bars {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nti-bar-btn {
+  display: grid;
+  width: calc(100% + 16px);
+  min-height: 34px;
+  grid-template-columns: minmax(120px, 168px) minmax(0, 1fr) 92px 52px;
+  align-items: center;
+  gap: 12px;
+  margin: 0 -8px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .nti-bar-btn:hover {
+    background: var(--hover);
+  }
+}
+.nti-bar-row.open > .nti-bar-btn {
+  background: color-mix(in srgb, var(--ink) 4%, transparent);
+}
+.nti-track {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.nti-bar {
+  display: flex;
+  height: 14px;
+  min-width: 3px;
+  gap: 2px;
+}
+.nti-bar > i {
+  display: block;
+  min-width: 2px;
+  border-radius: 1px;
+  transition: opacity 140ms;
+}
+.nti-bar > i:last-child {
+  border-radius: 1px 4px 4px 1px;
+}
+.nti-bar > i.dim {
+  opacity: 0.16;
+}
+.nti-detail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  padding: 6px 0 10px 32px;
+}
+.nti-dchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.nti-dchip b {
+  color: var(--ink);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.nti-detail-note {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+@container nti (max-width: 620px) {
+  .nti-bar-btn {
+    grid-template-areas:
+      'who num pct'
+      'track track track';
+    grid-template-columns: minmax(0, 1fr) auto 44px;
+    row-gap: 5px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+  .nti-bar-btn > .nti-who {
+    grid-area: who;
+  }
+  .nti-bar-btn > .nti-track {
+    grid-area: track;
+    padding-left: 32px;
+  }
+  .nti-bar-btn > .nti-num {
+    grid-area: num;
+  }
+  .nti-bar-btn > .nti-pct {
+    grid-area: pct;
+  }
+  .nti-detail {
+    padding-left: 32px;
+  }
+  /* 图例去掉占比，一行能放下两个 */
+  .nti-key .nti-share {
+    display: none;
+  }
+}
+
+/* B · 流向图 */
+.ntf-box {
+  position: relative;
+  margin: 6px 0 10px;
+}
+.ntf-svg {
+  position: absolute;
+  top: 0;
+  overflow: visible;
+}
+.ntf-labels {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+.ntf-labels.left {
+  left: 0;
+}
+.ntf-labels.right {
+  right: 0;
+}
+.ntf-label {
+  min-height: 24px;
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  white-space: nowrap;
+  transform: translateY(-50%);
+  transition: opacity 140ms;
+}
+.ntf-label.left {
+  right: 12px;
+}
+.ntf-label.right {
+  left: 12px;
+}
+.ntf-label b {
+  color: var(--ink);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.ntf-label.dim {
+  opacity: 0.35;
+}
+.ntf-name {
+  color: var(--ink);
+  font-weight: 500;
+}
+.ntf-link {
+  fill-opacity: 0.4;
+  cursor: pointer;
+  transition: fill-opacity 140ms;
+}
+.ntf-link.on {
+  fill-opacity: 0.8;
+}
+.ntf-link.dim {
+  fill-opacity: 0.08;
+}
+.ntf-node {
+  fill: color-mix(in srgb, var(--ink) 55%, transparent);
+  transition: opacity 140ms;
+}
+.ntf-node.dim {
+  opacity: 0.35;
+}
+
+.ntf-label {
+  min-height: 24px;
+  max-width: calc(100% - 16px);
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--sans);
+  cursor: pointer;
+  text-align: left;
+}
+.ntf-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ntf-label:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 3px;
+}
+.ntf-label b {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.nti-key {
+  height: auto;
+  min-height: 32px;
+  flex-wrap: wrap;
+  text-align: left;
+}
+.nt-chain {
+  overflow: hidden;
+}
+.node-site-users {
+  padding: 4px 8px 10px 30px;
+}
+.node-site-users ul {
+  display: grid;
+  gap: 4px;
+  margin: 4px 0;
+  padding: 0;
+  list-style: none;
+}
+.node-site-users li {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+}
+.node-site-users li > b {
+  grid-column: 2;
+  color: var(--ink-2);
+  font: 11px var(--mono);
+}
+.node-site-users li > .nti-share {
+  text-align: right;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ntf-link,
+  .ntf-node,
+  .ntf-label,
+  .nti-bar > i,
+  .nti-key {
+    transition: none;
+  }
+}

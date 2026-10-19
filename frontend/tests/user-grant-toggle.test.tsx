@@ -111,38 +111,64 @@ function mount(readSnapshot: () => Promise<Response>, write: (body: GrantWrite) 
 }
 
 describe('grant toggles', () => {
-  it('keeps a card locked after POST until the snapshot confirms the returned revision', async () => {
+  it('keeps card edits local until save and cancel restores the confirmed selection', async () => {
+    const read = vi.fn(async () => Response.json(snapshot(1, ['in-a', 'in-b'])));
+    const write = vi.fn(async (_body: GrantWrite) => Response.json({ revision_id: 2 }));
+    const { view, cards } = mount(read, write);
+
+    fireEvent.click(cards()[0]);
+    expect(cards()[0].getAttribute('aria-pressed')).toBe('false');
+    expect(write).not.toHaveBeenCalled();
+    const actions = view.container.querySelector('.grant-editor-actions')!;
+    expect([...actions.querySelectorAll('button')].map(button => button.textContent)).toEqual(['取消', '保存']);
+
+    fireEvent.click(view.getByRole('button', { name: '取消' }));
+    expect(cards()[0].getAttribute('aria-pressed')).toBe('true');
+    expect(view.queryByRole('button', { name: '保存' })).toBeNull();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it('keeps the proposed selection locked after save until the snapshot confirms its revision', async () => {
     const fresh = deferred<Response>();
     const read = vi.fn(() => fresh.promise);
     const write = vi.fn(async (_body: GrantWrite) => Response.json({ revision_id: 2 }));
-    const { cards } = mount(read, write);
+    const { view, cards } = mount(read, write);
     fireEvent.click(cards()[0]);
+    expect(write).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole('button', { name: '保存' }));
     await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
     expect(cards()[0].disabled).toBe(true);
-    expect(cards()[0].getAttribute('aria-pressed')).toBe('true');
+    expect(cards()[0].getAttribute('aria-pressed')).toBe('false');
+    expect((view.getByRole('button', { name: '保存中…' }) as HTMLButtonElement).disabled).toBe(true);
     await act(async () => fresh.resolve(Response.json(snapshot(2, ['in-b']))));
     await waitFor(() => expect(cards()[0].disabled).toBe(false));
     expect(cards()[0].getAttribute('aria-pressed')).toBe('false');
-    fireEvent.click(cards()[0]);
-    await waitFor(() => expect(write).toHaveBeenCalledTimes(2));
-    expect(write.mock.calls.map(([body]) => body.enabled)).toEqual([false, true]);
+    expect(view.queryByRole('button', { name: '保存' })).toBeNull();
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write.mock.calls[0][0].enabled).toBe(false);
   });
 
-  it('keeps A locked while B is submitted and settles independently', async () => {
+  it('submits every changed card from one save action in column order', async () => {
     const a = deferred<Response>();
     const b = deferred<Response>();
     const fresh = deferred<Response>();
     const write = vi.fn((body: GrantWrite) => (body.ingress_id === 'in-a' ? a.promise : b.promise));
-    const { cards } = mount(() => fresh.promise, write);
+    const { view, cards } = mount(() => fresh.promise, write);
     fireEvent.click(cards()[0]);
     fireEvent.click(cards()[1]);
+    expect(write).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(write).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(cards().map(card => card.disabled)).toEqual([true, true]));
     await act(async () => a.resolve(Response.json({ revision_id: 2 })));
-    expect(cards().map(card => card.disabled)).toEqual([true, true]);
-    await act(async () => fresh.resolve(Response.json(snapshot(2, ['in-b']))));
-    await waitFor(() => expect(cards()[0].disabled).toBe(false));
-    expect(cards()[1].disabled).toBe(true);
+    await waitFor(() => expect(write).toHaveBeenCalledTimes(2));
     await act(async () => b.resolve(Response.json({ revision_id: 3 })));
+    await act(async () => fresh.resolve(Response.json(snapshot(3, []))));
+    await waitFor(() => expect(cards().map(card => card.disabled)).toEqual([false, false]));
+    expect(write.mock.calls.map(([body]) => [body.ingress_id, body.enabled])).toEqual([
+      ['in-a', false],
+      ['in-b', false],
+    ]);
   });
 
   it('does not unlock a saved write on a canceled refresh, stale response or refresh error', async () => {
@@ -150,6 +176,7 @@ describe('grant toggles', () => {
     const read = vi.fn(() => stale.promise);
     const { client, view, cards } = mount(read, async () => Response.json({ revision_id: 2 }));
     fireEvent.click(cards()[0]);
+    fireEvent.click(view.getByRole('button', { name: '保存' }));
     await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
     await act(async () => client.cancelQueries({ queryKey: ['snapshot'] }));
     await act(async () => stale.resolve(Response.json(snapshot(1, ['in-a', 'in-b']))));
@@ -159,7 +186,7 @@ describe('grant toggles', () => {
       await client.refetchQueries({ queryKey: ['snapshot'] });
     });
     expect(cards()[0].disabled).toBe(true);
-    expect(cards()[0].getAttribute('aria-pressed')).toBe('true');
+    expect(cards()[0].getAttribute('aria-pressed')).toBe('false');
     read.mockImplementation(async () => Response.json({ error: '暂时读取失败' }, { status: 503 }));
     await act(async () => {
       await client.refetchQueries({ queryKey: ['snapshot'] });

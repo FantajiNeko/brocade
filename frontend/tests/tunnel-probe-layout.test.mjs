@@ -19,18 +19,15 @@ test('the tunnel detail probe panel collapses instead of overflowing narrow scre
     styles,
     /@container \(max-width: 700px\)[\s\S]*?\.tnd-metrics,\s*\.tnd-metrics\.is-3\s*\{\s*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?\.tnd-route\s*\{\s*flex-basis:\s*100%;/,
   );
-  assert.match(styles, /\.tunnel-probe-setting-facts code\s*\{[\s\S]*?overflow-wrap:\s*anywhere;/);
-  assert.match(styles, /\.tunnel-probe-settings\s*\{[\s\S]*?width:\s*100%;[\s\S]*?box-sizing:\s*border-box;/);
 });
 
 test('runtime settings stay inside the settings two-column flow', () => {
   assert.match(settings, /<div className="duo settings-layout">/);
   assert.match(settings, /<div className="col">[\s\S]*?<VpngateIntelligenceSection[\s\S]*?<\/fieldset>[\s\S]*?<\/div>/);
-  assert.match(settings, /<div className="col">[\s\S]*?<\/fieldset>[\s\S]*?<TunnelProbeSettingsSection[\s\S]*?<\/div>/);
-  assert.match(styles, /\.tunnel-probe-settings\s*\{[\s\S]*?container-type:\s*inline-size;/);
+  assert.doesNotMatch(settings, /TunnelProbeSettingsSection|set-tunnel-probes/);
   assert.match(styles, /\.vpngate-intelligence-settings\s*\{[\s\S]*?container-type:\s*inline-size;/);
   assert.match(
     styles,
-    /@container \(max-width: 700px\)[\s\S]*?\.vpngate-intelligence-layout\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/,
+    /@container \(max-width: 700px\)[\s\S]*?\.vpngate-intelligence-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/,
   );
 });

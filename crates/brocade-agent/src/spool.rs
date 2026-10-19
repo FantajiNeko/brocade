@@ -216,16 +216,35 @@ fn observe_wg_backend(state_dir: &Path) -> Option<String> {
     )
 }
 
-fn observe_versions(state_dir: &Path) -> NodeVersions {
+fn observe_versions(
+    state_dir: &Path,
+    xray_upgrade_in_progress: bool,
+    xray_upgrade_error: Option<&str>,
+) -> NodeVersions {
     let xray = crate::options::xray_binary_path();
+    let xray_version_output = run_command(&xray.to_string_lossy(), &["version"]).ok();
+    let xray_handoff = xray_upgrade_error.map_or_else(
+        || {
+            crate::xrayupdate::observe_handoff_capability(
+                state_dir,
+                xray_upgrade_in_progress,
+                xray_version_output.as_deref(),
+            )
+        },
+        |error| brocade_deployment::protocol::XrayHandoffCapability {
+            state: brocade_deployment::protocol::XrayHandoffState::Blocked,
+            reason: Some(format!("Xray 双进程状态损坏：{error}")),
+        },
+    );
     NodeVersions {
         // The sha256 of the running binary rather than `CARGO_PKG_VERSION`: nobody bumps a
         // workspace version on the way to a node, so that number claimed every build since it was
         // last touched was the same thing. See `identity.rs`.
         agent: crate::identity::self_identity().to_owned(),
-        xray: first_line(run_command(&xray.to_string_lossy(), &["version"]).ok()),
+        xray: first_line(xray_version_output.clone()),
         xray_installed_sha256: crate::installed_xray_sha256(),
         xray_running_sha256: crate::running_xray_sha256(),
+        xray_handoff: Some(xray_handoff),
         kernel_tls_module: Some(crate::kernel_tls_module_loaded()),
         phantun: first_line(run_command("phantun-client", &["--version"]).ok()),
         // OpenVPN alone is not a usable capability: without an openable TUN clone device every
@@ -270,16 +289,30 @@ fn observe_online_sources(state_dir: &Path) -> Result<Option<Vec<UserOnlineSourc
     if !enabled {
         return Ok(None);
     }
-    let api_port = crate::xray_api_port(&content)
-        .ok_or_else(|| "xray.json does not contain an API port".to_owned())?;
-    crate::xray_grpc::online_sources(api_port).map(Some)
+    let api_address = crate::xray_api_address(&content)
+        .ok_or_else(|| "xray.json does not contain an API address".to_owned())?;
+    crate::xray_grpc::online_sources(api_address).map(Some)
 }
 
 pub(crate) fn collect_runtime_report(
     state_dir: &Path,
     traffic: Option<brocade_deployment::protocol::NodeTrafficReading>,
 ) -> Result<NodeRuntimeReport, String> {
-    let versions = observe_versions(state_dir);
+    // Inspect and hash each release generation once per snapshot. Capability projection consumes
+    // the resulting presence bit instead of rereading and rehashing both process executables.
+    let (xray_upgrade, xray_upgrade_error) =
+        match crate::xrayupdate::read_upgrade_runtime(state_dir) {
+            Ok(runtime) => (runtime, None),
+            Err(error) => {
+                eprintln!("xray-upgrade: {error}");
+                (None, Some(error))
+            }
+        };
+    let versions = observe_versions(
+        state_dir,
+        xray_upgrade.is_some(),
+        xray_upgrade_error.as_deref(),
+    );
     let certificate = crate::certfile::observe(state_dir);
     let geodata = observe_geodata();
     let local_reconcile = fs::read_to_string(state_dir.join(LOCAL_RECONCILE_FILE))
@@ -305,6 +338,7 @@ pub(crate) fn collect_runtime_report(
         wireguard_health: wireguard_health_snapshot(state_dir),
         traffic,
         online_sources,
+        xray_upgrade,
         spool,
     })
 }
@@ -370,11 +404,36 @@ pub(crate) fn spool_push<T: serde::Serialize>(
     state_dir: &Path,
     item: &T,
 ) -> Result<(), String> {
+    spool_push_inner(spool, state_dir, item, false)
+}
+
+/// Append a fact unless the exact serialized fact is already durable. Configuration convergence
+/// recovery uses this after an Agent crash: the crash may have happened after the append but
+/// before its private recovery journal was removed, and replay must not manufacture a second
+/// observation while the first one is still queued.
+pub(crate) fn spool_push_unique<T: serde::Serialize>(
+    spool: Spool,
+    state_dir: &Path,
+    item: &T,
+) -> Result<(), String> {
+    spool_push_inner(spool, state_dir, item, true)
+}
+
+fn spool_push_inner<T: serde::Serialize>(
+    spool: Spool,
+    state_dir: &Path,
+    item: &T,
+    unique: bool,
+) -> Result<(), String> {
     let _guard = file_lock(spool)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut lines = spool_read_unlocked(spool, state_dir)?;
-    lines.push(serde_json::to_string(item).map_err(|error| error.to_string())?);
+    let line = serde_json::to_string(item).map_err(|error| error.to_string())?;
+    if unique && lines.iter().any(|existing| existing == &line) {
+        return Ok(());
+    }
+    lines.push(line);
     if lines.len() > spool.max {
         if spool.dropped_kind == DroppedKind::Usage {
             return Err(format!(
@@ -539,8 +598,9 @@ mod tests {
     use crate::options::{ApplyMode, Options};
 
     use super::{
-        body_for_attempt, collect_spool_backlog, first_line, observe_wg_backend, read_dropped,
-        spool_drain, spool_push, spool_read, DroppedKind, Spool, LOAD_SPOOL, OBSERVATION_SPOOL,
+        body_for_attempt, collect_runtime_report, collect_spool_backlog, first_line,
+        observe_wg_backend, read_dropped, spool_drain, spool_push, spool_read, DroppedKind, Spool,
+        LOAD_SPOOL, OBSERVATION_SPOOL,
     };
 
     const TEST_SPOOL: Spool = Spool {
@@ -566,6 +626,22 @@ mod tests {
 
         fs::write(dir.join("wireguard.disabled"), "").unwrap();
         assert_eq!(observe_wg_backend(&dir), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_upgrade_runtime_is_reported_as_a_blocked_capability() {
+        let dir = state_dir("corrupt-upgrade-runtime");
+        fs::write(dir.join("xray-upgrade.json"), b"{not-json").unwrap();
+
+        let report = collect_runtime_report(&dir, None).unwrap();
+        assert!(report.xray_upgrade.is_none());
+        let capability = report.versions.xray_handoff.unwrap();
+        assert_eq!(
+            capability.state,
+            brocade_deployment::protocol::XrayHandoffState::Blocked
+        );
+        assert!(capability.reason.unwrap().contains("双进程状态损坏"));
         fs::remove_dir_all(dir).unwrap();
     }
 

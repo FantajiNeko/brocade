@@ -1,3 +1,4 @@
+import { useMetricQuery } from '../ui/metric-cadence';
 import {
   useEffect,
   useMemo,
@@ -39,7 +40,7 @@ import { palette } from '../forge/palette';
 import { theme } from '../forge/theme';
 import { useNodeRealtime } from '../node-realtime';
 import { useSession } from '../session';
-import { Confirm, Empty, ErrorBox, SegSwitch } from '../ui/bits';
+import { Confirm, Empty, ErrorBox } from '../ui/bits';
 import { FieldLoading } from '../ui/loading';
 import { useNow } from '../ui/clock';
 import { PanelTitle } from '../ui/icons';
@@ -242,11 +243,11 @@ function catalogueState(status: VpngateCatalogStatus) {
   if (status.syncing) {
     return { label: '目录同步中', tone: 'warn' };
   }
-  if (status.last_error_code) {
-    return { label: '目录同步异常', tone: 'warn' };
-  }
   if (!status.enabled) {
     return { label: '目录已暂停', tone: 'idle' };
+  }
+  if (status.last_error_code) {
+    return { label: '目录同步异常', tone: 'warn' };
   }
   return { label: '目录正常', tone: '' };
 }
@@ -270,9 +271,19 @@ export function VpngatePage({
       : '',
   );
   const [countrySearch, setCountrySearch] = useState('');
-  const overview = useQuery({
+  const overview = useMetricQuery({
     queryKey: ['vpngate'],
     queryFn: fetchVpngateOverview,
+    metricFacts: data => [
+      data.status.enabled,
+      data.status.syncing,
+      data.status.last_success_run_id,
+      data.status.last_error_code,
+      data.status.last_error_detail,
+      data.admission_policy,
+      data.intelligence_policy,
+      data.intelligence_credentials,
+    ],
     retry: false,
     staleTime: 15_000,
     refetchInterval: 30_000,
@@ -285,9 +296,20 @@ export function VpngatePage({
     retry: false,
     refetchInterval: 15_000,
   });
-  const runtimes = useQuery({
+  const runtimes = useMetricQuery({
     queryKey: ['vpngate', 'runtimes'],
     queryFn: fetchVpngateRuntimes,
+    metricFacts: data =>
+      data.map(runtime => [
+        runtime.node_id,
+        runtime.outbound_id,
+        runtime.runtime_status,
+        runtime.selected_server_id,
+        runtime.latest_probe_status,
+        runtime.latest_error_code,
+        runtime.switch_request_id,
+        runtime.switch_status,
+      ]),
     retry: false,
     refetchInterval: 15_000,
   });
@@ -323,9 +345,13 @@ export function VpngatePage({
     defaultCountryCode ||
     configuredCountryCode;
   const country = countries.find(candidate => candidate.country_code === countryCode);
-  const runtimeServers = useQuery({
+  const runtimeServers = useMetricQuery({
     queryKey: directoryQueryKey(countryCode, DEFAULT_DIRECTORY_REQUEST),
     queryFn: () => fetchVpngateCountryServers(countryCode, DEFAULT_DIRECTORY_REQUEST),
+    metricFacts: data =>
+      data.items
+        .map(server => [server.id, server.active, server.latest_probe_status, server.latest_exit_ip])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
     enabled: tab === 'pool' && Boolean(countryCode),
     retry: false,
     staleTime: 30_000,
@@ -403,7 +429,14 @@ export function VpngatePage({
             <button
               className="btn"
               type="button"
-              disabled={!systemAdmin || sync.isPending || !overview.data || overview.data.status.syncing}
+              disabled={
+                !systemAdmin ||
+                sync.isPending ||
+                !overview.data ||
+                !overview.data.status.enabled ||
+                overview.data.status.syncing
+              }
+              title={overview.data && !overview.data.status.enabled ? '请先在配置中开启 VPN Gate' : undefined}
               onClick={() => sync.mutate()}
             >
               {sync.isPending ? '排队中…' : '立即同步'}
@@ -1038,9 +1071,13 @@ function CandidateTable({ countryCode, searchEnabled }: { countryCode: string; s
     }),
     [filter, page, querySearch, searchEnabled, sort],
   );
-  const directory = useQuery({
+  const directory = useMetricQuery({
     queryKey: directoryQueryKey(countryCode, request),
     queryFn: () => fetchVpngateCountryServers(countryCode, request),
+    metricFacts: data =>
+      data.items
+        .map(server => [server.id, server.active, server.latest_probe_status, server.latest_exit_ip])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
     retry: false,
     staleTime: 30_000,
     refetchInterval: 60_000,
@@ -1735,12 +1772,11 @@ function CollectionPanel({
   const queryClient = useQueryClient();
   const now = useNow();
   const { form, setForm } = useServerForm({
-    enabled: status.enabled,
     interval: String(status.interval_secs),
   });
-  const dirty = form.enabled !== status.enabled || form.interval !== String(status.interval_secs);
+  const dirty = form.interval !== String(status.interval_secs);
   const save = useMutation({
-    mutationFn: () => updateVpngateCatalogSettings({ enabled: form.enabled, interval_secs: Number(form.interval) }),
+    mutationFn: () => updateVpngateCatalogSettings({ enabled: status.enabled, interval_secs: Number(form.interval) }),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ['vpngate'] }),
   });
   const lastSync = syncHistory.at(-1);
@@ -1755,21 +1791,23 @@ function CollectionPanel({
         copy: lastSuccess,
         due: null,
       }
-    : status.last_error_code
+    : !status.enabled
       ? {
-          tone: 'err',
-          lamp: 'err',
-          label: '同步失败',
-          copy: `${lastSuccess}，目录保持该次快照`,
-          due: `重试 ${clockTime(status.next_sync_at_unix_secs)}`,
+          tone: '',
+          lamp: 'idle',
+          label: 'VPN Gate 已关闭',
+          copy: lastSync
+            ? `目录保持 ${clockTime(lastSync.finished_at_unix_secs)} 的快照，已发布 Chain 不受影响`
+            : '后台同步与拨测已暂停',
+          due: null,
         }
-      : !status.enabled
+      : status.last_error_code
         ? {
-            tone: '',
-            lamp: 'idle',
-            label: '自动同步已暂停',
-            copy: lastSync ? `目录保持 ${clockTime(lastSync.finished_at_unix_secs)} 的快照` : '尚无成功记录',
-            due: null,
+            tone: 'err',
+            lamp: 'err',
+            label: '同步失败',
+            copy: `${lastSuccess}，目录保持该次快照`,
+            due: `重试 ${clockTime(status.next_sync_at_unix_secs)}`,
           }
         : {
             tone: '',
@@ -1799,18 +1837,15 @@ function CollectionPanel({
               </span>
             </span>
           </header>
-          <p className="vpngate-collection-scope-note">
-            这里只管理 VPN Gate 目录的同步周期和快照；上游目录采集 Agent 在设置「情报任务」中统一选择。
-          </p>
           <div className={`cgr-notice vpngate-collection-status ${syncState.tone}`} role="status">
             <span className={`cg-lamp ${syncState.lamp}`} aria-hidden />
             <span className="vpngate-collection-status-text">
               <b>{syncState.label}</b>
-              {status.last_error_code && <code>{status.last_error_code}</code>}
+              {status.enabled && status.last_error_code && <code>{status.last_error_code}</code>}
               <span>{syncState.copy}</span>
             </span>
             {syncState.due && <span className="vpngate-collection-due">{syncState.due}</span>}
-            {status.last_error_code && status.last_error_detail && (
+            {status.enabled && status.last_error_code && status.last_error_detail && (
               <p className="vpngate-collection-error-detail">{status.last_error_detail}</p>
             )}
           </div>
@@ -1819,17 +1854,6 @@ function CollectionPanel({
 
           <div className="vpngate-collection-settings">
             <div className="vpngate-collection-controls">
-              <label>
-                自动同步
-                <SegSwitch
-                  checked={form.enabled}
-                  disabled={!systemAdmin}
-                  off="暂停"
-                  on="启用"
-                  ariaLabel="VPN Gate 自动同步"
-                  onChange={enabled => setForm(current => ({ ...current, enabled }))}
-                />
-              </label>
               <label>
                 同步间隔
                 <select
@@ -1844,6 +1868,7 @@ function CollectionPanel({
                   <option value="3600">1 小时</option>
                 </select>
               </label>
+              <span className="hint">整体开关在“配置 → VPN Gate”中管理</span>
               <span className="vpngate-collection-commit">
                 {save.isSuccess && !dirty && <span className="vpngate-collection-saved">已保存</span>}
                 <button

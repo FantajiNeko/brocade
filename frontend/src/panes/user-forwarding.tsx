@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
@@ -6,37 +6,44 @@ import {
   deleteForwardingEntitlement,
   deleteForwardingRule,
   fetchForwardingOverview,
+  fetchForwardingProbes,
   fetchNodes,
   fetchUsageMonthly,
   setForwardingEntitlement,
+  setForwardingQuota,
   updateForwardingRule,
   type ForwardingEntitlement,
   type ForwardingEntitlementWrite,
   type ForwardingOverview,
   type ForwardingProtocol,
+  type ForwardingProbe,
   type ForwardingRule,
   type ForwardingRuleWrite,
   type UserListItem,
+  type UserTrafficAccountingMode,
 } from '../api';
 import { Confirm, EmptyState, ErrorBox, SegmentedControl } from '../ui/bits';
 import { CopyButton, copyStateIcon } from '../ui/copy-button';
-import { DialogClose, DialogLayer } from '../ui/dialog';
 import { bytes, shareOf } from '../ui/format';
 import { endpointText, parseTarget, submittedHost, type ParsedTarget } from '../ui/forwarding-target';
 import { Icon, PanelTitle, type IconName } from '../ui/icons';
 import { FieldLoading } from '../ui/loading';
 import { observeBpsReading } from '../ui/observe-chart';
 import { RegionFlag } from '../ui/region-flag';
+import { useUnsavedChanges } from '../ui/navigation-guard';
 import { forwardingRuleRates, useUserTrafficSource } from '../user-traffic-source';
+import { UserTrafficAccountingSetting } from '../user-traffic-accounting';
+import {
+  ForwardingQuotaHistory,
+  forwardingQuotaJobsKey,
+  forwardingQuotaText,
+  forwardingQuotaValue,
+} from './forwarding-quota';
+import { ForwardingRuleProbe, forwardingProbeKey, forwardingProbePending } from './forwarding-probe';
 
-/* 用户详情 ·「转发入口」。
- *
- * 一张卡分两栏，写法同「用量与额度」：
- * - 左侧读数栏：本月转发（月度汇总里这位用户的转发行，含已删除规则）、下行 / 上行占比、
- *   当前速率（只有能看实时的身份才有），以及入口机器——点机器筛选右侧清单。
- * - 右侧规则清单：可搜索、排序；一条规则一行，点行展开详情，就地编辑。
- * 常态（已监听 / 已就绪）不写状态，只有同步中、收敛失败、已停用出字。
- * 删除规则、撤销与移除授权都先确认；授权与修改授权在对话框里一次填完策略。 */
+/* 用户详情「转发」页签：共用服务端查询，规则面板独立筛选机器。
+ * 月度转发独立于接入账本，已删除规则仍计入合计和所属机器；规则额度是数量上限。
+ * 授权与规则都在原行下展开；停止/移除授权原位确认，删除规则使用公共确认框。 */
 
 export interface ForwardingNodeOption {
   id: string;
@@ -47,6 +54,7 @@ export interface ForwardingNodeOption {
 }
 
 type RuleSort = 'port' | 'month' | 'created';
+type RuleFilter = 'all' | 'active' | 'attention' | 'disabled';
 type Traffic = { down: number; up: number };
 
 interface RuleDraft {
@@ -57,7 +65,11 @@ interface RuleDraft {
   name: string;
 }
 
-type RuleEditor = { mode: 'new'; draft: RuleDraft } | { mode: 'edit'; ruleId: number; draft: RuleDraft };
+type RuleEditor = ({ mode: 'new' } | { mode: 'edit'; ruleId: number }) & {
+  session: number;
+  draft: RuleDraft;
+  initial: RuleDraft;
+};
 
 interface PolicyDraft {
   nodeId: string;
@@ -67,18 +79,17 @@ interface PolicyDraft {
   end: string;
   max: string;
   allowPrivate: boolean;
+  quota: string;
 }
 
-type PolicyDialog = { mode: 'grant'; draft: PolicyDraft } | { mode: 'edit'; draft: PolicyDraft };
-type OpenMenu = { kind: 'rule'; id: number } | { kind: 'node'; id: string } | null;
+type PolicyDialog = {
+  mode: 'grant' | 'edit';
+  session: number;
+  draft: PolicyDraft;
+  initialQuota: { text: string; bytes: number | null };
+};
 
 const PROTOCOL_LABEL: Record<ForwardingProtocol, string> = { tcp: 'TCP', udp: 'UDP', tcp_udp: 'TCP + UDP' };
-
-const SORT_OPTIONS = [
-  { value: 'port', label: '入口端口' },
-  { value: 'month', label: '本月流量' },
-  { value: 'created', label: '创建时间' },
-] as const;
 
 // 新授权的默认策略：同时开放 TCP 与 UDP，使用完整的转发端口段，并允许内部目标。
 const GRANT_DEFAULTS = { start: 30_000, end: 59_999, max: 100, allowPrivate: true } as const;
@@ -92,6 +103,28 @@ const entitlementWrite = (entry: ForwardingEntitlement, enabled = entry.enabled)
   max_rules: entry.max_rules,
   allow_private_targets: entry.allow_private_targets,
 });
+
+const policyWrite = (draft: PolicyDraft, enabled: boolean): ForwardingEntitlementWrite => ({
+  enabled,
+  tcp_allowed: draft.tcp,
+  udp_allowed: draft.udp,
+  listen_port_start: Number(draft.start),
+  listen_port_end: Number(draft.end),
+  max_rules: Number(draft.max),
+  allow_private_targets: draft.allowPrivate,
+});
+const policyLimit = (dialog: PolicyDialog) =>
+  forwardingQuotaValue(dialog.draft.quota, dialog.initialQuota.text, dialog.initialQuota.bytes);
+const policyChanged = (dialog: PolicyDialog, entry: ForwardingEntitlement | undefined) =>
+  !entry ||
+  JSON.stringify(policyWrite(dialog.draft, entry.enabled)) !== JSON.stringify(entitlementWrite(entry)) ||
+  policyLimit(dialog) !== (entry.monthly_limit_bytes ?? null);
+const effectiveStatus = (rule: ForwardingRule, entry: ForwardingEntitlement | undefined) =>
+  !rule.enabled || !entry?.enabled ? 'disabled' : entry.quota_suspended ? 'quota-paused' : rule.runtime_status;
+const ruleCategory = (rule: ForwardingRule, entry: ForwardingEntitlement | undefined): Exclude<RuleFilter, 'all'> => {
+  const status = effectiveStatus(rule, entry);
+  return status === 'active' || status === 'disabled' ? status : 'attention';
+};
 
 const defaultProtocol = (entry: ForwardingEntitlement): ForwardingProtocol =>
   entry.tcp_allowed && entry.udp_allowed ? 'tcp_udp' : entry.tcp_allowed ? 'tcp' : 'udp';
@@ -136,18 +169,21 @@ const nextFreePort = (
 
 const entryState = (entry: ForwardingEntitlement) =>
   !entry.enabled
-    ? { tone: 'off', text: '已撤销' }
+    ? { tone: 'off', text: '已停止' }
     : entry.reconcile_status === 'error'
       ? { tone: 'bad', text: '收敛失败' }
       : entry.applied_generation !== entry.desired_generation
         ? { tone: 'warn', text: '同步中' }
-        : { tone: 'ok', text: '已就绪' };
+        : entry.quota_suspended
+          ? { tone: 'warn', text: '配额暂停' }
+          : { tone: 'ok', text: '已就绪' };
 
 const RULE_STATUS: Record<ForwardingRule['runtime_status'], { tone: string; text: string } | null> = {
   active: null,
   pending: { tone: 'warn', text: '同步中' },
   error: { tone: 'bad', text: '收敛失败' },
   disabled: { tone: 'off', text: '已停用' },
+  'quota-paused': { tone: 'warn', text: '配额暂停' },
 };
 
 /** 规则名默认就是目标地址；只有自定义过的名称才单独显示。 */
@@ -198,7 +234,8 @@ function checkRule(
   const problems: string[] = [];
   let targetBad = false;
   let portBad = false;
-  if (!entry) return { target, targetBad, portBad, problems: ['选择入口机器'], ok: false };
+  if (!entry) return { target, targetBad, portBad, problems: ['选择转发入口'], ok: false };
+  if (!entry.enabled) return { target, targetBad, portBad, problems: [`${entry.node_name} 已停止转发`], ok: false };
   if ('error' in parsed) {
     if (draft.target.trim()) {
       problems.push(parsed.error);
@@ -245,7 +282,7 @@ interface PolicyCheck {
 
 function checkPolicy(dialog: PolicyDialog, rules: ForwardingRule[]): PolicyCheck {
   const { draft } = dialog;
-  const ownRules = dialog.mode === 'edit' ? rules.filter(rule => rule.node_id === draft.nodeId) : [];
+  const ownRules = rules.filter(rule => rule.node_id === draft.nodeId);
   const enabledRules = ownRules.filter(rule => rule.enabled);
   const start = Number(draft.start);
   const end = Number(draft.end);
@@ -289,6 +326,8 @@ export function UserForwardingCard({
   canAuthorize,
   canManageRules,
   canViewRealtime = false,
+  accountingDisabled,
+  onAccountingModeChange,
 }: {
   user: UserListItem;
   nodes: ForwardingNodeOption[];
@@ -296,6 +335,8 @@ export function UserForwardingCard({
   canManageRules: boolean;
   /** 当前速率来自用户实时订阅，只有能看实时流量的身份才订阅。 */
   canViewRealtime?: boolean;
+  accountingDisabled: boolean;
+  onAccountingModeChange: (mode: UserTrafficAccountingMode) => void;
 }) {
   const qc = useQueryClient();
   const key = ['forwarding', user.tenant_id, user.id] as const;
@@ -305,59 +346,141 @@ export function UserForwardingCard({
     refetchInterval: query =>
       query.state.data?.rules.some(rule => rule.runtime_status === 'pending') ||
       query.state.data?.entitlements.some(
-        entry => entry.enabled && entry.desired_generation !== entry.applied_generation,
+        entry =>
+          entry.enabled &&
+          (entry.desired_generation !== entry.applied_generation ||
+            entry.quota_job_status === 'queued' ||
+            entry.quota_job_status === 'running' ||
+            (entry.monthly_limit_bytes != null &&
+              entry.monthly_used_bytes !== undefined &&
+              entry.monthly_used_bytes >= entry.monthly_limit_bytes) !== !!entry.quota_suspended),
       )
         ? 5_000
-        : false,
+        : query.state.data?.entitlements.some(entry => entry.monthly_limit_bytes != null)
+          ? 30_000
+          : false,
   });
   // 本月用量与用户页「用量与额度」共用同一份月度汇总
+  const probes = useQuery({
+    queryKey: forwardingProbeKey(user.tenant_id, user.id),
+    queryFn: () => fetchForwardingProbes(user.tenant_id, user.id),
+    enabled: canManageRules && !!overview.data?.rules.length,
+    refetchInterval: query => (query.state.data?.some(forwardingProbePending) ? 2_000 : false),
+    retry: false,
+  });
   const monthly = useQuery({ queryKey: ['usage-monthly'], queryFn: () => fetchUsageMonthly() });
   // 地区旗取机器列表；取不到时不画旗，不影响其余内容
   const fleet = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), retry: false });
   const realtime = useUserTrafficSource(user.tenant_id, user.id, canViewRealtime);
+  const accountingMultiplier = user.traffic_accounting_mode === 'double' ? 2 : 1;
 
-  const [filterNode, setFilterNode] = useState<string | null>(null);
+  const [pickedNode, setFilterNode] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<RuleFilter>('all');
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<RuleSort>('port');
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
   const [editor, setEditor] = useState<RuleEditor | null>(null);
-  const [menu, setMenu] = useState<OpenMenu>(null);
   const [policy, setPolicy] = useState<PolicyDialog | null>(null);
+  const [menu, setMenu] = useState<number | null>(null);
   const [deleting, setDeleting] = useState<ForwardingRule | null>(null);
-  const [revoking, setRevoking] = useState<ForwardingEntitlement | null>(null);
-  const [removing, setRemoving] = useState<ForwardingEntitlement | null>(null);
-
+  const serial = useRef(0);
+  const opener = useRef<HTMLElement | null>(null);
+  const activeSession = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    activeSession.current = editor?.session ?? policy?.session ?? null;
+  }, [editor?.session, policy?.session]);
+  const newSession = useCallback((trigger: HTMLElement) => {
+    opener.current = trigger;
+    return ++serial.current;
+  }, []);
+  const restoreFocus = useCallback((session: number) => {
+    if (activeSession.current === session) opener.current?.focus();
+  }, []);
+  const closeEditors = useCallback(() => {
+    opener.current?.focus();
+    setEditor(null);
+    setPolicy(null);
+  }, []);
   const storeResult = (value: ForwardingOverview) => qc.setQueryData(key, value);
-  const saveEntitlement = useMutation({
-    mutationFn: (value: { nodeId: string; body: ForwardingEntitlementWrite }) =>
-      setForwardingEntitlement(user.tenant_id, user.id, value.nodeId, value.body),
-    onSuccess: value => {
-      storeResult(value);
-      setPolicy(null);
-      setRevoking(null);
+  const savePolicy = useMutation({
+    mutationFn: async (dialog: PolicyDialog) => {
+      const nodeId = dialog.draft.nodeId;
+      let value = qc.getQueryData<ForwardingOverview>(key);
+      let current = value?.entitlements.find(entry => entry.node_id === nodeId);
+      const body = policyWrite(dialog.draft, current?.enabled ?? true);
+      const limit = policyLimit(dialog);
+      if (limit === undefined || !checkPolicy(dialog, value?.rules ?? []).ok)
+        throw new Error('授权参数无效，请检查后重试');
+      let savedPolicy = false;
+      if (!current || JSON.stringify(body) !== JSON.stringify(entitlementWrite(current))) {
+        value = await setForwardingEntitlement(user.tenant_id, user.id, nodeId, body);
+        storeResult(value);
+        current = value.entitlements.find(entry => entry.node_id === nodeId);
+        savedPolicy = true;
+        // A newly granted node must stay editable if its separate quota request fails.
+        setPolicy(active => (active?.session === dialog.session ? { ...active, mode: 'edit' } : active));
+      }
+      if (!current) throw new Error('保存响应缺少转发授权，请刷新后检查');
+      if (limit !== (current.monthly_limit_bytes ?? null)) {
+        try {
+          value = await setForwardingQuota(user.tenant_id, user.id, nodeId, limit);
+          storeResult(value);
+          void qc.invalidateQueries({ queryKey: forwardingQuotaJobsKey(user.tenant_id, user.id, nodeId) });
+        } catch (error) {
+          throw new Error(
+            `${current.node_name}：${savedPolicy ? '授权已保存，配额保存失败' : '配额保存失败'}：${error instanceof Error ? error.message : '请求失败，请重试'}`,
+            { cause: error },
+          );
+        }
+      }
+      return value;
+    },
+    onSuccess: (_value, dialog) => {
+      restoreFocus(dialog.session);
+      setPolicy(active => (active?.session === dialog.session ? null : active));
+      void qc.invalidateQueries({ queryKey: forwardingProbeKey(user.tenant_id, user.id) });
     },
   });
-  const dropEntitlement = useMutation({
-    mutationFn: (nodeId: string) => deleteForwardingEntitlement(user.tenant_id, user.id, nodeId),
-    onSuccess: (value, nodeId) => {
+  const lifecycle = useMutation({
+    mutationFn: async ({ nodeId, kind }: { nodeId: string; kind: 'stop' | 'remove' | 'resume'; session?: number }) => {
+      const current = qc.getQueryData<ForwardingOverview>(key)?.entitlements.find(entry => entry.node_id === nodeId);
+      if (!current) throw new Error('转发授权已不存在，请刷新');
+      if (kind === 'remove') {
+        if (current.enabled) throw new Error('先停止这台机器的转发，再移除入口');
+        return deleteForwardingEntitlement(user.tenant_id, user.id, nodeId);
+      }
+      return setForwardingEntitlement(user.tenant_id, user.id, nodeId, entitlementWrite(current, kind === 'resume'));
+    },
+    onSuccess: (value, variables) => {
       storeResult(value);
-      setRemoving(null);
-      setFilterNode(current => (current === nodeId ? null : current));
+      if (variables.kind === 'remove') setFilterNode(current => (current === variables.nodeId ? null : current));
+      if (variables.session !== undefined) {
+        restoreFocus(variables.session);
+        setPolicy(active => (active?.session === variables.session ? null : active));
+      }
+      void qc.invalidateQueries({ queryKey: forwardingProbeKey(user.tenant_id, user.id) });
     },
   });
   const createRule = useMutation({
-    mutationFn: (body: ForwardingRuleWrite) => createForwardingRule(user.tenant_id, user.id, body),
-    onSuccess: value => {
+    mutationFn: ({ body }: { body: ForwardingRuleWrite; session: number }) =>
+      createForwardingRule(user.tenant_id, user.id, body),
+    onSuccess: (value, variables) => {
       storeResult(value);
-      setEditor(null);
+      restoreFocus(variables.session);
+      setEditor(active => (active?.session === variables.session ? null : active));
+      void qc.invalidateQueries({ queryKey: forwardingProbeKey(user.tenant_id, user.id) });
     },
   });
   const updateRule = useMutation({
-    mutationFn: (value: { ruleId: number; body: ForwardingRuleWrite; fromEditor: boolean }) =>
+    mutationFn: (value: { ruleId: number; body: ForwardingRuleWrite; session?: number }) =>
       updateForwardingRule(user.tenant_id, user.id, value.ruleId, value.body),
     onSuccess: (value, variables) => {
       storeResult(value);
-      if (variables.fromEditor) setEditor(null);
+      if (variables.session !== undefined) {
+        restoreFocus(variables.session);
+        setEditor(active => (active?.session === variables.session ? null : active));
+      }
+      void qc.invalidateQueries({ queryKey: forwardingProbeKey(user.tenant_id, user.id) });
     },
   });
   const removeRule = useMutation({
@@ -375,6 +498,7 @@ export function UserForwardingCard({
 
   const entries = useMemo(() => overview.data?.entitlements ?? [], [overview.data]);
   const rules = useMemo(() => overview.data?.rules ?? [], [overview.data]);
+  const filterNode = entries.some(entry => entry.node_id === pickedNode) ? pickedNode : null;
   const entryOf = (nodeId: string) => entries.find(entry => entry.node_id === nodeId);
   const activeEntries = entries.filter(entry => entry.enabled);
   const granted = new Set(entries.map(entry => entry.node_id));
@@ -392,18 +516,23 @@ export function UserForwardingCard({
       row => row.tenant_id === user.tenant_id && row.user_id === user.id,
     );
     const byRule = new Map<number, Traffic>();
+    const byNode = new Map<string, Traffic>();
     for (const row of rows) {
+      const down = row.downlink_bytes * accountingMultiplier;
+      const up = row.uplink_bytes * accountingMultiplier;
+      const node = byNode.get(row.node_id) ?? { down: 0, up: 0 };
+      byNode.set(row.node_id, { down: node.down + down, up: node.up + up });
       const current = byRule.get(row.rule_id) ?? { down: 0, up: 0 };
-      byRule.set(row.rule_id, { down: current.down + row.downlink_bytes, up: current.up + row.uplink_bytes });
+      byRule.set(row.rule_id, { down: current.down + down, up: current.up + up });
     }
     const live = new Set(rules.map(rule => rule.id));
-    const down = rows.reduce((sum, row) => sum + row.downlink_bytes, 0);
-    const up = rows.reduce((sum, row) => sum + row.uplink_bytes, 0);
-    const deleted = rows
-      .filter(row => !live.has(row.rule_id))
-      .reduce((sum, row) => sum + row.downlink_bytes + row.uplink_bytes, 0);
-    return { byRule, down, up, deleted, start: monthly.data.month_start, end: monthly.data.month_end };
-  }, [monthly.data, rules, user.tenant_id, user.id]);
+    const down = rows.reduce((sum, row) => sum + row.downlink_bytes, 0) * accountingMultiplier;
+    const up = rows.reduce((sum, row) => sum + row.uplink_bytes, 0) * accountingMultiplier;
+    const deleted =
+      rows.filter(row => !live.has(row.rule_id)).reduce((sum, row) => sum + row.downlink_bytes + row.uplink_bytes, 0) *
+      accountingMultiplier;
+    return { byRule, byNode, down, up, deleted, start: monthly.data.month_start, end: monthly.data.month_end };
+  }, [accountingMultiplier, monthly.data, rules, user.tenant_id, user.id]);
   const monthOf = (rule: ForwardingRule): Traffic | null =>
     month ? (month.byRule.get(rule.id) ?? { down: 0, up: 0 }) : null;
 
@@ -431,17 +560,26 @@ export function UserForwardingCard({
     1,
     ...rules.map(rule => (month?.byRule.get(rule.id)?.down ?? 0) + (month?.byRule.get(rule.id)?.up ?? 0)),
   );
-  const multi = entries.length > 1 && !filterNode;
+  const scopedRules = rules.filter(rule => !filterNode || rule.node_id === filterNode);
+  const statusCounts = {
+    all: scopedRules.length,
+    active: scopedRules.filter(rule => ruleCategory(rule, entryOf(rule.node_id)) === 'active').length,
+    attention: scopedRules.filter(rule => ruleCategory(rule, entryOf(rule.node_id)) === 'attention').length,
+    disabled: scopedRules.filter(rule => ruleCategory(rule, entryOf(rule.node_id)) === 'disabled').length,
+  };
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase();
-    const filtered = rules.filter(
-      rule =>
+    const filtered = rules.filter(rule => {
+      const entry = entries.find(entry => entry.node_id === rule.node_id);
+      return (
         (!filterNode || rule.node_id === filterNode) &&
+        (statusFilter === 'all' || ruleCategory(rule, entry) === statusFilter) &&
         (!query ||
-          `:${rule.listen_port} ${rule.name} ${endpointText(rule.target_host, rule.target_port)}`
+          `:${rule.listen_port} ${rule.name} ${endpointText(rule.target_host, rule.target_port)} ${entry?.node_name ?? ''}`
             .toLowerCase()
-            .includes(query)),
-    );
+            .includes(query))
+      );
+    });
     const totalOf = (rule: ForwardingRule) => {
       const value = month?.byRule.get(rule.id);
       return value ? value.down + value.up : 0;
@@ -452,47 +590,60 @@ export function UserForwardingCard({
       created: (a, b) => parseTimestamp(b.created_at) - parseTimestamp(a.created_at),
     };
     return [...filtered].sort((a, b) => by[sort](a, b) || a.id - b.id);
-  }, [rules, filterNode, search, sort, month]);
-
+  }, [rules, entries, filterNode, statusFilter, search, sort, month]);
   const creatableEntries = activeEntries.filter(
-    entry => rules.filter(rule => rule.node_id === entry.node_id).length < entry.max_rules,
+    entry =>
+      (!filterNode || entry.node_id === filterNode) &&
+      rules.filter(rule => rule.node_id === entry.node_id).length < entry.max_rules,
   );
-
-  const draftFor = (entry: ForwardingEntitlement): RuleDraft => {
+  const selectedEntry = filterNode ? entryOf(filterNode) : undefined;
+  const createHint = !entries.length
+    ? '先授权一台机器'
+    : selectedEntry && !selectedEntry.enabled
+      ? '这台机器已停止转发'
+      : '规则数已达上限';
+  const closeRuleView = () => {
+    setEditor(null);
+    setMenu(null);
+  };
+  const beginCreate = (trigger: HTMLElement) => {
+    const entry = creatableEntries[0];
+    if (!entry) return;
+    if (editor?.mode === 'new') {
+      closeEditors();
+      return;
+    }
     const protocol = defaultProtocol(entry);
-    return {
+    const draft: RuleDraft = {
       nodeId: entry.node_id,
       target: '',
       port: String(nextFreePort(entry, rules, protocol) ?? ''),
       protocol,
       name: '',
     };
-  };
-  const beginCreate = () => {
-    const entry = creatableEntries.find(item => item.node_id === filterNode) ?? creatableEntries[0];
-    if (!entry) return;
-    createRule.reset();
-    setEditor({ mode: 'new', draft: draftFor(entry) });
-  };
-  const beginEdit = (rule: ForwardingRule) => {
-    updateRule.reset();
+    setPolicy(null);
     setMenu(null);
-    setEditor({
-      mode: 'edit',
-      ruleId: rule.id,
-      draft: {
-        nodeId: rule.node_id,
-        target: endpointText(rule.target_host, rule.target_port),
-        port: String(rule.listen_port),
-        protocol: rule.protocol,
-        name: customName(rule) ?? '',
-      },
-    });
+    setEditor({ mode: 'new', session: newSession(trigger), initial: draft, draft });
+  };
+  const beginEdit = (rule: ForwardingRule, trigger: HTMLElement) => {
+    if (editor?.mode === 'edit' && editor.ruleId === rule.id) {
+      closeEditors();
+      return;
+    }
+    const draft = {
+      nodeId: rule.node_id,
+      target: endpointText(rule.target_host, rule.target_port),
+      port: String(rule.listen_port),
+      protocol: rule.protocol,
+      name: customName(rule) ?? '',
+    };
+    setPolicy(null);
+    setMenu(null);
+    setEditor({ mode: 'edit', ruleId: rule.id, session: newSession(trigger), initial: draft, draft });
   };
   const toggleRule = (rule: ForwardingRule) =>
     updateRule.mutate({
       ruleId: rule.id,
-      fromEditor: false,
       body: {
         node_id: rule.node_id,
         name: rule.name,
@@ -503,10 +654,17 @@ export function UserForwardingCard({
         enabled: !rule.enabled,
       },
     });
-  const openGrant = () => {
-    saveEntitlement.reset();
+  const openGrant = (trigger: HTMLElement) => {
+    if (policy?.mode === 'grant') {
+      closeEditors();
+      return;
+    }
+    setEditor(null);
+    setMenu(null);
     setPolicy({
       mode: 'grant',
+      session: newSession(trigger),
+      initialQuota: { text: '', bytes: null },
       draft: {
         nodeId: '',
         tcp: true,
@@ -515,13 +673,22 @@ export function UserForwardingCard({
         end: String(GRANT_DEFAULTS.end),
         max: String(GRANT_DEFAULTS.max),
         allowPrivate: GRANT_DEFAULTS.allowPrivate,
+        quota: '',
       },
     });
   };
-  const openPolicy = (entry: ForwardingEntitlement) => {
-    saveEntitlement.reset();
+  const openPolicy = (entry: ForwardingEntitlement, trigger: HTMLElement) => {
+    if (policy?.mode === 'edit' && policy.draft.nodeId === entry.node_id) {
+      closeEditors();
+      return;
+    }
+    const quota = forwardingQuotaText(entry.monthly_limit_bytes);
+    setEditor(null);
+    setMenu(null);
     setPolicy({
       mode: 'edit',
+      session: newSession(trigger),
+      initialQuota: { text: quota, bytes: entry.monthly_limit_bytes ?? null },
       draft: {
         nodeId: entry.node_id,
         tcp: entry.tcp_allowed,
@@ -530,35 +697,54 @@ export function UserForwardingCard({
         end: String(entry.listen_port_end),
         max: String(entry.max_rules),
         allowPrivate: entry.allow_private_targets,
+        quota,
       },
     });
   };
-  const toggleExpanded = (ruleId: number) =>
+  const toggleExpanded = (ruleId: number) => {
+    if (editor?.mode === 'edit' && editor.ruleId === ruleId) {
+      closeEditors();
+      return;
+    }
     setExpanded(current => {
       const next = new Set(current);
       if (next.has(ruleId)) next.delete(ruleId);
       else next.add(ruleId);
       return next;
     });
-  // 行内操作（停用 / 启用、恢复授权）没有自己的表单，失败写在清单上方
-  const actionError = (!editor && updateRule.error) || (!policy && !revoking && saveEntitlement.error) || null;
-
+  };
+  useUnsavedChanges(
+    !!editor && JSON.stringify(editor.draft) !== JSON.stringify(editor.initial),
+    `${user.id} 的转发规则`,
+    `forwarding-rule:${user.tenant_id}/${user.id}`,
+  );
+  useUnsavedChanges(
+    !!policy && policyChanged(policy, entryOf(policy.draft.nodeId)),
+    `${user.id} 的转发授权`,
+    `forwarding-node:${user.tenant_id}/${user.id}`,
+  );
+  const actionError =
+    (updateRule.error &&
+      (updateRule.variables?.session === undefined || updateRule.variables.session !== editor?.session)) ||
+    (savePolicy.variables?.session !== policy?.session && savePolicy.error) ||
+    null;
   const ruleForm = (draftEditor: RuleEditor) => {
     const editing = draftEditor.mode === 'edit' ? rules.find(rule => rule.id === draftEditor.ruleId) : undefined;
-    const entry = entryOf(draftEditor.draft.nodeId);
-    const pending = draftEditor.mode === 'new' ? createRule.isPending : updateRule.isPending;
-    const error = draftEditor.mode === 'new' ? createRule.error : updateRule.error;
+    const mutation = draftEditor.mode === 'new' ? createRule : updateRule;
+    const ownMutation = mutation.variables?.session === draftEditor.session;
     return (
       <RuleForm
-        key={draftEditor.mode === 'new' ? 'new' : `edit-${draftEditor.ruleId}`}
+        key={draftEditor.session}
         editor={draftEditor}
-        entry={entry}
-        entries={activeEntries}
+        entry={entryOf(draftEditor.draft.nodeId)}
+        entries={draftEditor.mode === 'new' && selectedEntry ? [selectedEntry] : activeEntries}
         rules={rules}
-        pending={pending}
-        error={error}
-        onChange={draft => setEditor({ ...draftEditor, draft })}
-        onCancel={() => setEditor(null)}
+        pending={ownMutation && mutation.isPending}
+        error={ownMutation ? mutation.error : null}
+        onChange={draft =>
+          setEditor(active => (active?.session === draftEditor.session ? { ...active, draft } : active))
+        }
+        onCancel={closeEditors}
         onSubmit={(target, draft) => {
           const body: ForwardingRuleWrite = {
             node_id: draft.nodeId,
@@ -569,9 +755,32 @@ export function UserForwardingCard({
             target_port: target.port,
             enabled: editing ? editing.enabled : true,
           };
-          if (draftEditor.mode === 'new') createRule.mutate(body);
-          else updateRule.mutate({ ruleId: draftEditor.ruleId, body, fromEditor: true });
+          if (draftEditor.mode === 'new') createRule.mutate({ body, session: draftEditor.session });
+          else updateRule.mutate({ ruleId: draftEditor.ruleId, body, session: draftEditor.session });
         }}
+      />
+    );
+  };
+  const policyForm = () => {
+    if (!policy) return null;
+    const ownSave = savePolicy.variables?.session === policy.session;
+    const ownAction = lifecycle.variables?.session === policy.session;
+    return (
+      <PolicyEditorView
+        key={policy.session}
+        dialog={policy}
+        rules={rules}
+        nodes={availableNodes}
+        countryOf={countryOf}
+        entry={entryOf(policy.draft.nodeId)}
+        tenant={user.tenant_id}
+        user={user.id}
+        pending={(ownSave && savePolicy.isPending) || (ownAction && lifecycle.isPending)}
+        error={(ownSave && savePolicy.error) || (ownAction && lifecycle.error)}
+        onChange={draft => setPolicy(active => (active?.session === policy.session ? { ...active, draft } : active))}
+        onClose={closeEditors}
+        onSubmit={() => savePolicy.mutate(policy)}
+        onLifecycle={kind => lifecycle.mutate({ nodeId: policy.draft.nodeId, kind, session: policy.session })}
       />
     );
   };
@@ -588,7 +797,7 @@ export function UserForwardingCard({
       : null;
     return {
       entry: address ?? `:${rule.listen_port}`,
-      node: entry?.node_name ?? '入口机器',
+      node: entry?.node_name ?? '转发入口',
       month: usage ? usage.down + usage.up : null,
     };
   };
@@ -597,39 +806,20 @@ export function UserForwardingCard({
 
   return (
     <>
-      <section className="panel config-panel user-dcard user-forwarding-card">
+      <section className="panel config-panel user-dcard user-usage-card user-forwarding-usage">
         <header>
-          <PanelTitle of="chains">转发入口</PanelTitle>
-          {entries.length > 0 && (
-            <span className="rt">
-              <b>{activeEntries.length}</b> 台机器 · <b>{rules.length}</b> 条规则
-            </span>
-          )}
+          <PanelTitle of="usage">用量与额度</PanelTitle>
+          <span className="rt">
+            <b>{entries.length}</b> 个入口
+          </span>
         </header>
         <div className="user-dcard-body fwd-body">
           {overview.isPending ? (
             <FieldLoading label="读取转发授权" />
           ) : loadFailed ? (
             <ErrorBox error={overview.error} />
-          ) : entries.length === 0 ? (
-            <EmptyState
-              icon="chains"
-              title="尚未授权转发入口"
-              action={
-                canAuthorize && availableNodes.length > 0 ? (
-                  <button type="button" className="btn primary fwd-empty-action" onClick={openGrant}>
-                    <Icon of="plus" size={13} />
-                    授权机器
-                  </button>
-                ) : undefined
-              }
-            >
-              {canAuthorize
-                ? `授权一台机器后，${user.id} 可以在这台机器的端口范围内自建 TCP / UDP 端口转发。`
-                : '管理员授权机器后，用户才可以创建端口转发规则。'}
-            </EmptyState>
           ) : (
-            <div className="fwd-cockpit">
+            <div className="user-usage panel-full-bleed-body">
               <aside className="fwd-ledger user-usage-ledger" aria-label="本月转发">
                 <div className="user-usage-hero">
                   <span className="user-usage-hero-label">本月转发</span>
@@ -640,7 +830,7 @@ export function UserForwardingCard({
                   ) : (
                     <strong className="user-usage-hero-value none">{monthly.isPending ? '读取中' : '—'}</strong>
                   )}
-                  {month && (
+                  {month?.start && month.end && (
                     <span className="user-usage-reset">
                       {monthNumber(month.start)} 月 1 日起
                       <span className="usage-dot">·</span>
@@ -677,6 +867,11 @@ export function UserForwardingCard({
                     <span className="fwd-deleted">其中 {bytes(month.deleted)} 来自已删除的规则</span>
                   )}
                 </div>
+                <UserTrafficAccountingSetting
+                  mode={user.traffic_accounting_mode ?? 'single'}
+                  disabled={accountingDisabled}
+                  onChange={onAccountingModeChange}
+                />
                 {canViewRealtime && (
                   <div className="fwd-live">
                     <span>当前</span>
@@ -684,239 +879,370 @@ export function UserForwardingCard({
                     {liveSum && <small>{liveSum.active} 条在转发</small>}
                   </div>
                 )}
-                <div className="fwd-machines">
-                  <div className="fwd-mhead">
-                    <span>入口机器</span>
-                    {filterNode && (
-                      <button type="button" className="fwd-link" onClick={() => setFilterNode(null)}>
-                        全部
+              </aside>
+              {entries.length === 0 && policy?.mode !== 'grant' ? (
+                <EmptyState
+                  icon="forwarding"
+                  title="尚未授权转发入口"
+                  action={
+                    canAuthorize && availableNodes.length > 0 ? (
+                      <button
+                        type="button"
+                        className="btn primary fwd-empty-action"
+                        onClick={event => openGrant(event.currentTarget)}
+                      >
+                        <Icon of="plus" size={13} />
+                        授权机器
                       </button>
-                    )}
-                  </div>
+                    ) : undefined
+                  }
+                >
+                  {canAuthorize
+                    ? `授权一台机器后，${user.id} 可以在这台机器的端口范围内自建 TCP / UDP 端口转发。`
+                    : '管理员授权机器后，用户才可以创建端口转发规则。'}
+                </EmptyState>
+              ) : (
+                <div className="qta fwd-quotas fwe-aligned" role="list" aria-label="各转发入口的用量与规则额度">
                   {sortedEntries.map(entry => {
                     const state = entryState(entry);
                     const count = rules.filter(rule => rule.node_id === entry.node_id).length;
-                    const picked = filterNode === entry.node_id;
-                    const ruleCount = rules.filter(rule => rule.node_id === entry.node_id && rule.enabled).length;
+                    const traffic = month?.byNode.get(entry.node_id);
+                    const percent = entry.max_rules > 0 ? (count / entry.max_rules) * 100 : 0;
+                    const editing = canAuthorize && policy?.mode === 'edit' && policy.draft.nodeId === entry.node_id;
+                    const resuming =
+                      lifecycle.isPending &&
+                      lifecycle.variables?.kind === 'resume' &&
+                      lifecycle.variables.nodeId === entry.node_id;
                     return (
-                      <div key={entry.node_id} className={`fwd-mitem tone-${state.tone}${picked ? ' picked' : ''}`}>
-                        <button
-                          type="button"
-                          className="fwd-mpick"
-                          aria-pressed={picked}
-                          title={picked ? '显示全部机器的规则' : `只看 ${entry.node_name} 的规则`}
-                          onClick={() => setFilterNode(picked ? null : entry.node_id)}
-                        >
-                          <span className="fwd-mname">
+                      <div
+                        key={entry.node_id}
+                        role="listitem"
+                        className={`qta-r fwd-quota-row fwe-row ${percent >= 100 ? 'over' : percent >= 95 ? 'warn' : 'ok'}${editing ? ' fwe-open' : ''}`}
+                      >
+                        <span className="qta-name fwe-entry-name">
+                          <span className="qta-app">
                             <RegionFlag code={countryOf(entry.node_id)} />
                             <b>{entry.node_name || entry.node_id}</b>
                           </span>
-                          <span className={`fwd-mcount${count >= entry.max_rules ? ' full' : ''}`}>
-                            <b>{count}</b>/{entry.max_rules}
-                          </span>
-                          <span className="fwd-msub">
+                          <span className="qta-sub">
                             {state.tone === 'ok' ? (
                               `${allowedText(entry)} · ${entry.listen_port_start}–${entry.listen_port_end}`
                             ) : (
                               <span className={`fwd-st ${state.tone}`}>{state.text}</span>
                             )}
                           </span>
-                          <span className="fwd-capbar" aria-hidden="true">
-                            <i style={{ width: `${Math.min(100, (count / entry.max_rules) * 100)}%` }} />
+                        </span>
+                        <span className="qta-figs">
+                          {entry.monthly_used_bytes !== undefined
+                            ? bytes(entry.monthly_used_bytes)
+                            : month
+                              ? bytes(traffic ? traffic.down + traffic.up : 0)
+                              : '—'}
+                          {entry.monthly_limit_bytes != null && (
+                            <small className="dim"> / {bytes(entry.monthly_limit_bytes)}</small>
+                          )}
+                        </span>
+                        <span className="qta-left">
+                          规则
+                          <b>
+                            {count} / {entry.max_rules}
+                          </b>
+                        </span>
+                        <span className="qta-meter">
+                          <span className="qta-t" aria-hidden="true">
+                            <i style={{ width: `${Math.min(100, percent)}%` }} />
                           </span>
-                        </button>
-                        {canAuthorize && (
-                          <MoreMenu
-                            label={`${entry.node_name} 的授权操作`}
-                            open={menu?.kind === 'node' && menu.id === entry.node_id}
-                            onOpenChange={open => setMenu(open ? { kind: 'node', id: entry.node_id } : null)}
-                          >
-                            {entry.enabled ? (
-                              <>
-                                <MenuItem
-                                  icon="pencil"
-                                  title="修改授权"
-                                  note="协议、端口范围、规则上限、私网目标"
-                                  onSelect={() => openPolicy(entry)}
-                                />
-                                <MenuItem
-                                  icon="pause"
-                                  title="撤销授权"
-                                  note={`${ruleCount} 条规则停止转发，可以恢复`}
-                                  danger
-                                  onSelect={() => {
-                                    saveEntitlement.reset();
-                                    setRevoking(entry);
-                                  }}
-                                />
-                              </>
-                            ) : (
-                              <>
-                                <MenuItem
-                                  icon="play"
-                                  title="恢复授权"
-                                  note={`${ruleCount} 条规则重新监听`}
-                                  disabled={saveEntitlement.isPending}
-                                  onSelect={() =>
-                                    saveEntitlement.mutate({
-                                      nodeId: entry.node_id,
-                                      body: entitlementWrite(entry, true),
-                                    })
-                                  }
-                                />
-                                <MenuItem
-                                  icon="trash"
-                                  title="移除授权"
-                                  note={`连同 ${count} 条规则一起删除，流量记录保留`}
-                                  danger
-                                  onSelect={() => {
-                                    dropEntitlement.reset();
-                                    setRemoving(entry);
-                                  }}
-                                />
-                              </>
-                            )}
-                          </MoreMenu>
-                        )}
+                          <span className="qta-pct">{Math.round(percent)}%</span>
+                        </span>
+                        <span className="qta-acts">
+                          {canAuthorize && (
+                            <>
+                              {!entry.enabled && (
+                                <button
+                                  type="button"
+                                  className="btn fwe-resume"
+                                  aria-label={`恢复 ${entry.node_name} 的转发`}
+                                  disabled={resuming}
+                                  onClick={() => lifecycle.mutate({ nodeId: entry.node_id, kind: 'resume' })}
+                                >
+                                  {resuming ? '恢复中…' : '恢复'}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                className="fwd-ib"
+                                aria-label={`编辑 ${entry.node_name} 的转发授权`}
+                                title="编辑授权"
+                                aria-expanded={editing}
+                                onClick={event => openPolicy(entry, event.currentTarget)}
+                              >
+                                <Icon of="pencil" size={13} />
+                              </button>
+                            </>
+                          )}
+                        </span>
+                        {editing && <div className="fwe-sheet">{policyForm()}</div>}
                         {state.tone === 'bad' && entry.last_error && (
                           <p className="fwd-merr">
                             <Icon of="warn" size={12} />
                             {entry.last_error}
                           </p>
                         )}
+                        {lifecycle.error &&
+                          lifecycle.variables?.nodeId === entry.node_id &&
+                          lifecycle.variables.session === undefined && <ErrorBox error={lifecycle.error} />}
                       </div>
                     );
                   })}
-                  {canAuthorize && availableNodes.length > 0 && (
-                    <button type="button" className="fwd-add" onClick={openGrant}>
-                      <Icon of="plus" size={13} />
-                      <b>授权机器</b>
-                    </button>
+                  {canAuthorize && policy?.mode === 'grant' ? (
+                    <div className="qta-r fwd-quota-row fwe-row fwe-open fwe-grant" role="listitem">
+                      <span className="qta-name">
+                        <span className="qta-app">
+                          <b>授权机器</b>
+                        </span>
+                        <span className="qta-sub">转发入口</span>
+                      </span>
+                      <div className="fwe-sheet">{policyForm()}</div>
+                    </div>
+                  ) : (
+                    canAuthorize &&
+                    availableNodes.length > 0 && (
+                      <button type="button" className="fwd-add" onClick={event => openGrant(event.currentTarget)}>
+                        <Icon of="plus" size={13} />
+                        <b>授权机器</b>
+                      </button>
+                    )
                   )}
                 </div>
-              </aside>
-
-              <div className="fwd-main">
-                <div className="fwd-tools">
-                  <span className="user-list-search fwd-search">
-                    <Icon of="search" size={13} className="user-list-search-icon" />
-                    <input
-                      type="search"
-                      value={search}
-                      aria-label="搜索规则"
-                      placeholder="搜索端口、目标或名称"
-                      autoComplete="off"
-                      spellCheck={false}
-                      onChange={event => setSearch(event.target.value)}
-                    />
-                  </span>
-                  <SegmentedControl value={sort} options={SORT_OPTIONS} onChange={setSort} ariaLabel="排序" />
-                  {canManageRules && (
-                    <button
-                      type="button"
-                      className="btn fwd-new"
-                      disabled={creatableEntries.length === 0 || editor?.mode === 'new'}
-                      title={creatableEntries.length === 0 ? '已授权的机器都已达规则上限或已撤销' : undefined}
-                      onClick={beginCreate}
-                    >
-                      <Icon of="plus" size={13} />
-                      新建规则
-                    </button>
-                  )}
-                </div>
-                {actionError && <ErrorBox error={actionError} />}
-                {editor?.mode === 'new' && ruleForm(editor)}
-                {rules.length > 0 && (
-                  <div className={`fwd-cap${canViewRealtime ? '' : ' no-live'}`} aria-hidden="true">
-                    <span>入口</span>
-                    <span>目标</span>
-                    <span>协议</span>
-                    <span>本月</span>
-                    <span>{canViewRealtime ? '当前' : '状态'}</span>
-                  </div>
-                )}
-                <div className="fwd-rows" role="list" aria-label="转发规则">
-                  {visible.map(rule => {
-                    if (editor?.mode === 'edit' && editor.ruleId === rule.id) {
-                      return (
-                        <div key={rule.id} role="listitem" className="fwd-item editing">
-                          {ruleForm(editor)}
-                        </div>
-                      );
-                    }
-                    const entry = entryOf(rule.node_id);
-                    return (
-                      <RuleItem
-                        key={rule.id}
-                        rule={rule}
-                        entry={entry}
-                        country={countryOf(rule.node_id)}
-                        month={monthOf(rule)}
-                        live={liveOf(rule)}
-                        showLive={canViewRealtime}
-                        maxMonth={maxMonth}
-                        showNode={multi}
-                        open={expanded.has(rule.id)}
-                        canManage={canManageRules && !!entry?.enabled}
-                        busy={updateRule.isPending}
-                        menuOpen={menu?.kind === 'rule' && menu.id === rule.id}
-                        onMenu={open => setMenu(open ? { kind: 'rule', id: rule.id } : null)}
-                        onToggleOpen={() => toggleExpanded(rule.id)}
-                        onEdit={() => beginEdit(rule)}
-                        onToggleEnabled={() => toggleRule(rule)}
-                        onDelete={() => {
-                          removeRule.reset();
-                          setDeleting(rule);
-                        }}
-                      />
-                    );
-                  })}
-                </div>
-                {rules.length === 0 ? (
-                  <p className="fwd-none">还没有转发规则</p>
-                ) : visible.length === 0 ? (
-                  <p className="fwd-none">没有匹配的规则</p>
-                ) : null}
-              </div>
+              )}
             </div>
           )}
         </div>
         {!loadFailed && !overview.isPending && (
           <footer className="user-dcard-foot fwd-foot">
-            <span>转发流量单独统计，不占用线路额度；规则保存后由入口机器自动生效，不需要变更单。</span>
+            <span>转发流量单独统计，不占用线路额度；规则保存后由转发入口自动生效，不需要变更单。</span>
           </footer>
         )}
       </section>
+      <section className="panel config-panel user-dcard user-forwarding-card fwr-panel" aria-label="转发入口">
+        <header>
+          <PanelTitle of="forwarding">转发入口</PanelTitle>
+          <span className="rt">
+            <b>{rules.length}</b> 条规则
+          </span>
+          {canManageRules && overview.data && (
+            <button
+              type="button"
+              className="btn fwr-create"
+              disabled={creatableEntries.length === 0}
+              title={creatableEntries.length === 0 ? createHint : undefined}
+              aria-expanded={editor?.mode === 'new'}
+              onClick={event => beginCreate(event.currentTarget)}
+            >
+              <Icon of="plus" size={13} />
+              新建规则
+            </button>
+          )}
+        </header>
+        <div className="user-dcard-body panel-full-bleed-body fwd-body">
+          {overview.isPending ? (
+            <FieldLoading label="读取转发规则" />
+          ) : loadFailed ? (
+            <ErrorBox error={overview.error} />
+          ) : (
+            <div className="fwd-main fwr-main">
+              <div className="fwr-tools">
+                <label className="fwr-machine">
+                  <span>机器</span>
+                  <select
+                    className="f"
+                    aria-label="筛选转发机器"
+                    value={filterNode ?? ''}
+                    onChange={event => {
+                      closeRuleView();
+                      setFilterNode(event.target.value || null);
+                    }}
+                  >
+                    <option value="">全部机器 · {entries.length}</option>
+                    {sortedEntries.map(entry => (
+                      <option key={entry.node_id} value={entry.node_id}>
+                        {entry.node_name} · {rules.filter(rule => rule.node_id === entry.node_id).length} 条
+                        {!entry.enabled ? ' · 已停止' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <span className="user-list-search fwd-search">
+                  <Icon of="search" size={13} className="user-list-search-icon" />
+                  <input
+                    type="search"
+                    value={search}
+                    aria-label="搜索规则"
+                    placeholder="搜索端口、目标、名称"
+                    autoComplete="off"
+                    spellCheck={false}
+                    onChange={event => {
+                      closeRuleView();
+                      setSearch(event.target.value);
+                    }}
+                  />
+                </span>
+                <select
+                  className="f fwr-sort"
+                  aria-label="规则排序"
+                  value={sort}
+                  onChange={event => {
+                    closeRuleView();
+                    setSort(event.target.value as RuleSort);
+                  }}
+                >
+                  <option value="port">端口升序</option>
+                  <option value="month">本月流量 ↓</option>
+                  <option value="created">最近创建</option>
+                </select>
+              </div>
+              <div className="fwr-filterbar">
+                <SegmentedControl
+                  value={statusFilter}
+                  ariaLabel="筛选规则状态"
+                  options={(
+                    [
+                      ['all', '全部'],
+                      ['active', '已生效'],
+                      ['attention', '未生效'],
+                      ['disabled', '已停用'],
+                    ] as const
+                  ).map(([value, label]) => ({
+                    value,
+                    label: (
+                      <span className="fwr-filter-label">
+                        {label}
+                        <small>{statusCounts[value]}</small>
+                      </span>
+                    ),
+                  }))}
+                  onChange={next => {
+                    closeRuleView();
+                    setStatusFilter(next);
+                  }}
+                />
+                {canManageRules && selectedEntry && creatableEntries.length === 0 && (
+                  <span className="fwr-constraint">{createHint}</span>
+                )}
+                <span className="fwr-result" role="status">
+                  {visible.length} 条规则
+                </span>
+              </div>
+              {actionError && <ErrorBox error={actionError} />}
+              {overview.error && <ErrorBox error={overview.error} />}
+              {editor?.mode === 'new' && (
+                <div className="fwe-new">
+                  <div className="fwe-new-head">新建规则{selectedEntry && ` · ${selectedEntry.node_name}`}</div>
+                  {ruleForm(editor)}
+                </div>
+              )}
+              <div className="fwr-groups">
+                {sortedEntries.map(entry => {
+                  const groupRules = visible.filter(rule => rule.node_id === entry.node_id);
+                  if (!groupRules.length) return null;
+                  const state = entryState(entry);
+                  return (
+                    <section className="fwr-group" key={entry.node_id} aria-label={`${entry.node_name}的规则`}>
+                      <header className="fwr-group-head">
+                        <span className="fwr-group-name">
+                          <RegionFlag code={countryOf(entry.node_id)} />
+                          <b>{entry.node_name}</b>
+                        </span>
+                        {entry.public_ipv4 && <code>{entry.public_ipv4}</code>}
+                        {state.tone !== 'ok' && <span className={`fwd-st ${state.tone}`}>{state.text}</span>}
+                        <span className="fwr-group-count">{groupRules.length} 条</span>
+                      </header>
+                      <div className="fwr-columns" aria-hidden="true">
+                        <span>入口端口</span>
+                        <span>转发目标</span>
+                        <span>协议</span>
+                        <span>本月流量</span>
+                        <span>{canViewRealtime ? '当前' : '状态'}</span>
+                        <span />
+                      </div>
+                      <div role="list" aria-label={`${entry.node_name}转发规则`}>
+                        {groupRules.map(rule => {
+                          const editing = editor?.mode === 'edit' && editor.ruleId === rule.id;
+                          return (
+                            <RuleItem
+                              key={rule.id}
+                              rule={rule}
+                              entry={entry}
+                              probe={probes.data?.find(probe => probe.rule_id === rule.id)}
+                              probeError={probes.error}
+                              month={monthOf(rule)}
+                              live={liveOf(rule)}
+                              showLive={canViewRealtime}
+                              maxMonth={maxMonth}
+                              open={expanded.has(rule.id)}
+                              editing={editing}
+                              sheet={editing ? ruleForm(editor) : null}
+                              canManage={canManageRules && entry.enabled}
+                              canProbe={canManageRules}
+                              busy={updateRule.isPending && updateRule.variables?.ruleId === rule.id}
+                              menuOpen={menu === rule.id}
+                              onMenu={open => setMenu(open ? rule.id : null)}
+                              onToggleOpen={() => toggleExpanded(rule.id)}
+                              onEdit={trigger => beginEdit(rule, trigger)}
+                              onToggleEnabled={() => toggleRule(rule)}
+                              onDelete={() => {
+                                removeRule.reset();
+                                setDeleting(rule);
+                              }}
+                            />
+                          );
+                        })}
+                      </div>
+                    </section>
+                  );
+                })}
+              </div>
+              {visible.length === 0 && (
+                <div className="fwr-empty">
+                  <Icon of="forwarding" size={22} />
+                  <b>
+                    {!entries.length
+                      ? '尚未授权转发机器'
+                      : !scopedRules.length
+                        ? selectedEntry
+                          ? '这台机器还没有规则'
+                          : '还没有转发规则'
+                        : '没有匹配的规则'}
+                  </b>
+                  {!entries.length ? (
+                    <p>在「用量与额度」中授权机器后即可新建规则。</p>
+                  ) : search || statusFilter !== 'all' ? (
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => {
+                        setSearch('');
+                        setStatusFilter('all');
+                      }}
+                    >
+                      清除搜索与状态筛选
+                    </button>
+                  ) : (
+                    <p>
+                      {selectedEntry && !selectedEntry.enabled
+                        ? '这台机器已停止转发。'
+                        : canManageRules
+                          ? '点击「新建规则」添加第一个转发目标。'
+                          : '暂无转发规则。'}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </section>
 
-      {policy && (
-        <PolicyDialogView
-          dialog={policy}
-          rules={rules}
-          nodes={availableNodes}
-          countryOf={countryOf}
-          entry={policy.mode === 'edit' ? entryOf(policy.draft.nodeId) : undefined}
-          pending={saveEntitlement.isPending}
-          error={saveEntitlement.error}
-          onChange={draft => setPolicy({ ...policy, draft })}
-          onClose={() => setPolicy(null)}
-          onSubmit={() => {
-            const { draft } = policy;
-            const current = policy.mode === 'edit' ? entryOf(draft.nodeId) : undefined;
-            saveEntitlement.mutate({
-              nodeId: draft.nodeId,
-              body: {
-                enabled: current ? current.enabled : true,
-                tcp_allowed: draft.tcp,
-                udp_allowed: draft.udp,
-                listen_port_start: Number(draft.start),
-                listen_port_end: Number(draft.end),
-                max_rules: Number(draft.max),
-                allow_private_targets: draft.allowPrivate,
-              },
-            });
-          }}
-        />
-      )}
       {deleting && deletingView && (
         <Confirm
           title="删除转发规则"
@@ -942,45 +1268,6 @@ export function UserForwardingCard({
           onCancel={() => setDeleting(null)}
         />
       )}
-      {revoking && (
-        <Confirm
-          title={`撤销 ${revoking.node_name} 的转发授权`}
-          body={
-            <>
-              <p>
-                {rules.filter(rule => rule.node_id === revoking.node_id && rule.enabled).length}
-                条规则立即停止转发，入口端口不再监听，正在经过的连接会断开。规则与流量记录保留，恢复授权后按原样生效。
-              </p>
-              {saveEntitlement.error && <ErrorBox error={saveEntitlement.error} />}
-            </>
-          }
-          confirmLabel={saveEntitlement.isPending ? '撤销中…' : '撤销授权'}
-          confirmDisabled={saveEntitlement.isPending}
-          onConfirm={() =>
-            saveEntitlement.mutate({ nodeId: revoking.node_id, body: entitlementWrite(revoking, false) })
-          }
-          onCancel={() => setRevoking(null)}
-        />
-      )}
-      {removing && (
-        <Confirm
-          title="移除已撤销的转发入口"
-          body={
-            <>
-              <p>
-                将从 {user.id} 移除「{removing.node_name || removing.node_id}」的转发授权
-                {removing.rule_count > 0 ? `，并移除其下 ${removing.rule_count} 条规则` : ''}
-                ，入口端口释放。本月流量仍计入用量。
-              </p>
-              {dropEntitlement.error && <ErrorBox error={dropEntitlement.error} />}
-            </>
-          }
-          confirmLabel={dropEntitlement.isPending ? '移除中…' : '确认移除'}
-          confirmDisabled={dropEntitlement.isPending}
-          onConfirm={() => dropEntitlement.mutate(removing.node_id)}
-          onCancel={() => setRemoving(null)}
-        />
-      )}
     </>
   );
 }
@@ -990,14 +1277,17 @@ export function UserForwardingCard({
 function RuleItem({
   rule,
   entry,
-  country,
+  probe,
+  probeError,
   month,
   live,
   showLive,
   maxMonth,
-  showNode,
   open,
+  editing,
+  sheet,
   canManage,
+  canProbe,
   busy,
   menuOpen,
   onMenu,
@@ -1008,19 +1298,22 @@ function RuleItem({
 }: {
   rule: ForwardingRule;
   entry: ForwardingEntitlement | undefined;
-  country: string | null;
+  probe: ForwardingProbe | undefined;
+  probeError: Error | null;
   month: Traffic | null;
   live: Traffic | null;
   showLive: boolean;
   maxMonth: number;
-  showNode: boolean;
   open: boolean;
+  editing: boolean;
+  sheet: ReactNode;
   canManage: boolean;
+  canProbe: boolean;
   busy: boolean;
   menuOpen: boolean;
   onMenu: (open: boolean) => void;
   onToggleOpen: () => void;
-  onEdit: () => void;
+  onEdit: (trigger: HTMLElement) => void;
   onToggleEnabled: () => void;
   onDelete: () => void;
 }) {
@@ -1028,11 +1321,16 @@ function RuleItem({
   const target = endpointText(rule.target_host, rule.target_port);
   const v4 = entry ? entryAddress(entry, rule.listen_port, 'v4') : null;
   const v6 = entry ? entryAddress(entry, rule.listen_port, 'v6') : null;
-  const status = RULE_STATUS[rule.runtime_status];
+  const state = effectiveStatus(rule, entry);
+  const status = RULE_STATUS[state];
+  const detailId = useId();
+  const expandedNow = editing || open;
   const monthTotal = month ? month.down + month.up : null;
   const nowCell = status ? (
     <span className={`fwd-st ${status.tone}`}>{status.text}</span>
-  ) : !showLive ? null : live === null ? (
+  ) : !showLive ? (
+    <span className="fwd-st ok">已生效</span>
+  ) : live === null ? (
     <span className="fwd-idle">—</span>
   ) : live.down + live.up > 0 ? (
     <span className="fwd-rate" title={`下行 ${rateText(live.down)} · 上行 ${rateText(live.up)}`}>
@@ -1042,25 +1340,23 @@ function RuleItem({
   ) : (
     <span className="fwd-idle">空闲</span>
   );
-  const hasMenu = canManage || !!v6;
+  const hasMenu = canManage || !!v4 || !!v6;
   return (
-    <div role="listitem" className={`fwd-item st-${rule.runtime_status}${open ? ' open' : ''}`}>
+    <div
+      role="listitem"
+      className={`fwd-item fwr-item st-${state}${expandedNow ? ' open' : ''}${editing ? ' fwe-editing' : ''}`}
+    >
       <div className="fwd-row">
         <button
           type="button"
-          className={`fwd-rmain${showLive ? '' : ' no-live'}`}
-          aria-expanded={open}
+          className="fwr-rmain"
+          aria-expanded={expandedNow}
+          aria-controls={expandedNow ? detailId : undefined}
           aria-label={`${name ? `${name}，` : ''}入口 ${rule.listen_port} 转发到 ${target}`}
           onClick={onToggleOpen}
         >
           <span className="fwd-port">
             <Icon of="chevronDown" size={10} className="fwd-chev" />:{rule.listen_port}
-            {showNode && entry && (
-              <small>
-                <RegionFlag code={country} />
-                {entry.node_name}
-              </small>
-            )}
           </span>
           <span className={`fwd-target${name ? '' : ' plain'}`} title={target}>
             {name && <b>{name}</b>}
@@ -1085,23 +1381,37 @@ function RuleItem({
           </span>
           <span className="fwd-now">{nowCell}</span>
         </button>
-        <span className="fwd-acts">
-          {v4 && <AddressCopy text={v4} label={`复制入口 ${v4}`} className="fwd-ib" />}
+        <span className="fwr-acts">
           {canManage && (
             <button
               type="button"
-              className="fwd-ib"
-              aria-label={`编辑 :${rule.listen_port}`}
+              className="btn fwr-edit"
+              aria-label={`编辑 ${entry?.node_name ?? ''} :${rule.listen_port}`}
               title="编辑"
-              onClick={onEdit}
+              aria-expanded={editing}
+              onClick={event => onEdit(event.currentTarget)}
             >
-              <Icon of="pencil" size={13} />
+              编辑
             </button>
           )}
           {hasMenu && (
-            <MoreMenu label={`:${rule.listen_port} 的更多操作`} open={menuOpen} onOpenChange={onMenu}>
-              {canManage && (
-                <MenuItem icon="pencil" title="编辑规则" note="目标、入口端口、协议、名称" onSelect={onEdit} />
+            <MoreMenu
+              label={`${entry?.node_name ?? ''} :${rule.listen_port} 的更多操作`}
+              open={menuOpen}
+              onOpenChange={onMenu}
+            >
+              {v4 && (
+                <CopyButton text={v4} role="menuitem" label="复制 IPv4 入口">
+                  {(state, label) => (
+                    <>
+                      <Icon of={copyStateIcon(state)} size={14} className="action-menu-icon" />
+                      <span>
+                        {label}
+                        <small className="mono">{v4}</small>
+                      </span>
+                    </>
+                  )}
+                </CopyButton>
               )}
               {canManage && (
                 <MenuItem
@@ -1140,90 +1450,88 @@ function RuleItem({
           )}
         </span>
       </div>
-      {open && (
-        <div className="fwd-detail">
-          <dl className="fwd-kv">
-            <div className="wide">
-              <dt>入口</dt>
-              <dd>
-                {v4 && (
-                  <span className="fwd-addr">
-                    {v4}
-                    <AddressCopy text={v4} label="复制 IPv4 入口" />
-                  </span>
-                )}
-                {v6 && (
-                  <span className="fwd-addr">
-                    {v6}
-                    <AddressCopy text={v6} label="复制 IPv6 入口" />
-                  </span>
-                )}
-                {!v4 && !v6 && <span className="fwd-dim">入口机器暂无公网地址</span>}
-              </dd>
-            </div>
-            <div className="wide">
-              <dt>目标</dt>
-              <dd>
-                <code>{target}</code>
-                <span className="fwd-dim"> · {PROTOCOL_LABEL[rule.protocol]}</span>
-              </dd>
-            </div>
-            <div>
-              <dt>本月</dt>
-              <dd>{month ? <TrafficPair value={month} format={bytes} /> : '—'}</dd>
-            </div>
-            <div>
-              <dt>累计</dt>
-              <dd>
-                <TrafficPair value={{ down: rule.downlink_bytes, up: rule.uplink_bytes }} format={bytes} />
-              </dd>
-            </div>
-            {showLive && (
-              <div>
-                <dt>当前</dt>
-                <dd>{live ? <TrafficPair value={live} format={rateText} /> : <span className="fwd-dim">—</span>}</dd>
-              </div>
-            )}
-            <div>
-              <dt>创建</dt>
-              <dd>
-                {clockText(rule.created_at)}
-                <span className="fwd-dim"> · 修改 {clockText(rule.updated_at)}</span>
-              </dd>
-            </div>
-            <div className="wide">
-              <dt>状态</dt>
-              <dd>
-                <RuleStateLine rule={rule} entry={entry} />
-              </dd>
-            </div>
-          </dl>
-          {canManage && (
-            <div className="fwd-dfoot">
-              <button type="button" className="btn" onClick={onEdit}>
-                <Icon of="pencil" size={13} />
-                编辑
-              </button>
-              <button type="button" className="btn" disabled={busy} onClick={onToggleEnabled}>
-                <Icon of={rule.enabled ? 'pause' : 'play'} size={13} />
-                {rule.enabled ? '停用' : '启用'}
-              </button>
-              <span className="sp" />
-              <button type="button" className="btn danger" onClick={onDelete}>
-                <Icon of="trash" size={13} />
-                删除规则
-              </button>
-            </div>
-          )}
+      {sheet ? (
+        <div className="fwe-rule-sheet" id={detailId}>
+          {sheet}
         </div>
+      ) : (
+        open && (
+          <div className="fwd-detail fwr-detail" id={detailId}>
+            <dl className="fwd-kv">
+              <div className="wide">
+                <dt>入口</dt>
+                <dd>
+                  {v4 && (
+                    <span className="fwd-addr">
+                      {v4}
+                      <AddressCopy text={v4} label="复制 IPv4 入口" />
+                    </span>
+                  )}
+                  {v6 && (
+                    <span className="fwd-addr">
+                      {v6}
+                      <AddressCopy text={v6} label="复制 IPv6 入口" />
+                    </span>
+                  )}
+                  {!v4 && !v6 && <span className="fwd-dim">暂无公网地址</span>}
+                </dd>
+              </div>
+              <div className="wide">
+                <dt>目标</dt>
+                <dd>
+                  <code>{target}</code>
+                  <span className="fwd-dim"> · {PROTOCOL_LABEL[rule.protocol]}</span>
+                </dd>
+              </div>
+              <div>
+                <dt>本月</dt>
+                <dd>{month ? <TrafficPair value={month} format={bytes} /> : '—'}</dd>
+              </div>
+              <div>
+                <dt>累计</dt>
+                <dd>
+                  <TrafficPair value={{ down: rule.downlink_bytes, up: rule.uplink_bytes }} format={bytes} />
+                </dd>
+              </div>
+              {showLive && (
+                <div>
+                  <dt>当前</dt>
+                  <dd>{live ? <TrafficPair value={live} format={rateText} /> : <span className="fwd-dim">—</span>}</dd>
+                </div>
+              )}
+              <div>
+                <dt>创建</dt>
+                <dd>
+                  {clockText(rule.created_at)}
+                  <span className="fwd-dim"> · 修改 {clockText(rule.updated_at)}</span>
+                </dd>
+              </div>
+              <div className="wide">
+                <dt>状态</dt>
+                <dd>
+                  <RuleStateLine rule={rule} entry={entry} />
+                </dd>
+              </div>
+            </dl>
+            {canProbe && (
+              <ForwardingRuleProbe
+                rule={rule}
+                entry={entry}
+                result={probe}
+                queryError={probeError}
+                canManage={canProbe}
+              />
+            )}
+          </div>
+        )
       )}
     </div>
   );
 }
 
 function RuleStateLine({ rule, entry }: { rule: ForwardingRule; entry: ForwardingEntitlement | undefined }) {
-  const node = entry?.node_name ?? '入口机器';
-  switch (rule.runtime_status) {
+  const node = entry?.node_name ?? '转发入口';
+  switch (effectiveStatus(rule, entry)) {
     case 'active':
       return <>已监听 · {node} 已应用这条规则</>;
     case 'pending':
@@ -1239,7 +1547,9 @@ function RuleStateLine({ rule, entry }: { rule: ForwardingRule; entry: Forwardin
         </>
       );
     case 'disabled':
-      return <>{entry?.enabled === false ? '机器授权已撤销' : '已停用'} · 入口端口不监听，规则保留</>;
+      return <>{entry?.enabled === false ? '入口转发已停止' : '已停用'} · 入口端口不监听，规则保留</>;
+    case 'quota-paused':
+      return <>配额暂停 · 补足额度后恢复仍启用的规则</>;
   }
 }
 
@@ -1254,15 +1564,30 @@ function TrafficPair({ value, format }: { value: Traffic; format: (value: number
   );
 }
 
-function AddressCopy({ text, label, className }: { text: string; label: string; className?: string }) {
+function AddressCopy({ text, label }: { text: string; label: string }) {
   return (
-    <CopyButton text={text} label={label} iconOnly className={`fwd-copy${className ? ` ${className}` : ''}`}>
+    <CopyButton text={text} label={label} iconOnly className="fwd-copy">
       {state => <Icon of={copyStateIcon(state)} size={12} />}
     </CopyButton>
   );
 }
 
-/* ── 规则表单：新建在清单顶部、编辑替换原行 ── */
+/* ── 授权和规则共用的行内表单布局 ── */
+
+function InlineField({ label, htmlFor, children }: { label: string; htmlFor?: string; children: ReactNode }) {
+  return (
+    <div className="fwe-field">
+      {htmlFor ? (
+        <label className="fwe-k" htmlFor={htmlFor}>
+          {label}
+        </label>
+      ) : (
+        <span className="fwe-k">{label}</span>
+      )}
+      <div className="fwe-v">{children}</div>
+    </div>
+  );
+}
 
 function RuleForm({
   editor,
@@ -1290,24 +1615,7 @@ function RuleForm({
   const editingId = editor.mode === 'edit' ? editor.ruleId : undefined;
   const id = useId();
   const check = checkRule(draft, entry, rules, editingId);
-  const preview =
-    check.target && entry && !check.portBad ? (
-      <>
-        <Icon of="chains" size={12} />
-        <code>{endpointText(entry.public_ipv4 ?? entry.public_ipv6 ?? '入口', Number(draft.port))}</code>
-        <i>→</i>
-        <code>{endpointText(check.target.host, check.target.port)}</code>
-        <span className="fwd-dim">{PROTOCOL_LABEL[draft.protocol]}</span>
-      </>
-    ) : (
-      <span className="fwd-dim">粘贴「主机:端口」即可，协议头和路径会自动去掉</span>
-    );
-  const protocolOptions = (['tcp', 'udp', 'tcp_udp'] as const).map(protocol => ({
-    value: protocol,
-    label: PROTOCOL_LABEL[protocol],
-    disabled: !entry || !protocolAllowed(entry, protocol),
-  }));
-  // 新建时可换机器：只列还有余量的机器（当前选中的总在列表里）
+  const dirty = JSON.stringify(draft) !== JSON.stringify(editor.initial);
   const choosable = creating
     ? entries.filter(
         item =>
@@ -1316,33 +1624,32 @@ function RuleForm({
     : [];
   return (
     <form
-      className="fwd-edit"
-      aria-label={creating ? '新建转发规则' : `编辑入口 ${draft.port} 的规则`}
+      className="fwe-form rule inline"
+      aria-label={
+        creating
+          ? '新建转发规则'
+          : `编辑入口 ${rules.find(rule => rule.id === editingId)?.listen_port ?? draft.port} 的规则`
+      }
       onKeyDown={event => {
-        if (event.key === 'Escape') onCancel();
+        if (event.key === 'Escape' && !pending) {
+          event.preventDefault();
+          event.stopPropagation();
+          onCancel();
+        }
       }}
       onSubmit={event => {
         event.preventDefault();
-        if (check.ok && check.target) onSubmit(check.target, draft);
+        if (check.ok && check.target && !pending && dirty) onSubmit(check.target, draft);
       }}
     >
-      <div className="fwd-ehead">
-        <b>{creating ? '新建规则' : `编辑 :${rules.find(rule => rule.id === editingId)?.listen_port ?? draft.port}`}</b>
-        {entry && (
-          <span>
-            {entry.node_name}
-            {entry.public_ipv4 ? ` · ${entry.public_ipv4}` : ''}
-            {entry.public_ipv6 ? ` · ${entry.public_ipv6}` : ''}
-          </span>
-        )}
-      </div>
-      <div className="fwd-fields">
+      <div className="fwe-fields">
         {creating && choosable.length > 1 && (
-          <label className="fwd-f node">
-            <span>入口机器</span>
+          <InlineField label="转发入口" htmlFor={`${id}-node`}>
             <select
-              className="f"
+              id={`${id}-node`}
+              className="f fwe-select"
               value={draft.nodeId}
+              disabled={pending}
               onChange={event => {
                 const next = entries.find(item => item.node_id === event.target.value);
                 if (!next) return;
@@ -1361,250 +1668,316 @@ function RuleForm({
                 </option>
               ))}
             </select>
-          </label>
+          </InlineField>
         )}
-        <div className="fwd-f target">
-          <label htmlFor={`${id}-target`}>目标地址</label>
+        <InlineField label="目标地址" htmlFor={`${id}-target`}>
           <input
             id={`${id}-target`}
-            className="f mono"
+            className="f mono fwe-target"
             autoFocus
             autoComplete="off"
             spellCheck={false}
-            placeholder="example.com:443 或 [2001:db8::1]:443"
+            placeholder="example.com:443"
             value={draft.target}
-            aria-invalid={check.targetBad}
+            disabled={pending}
+            aria-invalid={check.targetBad || undefined}
             aria-describedby={`${id}-target-hint`}
             onChange={event => onChange({ ...draft, target: event.target.value })}
           />
           <small id={`${id}-target-hint`}>
             {check.target
               ? check.target.kind === '域名'
-                ? '域名，在入口机器上解析'
+                ? '域名，在转发入口上解析'
                 : `${check.target.kind} · 端口 ${check.target.port}`
               : '主机:端口'}
           </small>
-        </div>
-        <div className="fwd-f port">
-          <label htmlFor={`${id}-port`}>入口端口</label>
+        </InlineField>
+        <InlineField label="入口端口" htmlFor={`${id}-port`}>
           <input
             id={`${id}-port`}
-            className="f mono"
+            className="f mono fwe-num port"
             inputMode="numeric"
             autoComplete="off"
             value={draft.port}
-            aria-invalid={check.portBad}
-            aria-describedby={`${id}-port-hint`}
+            disabled={pending}
+            aria-invalid={check.portBad || undefined}
             onChange={event => onChange({ ...draft, port: event.target.value })}
           />
-          <small id={`${id}-port-hint`}>
-            {entry ? `授权范围 ${entry.listen_port_start}–${entry.listen_port_end}` : ''}
-          </small>
-        </div>
-        <div className="fwd-f proto">
-          <span>协议</span>
+          <small>{entry && `授权范围 ${entry.listen_port_start}–${entry.listen_port_end}`}</small>
+        </InlineField>
+        <InlineField label="协议">
           <SegmentedControl
             value={draft.protocol}
-            options={protocolOptions}
             ariaLabel="协议"
+            disabled={pending}
+            options={(['tcp', 'udp', 'tcp_udp'] as const).map(protocol => ({
+              value: protocol,
+              label: PROTOCOL_LABEL[protocol],
+              disabled: !entry || !protocolAllowed(entry, protocol),
+            }))}
             onChange={protocol => onChange({ ...draft, protocol })}
           />
-          <small>
-            {entry && !(entry.tcp_allowed && entry.udp_allowed) ? `这台机器只授权了 ${allowedText(entry)}` : ''}
-          </small>
-        </div>
-        <div className="fwd-f name">
-          <label htmlFor={`${id}-name`}>名称</label>
+        </InlineField>
+        <InlineField label="名称" htmlFor={`${id}-name`}>
           <input
             id={`${id}-name`}
-            className="f"
+            className="f fwe-name"
             autoComplete="off"
             maxLength={80}
-            placeholder={
-              check.target ? `留空：${endpointText(check.target.host, check.target.port)}` : '可选，留空用目标地址'
-            }
+            placeholder={check.target ? endpointText(check.target.host, check.target.port) : '可选'}
             value={draft.name}
+            disabled={pending}
             onChange={event => onChange({ ...draft, name: event.target.value })}
           />
-          <small />
-        </div>
+        </InlineField>
       </div>
+      {check.problems.length > 0 && (
+        <p className="fwe-problem" role="alert">
+          <Icon of="warn" size={12} />
+          {check.problems[0]}
+        </p>
+      )}
       {error ? <ErrorBox error={error} /> : null}
-      <footer>
-        <span className="fwd-msg" role={check.problems.length ? 'alert' : undefined}>
-          {check.problems.length ? (
-            <span className="bad">
-              <Icon of="warn" size={13} />
-              {check.problems[0]}
-            </span>
-          ) : (
-            preview
+      <footer className="fwe-foot">
+        <span className="fwe-preview">
+          {check.target && entry && !check.portBad && (
+            <>
+              <code>{endpointText(entry.public_ipv4 ?? entry.public_ipv6 ?? '入口', Number(draft.port))}</code>
+              <i>→</i>
+              <code>{endpointText(check.target.host, check.target.port)}</code>
+            </>
           )}
         </span>
         <span className="sp" />
-        <button type="button" className="btn" onClick={onCancel}>
+        <button type="button" className="btn" disabled={pending} onClick={onCancel}>
           取消
         </button>
-        <button type="submit" className="btn primary" disabled={!check.ok || pending}>
-          {pending ? '保存中…' : creating ? '创建规则' : '保存规则'}
+        <button type="submit" className="btn primary" disabled={!check.ok || !dirty || pending}>
+          {pending ? '保存中…' : creating ? '创建规则' : '保存'}
         </button>
       </footer>
     </form>
   );
 }
 
-/* ── 授权 / 修改授权 ── */
-
-function PolicyDialogView({
+function PolicyEditorView({
   dialog,
   rules,
   nodes,
   countryOf,
   entry,
+  tenant,
+  user,
   pending,
   error,
   onChange,
   onClose,
   onSubmit,
+  onLifecycle,
 }: {
   dialog: PolicyDialog;
   rules: ForwardingRule[];
   nodes: ForwardingNodeOption[];
   countryOf: (nodeId: string) => string | null;
   entry: ForwardingEntitlement | undefined;
+  tenant: string;
+  user: string;
   pending: boolean;
   error: unknown;
   onChange: (draft: PolicyDraft) => void;
   onClose: () => void;
   onSubmit: () => void;
+  onLifecycle: (kind: 'stop' | 'remove') => void;
 }) {
   const { draft } = dialog;
   const grant = dialog.mode === 'grant';
   const id = useId();
-  const title = grant ? '授权转发入口' : `修改 ${entry?.node_name ?? draft.nodeId} 的授权`;
+  const [confirming, setConfirming] = useState<'stop' | 'remove' | null>(null);
   const check = checkPolicy(dialog, rules);
-  const protocolChoice = draft.tcp && draft.udp ? 'both' : draft.tcp ? 'tcp' : 'udp';
+  const limit = policyLimit(dialog);
+  const dirty = policyChanged(dialog, entry);
+  const set = (patch: Partial<PolicyDraft>) => {
+    setConfirming(null);
+    onChange({ ...draft, ...patch });
+  };
+  const own = rules.filter(rule => rule.node_id === draft.nodeId);
   return (
-    <DialogLayer label={title} onClose={onClose}>
-      <form
-        className="dialog-surface fwd-dsurface"
-        onSubmit={event => {
+    <form
+      className="fwe-form inline"
+      aria-label={grant ? '授权转发入口' : `编辑 ${entry?.node_name ?? draft.nodeId} 的转发授权`}
+      onKeyDown={event => {
+        if (event.key === 'Escape' && !pending) {
           event.preventDefault();
-          if (check.ok) onSubmit();
-        }}
-      >
-        <header className="fwd-dtitle">
-          <b>{title}</b>
-          <DialogClose className="fwd-ib" aria-label="关闭">
-            <Icon of="close" size={13} />
-          </DialogClose>
-        </header>
-        <div className="fwd-dbody">
-          {grant && (
-            <fieldset className="fwd-f fwd-pickset">
-              <legend>机器</legend>
-              <div className="fwd-npick" role="radiogroup" aria-label="选择机器">
-                {nodes.map(node => (
-                  <button
-                    key={node.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={draft.nodeId === node.id}
-                    onClick={() => onChange({ ...draft, nodeId: node.id })}
-                  >
-                    <RegionFlag code={countryOf(node.id)} />
-                    <span>{node.name || node.id}</span>
-                  </button>
-                ))}
-              </div>
-            </fieldset>
-          )}
-          <div className="fwd-pfields">
-            <div className="fwd-f">
-              <span>协议</span>
-              <SegmentedControl
-                value={protocolChoice}
-                ariaLabel="允许的协议"
-                options={[
-                  { value: 'tcp', label: '只 TCP' },
-                  { value: 'udp', label: '只 UDP' },
-                  { value: 'both', label: 'TCP + UDP' },
-                ]}
-                onChange={choice => onChange({ ...draft, tcp: choice !== 'udp', udp: choice !== 'tcp' })}
-              />
-            </div>
-            <div className="fwd-f">
-              <span>端口范围</span>
-              <span className="fwd-range">
-                <input
-                  className="f mono"
-                  inputMode="numeric"
-                  aria-label="端口起始"
-                  value={draft.start}
-                  aria-invalid={check.rangeBad}
-                  onChange={event => onChange({ ...draft, start: event.target.value })}
-                />
-                <i>–</i>
-                <input
-                  className="f mono"
-                  inputMode="numeric"
-                  aria-label="端口结束"
-                  value={draft.end}
-                  aria-invalid={check.rangeBad}
-                  onChange={event => onChange({ ...draft, end: event.target.value })}
-                />
-              </span>
-              <small className={check.rangeBad ? 'bad' : undefined}>{check.rangeText}</small>
-            </div>
-            <div className="fwd-f">
-              <label htmlFor={`${id}-max`}>规则上限</label>
-              <input
-                id={`${id}-max`}
-                className="f mono"
-                inputMode="numeric"
-                value={draft.max}
-                aria-invalid={check.maxBad}
-                aria-describedby={`${id}-max-hint`}
-                onChange={event => onChange({ ...draft, max: event.target.value })}
-              />
-              <small id={`${id}-max-hint`} className={check.maxBad ? 'bad' : undefined}>
-                {check.maxText}
-              </small>
-            </div>
-            <label className="fwd-check">
-              <input
-                type="checkbox"
-                checked={draft.allowPrivate}
-                onChange={event => onChange({ ...draft, allowPrivate: event.target.checked })}
-              />
-              <span>
-                允许转发到私网与本机地址
-                <small>
-                  {draft.allowPrivate
-                    ? '目标可以是 10.0.0.0/8、192.168.0.0/16、127.0.0.1 等内部地址'
-                    : '目标是私网、环回、链路本地或保留地址时拒绝保存'}
-                </small>
-              </span>
-            </label>
-          </div>
-          {check.problem && (
-            <p className="fwd-msg">
-              <span className="bad">
-                <Icon of="warn" size={13} />
-                {check.problem}
-              </span>
-            </p>
-          )}
-          {error ? <ErrorBox error={error} /> : null}
-        </div>
-        <footer className="fwd-dfooter">
-          <DialogClose className="btn">取消</DialogClose>
-          <button type="submit" className="btn primary" disabled={!check.ok || pending}>
-            {pending ? '保存中…' : grant ? '授权' : '保存授权'}
+          event.stopPropagation();
+          if (confirming) setConfirming(null);
+          else onClose();
+        }
+      }}
+      onSubmit={event => {
+        event.preventDefault();
+        if (!confirming && check.ok && limit !== undefined && dirty && !pending) onSubmit();
+      }}
+    >
+      <div className="fwe-fields">
+        {grant && (
+          <InlineField label="机器">
+            <span className="fwe-pick" role="radiogroup" aria-label="选择机器">
+              {nodes.map(node => (
+                <button
+                  key={node.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={draft.nodeId === node.id}
+                  disabled={pending}
+                  onClick={() => set({ nodeId: node.id })}
+                >
+                  <RegionFlag code={countryOf(node.id)} />
+                  {node.name || node.id}
+                </button>
+              ))}
+            </span>
+          </InlineField>
+        )}
+        <InlineField label="流量配额" htmlFor={`${id}-quota`}>
+          <span className="fwe-unit">
+            <input
+              id={`${id}-quota`}
+              className="f mono fwe-num quota"
+              aria-label="月度转发额度（GiB）"
+              inputMode="decimal"
+              autoComplete="off"
+              autoFocus={!grant}
+              placeholder="不限"
+              maxLength={24}
+              value={draft.quota}
+              disabled={pending}
+              aria-invalid={limit === undefined || undefined}
+              onChange={event => set({ quota: event.target.value })}
+            />
+            <i>GiB</i>
+          </span>
+          <small className={limit === undefined ? 'bad' : undefined} role={limit === undefined ? 'alert' : undefined}>
+            {limit === undefined ? '请输入正数，最多两位小数' : '留空表示不限'}
+          </small>
+          {entry && <ForwardingQuotaHistory tenant={tenant} user={user} entry={entry} />}
+        </InlineField>
+        <InlineField label="协议">
+          <SegmentedControl
+            value={draft.tcp && draft.udp ? 'both' : draft.tcp ? 'tcp' : 'udp'}
+            ariaLabel="允许的协议"
+            disabled={pending}
+            options={[
+              { value: 'tcp', label: '只 TCP' },
+              { value: 'udp', label: '只 UDP' },
+              { value: 'both', label: 'TCP + UDP' },
+            ]}
+            onChange={choice => set({ tcp: choice !== 'udp', udp: choice !== 'tcp' })}
+          />
+        </InlineField>
+        <InlineField label="入口端口">
+          <span className="fwe-range">
+            <input
+              className="f mono fwe-num port"
+              inputMode="numeric"
+              aria-label="端口起始"
+              value={draft.start}
+              disabled={pending}
+              aria-invalid={check.rangeBad || undefined}
+              onChange={event => set({ start: event.target.value })}
+            />
+            <i>–</i>
+            <input
+              className="f mono fwe-num port"
+              inputMode="numeric"
+              aria-label="端口结束"
+              value={draft.end}
+              disabled={pending}
+              aria-invalid={check.rangeBad || undefined}
+              onChange={event => set({ end: event.target.value })}
+            />
+          </span>
+          <small className={check.rangeBad ? 'bad' : undefined}>{check.rangeText}</small>
+        </InlineField>
+        <InlineField label="规则上限" htmlFor={`${id}-max`}>
+          <input
+            id={`${id}-max`}
+            className="f mono fwe-num max"
+            inputMode="numeric"
+            value={draft.max}
+            disabled={pending}
+            aria-invalid={check.maxBad || undefined}
+            onChange={event => set({ max: event.target.value })}
+          />
+          <small className={check.maxBad ? 'bad' : undefined}>{check.maxText}</small>
+        </InlineField>
+        <InlineField label="私网目标">
+          <SegmentedControl
+            value={draft.allowPrivate}
+            ariaLabel="允许转发到私网与本机地址"
+            disabled={pending}
+            options={[
+              { value: false, label: '拒绝' },
+              { value: true, label: '允许' },
+            ]}
+            onChange={allowPrivate => set({ allowPrivate })}
+          />
+        </InlineField>
+      </div>
+      {check.problem && (
+        <p className="fwe-problem" role="alert">
+          <Icon of="warn" size={12} />
+          {check.problem}
+        </p>
+      )}
+      {error ? <ErrorBox error={error} /> : null}
+      {confirming ? (
+        <footer className="fwe-foot confirming" role="alert">
+          <p>
+            {confirming === 'stop'
+              ? `${entry?.node_name} 的 ${own.filter(rule => rule.enabled).length} 条规则停止监听，经过的连接会断开；规则与用量保留，其他用户不受影响。`
+              : `连同 ${own.length} 条规则一起移除，入口端口释放，本月用量保留。`}
+          </p>
+          <button type="button" className="btn" disabled={pending} onClick={() => setConfirming(null)}>
+            返回
+          </button>
+          <button
+            type="button"
+            className="btn danger"
+            disabled={pending}
+            autoFocus
+            onClick={() => onLifecycle(confirming)}
+          >
+            {pending ? '处理中…' : confirming === 'stop' ? '停止转发' : '移除入口'}
           </button>
         </footer>
-      </form>
-    </DialogLayer>
+      ) : (
+        <footer className="fwe-foot">
+          {!grant && entry && (
+            <button
+              type="button"
+              className="btn fwe-side"
+              disabled={dirty || pending}
+              title={dirty ? '先保存或取消修改' : undefined}
+              onClick={() => setConfirming(entry.enabled ? 'stop' : 'remove')}
+            >
+              <Icon of={entry.enabled ? 'pause' : 'trash'} size={12} />
+              {entry.enabled ? '停止转发' : '移除入口'}
+            </button>
+          )}
+          <span className="sp" />
+          <button type="button" className="btn" disabled={pending} onClick={onClose}>
+            取消
+          </button>
+          <button
+            type="submit"
+            className="btn primary"
+            disabled={!check.ok || limit === undefined || !dirty || pending}
+          >
+            {pending ? '保存中…' : grant ? '授权' : '保存'}
+          </button>
+        </footer>
+      )}
+    </form>
   );
 }
 

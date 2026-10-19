@@ -3,7 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
-use brocade_deployment::protocol::RouteIpReport;
+use brocade_deployment::protocol::{
+    ConfigXrayForceRetirementCommand, RouteIpReport, XrayUpgradePhase, XrayUpgradeRuntime,
+    XrayUpgradeSource,
+};
 
 use crate::{
     credentials::{generate_node_token, node_token_display_prefix, node_token_hash},
@@ -280,50 +283,8 @@ pub async fn record_node_poll(
     .bind(node_id)
     .fetch_optional(&mut *tx)
     .await?;
-    match presence.as_deref() {
-        // A pre-feature database or direct test fixture has no row. Establish its baseline without
-        // sending a fleet-wide "online" storm during rollout.
-        None => {
-            sqlx::query(
-                "INSERT INTO node_presence_state (node_id, status, since_at)
-                 VALUES ($1, 'online', to_timestamp($2))",
-            )
-            .bind(node_id)
-            .bind(server_now as f64)
-            .execute(&mut *tx)
-            .await?;
-        }
-        Some("waiting" | "offline") => {
-            let previous = presence.as_deref().unwrap_or("offline");
-            sqlx::query(
-                "UPDATE node_presence_state
-                    SET status = 'online', since_at = to_timestamp($2)
-                  WHERE node_id = $1",
-            )
-            .bind(node_id)
-            .bind(server_now as f64)
-            .execute(&mut *tx)
-            .await?;
-            crate::notifications::insert_machine_event(
-                &mut tx,
-                node_id,
-                "node_online",
-                None,
-                Some(previous),
-                Some("online"),
-                server_now,
-                None,
-                None,
-            )
-            .await?;
-        }
-        Some("online") => {}
-        Some(other) => {
-            return Err(StoreError::InvalidData(format!(
-                "node {node_id} has invalid presence status {other}"
-            )))
-        }
-    }
+    crate::notifications::mark_online_locked(&mut tx, node_id, presence.as_deref(), server_now)
+        .await?;
     tx.commit().await?;
 
     Ok(())
@@ -437,6 +398,11 @@ pub async fn record_node_runtime(
         .as_ref()
         .map(serde_json::to_value)
         .transpose()?;
+    let xray_upgrade = report
+        .xray_upgrade
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
     // The rule database is the semantic inverse of `last_local_reconcile`: the latter is the
     // last thing that happened and must not be erased by a round in which it did not run,
     // whereas the rule database is the fact of this moment and is overwritten every round.
@@ -459,6 +425,7 @@ pub async fn record_node_runtime(
              last_local_reconcile = COALESCE($4, last_local_reconcile),
              wireguard_health = COALESCE($5, wireguard_health),
              geodata_observed = $6,
+             xray_upgrade = $9,
              runtime_reported_at = to_timestamp($7),
              online_sources_reported_at = CASE
                  WHEN $8 THEN to_timestamp($7)
@@ -477,6 +444,7 @@ pub async fn record_node_runtime(
     .bind(geodata)
     .bind(observed_at as f64)
     .bind(report.online_sources.is_some())
+    .bind(xray_upgrade)
     .execute(&mut *tx)
     .await?;
 
@@ -502,6 +470,19 @@ pub async fn record_node_runtime(
             "node {node_id} does not have an active node token"
         )));
     }
+    if report.xray_upgrade.is_none() {
+        // The request is an authorization ledger. Clearing the transient two-generation runtime
+        // settles it regardless of whether the old generation drained naturally just before the
+        // command arrived or was explicitly terminated; both are safe terminal outcomes.
+        sqlx::query(
+            "UPDATE config_xray_force_retirements
+                SET settled_at = COALESCE(settled_at, now())
+              WHERE node_id = $1 AND settled_at IS NULL",
+        )
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     if let Some(online_sources) = report.online_sources.as_deref() {
         crate::user_presence::replace_node_snapshot(&mut tx, node_id, observed_at, online_sources)
@@ -509,6 +490,144 @@ pub async fn record_node_runtime(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Return the only active force-retirement authorization for this node.
+///
+/// An operator-created authorization wins. Otherwise, a newer configuration work order that is
+/// actually eligible for this node authorizes retiring the preceding configuration generation so
+/// it cannot block the new release until the old grace window expires. The Agent still treats the
+/// result as a hint until its local durable runtime matches the complete tuple; no PID or process
+/// identity crosses the control-plane boundary.
+pub async fn config_xray_force_retirement_command(
+    pool: &PgPool,
+    node_id: &str,
+) -> Result<Option<ConfigXrayForceRetirementCommand>> {
+    let read_active = || async {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT deployment_id, claim_generation
+               FROM config_xray_force_retirements
+              WHERE node_id = $1 AND settled_at IS NULL",
+        )
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await
+    };
+    let command_from = |(deployment_id, claim_generation): (i64, i64)| {
+        Ok(ConfigXrayForceRetirementCommand {
+            deployment_id,
+            claim_generation: u64::try_from(claim_generation).map_err(|_| {
+                StoreError::InvalidData(format!(
+                    "node {node_id} force-retirement claim generation is negative"
+                ))
+            })?,
+        })
+    };
+    if let Some(identity) = read_active().await? {
+        return command_from(identity).map(Some);
+    }
+
+    let Some(next) = crate::deployment::load_desired_for_node(pool, node_id).await? else {
+        return Ok(None);
+    };
+    let mut tx = pool.begin().await?;
+    let next_release = sqlx::query(
+        "SELECT kind, active, status
+           FROM deployments
+          WHERE id = $1
+          FOR SHARE",
+    )
+    .bind(next.deployment_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(next_release) = next_release else {
+        return Ok(None);
+    };
+    let next_kind: String = next_release.try_get("kind")?;
+    let next_active: Option<bool> = next_release.try_get("active")?;
+    let next_status: String = next_release.try_get("status")?;
+    if next_kind != "config"
+        || next_active != Some(true)
+        || !matches!(next_status.as_str(), "planned" | "running")
+    {
+        return Ok(None);
+    }
+
+    let Some(runtime_value) = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT xray_upgrade
+           FROM node_agent_state
+          WHERE node_id = $1
+            AND runtime_reported_at >= now() - interval '2 minutes'
+          FOR UPDATE",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten() else {
+        return Ok(None);
+    };
+    let runtime: XrayUpgradeRuntime = serde_json::from_value(runtime_value).map_err(|error| {
+        StoreError::InvalidData(format!(
+            "node {node_id} reported invalid Xray handoff state: {error}"
+        ))
+    })?;
+    let (deployment_id, claim_generation) = match runtime.source {
+        XrayUpgradeSource::ConfigDeployment {
+            deployment_id,
+            claim_generation,
+        } if deployment_id != next.deployment_id => (deployment_id, claim_generation),
+        _ => return Ok(None),
+    };
+    if !runtime.old.alive
+        || !matches!(
+            runtime.phase,
+            XrayUpgradePhase::Draining | XrayUpgradePhase::Blocked
+        )
+        || !runtime
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.alive && candidate.accepting == Some(true))
+    {
+        return Ok(None);
+    }
+    let claim_generation = i64::try_from(claim_generation).map_err(|_| {
+        StoreError::Conflict("claim generation is out of PostgreSQL bigint range".to_owned())
+    })?;
+    sqlx::query(
+        "UPDATE config_xray_force_retirements
+            SET settled_at = COALESCE(settled_at, now())
+          WHERE node_id = $1
+            AND settled_at IS NULL
+            AND (deployment_id, claim_generation) <> ($2, $3)",
+    )
+    .bind(node_id)
+    .bind(deployment_id)
+    .bind(claim_generation)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO config_xray_force_retirements (
+             deployment_id, node_id, claim_generation, requested_by
+         ) VALUES ($1, $2, $3, $4)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(deployment_id)
+    .bind(node_id)
+    .bind(claim_generation)
+    .bind(format!("deployment:{}", next.deployment_id))
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT deployment_id, claim_generation
+           FROM config_xray_force_retirements
+          WHERE node_id = $1 AND settled_at IS NULL",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let command = row.map(command_from).transpose()?;
+    tx.commit().await?;
+    Ok(command)
 }
 
 #[cfg(test)]

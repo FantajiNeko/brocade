@@ -102,9 +102,9 @@ static HOP_BASELINE: Mutex<Option<(u64, BTreeMap<String, u64>)>> = Mutex::new(No
 /// forwarding outbounds count; `out:egress` and `out:block` do not — the first
 /// always carries traffic (so it measures no relay liveness), the second never
 /// does.
-pub(crate) fn read_hop_downlinks(api_port: u16) -> Result<BTreeMap<String, u64>, String> {
+pub(crate) fn read_hop_downlinks(api_address: SocketAddr) -> Result<BTreeMap<String, u64>, String> {
     Ok(hop_downlinks_from_stats(&crate::xray_grpc::query_stats(
-        api_port,
+        api_address,
         "outbound>>>out:",
     )?))
 }
@@ -138,6 +138,11 @@ pub(crate) fn hop_downlinks_from_stats(
 /// A suffix ending in `@local` is a same-process loopback reference, not a link, and is omitted.
 /// `None` for anything else (egress/block/local listener).
 fn hop_of_tag(tag: &str) -> Option<(&str, &str)> {
+    // Existing TCP flows can outlive the temporary endpoint-swap handler. Keep each
+    // raw counter's own baseline, then fold both tags into the same physical hop.
+    let tag = tag
+        .strip_suffix(brocade_deployment::hotswap::ENDPOINT_SWAP_SUFFIX)
+        .unwrap_or(tag);
     let (chain, peer) = tag.strip_prefix("out:")?.split_once('>')?;
     let Some((source, target)) = chain.split_once('~') else {
         return Some((chain, peer));
@@ -508,8 +513,8 @@ pub(crate) fn collect_ping_probe_report(
     }))
 }
 
-/// Send one already timestamped observation. Callers deliberately do not retry this request: Ping
-/// is freshness-oriented diagnostic data, so the runtime keeps at most one newer pending report.
+/// Send one already timestamped observation. The daemon owns its bounded FIFO and retry policy;
+/// the one-shot command surfaces any delivery failure directly to the operator.
 pub(crate) fn send_ping_probe_report(
     options: &Options,
     request: &PingProbeReportRequest,
@@ -1327,37 +1332,74 @@ pub(crate) enum XrayListenProtocol {
     Udp,
 }
 
-/// Every inbound's (tag, listen, port, protocol) from xray.json, for probing ports one by one.
+/// Every inbound and direct management server from xray.json, for per-listener health checks.
 pub(crate) fn xray_listen_ports(content: &str) -> Vec<(String, String, u16, XrayListenProtocol)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
         return Vec::new();
     };
-    value
-        .get("inbounds")
-        .and_then(serde_json::Value::as_array)
-        .map(|inbounds| {
-            inbounds
-                .iter()
-                .filter_map(|inbound| {
-                    let tag = inbound.get("tag")?.as_str()?.to_owned();
-                    let listen = inbound
-                        .get("listen")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("0.0.0.0")
-                        .to_owned();
-                    let port = u16::try_from(inbound.get("port")?.as_u64()?).ok()?;
-                    let protocol = if inbound.get("protocol").and_then(serde_json::Value::as_str)
-                        == Some("hysteria")
-                    {
-                        XrayListenProtocol::Udp
-                    } else {
-                        XrayListenProtocol::Tcp
-                    };
-                    Some((tag, listen, port, protocol))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(inbounds) = value.get("inbounds").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for inbound in inbounds {
+        let Some(tag) = inbound.get("tag").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let listen = inbound
+            .get("listen")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0.0.0.0");
+        let Some(port) = inbound
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+        else {
+            continue;
+        };
+        let protocol = inbound.get("protocol").and_then(serde_json::Value::as_str);
+        if protocol == Some("hysteria") {
+            ports.push((
+                tag.to_owned(),
+                listen.to_owned(),
+                port,
+                XrayListenProtocol::Udp,
+            ));
+            continue;
+        }
+        let networks = if protocol == Some("dokodemo-door") {
+            inbound
+                .get("settings")
+                .and_then(|settings| settings.get("network"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tcp")
+        } else {
+            "tcp"
+        };
+        for network in networks.split(',').map(str::trim) {
+            let protocol = match network {
+                "tcp" => XrayListenProtocol::Tcp,
+                "udp" => XrayListenProtocol::Udp,
+                _ => continue,
+            };
+            ports.push((tag.to_owned(), listen.to_owned(), port, protocol));
+        }
+    }
+    for scope in ["api", "metrics"] {
+        if let Some(address) = value
+            .get(scope)
+            .and_then(|config| config.get("listen"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|listen| listen.parse::<std::net::SocketAddr>().ok())
+        {
+            ports.push((
+                format!("{scope}:direct"),
+                address.ip().to_string(),
+                address.port(),
+                XrayListenProtocol::Tcp,
+            ));
+        }
+    }
+    ports
 }
 
 /// Which peer address belongs to which hop, read out of xray's own outbound configuration.

@@ -451,11 +451,15 @@ async fn subscription_usage(
                AND q.app_id = ANY($3::text[])
          )
          SELECT u.upload_bytes, u.download_bytes, u.has_gap,
+                owner.traffic_accounting_mode,
                 CASE WHEN l.limited_count = cardinality($3::text[])
                      THEN l.total_bytes ELSE NULL END AS total_bytes,
                 to_char(b.month_end AT TIME ZONE 'Asia/Hong_Kong',
                         'YYYY-MM-DD\"T\"HH24:MI:SS') || '+08:00' AS reset_at
-         FROM used u, limits l, bounds b",
+         FROM used u
+         CROSS JOIN limits l
+         CROSS JOIN bounds b
+         JOIN users owner ON owner.tenant_id = $1 AND owner.id = $2",
     )
     .bind(tenant_id)
     .bind(user_id)
@@ -463,8 +467,22 @@ async fn subscription_usage(
     .fetch_one(pool)
     .await?;
 
-    let upload_bytes = nonnegative_bytes("upload_bytes", row.try_get("upload_bytes")?)?;
-    let download_bytes = nonnegative_bytes("download_bytes", row.try_get("download_bytes")?)?;
+    let multiplier = match row
+        .try_get::<String, _>("traffic_accounting_mode")?
+        .as_str()
+    {
+        "single" => 1,
+        "double" => 2,
+        other => {
+            return Err(StoreError::InvalidData(format!(
+                "unknown user traffic accounting mode {other}"
+            )))
+        }
+    };
+    let upload_bytes =
+        nonnegative_bytes("upload_bytes", row.try_get("upload_bytes")?)?.saturating_mul(multiplier);
+    let download_bytes = nonnegative_bytes("download_bytes", row.try_get("download_bytes")?)?
+        .saturating_mul(multiplier);
     let total_bytes = row
         .try_get::<Option<i64>, _>("total_bytes")?
         .map(|value| nonnegative_bytes("total_bytes", value))

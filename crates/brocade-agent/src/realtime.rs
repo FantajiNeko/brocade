@@ -256,8 +256,8 @@ fn user_traffic_report(
 fn read_user_counters(state_dir: &Path, forwarding: bool) -> Result<UserTrafficCounters, String> {
     let content = fs::read_to_string(state_dir.join("xray.json"))
         .map_err(|error| format!("cannot read xray config: {error}"))?;
-    let api_port = crate::xray_api_port(&content).ok_or("xray api port is absent")?;
-    let mut counters: UserTrafficCounters = crate::read_xray_usage_counters(api_port)?
+    let api_address = crate::xray_api_address(&content).ok_or("xray API address is absent")?;
+    let mut counters: UserTrafficCounters = crate::read_xray_usage_counters(api_address)?
         .into_iter()
         .filter(|counter| parse_grant_label(&counter.label).is_some())
         .map(|counter| {
@@ -269,7 +269,7 @@ fn read_user_counters(state_dir: &Path, forwarding: bool) -> Result<UserTrafficC
         .collect();
     if forwarding {
         counters.extend(
-            crate::forwarding::read_counters(api_port)?
+            crate::forwarding::read_counters(api_address)?
                 .into_iter()
                 .map(|(id, counters)| (format!("fwd:{id}"), counters)),
         );
@@ -449,11 +449,13 @@ pub(crate) fn run(options: &Options, vpngate: VpngateCache) {
     // Polling fallback is independent of management connectivity and NIC sampling.
     thread::spawn(move || loop {
         let started = Instant::now();
-        let api_port = fs::read_to_string(state_dir.join("xray.json"))
+        let api_address = fs::read_to_string(state_dir.join("xray.json"))
             .ok()
-            .and_then(|content| crate::xray_api_port(&content));
-        let health_report = api_port.and_then(|port| crate::xray_grpc::reverse_health(port).ok());
-        let mux_report = api_port.and_then(|port| crate::xray_grpc::mux_snapshot(port).ok());
+            .and_then(|content| crate::xray_api_address(&content));
+        let health_report =
+            api_address.and_then(|address| crate::xray_grpc::reverse_health(address).ok());
+        let mux_report =
+            api_address.and_then(|address| crate::xray_grpc::mux_snapshot(address).ok());
         if let Ok(mut value) = health_cache.lock() {
             *value = health_report;
         }
@@ -585,14 +587,11 @@ fn serve(
                             sampler.reset();
                             user_traffic_sampler.reset();
                             next_sample = Instant::now();
-                        } else if active
-                            .as_ref()
-                            .is_some_and(|(_, _, current_users)| current_users != &user_traffic)
-                        {
-                            // Adding a user watcher changes its baseline, never the existing NIC
-                            // timeline shared with the fleet header and machine observations.
-                            user_traffic_sampler.reset();
                         }
+                        // The baseline contains all observed counters, not just selected users.
+                        // A watcher change or authorization renewal only changes which deltas we
+                        // emit. Preserve the baseline; new/reset counters get their own gap, and
+                        // advance_counters rejects a baseline that has become too old.
                         if diagnostics
                             && active
                                 .as_ref()
@@ -787,6 +786,71 @@ mod tests {
         );
         assert!(reset.has_gap);
         assert!(reset.users.is_empty());
+    }
+
+    #[test]
+    fn user_rate_baselines_survive_selection_changes_and_isolate_new_counter_gaps() {
+        let start = Instant::now();
+        let alice = brocade_core::model::grant_label("alice", "platform", "entry");
+        let bob = brocade_core::model::grant_label("bob", "platform", "entry");
+        let carol = brocade_core::model::grant_label("carol", "platform", "entry");
+        let selected = |labels| RealtimeUserTrafficSelector::Labels {
+            labels,
+            forwarding: Vec::new(),
+        };
+        let mut sampler = UserTrafficSampler::default();
+        sampler.advance_counters(
+            BTreeMap::from([(alice.clone(), (100, 200)), (bob.clone(), (50, 50))]),
+            &selected(vec![alice.clone()]),
+            start,
+        );
+        // A second watcher may select counters that were already observed but not emitted.
+        let report = sampler.advance_counters(
+            BTreeMap::from([(alice.clone(), (110, 220)), (bob.clone(), (80, 90))]),
+            &selected(vec![alice.clone(), bob.clone()]),
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(report.state, RealtimeUserTrafficState::Ready);
+        assert!(!report.has_gap);
+        assert_eq!(report.users.len(), 2);
+        assert_eq!(report.users[0].user_id, "bob");
+        assert_eq!(report.users[0].downlink_bytes_per_sec, 40);
+
+        // Removing a watcher narrows the output immediately without discarding other baselines.
+        let report = sampler.advance_counters(
+            BTreeMap::from([(alice.clone(), (120, 240)), (bob.clone(), (90, 100))]),
+            &selected(vec![alice.clone()]),
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(report.users.len(), 1);
+        assert_eq!(report.users[0].user_id, "alice");
+        assert_eq!(report.users[0].downlink_bytes_per_sec, 20);
+
+        // A genuinely new label only makes that label unknown; existing rates remain valid.
+        let counters = BTreeMap::from([
+            (alice.clone(), (130, 260)),
+            (bob.clone(), (100, 110)),
+            (carol, (500, 500)),
+        ]);
+        let report = sampler.advance_counters(
+            counters.clone(),
+            &RealtimeUserTrafficSelector::All {
+                forwarding: Vec::new(),
+            },
+            start + Duration::from_secs(3),
+        );
+        assert_eq!(report.state, RealtimeUserTrafficState::Ready);
+        assert!(report.has_gap);
+        assert_eq!(report.users.len(), 2);
+
+        // A long pause still requires a new baseline, regardless of the requested selector.
+        let report = sampler.advance_counters(
+            counters,
+            &selected(vec![alice]),
+            start + Duration::from_secs(65),
+        );
+        assert_eq!(report.state, RealtimeUserTrafficState::Warming);
+        assert!(report.users.is_empty());
     }
 
     #[test]

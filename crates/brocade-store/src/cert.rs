@@ -430,15 +430,25 @@ pub async fn complete_certificate_scan(
 }
 
 pub async fn prune_certificate_scans(pool: &PgPool) -> Result<u64> {
+    prune_certificate_scans_hours(
+        pool,
+        u32::try_from(CERTIFICATE_SCAN_RETENTION_DAYS).expect("positive certificate retention")
+            * 24,
+    )
+    .await
+}
+
+pub(crate) async fn prune_certificate_scans_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     Ok(sqlx::query(
         "DELETE FROM certificate_scan_runs WHERE id IN (
              SELECT id FROM certificate_scan_runs
               WHERE status IN ('succeeded', 'failed')
-                AND finished_at < now() - make_interval(days => $1)
+                AND finished_at < now() - make_interval(secs => $1::double precision)
               ORDER BY id LIMIT 1000
          )",
     )
-    .bind(CERTIFICATE_SCAN_RETENTION_DAYS)
+    .bind(retain_secs)
     .execute(pool)
     .await?
     .rows_affected())

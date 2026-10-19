@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { NodeAgentStateItem, NodeTrafficView, UsageNodeSeries } from '../src/api';
+import type { NodeAgentStateItem, NodeTrafficItem, NodeTrafficView, UsageNodeSeries } from '../src/api';
 
 let exactBytes: typeof import('../src/panes/nodes').exactBytes;
 let trafficCalibrationBytes: typeof import('../src/panes/nodes').trafficCalibrationBytes;
@@ -33,6 +33,7 @@ const view: NodeTrafficView = {
       tenant_id: 'platform',
       name: '香港',
       cycle_kind: 'monthly',
+      accounting_mode: 'bidirectional_sum',
       reset_month: null,
       reset_day: 1,
       quota_bytes: null,
@@ -110,7 +111,7 @@ describe('node traffic accounting values', () => {
     expect(exactBytes('not-a-counter')).toBe('—');
   });
 
-  it('saves yearly UTC reset policy and a total-only calibration immediately', async () => {
+  it('stays expanded and saves quota, yearly UTC reset policy, and calibration together', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -125,20 +126,41 @@ describe('node traffic accounting values', () => {
     );
 
     const title = await screen.findByText('流量统计');
-    const panel = title.closest('details');
-    expect(panel?.open).toBe(false);
-    expect(screen.getByText('缺口')).toBeTruthy();
-    fireEvent.click(title.closest('summary')!);
-    expect(panel?.open).toBe(true);
-    expect(screen.getByText('本期总量')).toBeTruthy();
-    expect(screen.getByText('缺口 · 机器重启')).toBeTruthy();
+    const panel = title.closest('.node-traffic-accounting');
+    expect(panel?.tagName).toBe('DIV');
+    expect(panel?.querySelector('summary')).toBeNull();
+    expect(screen.queryByText('缺口')).toBeNull();
+    expect(panel?.querySelector('.node-traffic-used b')?.textContent).toBe('1.50 TiB');
+    // 没有额度时只有读数，不画额度条也不写百分比。
+    expect(panel?.querySelector('.node-traffic-meter')).toBeNull();
+    expect(panel?.querySelector('.node-traffic-used')?.textContent).not.toContain('%');
+    expect(screen.queryByText('缺口 · 机器重启')).toBeNull();
+    expect(screen.queryByText(/才开始记账/)).toBeNull();
     expect(screen.getByLabelText('接收与发送流量').textContent).toContain('1.00 TiB');
     expect(screen.queryByText(/Agent 每 10 秒原子落盘/)).toBeNull();
     expect(screen.getByText('eth0')).toBeTruthy();
+    expect(screen.getByText('接收与发送相加。')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('机器流量计量口径'), {
+      target: { value: 'bidirectional_max' },
+    });
+    // 说明只写当前选中的口径。
+    expect(screen.queryByText('接收与发送相加。')).toBeNull();
+    expect(screen.getByText('整个账期累计后取较大的方向，不按天取大。')).toBeTruthy();
+    const quota = screen.getByLabelText('机器流量额度');
+    fireEvent.change(quota, { target: { value: '2.555' } });
+    expect(quota.getAttribute('aria-invalid')).toBe('true');
+    expect(screen.getByText(/流量额度需为大于 0 的数字、最多两位小数/)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '每年' }));
     fireEvent.change(screen.getByLabelText('重置月份'), { target: { value: '2' } });
     fireEvent.change(screen.getByLabelText('重置日'), { target: { value: '29' } });
+    fireEvent.change(quota, { target: { value: '2.5' } });
+    // 校准是一次动作，不是常驻字段：点「校准」才出现输入框。
+    expect(screen.queryByLabelText('当前流量校准值')).toBeNull();
+    expect(screen.getByText('本期未校准')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '校准' }));
     fireEvent.change(screen.getByLabelText('当前流量校准值'), { target: { value: '1.5' } });
+    // 保存栏只有按钮，不逐条复述改动。
+    expect(document.querySelector('.config-panel-savebar')?.textContent).toBe('保存还原');
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
@@ -146,10 +168,82 @@ describe('node traffic accounting values', () => {
     expect(url).toBe('/node-traffic/nodes/hk');
     expect(JSON.parse(String(init.body))).toEqual({
       cycle_kind: 'yearly',
+      accounting_mode: 'bidirectional_max',
       reset_month: 2,
       reset_day: 29,
-      quota_bytes: null,
+      quota_bytes: '2748779069440',
       calibrated_total_bytes: '1610612736',
     });
+  });
+
+  const TIB = 1024 ** 4;
+  const DAY = 86_400;
+
+  function renderCard(patch: Partial<NodeTrafficItem>, canEdit = true) {
+    const item = { ...view.nodes[0], ...patch };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ nodes: [item] }) }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData<NodeTrafficView>(['node-traffic'], { nodes: [item] });
+    render(
+      <QueryClientProvider client={client}>
+        <TrafficAccountingCard node={{ node_id: 'hk', name: '香港' } as NodeAgentStateItem} canEdit={canEdit} />
+      </QueryClientProvider>,
+    );
+    const panel = document.querySelector('.node-traffic-accounting');
+    expect(panel).toBeTruthy();
+    return panel!;
+  }
+
+  it('compares the used share of the quota with the elapsed share of the period', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const end = now + 3.25 * DAY;
+    const panel = renderCard({
+      quota_bytes: String(2 * TIB),
+      total_bytes: String(1.5 * TIB),
+      period_start_unix_secs: now - 10 * DAY,
+      period_end_unix_secs: end,
+    });
+
+    const used = panel.querySelector('.node-traffic-used')?.textContent ?? '';
+    expect(used).toContain('1.50 TiB');
+    expect(used).toContain('/ 2 TiB');
+    expect(used).toContain('75%');
+    expect(panel.querySelector('.node-traffic-used .over')).toBeNull();
+    expect(panel.querySelector('.node-traffic-reset')?.textContent).toBe(
+      `3 天后重置 · ${new Date(end * 1000).toISOString().slice(5, 10)} UTC`,
+    );
+    const pace = panel.querySelector<HTMLElement>('.node-traffic-pace');
+    expect(pace).toBeTruthy();
+    expect(Number.parseFloat(pace!.style.left)).toBeCloseTo((10 / 13.25) * 100, 0);
+    expect(panel.querySelector('.cap-q')).toBeNull();
+    expect(panel.querySelector('.cap-bar .u')).toBeTruthy();
+  });
+
+  it('marks traffic above the quota and dims the direction the accounting mode leaves out', () => {
+    const panel = renderCard({
+      accounting_mode: 'outbound_only',
+      quota_bytes: String(TIB),
+      rx_bytes: String(0.5 * TIB),
+      tx_bytes: String(1.5 * TIB),
+      total_bytes: String(1.5 * TIB),
+    });
+
+    expect(panel.querySelector('.node-traffic-used .over')?.textContent).toBe('150%');
+    expect(panel.querySelector('.cap-bar .u.x')).toBeTruthy();
+    expect(panel.querySelector('.cap-q')).toBeTruthy();
+    expect(panel.querySelector('.node-traffic-pace')).toBeNull();
+    expect(panel.querySelector('.node-traffic-directions .rx')?.classList.contains('off')).toBe(true);
+    expect(panel.querySelector('.node-traffic-directions .tx')?.classList.contains('off')).toBe(false);
+    expect(screen.getByText('只计发送。')).toBeTruthy();
+  });
+
+  it('shows the calibration state to read-only viewers without edit controls', () => {
+    const panel = renderCard({ calibrated_at_unix_secs: Math.floor(Date.now() / 1000) - 3 * DAY }, false);
+
+    expect(panel.textContent).toContain('已校准 · 3');
+    expect(screen.queryByRole('button', { name: '校准' })).toBeNull();
+    expect(screen.queryByLabelText('当前流量校准值')).toBeNull();
+    expect((screen.getByLabelText('机器流量计量口径') as HTMLSelectElement).disabled).toBe(true);
+    expect(panel.querySelector('.config-panel-savebar')).toBeNull();
   });
 });

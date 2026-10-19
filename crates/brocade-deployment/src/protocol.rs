@@ -11,7 +11,35 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 29;
+pub const AGENT_PROTOCOL_VERSION: u32 = 36;
+
+/// Single on-demand TCP pings are independent of listener convergence and accounting.
+pub const FORWARDING_PROBE_PROTOCOL_VERSION: u32 = 36;
+
+/// First Agent protocol whose configuration-deployment path fails closed when a live Xray cannot
+/// be hot-swapped or handed off. Console must not dispatch desired state to an older Agent because
+/// the old implementation could restart Xray after a handoff precondition failed.
+pub const CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION: u32 = 32;
+/// First Agent wire contract that can consume an operator authorization to end the old Xray
+/// generation of an exact configuration handoff. Older Agents keep draining naturally and must
+/// never be shown an action they cannot execute.
+pub const CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION: u32 = 33;
+
+/// First Agent protocol that understands explicit Xray restart/handoff policy and reports the
+/// two process generations while an Xray release is in progress.
+pub const XRAY_HANDOFF_PROTOCOL_VERSION: u32 = 30;
+
+/// Bounds the old generation's connection-drain deadline. It is independent from the control
+/// plane's overall execution deadline: expiry only authorizes termination for an explicitly
+/// force-authorized handoff.
+pub const XRAY_HANDOFF_MIN_DRAIN_SECS: u32 = 10;
+pub const XRAY_HANDOFF_MAX_DRAIN_SECS: u32 = 24 * 60 * 60;
+pub const XRAY_HANDOFF_DEFAULT_DRAIN_SECS: u32 = 2 * 60;
+
+/// A claimed handoff target with no terminal report after this interval is displayed as an
+/// overall execution timeout. This is observation, not destructive authority: the target remains
+/// dispatched and a late report for the same attempt is still accepted.
+pub const XRAY_HANDOFF_EXECUTION_TIMEOUT_SECS: u32 = 60 * 60;
 
 /// First Agent protocol that can reconcile user-managed forwarding listeners and report their
 /// per-rule counters. Forwarding has its own desired-state endpoint, so older Agents continue
@@ -1149,7 +1177,9 @@ mod agent_release_compat_tests {
         assert_eq!(new.release_id, None);
         assert_eq!(new.attempt, None);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
-        assert_eq!(AGENT_PROTOCOL_VERSION, 29);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 36);
+        assert_eq!(CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION, 32);
+        assert_eq!(CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, 33);
     }
 }
 
@@ -1582,6 +1612,9 @@ pub struct UsageReportRequest {
     pub xray_epoch: String,
     pub route: Option<RouteIpReport>,
     pub counters: Vec<UsageCounter>,
+    /// Optional observation dimensions. Never added to billable user totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_usage: Option<crate::site_usage::SiteUsageReport>,
     /// Confirmed managed-process downtime, not missing collection. Cumulative counters never
     /// reset to zero. Optional so older Agents and stored receipts retain their wire shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1607,6 +1640,7 @@ mod usage_zero_window_compat_tests {
         });
         let decoded: UsageReportRequest = serde_json::from_value(legacy.clone()).unwrap();
         assert!(decoded.zero_windows.is_empty());
+        assert!(decoded.site_usage.is_none());
         assert_eq!(
             serde_json::to_value(decoded).unwrap(),
             legacy,
@@ -2257,7 +2291,132 @@ pub struct NodeRuntimeReport {
     /// Agent or a temporarily unreachable Xray API from making every user appear offline.
     #[serde(default)]
     pub online_sources: Option<Vec<UserOnlineSources>>,
+    /// Operation-scoped Xray process generations. This is present only while a binary release or
+    /// compatible configuration deployment owns the handoff boundary. A terminal operation
+    /// reports `None`, which tells Console to clear the transient two-PID view rather than
+    /// retaining stale process identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_upgrade: Option<XrayUpgradeRuntime>,
     pub spool: SpoolBacklog,
+}
+
+/// Whether the currently installed and serving Xray can enter a managed listener handoff.
+///
+/// This is a live readiness observation, not a version-number guess. `Ready` therefore means the
+/// Agent verified both the binary capability marker and the serving generation's private control
+/// endpoint. During a release the same capability is `Busy`, preventing a second attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XrayHandoffCapability {
+    pub state: XrayHandoffState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XrayHandoffState {
+    Unsupported,
+    Ready,
+    Busy,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum XrayReleaseStrategy {
+    /// Stop the serving process and start the approved bytes. Existing connections are lost.
+    #[default]
+    Restart,
+    /// Transfer new admissions and wait for the old generation to drain. A timeout blocks the
+    /// release and leaves the old generation alive.
+    Handoff,
+    /// As above, but explicitly retire the old generation after the approved drain timeout.
+    HandoffForce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XrayUpgradePhase {
+    Preparing,
+    CandidateReady,
+    Switching,
+    Draining,
+    Blocked,
+    Forcing,
+    RollingBack,
+}
+
+/// Control-plane operation that owns a temporary two-generation Xray runtime.
+///
+/// Older Agents only created this state for binary releases and did not serialize this field, so
+/// the default deliberately preserves that interpretation. A configuration deployment keeps its
+/// own immutable identity here instead of manufacturing a binary release and accidentally
+/// satisfying that release's retry or completion fences.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum XrayUpgradeSource {
+    #[default]
+    BinaryRelease,
+    ConfigDeployment {
+        deployment_id: i64,
+        claim_generation: u64,
+    },
+}
+
+/// One process identity in the temporary two-generation release view. PID alone is never an
+/// identity: start ticks and boot id prevent PID reuse from making an unrelated process eligible
+/// for a signal or from appearing as the approved generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XrayUpgradeProcess {
+    pub pid: i32,
+    pub pid_start_ticks: u64,
+    pub boot_id: String,
+    pub sha256: String,
+    pub alive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepting: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_connections: Option<u64>,
+}
+
+/// Temporary process-level evidence for an executing Xray binary or configuration transition. It
+/// is deliberately outside `NodeVersions`: after completion the machine returns to one serving
+/// identity and this value is cleared. `source` identifies the immutable operation that owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct XrayUpgradeRuntime {
+    #[serde(default)]
+    pub source: XrayUpgradeSource,
+    pub release_id: i64,
+    pub attempt: u32,
+    pub strategy: XrayReleaseStrategy,
+    pub phase: XrayUpgradePhase,
+    pub old: XrayUpgradeProcess,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<XrayUpgradeProcess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_deadline_unix_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// Exact, replay-safe authorization returned only to the node that owns this configuration
+/// handoff. The Agent still revalidates its durable runtime and healthy candidate before
+/// terminating anything. A newer executable configuration release may authorize retirement
+/// before the old generation's own drain deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigXrayForceRetirementCommand {
+    pub deployment_id: i64,
+    pub claim_generation: u64,
+}
+
+/// Audit result returned to the operator who authorizes an interrupted old-generation drain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigXrayForceRetirementResult {
+    pub deployment_id: i64,
+    pub node_id: String,
+    pub claim_generation: u64,
+    pub active_connections: u64,
+    pub reused: bool,
 }
 
 /// Active public source addresses for one compiled grant label.
@@ -2282,6 +2441,16 @@ pub struct OnlineSource {
     /// older Agent/Xray; it must never be inferred from the configured or permitted protocols.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocols: Option<Vec<OnlineSourceProtocol>>,
+    /// Start of Xray's current continuous online epoch for this label and source address. Missing
+    /// means the running Xray predates source-session accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online_since_unix_secs: Option<i64>,
+    /// Bytes carried during the current online epoch. These are operational session counters, not
+    /// billable totals; both reset when the source's online reference count reaches zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_uplink_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_downlink_bytes: Option<u64>,
 }
 
 /// Bounded protocol vocabulary for online presence, independent of grant/traffic identities.
@@ -2349,6 +2518,9 @@ pub struct NodeVersions {
     /// identified, not that the managed binary is absent.
     #[serde(default)]
     pub xray_running_sha256: Option<String>,
+    /// Live handoff eligibility of the serving Xray generation. Missing is an older Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_handoff: Option<XrayHandoffCapability>,
     /// Whether Linux currently exposes the `tls` kernel module used by the AnyTLS kTLS path.
     ///
     /// New Agents try to load it once at startup and again before starting Xray. `None` is an
@@ -2400,6 +2572,11 @@ pub struct XrayReleaseOffer {
     pub url: String,
     pub sha256: String,
     pub previous_sha256: String,
+    #[serde(default)]
+    pub strategy: XrayReleaseStrategy,
+    /// Required for either handoff strategy and absent for a direct restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_timeout_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2422,6 +2599,14 @@ pub struct XrayReleaseReport {
     /// canary transition.
     #[serde(default)]
     pub performed_update: bool,
+    /// Echoes the immutable strategy carried by the offer. Missing legacy reports are destructive
+    /// restarts and therefore deserialize as `Restart`.
+    #[serde(default)]
+    pub strategy: XrayReleaseStrategy,
+    /// True only when `handoff-force` crossed its explicit destructive boundary and signalled the
+    /// old generation before it had drained naturally.
+    #[serde(default)]
+    pub forced_retirement: bool,
     pub xray_enabled: bool,
     #[serde(default)]
     pub installed_sha256: Option<String>,
@@ -3549,10 +3734,13 @@ mod tests {
     }
 
     #[test]
-    fn online_source_protocols_are_additive_and_use_stable_names() {
+    fn online_source_fields_are_additive_and_use_stable_names() {
         let legacy = serde_json::json!({"ip": "1.1.1.1", "last_seen_unix_secs": 1});
         let mut source: OnlineSource = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(source.protocols, None);
+        assert_eq!(source.online_since_unix_secs, None);
+        assert_eq!(source.session_uplink_bytes, None);
+        assert_eq!(source.session_downlink_bytes, None);
         assert_eq!(serde_json::to_value(&source).unwrap(), legacy);
         source.protocols = Some(vec![
             OnlineSourceProtocol::Vless,
@@ -3560,11 +3748,17 @@ mod tests {
             OnlineSourceProtocol::Hysteria2,
             OnlineSourceProtocol::MtProto,
         ]);
+        source.online_since_unix_secs = Some(1);
+        source.session_uplink_bytes = Some(123);
+        source.session_downlink_bytes = Some(456);
         let mut value = serde_json::to_value(source).unwrap();
         assert_eq!(
             value["protocols"],
             serde_json::json!(["vless", "anytls", "hysteria2", "mtproto"])
         );
+        assert_eq!(value["online_since_unix_secs"], 1);
+        assert_eq!(value["session_uplink_bytes"], 123);
+        assert_eq!(value["session_downlink_bytes"], 456);
         #[derive(Deserialize)]
         struct LegacySource {
             ip: String,
@@ -3614,6 +3808,7 @@ mod tests {
         .unwrap();
         assert_eq!(versions.xray_installed_sha256, None);
         assert_eq!(versions.xray_running_sha256, None);
+        assert_eq!(versions.xray_handoff, None);
         assert_eq!(versions.kernel_tls_module, None);
         assert_eq!(versions.openvpn, None);
         assert_eq!(versions.vpngate_catalog_probe_workers, None);
@@ -3639,6 +3834,7 @@ mod tests {
         .unwrap();
         assert_eq!(report.traffic, None);
         assert_eq!(report.online_sources, None);
+        assert_eq!(report.xray_upgrade, None);
         assert_eq!(report.spool.usage_dropped, None);
         assert_eq!(report.spool.observation_dropped, None);
         assert_eq!(report.spool.load, 0);
@@ -3696,7 +3892,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 29);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 36);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,
@@ -3708,6 +3904,8 @@ mod tests {
         }))
         .unwrap();
         assert!(!report.performed_update);
+        assert_eq!(report.strategy, XrayReleaseStrategy::Restart);
+        assert!(!report.forced_retirement);
 
         let encoded = serde_json::to_value(XrayReleaseReport {
             performed_update: true,
@@ -3723,6 +3921,93 @@ mod tests {
         assert_eq!(earlier.installed_sha256, Some("a".repeat(64)));
         assert_eq!(earlier.running_sha256, Some("a".repeat(64)));
         assert_eq!(earlier.error, None);
+    }
+
+    #[test]
+    fn xray_upgrade_runtime_keeps_both_process_identities_and_strategy() {
+        let old = XrayUpgradeProcess {
+            pid: 101,
+            pid_start_ticks: 8_001,
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            sha256: "a".repeat(64),
+            alive: true,
+            accepting: Some(false),
+            active_connections: Some(3),
+        };
+        let candidate = XrayUpgradeProcess {
+            pid: 202,
+            pid_start_ticks: 8_101,
+            boot_id: old.boot_id.clone(),
+            sha256: "b".repeat(64),
+            alive: true,
+            accepting: Some(true),
+            active_connections: Some(1),
+        };
+        let runtime = XrayUpgradeRuntime {
+            source: XrayUpgradeSource::BinaryRelease,
+            release_id: 7,
+            attempt: 2,
+            strategy: XrayReleaseStrategy::HandoffForce,
+            phase: XrayUpgradePhase::Draining,
+            old,
+            candidate: Some(candidate),
+            drain_deadline_unix_secs: Some(1_800_000_000),
+            blocked_reason: None,
+        };
+
+        let value = serde_json::to_value(&runtime).unwrap();
+        assert_eq!(value["strategy"], "handoff-force");
+        assert_eq!(value["source"]["kind"], "binary-release");
+        assert_eq!(value["old"]["pid"], 101);
+        assert_eq!(value["candidate"]["pid"], 202);
+        assert_eq!(
+            serde_json::from_value::<XrayUpgradeRuntime>(value.clone()).unwrap(),
+            runtime
+        );
+
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("source");
+        assert_eq!(
+            serde_json::from_value::<XrayUpgradeRuntime>(legacy)
+                .unwrap()
+                .source,
+            XrayUpgradeSource::BinaryRelease
+        );
+
+        let mut config_runtime = runtime;
+        config_runtime.source = XrayUpgradeSource::ConfigDeployment {
+            deployment_id: 603,
+            claim_generation: 0,
+        };
+        config_runtime.release_id = -603;
+        config_runtime.attempt = 0;
+        let config_value = serde_json::to_value(&config_runtime).unwrap();
+        assert_eq!(config_value["source"]["kind"], "config-deployment");
+        assert_eq!(config_value["source"]["deployment_id"], 603);
+        assert_eq!(
+            serde_json::from_value::<XrayUpgradeRuntime>(config_value).unwrap(),
+            config_runtime
+        );
+    }
+
+    #[test]
+    fn config_xray_force_retirement_command_carries_no_process_identity() {
+        let command = ConfigXrayForceRetirementCommand {
+            deployment_id: 604,
+            claim_generation: 7,
+        };
+        let value = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "deployment_id": 604,
+                "claim_generation": 7,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ConfigXrayForceRetirementCommand>(value).unwrap(),
+            command
+        );
     }
 
     #[test]

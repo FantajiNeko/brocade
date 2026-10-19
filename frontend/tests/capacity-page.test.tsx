@@ -32,6 +32,7 @@ function machine(node_id: string, name: string, extra: Partial<MachineTrafficMod
     tenant_id: 'platform',
     name,
     cycle_kind: 'monthly',
+    accounting_mode: 'bidirectional_sum',
     reset_month: null,
     reset_day: 1,
     period_start_unix_secs: start,
@@ -263,7 +264,13 @@ describe('machine capacity forecast', () => {
       '可信度 高 · 近 28 天中 28 天记录完整 · 误差按本机历史',
     );
     expect(within(detail).getByText('alice')).toBeTruthy();
-    expect(within(detail).getByText('platform · CN2 入口')).toBeTruthy();
+    // 用户占用：与名册同一张身份牌；第二行只写线路，不写租户；「未归因」只留空位
+    expect(within(detail).getByText('CN2 入口')).toBeTruthy();
+    expect(within(detail).queryByText(/platform/)).toBeNull();
+    const aliceAvatar = detail.querySelector('.cap-user:not(.head):not(.rest) .user-avatar.cell');
+    expect(aliceAvatar?.getAttribute('data-avatar-mark')).toBe('apple');
+    expect(aliceAvatar?.querySelector('.user-avatar-mark')).not.toBeNull();
+    expect(detail.querySelector('.cap-user.rest .user-avatar')).toBeNull();
     expect(within(detail).getByText('66.7%')).toBeTruthy();
     expect(within(detail).getByText('未归因')).toBeTruthy();
     expect(within(detail).getByText('33.3%')).toBeTruthy();
@@ -331,6 +338,7 @@ describe('machine capacity forecast', () => {
     expect(String(put[0])).toBe('/node-traffic/nodes/sg-unset');
     expect(JSON.parse(String((put[1] as RequestInit).body))).toEqual({
       cycle_kind: 'monthly',
+      accounting_mode: 'bidirectional_sum',
       reset_month: null,
       reset_day: 1,
       quota_bytes: String(1.5 * TiB),

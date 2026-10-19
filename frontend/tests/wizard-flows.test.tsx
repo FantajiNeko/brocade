@@ -23,6 +23,7 @@ const agentNodes = [
     tenant_id: 'platform',
     name: '香港边缘',
     public_ipv4: '203.0.113.10',
+    public_ipv4_country: 'HK',
     public_ipv6: '2001:db8::10',
     public_ipv4_nat: false,
     public_ipv6_nat: false,
@@ -33,6 +34,7 @@ const agentNodes = [
     tenant_id: 'platform',
     name: '新加坡中转',
     public_ipv4: '198.51.100.20',
+    public_ipv4_country: 'SG',
     public_ipv6: null,
     public_ipv4_nat: false,
     public_ipv6_nat: false,
@@ -507,14 +509,75 @@ describe('新建链向导', () => {
       target: { value: 'hk-edge-01' },
     });
     expect(view.getByText('3 种 · 端口自动避让')).toBeTruthy();
-    expect(view.getByText('未命名 · 全球加速')).toBeTruthy();
+    expect(view.getByText('香港边缘 直出 · 全球加速')).toBeTruthy();
     expect(view.getByRole('textbox', { name: '链名称' }).getAttribute('placeholder')).toBe('给这条链起个名字');
+    expect((view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement).value).toBe('香港边缘 直出');
     expect(view.queryByLabelText('新链摘要')).toBeNull();
     expect(view.container.querySelectorAll('.nd-paper')).toHaveLength(1);
     expect(view.container.querySelectorAll('.wz-head, .wz-foot')).toHaveLength(0);
-    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+    expect(view.queryByLabelText('出口地区标识')).toBeNull();
+    expect(view.queryByText('出口地区标识')).toBeNull();
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '亚太分流' } });
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
+  });
+
+  it('链名称跟随主路径，手动命名或清空后不再覆盖用户输入', () => {
+    const view = mount();
+    const name = view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement;
+    expect(name.value).toBe('');
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
+    expect(name.value).toBe('香港边缘 直出');
+    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
+      target: { value: 'sg-relay-01' },
+    });
+    expect(name.value).toBe('香港边缘 → 新加坡中转');
+    fireEvent.click(view.getByRole('button', { name: '把 新加坡中转 移出本链' }));
+    expect(name.value).toBe('香港边缘 直出');
+
+    fireEvent.change(name, { target: { value: '手动链名' } });
+    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
+      target: { value: 'sg-relay-01' },
+    });
+    expect(name.value).toBe('手动链名');
+    fireEvent.change(name, { target: { value: '' } });
+    fireEvent.click(view.getByRole('button', { name: '把 新加坡中转 移出本链' }));
+    expect(name.value).toBe('');
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+  });
+
+  it('新增规则默认 geosite，关键词紧随其后，并保持终端规则置底', () => {
+    const view = mount();
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
+    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    const match = view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }) as HTMLSelectElement;
+    expect(match.value).toBe('geosite');
+    expect([...match.options].slice(0, 2).map(option => option.value)).toEqual(['geosite', 'domain_keyword']);
+    expect([...match.options].map(option => option.value)).toEqual(
+      expect.arrayContaining(['domain_suffix', 'geoip', 'sniffing_failed', 'any']),
+    );
+    const values = view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }) as HTMLInputElement;
+    expect(values.value).toBe('');
+    expect(values.placeholder).toContain('netflix');
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.change(values, { target: { value: 'netflix' } });
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
+
+    fireEvent.change(match, { target: { value: 'domain_keyword' } });
+    expect(values.value).toBe('');
+    expect(values.placeholder).toContain('google');
+    expect((view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }) as HTMLSelectElement).value).toBe('egress');
+    fireEvent.change(match, { target: { value: 'sniffing_failed' } });
+    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    const matches = view.getAllByRole('combobox', { name: /香港边缘 第 \d+ 条匹配条件/ }) as HTMLSelectElement[];
+    expect(matches.map(select => select.value)).toEqual(['geosite', 'sniffing_failed', 'any']);
+    expect(matches[0].querySelector<HTMLOptionElement>('option[value="sniffing_failed"]')?.disabled).toBe(true);
+    expect(matches.at(-1)?.disabled).toBe(true);
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
   });
 
   it('接入协议沿用详情页的逐行选择样式，图标与端口编辑不干扰开关', () => {
@@ -530,7 +593,7 @@ describe('新建链向导', () => {
       'TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。',
       'TCP 入站；支持 TLS / REALITY、Padding 与连接复用。',
       'QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。',
-      '先选择入口节点',
+      'Telegram MTProto 代理。',
     ]);
 
     const anyTls = view.getByRole('checkbox', { name: 'AnyTLS' }) as HTMLInputElement;
@@ -555,7 +618,30 @@ describe('新建链向导', () => {
     );
   });
 
-  it('在新链中启用 MTProxy，并把端口和投影一同写入草稿', async () => {
+  it('所有接入协议都可先选择，切换入口不会重置协议选择', () => {
+    const view = mount();
+    const protocols = ['VLESS · REALITY', 'VLESS · Encryption', 'AnyTLS', 'Hysteria 2', 'MTProxy'];
+    const choices = protocols.map(name => view.getByRole('checkbox', { name }) as HTMLInputElement);
+    const selected = choices.map(choice => {
+      expect(choice.disabled).toBe(false);
+      const initial = choice.checked;
+      fireEvent.click(choice);
+      expect(choice.checked).toBe(!initial);
+      return choice.checked;
+    });
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+
+    for (const nodeId of ['hk-edge-01', 'sg-relay-01']) {
+      fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: nodeId } });
+      expect(choices.map(choice => choice.checked)).toEqual(selected);
+      expect(choices.every(choice => !choice.disabled)).toBe(true);
+      fireEvent.click(view.getByRole('button', { name: '换一台当入口' }));
+      expect(choices.map(choice => choice.checked)).toEqual(selected);
+      expect(choices.every(choice => !choice.disabled)).toBe(true);
+    }
+  });
+
+  it('先选择 MTProxy 和端口，再选择入口，并把端口和投影一同写入草稿', async () => {
     draft.init(`wizard-mtproxy-${Math.random()}`);
     draft.clear();
     const done = vi.fn();
@@ -567,50 +653,249 @@ describe('新建链向导', () => {
       </QueryClientProvider>,
     );
     const mtproxy = view.getByRole('checkbox', { name: 'MTProxy' }) as HTMLInputElement;
-    expect(mtproxy.disabled).toBe(true);
+    expect(mtproxy.disabled).toBe(false);
+    fireEvent.click(mtproxy);
+    fireEvent.change(view.getByRole('textbox', { name: 'MTProxy 监听端口' }), { target: { value: '28812' } });
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
 
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
     expect(mtproxy.disabled).toBe(false);
-    fireEvent.click(mtproxy);
-    expect((view.getByRole('textbox', { name: 'MTProxy 监听端口' }) as HTMLInputElement).value).toBe('28800');
+    expect(mtproxy.checked).toBe(true);
+    expect((view.getByRole('textbox', { name: 'MTProxy 监听端口' }) as HTMLInputElement).value).toBe('28812');
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: 'Telegram 接入' } });
     fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
 
     await waitFor(() => expect(done).toHaveBeenCalledOnce());
     expect(draft.ops().find(op => op.op === 'create_ingress')).toMatchObject({
       ingress: {
-        wires: { mtproto: { port: 28800 } },
+        wires: { mtproto: { port: 28812 } },
         projection: { mtproto: {} },
       },
     });
   });
 
-  it('NAT 入口不允许在新链中启用 MTProxy', () => {
+  it.each([
+    [null, false, '当前机器没有配置公网 IPv4，不能启用 MTProxy'],
+    ['203.0.113.10', true, '当前机器的公网 IPv4 未直接配置在网卡上，不能启用 MTProxy'],
+  ])('不兼容入口仍可选择 MTProxy，创建校验提示原因：%s / NAT=%s', (publicIpv4, nat, reason) => {
     const client = queryClient();
     client.setQueryData(['nodes'], {
-      nodes: [...agentNodes, { ...agentNodes[0], node_id: 'nat-edge-01', name: 'NAT 入口', public_ipv4_nat: true }],
+      nodes: [{ ...agentNodes[0], public_ipv4: publicIpv4, public_ipv4_nat: nat }, agentNodes[1]],
     });
     const view = mount(client);
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: 'Telegram 接入' } });
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
-      target: { value: 'nat-edge-01' },
+      target: { value: 'hk-edge-01' },
     });
-    expect((view.getByRole('checkbox', { name: 'MTProxy' }) as HTMLInputElement).disabled).toBe(true);
-    expect(view.getByText('当前机器的公网 IPv4 未直接配置在网卡上，不能启用 MTProxy')).toBeTruthy();
+    const mtproxy = view.getByRole('checkbox', { name: 'MTProxy' }) as HTMLInputElement;
+    expect(mtproxy.disabled).toBe(false);
+    expect(view.queryByRole('alert')).toBeNull();
+    fireEvent.click(mtproxy);
+    expect(mtproxy.checked).toBe(true);
+    expect(view.getByRole('alert').textContent).toBe(reason);
+    expect(view.getByText('Telegram MTProto 代理。')).toBeTruthy();
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(mtproxy);
+    expect(view.queryByRole('alert')).toBeNull();
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
+    fireEvent.click(mtproxy);
+    fireEvent.click(view.getByRole('button', { name: '换一台当入口' }));
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'sg-relay-01' },
+    });
+    expect(mtproxy.checked).toBe(true);
+    expect(view.queryByRole('alert')).toBeNull();
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
   });
 
   it('选择用户不依赖入口节点，之后选择入口仍保留授权选择', () => {
     const view = mount();
     expect(view.queryByText('先选择入口节点，再添加可用用户。')).toBeNull();
-    fireEvent.change(view.getByRole('combobox', { name: '添加可用用户' }), {
-      target: { value: 'platform/alice' },
-    });
-    expect(view.getByRole('button', { name: '撤销 alice 的授权' })).toBeTruthy();
+    const alice = view.getByRole('button', { name: /^alice(?:\s|$)/ });
+    fireEvent.click(alice);
+    expect(alice.getAttribute('aria-pressed')).toBe('true');
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
-    expect(view.getByRole('button', { name: '撤销 alice 的授权' })).toBeTruthy();
+    expect(view.getByRole('button', { name: /^alice(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('授权用户按租户分组并使用共享头像，搜索和全选只作用于当前可见用户', () => {
+    const client = queryClient();
+    client.setQueryData(['tenants'], {
+      tenants: [
+        { id: 'platform', name: '平台', node_count: 2, user_count: 3, operator_count: 1 },
+        { id: 'platform.design', name: '设计团队', node_count: 0, user_count: 1, operator_count: 0 },
+      ],
+    });
+    const cachedUsers = client.getQueryData<{ users: object[] }>(['users']);
+    client.setQueryData(['users'], {
+      users: [
+        ...(cachedUsers?.users ?? []),
+        { tenant_id: 'platform.design', id: 'carol', status: 'active', created_at: '', created_revision: 1 },
+      ],
+    });
+    const view = mount(client);
+    expect(view.getByText('授权用户')).toBeTruthy();
+    expect(view.queryByText('谁能用')).toBeNull();
+    expect(view.getByRole('region', { name: '设计团队的用户' })).toBeTruthy();
+    const alice = view.getByRole('button', { name: /^alice(?:\s|$)/ });
+    const avatar = alice.querySelector('.user-generated-avatar');
+    expect(avatar).toBeTruthy();
+    expect(avatar?.querySelector('.user-avatar-mark')).toBeTruthy();
+    expect(avatar?.querySelector('img')).toBeNull();
+    fireEvent.click(alice);
+    const search = view.getByRole('searchbox', { name: /搜索/ });
+    fireEvent.change(search, { target: { value: '设计团队' } });
+    expect(view.getByRole('region', { name: '设计团队的用户' })).toBeTruthy();
+    expect(view.getByRole('button', { name: /^carol(?:\s|$)/ })).toBeTruthy();
+    expect(view.queryByRole('button', { name: /^alice(?:\s|$)/ })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '全选' }));
+    expect(view.getByRole('button', { name: /^carol(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true');
+
+    fireEvent.change(search, { target: { value: 'BOB' } });
+    const bob = view.getByRole('button', { name: /^bob(?:\s|$)/ });
+    expect(bob.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(bob);
+    fireEvent.change(search, { target: { value: 'no-such-user' } });
+    expect(view.getByText('没有匹配的用户')).toBeTruthy();
+    fireEvent.change(search, { target: { value: '' } });
+    for (const id of ['alice', 'bob', 'carol']) {
+      expect(view.getByRole('button', { name: new RegExp(`^${id}(?:\\s|$)`) }).getAttribute('aria-pressed')).toBe(
+        'true',
+      );
+    }
+    expect(view.getByRole('button', { name: /legacy-user/ }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(view.getByRole('button', { name: /^(?:清空|全不选)$/ }));
+    for (const id of ['alice', 'bob', 'carol']) {
+      expect(view.getByRole('button', { name: new RegExp(`^${id}(?:\\s|$)`) }).getAttribute('aria-pressed')).toBe(
+        'false',
+      );
+    }
+  });
+
+  it('搜索中新增用户后清空筛选，并在创建成功后自动选中', async () => {
+    const client = queryClient();
+    const cachedSnapshot = client.getQueryData(['snapshot']);
+    const cachedRevisions = client.getQueryData(['revisions']);
+    const fetcher = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/users' && init?.method === 'POST') {
+        return Response.json(
+          {
+            revision_id: 13,
+            user: {
+              tenant_id: 'platform',
+              id: 'carol',
+              status: 'active',
+              created_at: '2026-10-19T00:00:00Z',
+              created_revision: 13,
+            },
+          },
+          { status: 201 },
+        );
+      }
+      if (path.startsWith('/revisions')) return Response.json(cachedRevisions);
+      if (path === '/model/snapshot') return Response.json(cachedSnapshot);
+      return Response.json({ error: `unexpected request: ${path}` }, { status: 500 });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const view = mount(client);
+
+    expect(view.getByRole('group', { name: '选择可用用户' })).toBeTruthy();
+    const search = view.getByRole('searchbox', { name: /搜索/ }) as HTMLInputElement;
+    fireEvent.change(search, { target: { value: 'alice' } });
+    fireEvent.click(view.getByRole('button', { name: /^新增用户/ }));
+    fireEvent.change(view.getByRole('textbox', { name: '新用户 ID' }), { target: { value: 'carol' } });
+    fireEvent.click(view.getByRole('button', { name: '新增并选中' }));
+
+    await waitFor(() =>
+      expect(view.getByRole('button', { name: /^carol(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true'),
+    );
+    const createCall = fetcher.mock.calls.find(([path, init]) => path === '/users' && init?.method === 'POST');
+    expect(createCall).toBeTruthy();
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({ tenant_id: 'platform', id: 'carol' });
+    expect(search.value).toBe('');
+    expect(view.queryByRole('group', { name: '新增用户' })).toBeNull();
+  });
+
+  it('新增用户推进修订时保留已挂载表面和输入，等待修订和编译完成后才能加入草稿', async () => {
+    draft.init(`wizard-user-refresh-${Math.random()}`);
+    draft.clear();
+    const client = queryClient();
+    const cachedSnapshot = client.getQueryData(['snapshot']);
+    let finishRevisions!: (response: Response) => void;
+    const refreshedRevisions = new Promise<Response>(resolve => {
+      finishRevisions = resolve;
+    });
+    let finishCompile!: (response: Response) => void;
+    const refreshedCompile = new Promise<Response>(resolve => {
+      finishCompile = resolve;
+    });
+    const fetcher = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/users' && init?.method === 'POST') {
+        return Response.json({
+          revision_id: 13,
+          user: { tenant_id: 'platform', id: 'carol', status: 'active', created_at: '', created_revision: 13 },
+        });
+      }
+      if (path.startsWith('/revisions')) return refreshedRevisions;
+      if (path === '/model/snapshot') return Response.json(cachedSnapshot);
+      if (path === '/compile/13') return refreshedCompile;
+      return Response.json({ error: `unexpected request: ${path}` }, { status: 500 });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const view = mount(client);
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
+    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
+      target: { value: 'sg-relay-01' },
+    });
+    const name = view.getByRole('textbox', { name: '链名称' });
+    const port = view.getByRole('textbox', { name: 'AnyTLS 监听端口' });
+    fireEvent.change(name, { target: { value: '刷新中保留的链' } });
+    fireEvent.change(port, { target: { value: '25444' } });
+    fireEvent.click(view.getByRole('button', { name: /^alice(?:\s|$)/ }));
+    const anyTlsCard = view.getByRole('checkbox', { name: 'AnyTLS' }).closest('.wzp-card') as HTMLElement;
+    fireEvent.click(within(anyTlsCard).getByRole('button', { name: '参数' }));
+    const padding = view.getByRole('combobox', { name: 'Padding' });
+    fireEvent.click(view.getByRole('button', { name: /^新增用户/ }));
+    fireEvent.change(view.getByRole('textbox', { name: '新用户 ID' }), { target: { value: 'carol' } });
+    fireEvent.click(view.getByRole('button', { name: '新增并选中' }));
+
+    await waitFor(() => expect(fetcher.mock.calls.some(([path]) => path.startsWith('/revisions'))).toBe(true));
+    expect(client.getQueryData(['revisions'])).toMatchObject({ current_revision: 12 });
+    expect(client.getQueryState(['revisions'])).toMatchObject({ status: 'success', fetchStatus: 'fetching' });
+    expect(view.getByRole('textbox', { name: '链名称' })).toBe(name);
+    expect((name as HTMLInputElement).value).toBe('刷新中保留的链');
+    expect(view.getByRole('textbox', { name: 'AnyTLS 监听端口' })).toBe(port);
+    expect((port as HTMLInputElement).value).toBe('25444');
+    expect(view.getByRole('combobox', { name: 'Padding' })).toBe(padding);
+    expect(view.getByText('等待最新配置加载完成')).toBeTruthy();
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+    expect(fetcher.mock.calls.some(([path]) => path === '/compile/13')).toBe(false);
+    expect(draft.ops()).toEqual([]);
+
+    finishRevisions(Response.json({ current_revision: 13, revisions: [{ id: 13 }] }));
+    await waitFor(() => expect(fetcher.mock.calls.some(([path]) => path === '/compile/13')).toBe(true));
+    expect(view.getByRole('textbox', { name: '链名称' })).toBe(name);
+    expect((name as HTMLInputElement).value).toBe('刷新中保留的链');
+    expect(view.getByRole('textbox', { name: 'AnyTLS 监听端口' })).toBe(port);
+    expect((port as HTMLInputElement).value).toBe('25444');
+    expect(view.getByRole('combobox', { name: 'Padding' })).toBe(padding);
+    expect(view.getByRole('button', { name: /^alice(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true');
+    expect(view.getByRole('button', { name: /^carol(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true');
+    expect(view.getByText('等待最新配置加载完成')).toBeTruthy();
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+    expect(draft.ops()).toEqual([]);
+
+    finishCompile(Response.json({ diagnostics: [], system: { nodes: [] } }));
+    await waitFor(() => expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false));
+    expect(view.getByRole('textbox', { name: '链名称' })).toBe(name);
+    expect((port as HTMLInputElement).value).toBe('25444');
+    expect(view.getByRole('combobox', { name: 'Padding' })).toBe(padding);
   });
 
   it('入口租户变化时保留已选用户并说明不可授权，切回后恢复', () => {
@@ -628,20 +913,19 @@ describe('新建链向导', () => {
         </SessionProvider>
       </QueryClientProvider>,
     );
-    fireEvent.change(view.getByRole('combobox', { name: '添加可用用户' }), {
-      target: { value: 'platform/alice' },
-    });
+    fireEvent.click(view.getByRole('button', { name: /^alice(?:\s|$)/ }));
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'branch-edge-01' },
     });
-    expect(view.getByRole('button', { name: '撤销 alice 的授权' })).toBeTruthy();
-    expect(view.getByText('alice · 该用户不在当前入口的可授权范围内')).toBeTruthy();
+    const unavailable = view.getByRole('button', { name: /^alice/ });
+    expect(unavailable.getAttribute('aria-pressed')).toBe('true');
+    expect(unavailable.getAttribute('title')).toContain('不在当前入口的可授权范围内');
     expect(view.getByText('alice 当前不可授权，本次不会写入。')).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '换一台当入口' }));
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
-    expect(view.getByRole('button', { name: '撤销 alice 的授权' })).toBeTruthy();
+    expect(view.getByRole('button', { name: /^alice(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true');
     expect(view.queryByText('alice 当前不可授权，本次不会写入。')).toBeNull();
   });
 
@@ -723,6 +1007,7 @@ describe('新建链向导', () => {
                   no_mail: true,
                   no_udp_amplification: true,
                   tcp_and_quic_only: false,
+                  cn_source_block: 'off',
                 },
                 identity: { public_key: 'public', short_ids: ['0123abcd'] },
                 wires: { vless: { kind: 'vless-reality' } },
@@ -828,6 +1113,30 @@ describe('新建链向导', () => {
     });
   });
 
+  it('协议参数显示实际证书和伪装目标，并准确说明会话票据及空带宽行为', () => {
+    const view = mount();
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
+    const protocol = (name: string) => view.getByRole('checkbox', { name }).closest('.wzp-card') as HTMLElement;
+    const expand = (name: string) => fireEvent.click(within(protocol(name)).getByRole('button', { name: '参数' }));
+
+    expand('VLESS · REALITY');
+    fireEvent.change(view.getByRole('combobox', { name: 'REALITY 目标来源' }), {
+      target: { value: 'global-site' },
+    });
+    expect(within(protocol('VLESS · REALITY')).getByText('www.cloudflare.com:443', { exact: true })).toBeTruthy();
+    expect(within(protocol('VLESS · REALITY')).getByText('www.cloudflare.com', { exact: true })).toBeTruthy();
+
+    expand('VLESS · Encryption');
+    expect(protocol('VLESS · Encryption').textContent).toMatch(/会话票据有效期\s*600s/);
+    expand('AnyTLS');
+    expect(within(protocol('AnyTLS')).getByText('hk.nodes.example.net', { exact: true })).toBeTruthy();
+    expand('Hysteria 2');
+    expect(protocol('Hysteria 2').textContent).toMatch(/留空.*BBR/);
+    expect(within(protocol('Hysteria 2')).getByText('hk.nodes.example.net', { exact: true })).toBeTruthy();
+  });
+
   it('不允许给停用用户授权，并在入口改变授权范围时保留明确状态', () => {
     const view = mount();
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
@@ -835,12 +1144,10 @@ describe('新建链向导', () => {
     });
     const disabledUser = view.getByRole('button', { name: /legacy-user/ });
     expect(disabledUser.hasAttribute('disabled')).toBe(true);
-    expect(disabledUser.getAttribute('title')).toBe('该用户已停用');
-    fireEvent.change(view.getByRole('combobox', { name: '添加可用用户' }), {
-      target: { value: 'platform/alice' },
-    });
+    expect(disabledUser.getAttribute('title')).toContain('该用户已停用');
+    fireEvent.click(view.getByRole('button', { name: /^alice(?:\s|$)/ }));
     expect(view.getByText('1 人已选')).toBeTruthy();
-    expect(view.getByRole('button', { name: '撤销 alice 的授权' })).toBeTruthy();
+    expect(view.getByRole('button', { name: /^alice(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true');
   });
 
   it('拦截反向中转监听与任一入口协议撞端口', () => {
@@ -882,7 +1189,7 @@ describe('新建链向导', () => {
     expect(view.queryAllByText(/填写自定义主机地址/)).toHaveLength(0);
   });
 
-  it('例外支路、主干、订阅地区和授权按预览写入同一批草稿', async () => {
+  it('例外支路、主干、末尾节点地区和授权按预览写入同一批草稿', async () => {
     draft.init(`wizard-graph-${Math.random()}`);
     draft.clear();
     const client = queryClient();
@@ -891,6 +1198,7 @@ describe('新建链向导', () => {
       node_id: 'tw-exit-01',
       name: '台湾出口',
       public_ipv4: '192.0.2.30',
+      public_ipv4_country: 'TW',
     };
     client.setQueryData(['nodes'], { nodes: [...agentNodes, third] });
     const snapshot = client.getQueryData<{ snapshot: { nodes: unknown[]; apps: unknown[] } }>(['snapshot']);
@@ -929,9 +1237,10 @@ describe('新建链向导', () => {
     expect(menu?.textContent).toContain('管理隧道');
     fireEvent.click(within(document.body).getByRole('button', { name: /NODE台湾出口.*加入本链/ }));
     expect(view.container.querySelector('.wzr-dial-address')?.textContent).toBe('192.0.2.30');
-    fireEvent.change(view.getByRole('combobox', { name: '订阅地区' }), { target: { value: 'JP' } });
-    fireEvent.change(view.getByRole('combobox', { name: '添加可用用户' }), { target: { value: 'platform/alice' } });
-    const preview = view.getByRole('button', { name: /预览 6 条草稿操作/ });
+    expect(view.queryByRole('combobox', { name: '订阅地区' })).toBeNull();
+    expect(view.queryByLabelText('出口地区标识')).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: /^alice(?:\s|$)/ }));
+    const preview = view.getByRole('button', { name: '配置预览' });
     fireEvent.click(preview);
     expect(view.getByText(/香港边缘：domain_suffix=example.com → 转发 台湾出口；任意 → 转发 新加坡中转/)).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
@@ -956,7 +1265,7 @@ describe('新建链向导', () => {
     ]);
     expect(steps[1]).toMatchObject({ step: { accept: {}, hop_in: { port: 20000 } } });
     expect(steps[2]).toMatchObject({ step: { accept: {}, hop_in: { port: 20000 } } });
-    expect(ops[0]).toMatchObject({ chain: { subscription_country: 'JP' } });
+    expect(ops[0]).toMatchObject({ chain: { subscription_country: 'SG' } });
     expect(ops.at(-1)).toMatchObject({ grant: { user_id: 'alice' } });
   });
 
@@ -1046,7 +1355,7 @@ describe('新建链向导', () => {
     });
   });
 
-  it('出网规则的自定义 DNS 使用机器级草稿操作，并在缺少地址时阻止提交', async () => {
+  it('提交同时保留协议参数、授权、主路径和机器级 DNS，缺少 DNS 地址时阻止提交', async () => {
     draft.init(`wizard-dns-${Math.random()}`);
     draft.clear();
     const done = vi.fn();
@@ -1059,9 +1368,23 @@ describe('新建链向导', () => {
     );
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: 'DNS 测试' } });
+    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
+      target: { value: 'sg-relay-01' },
+    });
+    fireEvent.click(view.getByRole('button', { name: /^alice(?:\s|$)/ }));
+    const encryption = view.getByRole('checkbox', { name: 'VLESS · Encryption' });
+    fireEvent.click(encryption);
+    fireEvent.click(within(encryption.closest('.wzp-card') as HTMLElement).getByRole('button', { name: '参数' }));
+    fireEvent.change(view.getByRole('combobox', { name: '握手档位' }), { target: { value: 'native' } });
+    fireEvent.change(view.getByRole('textbox', { name: 'VLESS Encryption 监听端口' }), {
+      target: { value: '25443' },
+    });
     fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    expect((view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }) as HTMLSelectElement).value).toBe(
+      'geosite',
+    );
     fireEvent.change(view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }), {
-      target: { value: 'example.com' },
+      target: { value: 'netflix' },
     });
     fireEvent.change(view.getByRole('combobox', { name: /DNS 解析方式.*第 1 条/ }), {
       target: { value: 'custom' },
@@ -1072,10 +1395,44 @@ describe('新建链向导', () => {
     });
     fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
     await waitFor(() => expect(done).toHaveBeenCalledOnce());
-    expect(draft.ops().find(op => op.op === 'set_node_egress_dns')).toMatchObject({
+    const ops = draft.ops();
+    expect(ops.map(op => op.op)).toEqual([
+      'create_chain',
+      'create_ingress',
+      'put_step',
+      'put_step',
+      'set_node_egress_dns',
+      'upsert_grant',
+    ]);
+    expect(ops[0]).toMatchObject({ chain: { name: 'DNS 测试', subscription_country: 'SG' } });
+    expect(ops.find(op => op.op === 'create_ingress')).toMatchObject({
+      ingress: {
+        node_id: 'hk-edge-01',
+        reality: { fallback_mode: 'node-certificate' },
+        wires: {
+          vless: { kind: 'vless-reality' },
+          vless_encryption: { port: 25443, options: { appearance: 'native', ticket_lifetime: '600s' } },
+          anytls: { port: 14443 },
+          hysteria2: { port: 30000, hop: { start: 30000, end: 30099 } },
+        },
+      },
+    });
+    expect(ops.find(op => op.op === 'put_step' && op.node_id === 'hk-edge-01')).toMatchObject({
+      step: {
+        rules: [
+          { m: { t: 'geosite', v: ['netflix'] }, a: { t: 'egress' } },
+          { m: { t: 'any' }, a: { t: 'forward', to: 'sg-relay-01' } },
+        ],
+      },
+    });
+    expect(ops.find(op => op.op === 'put_step' && op.node_id === 'sg-relay-01')).toMatchObject({
+      step: { hop_in: { port: 20000 }, rules: [{ m: { t: 'any' }, a: { t: 'egress' } }] },
+    });
+    expect(ops.find(op => op.op === 'set_node_egress_dns')).toMatchObject({
       node_id: 'hk-edge-01',
-      selector: { t: 'domain_suffix', v: ['example.com'] },
+      selector: { t: 'geosite', v: ['netflix'] },
       resolution: { address: '1.1.1.1', port: 53 },
     });
+    expect(ops.at(-1)).toMatchObject({ grant: { tenant_id: 'platform', user_id: 'alice' } });
   });
 });

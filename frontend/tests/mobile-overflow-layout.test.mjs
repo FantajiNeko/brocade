@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
+const traffic = readFileSync(new URL('../src/user-traffic-realtime.tsx', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 const users = readFileSync(new URL('../src/panes/users.tsx', import.meta.url), 'utf8');
 const shell = readFileSync(new URL('../src/forge/shell.tsx', import.meta.url), 'utf8');
@@ -44,10 +45,14 @@ test('手机端不渲染桌面面包屑或额外返回条', () => {
 });
 
 test('手机端导航栏与内容面板保留呼吸距离', () => {
-  assert.match(styles, /@media \(max-width: 375px\)[\s\S]*?\.forge\.narrow \.fg-brand\s*\{[\s\S]*?display:\s*none;/);
+  assert.match(styles, /@media \(max-width: 420px\)[\s\S]*?\.forge\.narrow \.fg-brand\s*\{[\s\S]*?display:\s*none;/);
   assert.match(
     styles,
     /@media \(max-width: 820px\)[\s\S]*?\.fg-facebar \.fg-nv\s*\{[\s\S]*?gap:\s*4px;[\s\S]*?padding:\s*0 6px;/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 375px\)\s*\{\s*\.fg-facebar\s*\{\s*gap:\s*1px;\s*\}\s*\.fg-facebar \.fg-nv\s*\{\s*gap:\s*3px;\s*padding:\s*0 2px;/,
   );
   assert.match(styles, /@media \(max-width: 820px\)[\s\S]*?\.fg-sheet\s*\{[\s\S]*?margin:\s*12px 8px;/);
   assert.match(
@@ -60,6 +65,58 @@ test('手机端机器详情页签沿用页头底色，不额外切出一层背�
   const tabsRule = styles.match(/\.nd-sheet > \.nd-paper > \.nd-page-head > \.nd-tabs\s*\{[^}]+\}/)?.[0] ?? '';
   assert.match(tabsRule, /border-bottom:\s*1px solid var\(--line\)/);
   assert.doesNotMatch(tabsRule, /background(?:-color)?:/);
+});
+
+test('机器实时卡使用小时柱状图，移除接入面网格及其工具行', () => {
+  assert.match(traffic, /presentation=\{users \? 'bar' : 'line'\}/);
+  assert.doesNotMatch(traffic, /NodeAccessMatrix|NODE_SORTS|rut-access/);
+  assert.doesNotMatch(styles, /\.rut-row|\.rut-chip|\.rut-composition|\.realtime-user-traffic-dashboard/);
+});
+
+test('用户详情复用机器详情的页头层级，窄卡头像不压住名称且页签三等分', () => {
+  assert.match(
+    users,
+    /className="user-dhead-main"[\s\S]*?className="user-dhead-identity"[\s\S]*?className="nd-tabs user-detail-tabs"[\s\S]*?className="user-dhead-tools"/,
+  );
+  assert.match(
+    styles,
+    /\.user-dhead-main\s*\{[\s\S]*?display:\s*flex;[\s\S]*?min-height:\s*64px;[\s\S]*?align-items:\s*center;/,
+  );
+  const avatarRule = styles.match(/\.user-dhead \.plate\s*\{[^}]+\}/)?.[0] ?? '';
+  assert.match(avatarRule, /width:\s*44px/);
+  assert.match(avatarRule, /height:\s*44px/);
+  assert.match(
+    styles,
+    /\.user-split-detail\s*\{[\s\S]*?border:\s*1px solid var\(--line\);[\s\S]*?background:\s*var\(--block\);[\s\S]*?box-shadow:\s*var\(--sheet-shadow\);/,
+  );
+  assert.match(
+    styles,
+    /\.user-dhead\s*\{[\s\S]*?margin:\s*0 -13px;[\s\S]*?border-bottom:\s*1px solid var\(--line-soft\);[\s\S]*?background:\s*var\(--band\);/,
+  );
+  assert.match(
+    styles,
+    /\.user-dacts \.btn\s*\{[\s\S]*?border-color:\s*transparent;[\s\S]*?background:\s*transparent;[\s\S]*?box-shadow:\s*none;[\s\S]*?color:\s*var\(--ink-2\);/,
+  );
+  assert.match(
+    styles,
+    /\.user-dhead \.user-detail-tabs button\s*\{[\s\S]*?border:\s*0;[\s\S]*?background:\s*transparent;[\s\S]*?box-shadow:\s*none;[\s\S]*?\.user-dhead \.user-detail-tabs button\[aria-selected='true'\]\s*\{[\s\S]*?background:\s*var\(--action-wash\);[\s\S]*?color:\s*var\(--action\);/,
+  );
+  assert.match(
+    styles,
+    /@container user-header \(max-width: 700px\)[\s\S]*?\.user-dhead \.user-detail-tabs \.nd-tabs-seg\s*\{[\s\S]*?width:\s*100%;[\s\S]*?\.user-dhead \.user-detail-tabs button\s*\{[\s\S]*?flex:\s*1 1 0;/,
+  );
+  assert.match(
+    styles,
+    /@container user-header \(max-width: 820px\)[\s\S]*?\.user-dhead \.plate\s*\{[\s\S]*?width:\s*32px;[\s\S]*?height:\s*32px;[\s\S]*?\.user-dhead \.plate > \.node-lamp\s*\{[\s\S]*?width:\s*8px;[\s\S]*?height:\s*8px;/,
+  );
+  assert.match(
+    styles,
+    /@container user-header \(max-width: 700px\)[\s\S]*?\.user-dhead-main:has\(> \.user-detail-tabs\)\s*\{[\s\S]*?grid-template-rows:\s*54px 40px;[\s\S]*?\.user-dhead \.user-detail-tabs\s*\{[\s\S]*?grid-row:\s*2;[\s\S]*?border-top:\s*1px solid var\(--line-soft\);[\s\S]*?background:\s*var\(--block\);[\s\S]*?\.user-dhead-tools\s*\{[\s\S]*?grid-row:\s*1;/,
+  );
+  assert.match(
+    styles,
+    /@container user-header \(max-width: 440px\)[\s\S]*?\.user-dhead-main\s*\{[\s\S]*?grid-template-columns:\s*54px minmax\(0, 1fr\) max-content;[\s\S]*?\.user-dhead-main:has\(> \.user-detail-tabs\)\s*\{[\s\S]*?grid-template-rows:\s*50px 24px 40px;[\s\S]*?\.user-dhead \.dname\s*\{[\s\S]*?grid-column:\s*2;[\s\S]*?padding-left:\s*0;[\s\S]*?\.user-dhead \.dsub\s*\{[\s\S]*?grid-column:\s*1 \/ -1;[\s\S]*?grid-row:\s*2;[\s\S]*?\.user-dhead \.user-detail-tabs\s*\{[\s\S]*?grid-row:\s*3;/,
+  );
 });
 
 test('手机端表单控件可以收缩到所在字段宽度', () => {
@@ -91,15 +148,13 @@ test('手机端表单控件可以收缩到所在字段宽度', () => {
   );
 });
 
-test('用户 UUID 使用带状态反馈的紧凑复制按钮', () => {
+test('用户 UUID 收进「更多」菜单：带状态反馈的复制项，手机上随菜单宽度换行', () => {
   assert.match(
     users,
-    /className="user-fcopy user-duuid-copy"[\s\S]*?label="复制 UUID"[\s\S]*?successLabel="UUID 已复制"[\s\S]*?iconOnly/,
+    /role="menuitem"\s+className="user-action-copy"[\s\S]*?label="复制 UUID"[\s\S]*?successLabel="UUID 已复制"/,
   );
-  assert.match(
-    styles,
-    /\.user-duuid-copy\s*\{[\s\S]*?width:\s*24px;[\s\S]*?height:\s*24px;[\s\S]*?border-radius:\s*7px;/,
-  );
+  assert.doesNotMatch(users, /user-duuid/);
+  assert.match(styles, /\.user-action-menu small\.mono\s*\{[^}]*overflow-wrap:\s*anywhere;/);
 });
 
 test('手机端图表和拓扑操作不会把关键控件推出屏幕', () => {

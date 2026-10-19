@@ -122,6 +122,20 @@ CREATE TABLE admin_sessions (
     CONSTRAINT admin_sessions_operator_id_fkey FOREIGN KEY (operator_id) REFERENCES admin_operators(id) ON DELETE CASCADE
 );
 
+-- Runtime TTL overrides for the Store's explicit bounded-data allow-list. Absence means the
+-- compiled default; table names are additionally validated by the Store before writes, so this
+-- table can never turn model or audit state into expiring data.
+CREATE TABLE data_retention_policies (
+    table_name TEXT NOT NULL,
+    ttl_hours INTEGER NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    updated_by TEXT NOT NULL,
+    CONSTRAINT data_retention_policies_pkey PRIMARY KEY (table_name),
+    CONSTRAINT data_retention_policies_ttl_range CHECK (ttl_hours >= 1 AND ttl_hours <= 87600),
+    CONSTRAINT data_retention_policies_updated_by_fkey
+        FOREIGN KEY (updated_by) REFERENCES admin_operators(id) ON DELETE RESTRICT
+);
+
 CREATE TABLE apps (
     id TEXT NOT NULL,
     label TEXT NOT NULL,
@@ -431,7 +445,7 @@ CREATE TABLE vpngate_server_observations (
 
 CREATE TABLE vpngate_catalog_state (
     id BOOLEAN NOT NULL,
-    enabled BOOLEAN DEFAULT true NOT NULL,
+    enabled BOOLEAN DEFAULT false NOT NULL,
     interval_secs INTEGER DEFAULT 900 NOT NULL,
     -- Successful connectivity checks stay out of the catalogue probe queue for this long. Full
     -- single-stream performance measurements have their own slower schedule. Ownership of the
@@ -700,6 +714,9 @@ CREATE TABLE chains (
 -- workflow pulls, the same source install.sh installs from the release archive, so enabling
 -- auto-update does not change routing semantics.
 CREATE TABLE control_state (
+    site_usage_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    other_domain_policy JSONB NOT NULL DEFAULT '{"enabled":false,"top_n":128,"max_domains_per_user":1024,"node_capacity":4096,"report_interval_secs":30}'::jsonb,
+    sniffing_failed_policy JSONB NOT NULL DEFAULT '{"enabled":false,"top_n":128,"max_targets_per_user":1024,"node_capacity":4096,"report_interval_secs":30}'::jsonb,
     id BOOLEAN DEFAULT true NOT NULL,
     overlay_cidr CIDR NOT NULL,
     current_revision BIGINT NOT NULL,
@@ -1136,6 +1153,20 @@ CREATE TABLE nodes (
     CONSTRAINT nodes_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT
 );
 
+-- A machine's flag is presentation metadata, not desired state. Keep a manual correction outside
+-- the revisioned Node model so fixing an inaccurate GeoIP result neither changes artifacts nor
+-- creates a deployment. The actor and timestamp preserve who replaced the automatic answer.
+CREATE TABLE node_region_overrides (
+    node_id TEXT NOT NULL,
+    country_code TEXT NOT NULL,
+    selected_by TEXT NOT NULL,
+    selected_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT node_region_overrides_pkey PRIMARY KEY (node_id),
+    CONSTRAINT node_region_overrides_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT node_region_overrides_country_shape CHECK (country_code ~ '^[A-Z]{2}$'),
+    CONSTRAINT node_region_overrides_selected_by_shape CHECK (length(btrim(selected_by)) BETWEEN 1 AND 256)
+);
+
 -- Catalogue measurement is intentionally opt-in per Agent. This is operational control-plane
 -- state: changing the worker set neither creates a model revision nor rewrites historical samples.
 CREATE TABLE vpngate_probe_nodes (
@@ -1149,11 +1180,11 @@ CREATE TABLE vpngate_probe_nodes (
     CONSTRAINT vpngate_probe_nodes_workers_range CHECK (workers BETWEEN 1 AND 128)
 );
 
--- Catalogue collection and exit-IP intelligence share one operator-selected Agent set. Catalogue
--- leases are per node because VPN Gate returns a substantially different snapshot to different
--- network origins; IP intelligence remains globally deduplicated per exit address. Neither task
--- requires OpenVPN, and changing this set is operational state rather than a model revision.
-CREATE TABLE vpngate_intelligence_nodes (
+-- Catalogue collection is independently assigned from probing and exit-IP intelligence. Leases
+-- are per node because VPN Gate returns a substantially different snapshot to different network
+-- origins. Collection does not require OpenVPN, and changing this set is operational state rather
+-- than a model revision.
+CREATE TABLE vpngate_catalog_nodes (
     node_id TEXT NOT NULL,
     selected_by TEXT NOT NULL,
     selected_at TIMESTAMPTZ DEFAULT now() NOT NULL,
@@ -1164,16 +1195,27 @@ CREATE TABLE vpngate_intelligence_nodes (
     catalogue_last_success_run_id BIGINT,
     catalogue_last_error_code TEXT,
     catalogue_last_error_detail TEXT,
-    CONSTRAINT vpngate_intelligence_nodes_pkey PRIMARY KEY (node_id),
-    CONSTRAINT vpngate_intelligence_nodes_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
-    CONSTRAINT vpngate_intelligence_nodes_selected_by_shape CHECK (length(btrim(selected_by)) BETWEEN 1 AND 256),
-    CONSTRAINT vpngate_intel_nodes_catalogue_generation_nonnegative CHECK (catalogue_lease_generation >= 0),
-    CONSTRAINT vpngate_intel_nodes_catalogue_lease_coherent CHECK (
+    CONSTRAINT vpngate_catalog_nodes_pkey PRIMARY KEY (node_id),
+    CONSTRAINT vpngate_catalog_nodes_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT vpngate_catalog_nodes_selected_by_shape CHECK (length(btrim(selected_by)) BETWEEN 1 AND 256),
+    CONSTRAINT vpngate_catalog_nodes_generation_nonnegative CHECK (catalogue_lease_generation >= 0),
+    CONSTRAINT vpngate_catalog_nodes_lease_coherent CHECK (
         (catalogue_lease_until IS NULL AND catalogue_active_run_id IS NULL)
         OR (catalogue_lease_until IS NOT NULL AND catalogue_active_run_id IS NOT NULL)
     ),
-    CONSTRAINT vpngate_intel_nodes_catalogue_active_run_fkey FOREIGN KEY (catalogue_active_run_id) REFERENCES vpngate_sync_runs(id),
-    CONSTRAINT vpngate_intel_nodes_catalogue_success_run_fkey FOREIGN KEY (catalogue_last_success_run_id) REFERENCES vpngate_sync_runs(id)
+    CONSTRAINT vpngate_catalog_nodes_active_run_fkey FOREIGN KEY (catalogue_active_run_id) REFERENCES vpngate_sync_runs(id),
+    CONSTRAINT vpngate_catalog_nodes_success_run_fkey FOREIGN KEY (catalogue_last_success_run_id) REFERENCES vpngate_sync_runs(id)
+);
+
+-- Exit-IP intelligence has its own operator-selected Agent set. Work remains globally deduplicated
+-- per exit address, and collection does not require OpenVPN.
+CREATE TABLE vpngate_intelligence_nodes (
+    node_id TEXT NOT NULL,
+    selected_by TEXT NOT NULL,
+    selected_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT vpngate_intelligence_nodes_pkey PRIMARY KEY (node_id),
+    CONSTRAINT vpngate_intelligence_nodes_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT vpngate_intelligence_nodes_selected_by_shape CHECK (length(btrim(selected_by)) BETWEEN 1 AND 256)
 );
 
 -- Exit identity and intelligence are global facts, so selected Agents obtain them once per IP.
@@ -1542,6 +1584,27 @@ CREATE TABLE deployment_target_state (
     CONSTRAINT deployment_target_state_deployment_id_node_id_fkey FOREIGN KEY (deployment_id, node_id) REFERENCES deployment_targets(deployment_id, node_id) ON DELETE CASCADE
 );
 
+-- One exact configuration handoff may end its old generation either after the bounded drain or
+-- when a newer executable configuration release must proceed. This is an authorization ledger,
+-- not desired model state and not an Xray binary release: the Agent pulls it only while the
+-- matching two-generation runtime exists. requested_by is an operator id or deployment:<id>.
+CREATE TABLE config_xray_force_retirements (
+    deployment_id BIGINT NOT NULL,
+    node_id TEXT NOT NULL,
+    claim_generation BIGINT NOT NULL,
+    requested_by TEXT NOT NULL,
+    requested_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    settled_at TIMESTAMPTZ,
+    CONSTRAINT config_xray_force_retirements_claim_generation_check CHECK (claim_generation >= 0),
+    CONSTRAINT config_xray_force_retirements_pkey PRIMARY KEY (deployment_id, node_id, claim_generation),
+    CONSTRAINT config_xray_force_retirements_target_fkey
+        FOREIGN KEY (deployment_id, node_id)
+        REFERENCES deployment_targets(deployment_id, node_id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX config_xray_force_retirements_one_active_per_node
+    ON config_xray_force_retirements (node_id)
+    WHERE settled_at IS NULL;
+
 -- A wave enters the execution timeline before an Agent claims any target. Keeping this control-
 -- plane event separate from deployment_target_state.dispatched_at prevents a slow poll or a lease
 -- refresh from rewriting the time shown to operators.
@@ -1734,6 +1797,9 @@ CREATE TABLE users (
     created_revision BIGINT,
     status TEXT DEFAULT 'active' NOT NULL,
     account_type TEXT DEFAULT 'formal' NOT NULL,
+    -- Billing derives from immutable raw uplink/downlink counters. `double` models providers that
+    -- charge both legs of proxy traffic; it never rewrites those counters.
+    traffic_accounting_mode TEXT DEFAULT 'single' NOT NULL,
     -- One replaceable direct-login credential belongs to the user itself. The plaintext TOKEN is
     -- never stored; timestamps keep issuance, successful use, and revocation auditable.
     direct_login_token_hash TEXT,
@@ -1742,6 +1808,7 @@ CREATE TABLE users (
     direct_login_revoked_at TIMESTAMPTZ,
     CONSTRAINT users_status_check CHECK ((status IN ('active', 'disabled'))),
     CONSTRAINT users_account_type_check CHECK ((account_type IN ('formal', 'test'))),
+    CONSTRAINT users_traffic_accounting_mode_check CHECK ((traffic_accounting_mode IN ('single', 'double'))),
     CONSTRAINT users_direct_login_token_hash_length CHECK (
         direct_login_token_hash IS NULL OR length(direct_login_token_hash) = 64
     ),
@@ -1928,20 +1995,22 @@ CREATE TABLE ingresses (
     hy2_obfs_password TEXT,
     hy2_masquerade_kind TEXT DEFAULT 'not-found' NOT NULL,
     hy2_masquerade_url TEXT,
-    -- What this entrance refuses to carry, before anything its chain says. Five columns rather
+    -- What this entrance refuses to carry, before anything its chain says. Six columns rather
     -- than one JSONB blob: each is a separate operator decision with its own default, and a blob
     -- would make "which of these is on" a question you have to parse to answer — including in the
     -- WHERE that decides whether a write changed anything.
     --
     -- Four default TRUE. They refuse what nobody knowingly wants: reaching the fleet's own overlay
     -- from outside, seeding torrents from a shared address, sending mail from an address that gets
-    -- blacklisted for it, and bouncing amplification traffic off open UDP services. The fifth is
-    -- FALSE because it takes games and voice with it.
+    -- blacklisted for it, and bouncing amplification traffic off open UDP services. The other two
+    -- default disabled: one takes games and voice with it, while source-region admission is an
+    -- explicit operator choice.
     guard_no_private BOOLEAN DEFAULT TRUE NOT NULL,
     guard_no_bittorrent BOOLEAN DEFAULT TRUE NOT NULL,
     guard_no_mail BOOLEAN DEFAULT TRUE NOT NULL,
     guard_no_udp_amplification BOOLEAN DEFAULT TRUE NOT NULL,
     guard_tcp_and_quic_only BOOLEAN DEFAULT FALSE NOT NULL,
+    guard_cn_source_block TEXT DEFAULT 'off' NOT NULL,
     -- The outward projection: the address written in subscriptions. One pair per family, with NULL
     -- meaning that family is not projected. See brocade_core::model::Projection.
     projection_v4_host TEXT,
@@ -1954,6 +2023,9 @@ CREATE TABLE ingresses (
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     created_revision BIGINT,
     CONSTRAINT ingresses_port_check CHECK (((port >= 1) AND (port <= 65535))),
+    CONSTRAINT ingresses_guard_cn_source_block_known CHECK (
+        guard_cn_source_block IN ('off', 'ipv4', 'ipv4-and-ipv6')
+    ),
     CONSTRAINT ingresses_vless_encryption_port_check CHECK (
         vless_encryption_port IS NULL OR (vless_encryption_port BETWEEN 1 AND 65535
             AND vless_encryption_private_key IS NOT NULL AND vless_encryption_public_key IS NOT NULL)
@@ -2467,6 +2539,29 @@ CREATE TABLE jobs (
     CONSTRAINT jobs_pkey PRIMARY KEY (id)
 );
 
+-- BEGIN FORWARDING QUOTA SCHEMA
+CREATE TABLE forwarding_node_quotas (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    limit_bytes BIGINT CHECK (limit_bytes > 0),
+    suspended BOOLEAN DEFAULT false NOT NULL,
+    last_job_id BIGINT REFERENCES jobs(id) ON DELETE RESTRICT,
+    updated_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    PRIMARY KEY (tenant_id, user_id, node_id),
+    FOREIGN KEY (tenant_id, user_id, node_id)
+        REFERENCES forwarding_entitlements(tenant_id, user_id, node_id) ON DELETE CASCADE
+);
+CREATE INDEX forwarding_quota_jobs_by_owner ON jobs
+    ((payload->>'tenant_id'), (payload->>'user_id'), (payload->>'node_id'), id DESC)
+    WHERE kind='forwarding-quota';
+CREATE INDEX forwarding_quota_jobs_pending_node ON jobs
+    ((payload->>'node_id'), ((payload->>'generation')::bigint))
+    WHERE kind='forwarding-quota' AND status IN ('queued','running');
+-- END FORWARDING QUOTA SCHEMA
+
 -- A relay hop's liveness.
 --
 -- Its own table apart from link_probes, because they answer two different questions at two different
@@ -2608,6 +2703,9 @@ CREATE TABLE node_agent_state (
     route_ipv4 TEXT,
     route_ipv6 TEXT,
     runtime_versions JSONB DEFAULT '{}'::jsonb NOT NULL,
+    -- Present only during one Xray release attempt. The Agent reports both generations with
+    -- boot/start/digest identity; a terminal runtime snapshot clears it back to NULL.
+    xray_upgrade JSONB,
     last_local_reconcile JSONB,
     wireguard_health JSONB DEFAULT '{}'::jsonb NOT NULL,
     spool_backlog JSONB DEFAULT '{}'::jsonb NOT NULL,
@@ -2641,6 +2739,9 @@ CREATE TABLE node_agent_state (
     usage_last_result JSONB DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT node_agent_state_pkey PRIMARY KEY (node_id),
     CONSTRAINT node_agent_state_token_hash_key UNIQUE (token_hash),
+    CONSTRAINT node_agent_state_xray_upgrade_object CHECK (
+        xray_upgrade IS NULL OR jsonb_typeof(xray_upgrade) = 'object'
+    ),
     CONSTRAINT node_agent_state_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
 );
 
@@ -2664,6 +2765,11 @@ CREATE TABLE user_online_sources (
     -- Last accepted per-node/ingress protocol set, not a cumulative connection history.
     -- NULL preserves unknown legacy observations without guessing from configured listeners.
     protocols JSONB,
+    -- Current continuous Xray online epoch and its operational byte counters. All three stay
+    -- NULL for older Agent/Xray reports; they are not reconstructed from billable usage.
+    online_since_at TIMESTAMPTZ,
+    session_uplink_bytes BIGINT,
+    session_downlink_bytes BIGINT,
     CONSTRAINT user_online_sources_pkey
         PRIMARY KEY (node_id, tenant_id, user_id, ingress_id, source_ip),
     CONSTRAINT user_online_sources_node_fkey
@@ -2681,6 +2787,20 @@ CREATE TABLE user_online_sources (
             jsonb_array_length(protocols) BETWEEN 1 AND 5
             AND protocols <@ '["vless", "anytls", "hysteria2", "mtproto", "unknown"]'::jsonb
         ELSE FALSE END
+    ),
+    CONSTRAINT user_online_sources_session_shape CHECK (
+        (
+            online_since_at IS NULL
+            AND session_uplink_bytes IS NULL
+            AND session_downlink_bytes IS NULL
+        ) OR (
+            online_since_at IS NOT NULL
+            AND session_uplink_bytes IS NOT NULL
+            AND session_downlink_bytes IS NOT NULL
+            AND online_since_at <= last_observed_at
+            AND session_uplink_bytes >= 0
+            AND session_downlink_bytes >= 0
+        )
     )
 );
 
@@ -2948,6 +3068,7 @@ CREATE INDEX notification_deliveries_lease_idx
 CREATE TABLE node_traffic_policy (
     node_id TEXT NOT NULL,
     cycle_kind TEXT DEFAULT 'monthly' NOT NULL,
+    accounting_mode TEXT DEFAULT 'bidirectional_sum' NOT NULL,
     reset_month INTEGER,
     reset_day INTEGER DEFAULT 1 NOT NULL,
     -- Provider-side allowance for this reset cycle. NULL deliberately means "not configured":
@@ -2958,6 +3079,9 @@ CREATE TABLE node_traffic_policy (
     CONSTRAINT node_traffic_policy_pkey PRIMARY KEY (node_id),
     CONSTRAINT node_traffic_policy_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
     CONSTRAINT node_traffic_policy_cycle_kind CHECK (cycle_kind IN ('monthly', 'yearly')),
+    CONSTRAINT node_traffic_policy_accounting_mode CHECK (
+        accounting_mode IN ('bidirectional_sum', 'bidirectional_max', 'outbound_only', 'inbound_only')
+    ),
     CONSTRAINT node_traffic_policy_reset_month CHECK (
         (cycle_kind = 'monthly' AND reset_month IS NULL)
         OR (cycle_kind = 'yearly' AND reset_month BETWEEN 1 AND 12)
@@ -3027,11 +3151,26 @@ CREATE TABLE node_traffic_calibrations (
     calibrated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     target_total_bytes NUMERIC(20,0) NOT NULL,
     accounted_total_bytes NUMERIC(20,0) NOT NULL,
+    accounting_mode TEXT DEFAULT 'bidirectional_sum' NOT NULL,
+    accounted_rx_bytes NUMERIC(20,0),
+    accounted_tx_bytes NUMERIC(20,0),
     calibrated_by TEXT NOT NULL,
     CONSTRAINT node_traffic_calibrations_pkey PRIMARY KEY (id),
     CONSTRAINT node_traffic_calibrations_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
     CONSTRAINT node_traffic_calibrations_target_nonnegative CHECK (target_total_bytes >= 0),
     CONSTRAINT node_traffic_calibrations_accounted_nonnegative CHECK (accounted_total_bytes >= 0),
+    CONSTRAINT node_traffic_calibrations_accounting_mode CHECK (
+        accounting_mode IN ('bidirectional_sum', 'bidirectional_max', 'outbound_only', 'inbound_only')
+    ),
+    CONSTRAINT node_traffic_calibrations_directional_nonnegative CHECK (
+        (accounted_rx_bytes IS NULL AND accounted_tx_bytes IS NULL)
+        OR (
+            accounted_rx_bytes IS NOT NULL
+            AND accounted_tx_bytes IS NOT NULL
+            AND accounted_rx_bytes >= 0
+            AND accounted_tx_bytes >= 0
+        )
+    ),
     CONSTRAINT node_traffic_calibrations_actor_shape CHECK (length(btrim(calibrated_by)) BETWEEN 1 AND 256)
 );
 
@@ -3047,6 +3186,7 @@ CREATE TABLE node_traffic_forecasts (
     period_start DATE NOT NULL,
     period_end DATE NOT NULL,
     quota_bytes NUMERIC(20,0),
+    accounting_mode TEXT DEFAULT 'bidirectional_sum' NOT NULL,
     used_bytes NUMERIC(20,0) NOT NULL,
     p50_bytes NUMERIC(20,0) NOT NULL,
     p90_bytes NUMERIC(20,0) NOT NULL,
@@ -3054,6 +3194,9 @@ CREATE TABLE node_traffic_forecasts (
     CONSTRAINT node_traffic_forecasts_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
     CONSTRAINT node_traffic_forecasts_period CHECK (period_end > period_start),
     CONSTRAINT node_traffic_forecasts_quota_positive CHECK (quota_bytes IS NULL OR quota_bytes > 0),
+    CONSTRAINT node_traffic_forecasts_accounting_mode CHECK (
+        accounting_mode IN ('bidirectional_sum', 'bidirectional_max', 'outbound_only', 'inbound_only')
+    ),
     CONSTRAINT node_traffic_forecasts_ordered CHECK (
         used_bytes >= 0 AND p50_bytes >= used_bytes AND p90_bytes >= p50_bytes
     )
@@ -3071,6 +3214,8 @@ CREATE TABLE binary_releases (
     status TEXT DEFAULT 'running' NOT NULL,
     active BOOLEAN GENERATED ALWAYS AS (status IN ('running', 'halted')) STORED,
     note TEXT,
+    xray_strategy TEXT,
+    xray_drain_timeout_seconds INTEGER,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     created_by TEXT NOT NULL,
     halted_at TIMESTAMPTZ,
@@ -3084,6 +3229,23 @@ CREATE TABLE binary_releases (
     CONSTRAINT binary_releases_note_length CHECK (((note IS NULL) OR (length(note) <= 2000))),
     CONSTRAINT binary_releases_status_known CHECK ((status IN ('running', 'halted', 'succeeded', 'canceled'))),
     CONSTRAINT binary_releases_component_known CHECK (component IN ('agent', 'xray')),
+    CONSTRAINT binary_releases_xray_strategy_known CHECK (
+        xray_strategy IS NULL OR xray_strategy IN ('restart', 'handoff', 'handoff-force')
+    ),
+    CONSTRAINT binary_releases_xray_execution_shape CHECK (
+        (component = 'agent' AND xray_strategy IS NULL AND xray_drain_timeout_seconds IS NULL)
+        OR
+        (component = 'xray' AND (
+            -- NULL/NULL is retained only for Xray release rows created before this field existed;
+            -- every new release requires an explicit strategy in the Store.
+            (xray_strategy IS NULL AND xray_drain_timeout_seconds IS NULL)
+            OR (xray_strategy = 'restart' AND xray_drain_timeout_seconds IS NULL)
+            OR (
+                xray_strategy IN ('handoff', 'handoff-force')
+                AND xray_drain_timeout_seconds BETWEEN 10 AND 86400
+            )
+        ))
+    ),
     CONSTRAINT binary_releases_created_by_fkey FOREIGN KEY (created_by) REFERENCES admin_operators(id) ON DELETE RESTRICT
 );
 
@@ -3101,6 +3263,7 @@ CREATE TABLE binary_release_targets (
     reported_service_enabled BOOLEAN,
     reported_installed_sha256 TEXT,
     reported_running_sha256 TEXT,
+    reported_forced_retirement BOOLEAN,
     dispatched_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
     CONSTRAINT binary_release_targets_pkey PRIMARY KEY (release_id, node_id),
@@ -3953,6 +4116,21 @@ CREATE TABLE usage_rollups (
 );
 CREATE INDEX usage_rollups_by_period ON usage_rollups (period_start, period_end);
 
+-- BEGIN USER MACHINE USAGE SCHEMA
+-- Historical ingress attribution survives raw-window retention and later grant changes.
+CREATE TABLE usage_user_node_rollups (
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    period_start TIMESTAMPTZ NOT NULL,
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    has_gap BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (tenant_id, user_id, period_start, node_id),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE RESTRICT
+);
+-- END USER MACHINE USAGE SCHEMA
+
 -- Machine month totals are operational summaries, not a reason to retain every 30-second
 -- accounting window forever. Keep user and relay traffic separate: ingress bytes belong to a
 -- user while hop bytes describe the work performed by a relay machine. Tenant remains part of
@@ -4143,6 +4321,203 @@ CREATE INDEX usage_samples_by_node_window
 CREATE INDEX usage_samples_by_window_end ON usage_samples USING btree (window_end);
 
 CREATE INDEX users_by_tenant_status ON users USING btree (tenant_id, status, id);
+
+-- Fixed-category observations are separate from all billable accounting projections.
+-- BEGIN USER SITE USAGE SCHEMA
+CREATE TABLE node_site_usage_state (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    epoch TEXT NOT NULL,
+    activation_id BIGINT NOT NULL DEFAULT 0 CHECK (activation_id >= 0),
+    generation_id BIGINT NOT NULL,
+    read_at BIGINT NOT NULL CHECK (read_at > 0),
+    baseline_at BIGINT NOT NULL CHECK (baseline_at > 0 AND baseline_at <= read_at),
+    limited BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE site_usage_counter_heads (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    site_id TEXT NOT NULL,
+    read_at BIGINT NOT NULL CHECK (read_at > 0),
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (node_id, label, site_id)
+);
+
+CREATE TABLE user_site_usage_hourly (
+    bucket BIGINT NOT NULL CHECK (bucket > 0 AND bucket % 3600 = 0),
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    site_id TEXT NOT NULL,
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (bucket, node_id, tenant_id, user_id, site_id),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX user_site_usage_hourly_by_user ON user_site_usage_hourly (tenant_id, user_id, bucket);
+-- END USER SITE USAGE SCHEMA
+
+-- BEGIN USER INGRESS USAGE SCHEMA
+-- A machine's inflow by access chain: user traffic per ingress and +08 day, accumulated in the
+-- transaction that accepts the accounting window. The chain is frozen from the ingress at insert,
+-- like usage_samples.app_id, so history keeps its attribution after the model moves on; NULL only
+-- when the ingress was already gone. Keyed by machine first: every read is one machine's period.
+CREATE TABLE usage_user_ingress_rollups (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    period_start TIMESTAMPTZ NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    ingress_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    chain_id TEXT,
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    has_gap BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (node_id, period_start, tenant_id, user_id, ingress_id),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE RESTRICT
+);
+-- The machine's outflow card reads one machine's hours across every user.
+CREATE INDEX user_site_usage_hourly_by_node ON user_site_usage_hourly (node_id, bucket);
+-- END USER INGRESS USAGE SCHEMA
+
+-- BEGIN OTHER DOMAIN USAGE SCHEMA
+CREATE TABLE node_other_domain_state (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    epoch TEXT NOT NULL,
+    read_at BIGINT NOT NULL CHECK (read_at > 0),
+    observed_since BIGINT NOT NULL CHECK (observed_since > 0),
+    limited BOOLEAN NOT NULL
+);
+CREATE TABLE other_domain_counter_heads (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    epoch TEXT NOT NULL,
+    bucket BIGINT NOT NULL CHECK (bucket > 0 AND bucket % 3600 = 0),
+    label TEXT NOT NULL CHECK (octet_length(label) <= 256),
+    domain TEXT NOT NULL CHECK (octet_length(domain) <= 253),
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (node_id, epoch, bucket, label, domain)
+);
+CREATE INDEX other_domain_heads_by_bucket ON other_domain_counter_heads (bucket);
+CREATE TABLE user_other_domain_hourly (
+    bucket BIGINT NOT NULL CHECK (bucket > 0 AND bucket % 3600 = 0),
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    domain TEXT NOT NULL CHECK (octet_length(domain) <= 253),
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (bucket, node_id, tenant_id, user_id, domain),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX user_other_domain_by_user ON user_other_domain_hourly (tenant_id, user_id, bucket);
+CREATE INDEX user_other_domain_by_bucket ON user_other_domain_hourly (bucket);
+CREATE INDEX user_other_domain_by_node ON user_other_domain_hourly (node_id, bucket);
+-- END OTHER DOMAIN USAGE SCHEMA
+
+-- BEGIN SNIFFING FAILED USAGE SCHEMA
+CREATE TABLE node_sniffing_failed_state (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    epoch TEXT NOT NULL,
+    read_at BIGINT NOT NULL CHECK (read_at > 0),
+    observed_since BIGINT NOT NULL CHECK (observed_since > 0),
+    limited BOOLEAN NOT NULL
+);
+CREATE TABLE sniffing_failed_counter_heads (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    epoch TEXT NOT NULL,
+    bucket BIGINT NOT NULL CHECK (bucket > 0 AND bucket % 3600 = 0),
+    label TEXT NOT NULL CHECK (octet_length(label) <= 256),
+    target TEXT NOT NULL CHECK (octet_length(target) <= 80),
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (node_id, epoch, bucket, label, target)
+);
+CREATE INDEX sniffing_failed_heads_by_bucket ON sniffing_failed_counter_heads (bucket);
+CREATE TABLE user_sniffing_failed_hourly (
+    bucket BIGINT NOT NULL CHECK (bucket > 0 AND bucket % 3600 = 0),
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    target TEXT NOT NULL CHECK (octet_length(target) <= 80),
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (bucket, node_id, tenant_id, user_id, target),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX user_sniffing_failed_by_user ON user_sniffing_failed_hourly (tenant_id, user_id, bucket);
+CREATE INDEX user_sniffing_failed_by_bucket ON user_sniffing_failed_hourly (bucket);
+CREATE INDEX user_sniffing_failed_by_node ON user_sniffing_failed_hourly (node_id, bucket);
+-- END SNIFFING FAILED USAGE SCHEMA
+
+-- A row exists only for installations initialized by a Console version which offers the guided
+-- first-run flow. Absence is deliberately "not applicable": upgrading an established deployment
+-- must not infer that its already-operational fleet needs onboarding. The row contains references
+-- and audit evidence only; user credentials and rendered subscription contents never enter it.
+CREATE TABLE first_run_onboarding (
+    id BOOLEAN NOT NULL DEFAULT TRUE,
+    root_tenant_id TEXT NOT NULL,
+    started_by TEXT NOT NULL,
+    started_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    node_id TEXT,
+    app_id TEXT,
+    chain_id TEXT,
+    ingress_id TEXT,
+    user_tenant_id TEXT,
+    user_id TEXT,
+    target_revision_id BIGINT,
+    deployment_id BIGINT,
+    completed_at TIMESTAMPTZ,
+    completed_by TEXT,
+    probe_id TEXT,
+    probe_item_id TEXT,
+    probe_serving_generation BIGINT,
+    probe_protocol TEXT,
+    probe_family TEXT,
+    CONSTRAINT first_run_onboarding_pkey PRIMARY KEY (id),
+    CONSTRAINT first_run_onboarding_singleton CHECK (id),
+    CONSTRAINT first_run_onboarding_root_tenant_fkey FOREIGN KEY (root_tenant_id)
+        REFERENCES tenants(id) ON DELETE RESTRICT,
+    CONSTRAINT first_run_onboarding_started_by_fkey FOREIGN KEY (started_by)
+        REFERENCES admin_operators(id) ON DELETE RESTRICT,
+    CONSTRAINT first_run_onboarding_node_fkey FOREIGN KEY (node_id)
+        REFERENCES nodes(id) ON DELETE SET NULL,
+    CONSTRAINT first_run_onboarding_app_fkey FOREIGN KEY (app_id)
+        REFERENCES apps(id) ON UPDATE CASCADE ON DELETE SET NULL,
+    CONSTRAINT first_run_onboarding_chain_fkey FOREIGN KEY (chain_id)
+        REFERENCES chains(id) ON UPDATE CASCADE ON DELETE SET NULL,
+    CONSTRAINT first_run_onboarding_ingress_fkey FOREIGN KEY (ingress_id)
+        REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE SET NULL,
+    CONSTRAINT first_run_onboarding_user_fkey FOREIGN KEY (user_tenant_id, user_id)
+        REFERENCES users(tenant_id, id) ON DELETE SET NULL,
+    CONSTRAINT first_run_onboarding_revision_fkey FOREIGN KEY (target_revision_id)
+        REFERENCES revisions(id) ON DELETE RESTRICT,
+    CONSTRAINT first_run_onboarding_deployment_fkey FOREIGN KEY (deployment_id)
+        REFERENCES deployments(id) ON DELETE RESTRICT,
+    CONSTRAINT first_run_onboarding_completed_by_fkey FOREIGN KEY (completed_by)
+        REFERENCES admin_operators(id) ON DELETE RESTRICT,
+    CONSTRAINT first_run_onboarding_user_pair CHECK (
+        (user_tenant_id IS NULL) = (user_id IS NULL)
+    ),
+    CONSTRAINT first_run_onboarding_model_refs CHECK (
+        completed_at IS NOT NULL
+        OR (app_id IS NULL AND chain_id IS NULL AND ingress_id IS NULL
+            AND user_tenant_id IS NULL AND user_id IS NULL AND target_revision_id IS NULL)
+        OR
+        (app_id IS NOT NULL AND chain_id IS NOT NULL AND ingress_id IS NOT NULL
+            AND user_tenant_id IS NOT NULL AND user_id IS NOT NULL AND target_revision_id IS NOT NULL)
+    ),
+    CONSTRAINT first_run_onboarding_probe_evidence CHECK (
+        (completed_at IS NULL AND completed_by IS NULL AND probe_id IS NULL
+            AND probe_item_id IS NULL AND probe_serving_generation IS NULL
+            AND probe_protocol IS NULL AND probe_family IS NULL)
+        OR
+        (completed_at IS NOT NULL AND completed_by IS NOT NULL AND probe_id IS NOT NULL
+            AND probe_item_id IS NOT NULL AND probe_serving_generation IS NOT NULL
+            AND probe_protocol IS NOT NULL AND probe_family IS NOT NULL)
+    )
+);
 
 -- The initial revision and the control plane's single-row state. These two are the minimum facts for
 -- an empty database to run at all: current_revision has a foreign key into revisions, so the revision

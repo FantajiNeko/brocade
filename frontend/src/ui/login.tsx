@@ -293,7 +293,7 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
         if (bootstrapToken.trim() && operatorId.trim() && password.length >= PASSWORD_MIN_LENGTH) init.mutate();
       }}
     >
-      <p className="login-lead">面板支持多用户统计；初始化时会预置使用者 zero，默认不开放登录。</p>
+      <p className="login-lead">先创建系统管理员；登录后由入门向导纳管首台机器并创建第一个用户。</p>
       <label className="login-field">
         <span>初始化凭据</span>
         <ConfigSecretInput

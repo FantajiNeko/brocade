@@ -10,6 +10,54 @@ use crate::{AdminContext, Result, StoreError};
 
 const MAX_REMOVE_NODES: usize = 200;
 
+/// Replace the best-effort GeoIP flag without changing desired state or creating a deployment.
+/// `None` removes the correction and returns the machine to automatic detection.
+pub async fn update_node_region_override(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: UpdateNodeRegionRequest,
+) -> Result<NodeRegionOverride> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can update node regions".to_owned(),
+        ));
+    }
+    let node_id = required_text(node_id, "node id")?;
+    let country_code =
+        normalize_optional_country_code(request.country_code, "node region country code")?;
+    let mut tx = pool.begin().await?;
+    ensure_node_exists_tx(&mut tx, &node_id).await?;
+    match &country_code {
+        Some(country_code) => {
+            sqlx::query(
+                "INSERT INTO node_region_overrides (node_id, country_code, selected_by)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (node_id) DO UPDATE
+                 SET country_code = EXCLUDED.country_code,
+                     selected_by = EXCLUDED.selected_by,
+                     selected_at = now()",
+            )
+            .bind(&node_id)
+            .bind(country_code)
+            .bind(actor.operator_id())
+            .execute(&mut *tx)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM node_region_overrides WHERE node_id = $1")
+                .bind(&node_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(NodeRegionOverride {
+        node_id,
+        country_code,
+    })
+}
+
 /// Permanently remove terminally retired machines and every business chain containing one of
 /// them. The entire operation is one model revision and one database transaction.
 ///

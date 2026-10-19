@@ -305,18 +305,17 @@ pub(crate) async fn create_user_tx(
     ))
 }
 
-/// Create the root tenant and bootstrap network user as one model revision inside system
-/// initialization. The caller owns both the admin-table lock and this transaction, so the product
-/// cannot become "initialized" without the tenant/user pair that makes it usable.
-pub(crate) async fn bootstrap_tenant_and_user_tx(
+/// Create the root tenant as one model revision inside system initialization. The caller owns both
+/// the admin-table lock and this transaction, so the product cannot become "initialized" without
+/// a tenant to hold the resources subsequently created by the first-run flow.
+pub(crate) async fn bootstrap_root_tenant_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
     tenant_id: &str,
-    user_id: &str,
 ) -> Result<u64> {
     let previous = lock_control_state(tx).await?;
     let revision_id = insert_revision(tx, actor.operator_id(), "initialize system").await?;
-    let tenant_changed = create_tenant_tx(
+    let changed = create_tenant_tx(
         tx,
         actor,
         revision_id,
@@ -327,18 +326,7 @@ pub(crate) async fn bootstrap_tenant_and_user_tx(
         },
     )
     .await?;
-    let (_, user_changed) = create_user_tx(
-        tx,
-        actor,
-        revision_id,
-        CreateUserRequest {
-            tenant_id: tenant_id.to_owned(),
-            id: user_id.to_owned(),
-            note: None,
-        },
-    )
-    .await?;
-    commit_revision(tx, revision_id, previous, tenant_changed || user_changed).await
+    commit_revision(tx, revision_id, previous, changed).await
 }
 
 pub async fn rotate_user_uuid(
@@ -456,12 +444,14 @@ pub async fn update_user_profile(
     actor.require_tenant_access(&tenant_id, "user profile")?;
     let result = sqlx::query(
         "UPDATE users
-         SET account_type = $3
+         SET account_type = $3,
+             traffic_accounting_mode = COALESCE($4, traffic_accounting_mode)
          WHERE tenant_id = $1 AND id = $2",
     )
     .bind(&tenant_id)
     .bind(&user_id)
     .bind(request.account_type.as_str())
+    .bind(request.traffic_accounting_mode.map(|mode| mode.as_str()))
     .execute(pool)
     .await?;
     if result.rows_affected() == 0 {
@@ -1654,7 +1644,8 @@ pub(crate) async fn upsert_chain_tx(
     let id = required_slug(request.id, "chain id")?;
     let tenant_id = required_text(request.tenant_id, "tenant_id")?;
     let name = required_text(request.name, "chain name")?;
-    let subscription_country = normalize_subscription_country(request.subscription_country)?;
+    let subscription_country =
+        normalize_optional_country_code(request.subscription_country, "subscription country")?;
     actor.require_tenant_access(&tenant_id, "chain")?;
     validate_model_id("chain", &id)?;
     ensure_app_exists_tx(tx, &app_id).await?;
@@ -1743,7 +1734,7 @@ pub(crate) async fn upsert_chain_tx(
     ))
 }
 
-fn normalize_subscription_country(value: Option<String>) -> Result<Option<String>> {
+fn normalize_optional_country_code(value: Option<String>, field: &str) -> Result<Option<String>> {
     let Some(value) = value.map(|value| value.trim().to_ascii_uppercase()) else {
         return Ok(None);
     };
@@ -1751,9 +1742,9 @@ fn normalize_subscription_country(value: Option<String>) -> Result<Option<String
         return Ok(None);
     }
     if value.len() != 2 || !value.bytes().all(|byte| byte.is_ascii_uppercase()) {
-        return Err(StoreError::InvalidData(
-            "subscription country must be a two-letter ISO country code".to_owned(),
-        ));
+        return Err(StoreError::InvalidData(format!(
+            "{field} must be a two-letter region code"
+        )));
     }
     Ok(Some(value))
 }
@@ -2546,7 +2537,7 @@ pub(crate) async fn upsert_ingress_tx(
             anytls_reality_private_key, anytls_reality_public_key,
             anytls_reality_short_ids,
             vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options,
-            protocol_projection, mtproto_port
+            protocol_projection, mtproto_port, guard_cn_source_block
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
@@ -2564,7 +2555,7 @@ pub(crate) async fn upsert_ingress_tx(
             $45, $46, $47, $48,
             $49, $50, $51,
             $52, $53, $54, $55, $56, $57, $58, $59, $60,
-            $61, $62, $63, $64, $65, $66, $67, $68, $69
+            $61, $62, $63, $64, $65, $66, $67, $68, $69, $70
          )
          ON CONFLICT (id) DO UPDATE SET
             chain_id = EXCLUDED.chain_id,
@@ -2601,6 +2592,7 @@ pub(crate) async fn upsert_ingress_tx(
             guard_no_mail = EXCLUDED.guard_no_mail,
             guard_no_udp_amplification = EXCLUDED.guard_no_udp_amplification,
             guard_tcp_and_quic_only = EXCLUDED.guard_tcp_and_quic_only,
+            guard_cn_source_block = EXCLUDED.guard_cn_source_block,
             hy2_bbr_profile = EXCLUDED.hy2_bbr_profile,
             hy2_quic_init_stream_window = EXCLUDED.hy2_quic_init_stream_window,
             hy2_quic_max_stream_window = EXCLUDED.hy2_quic_max_stream_window,
@@ -2698,6 +2690,7 @@ pub(crate) async fn upsert_ingress_tx(
             OR ingresses.vless_encryption_options IS DISTINCT FROM EXCLUDED.vless_encryption_options
             OR ingresses.protocol_projection IS DISTINCT FROM EXCLUDED.protocol_projection
             OR ingresses.mtproto_port IS DISTINCT FROM EXCLUDED.mtproto_port
+            OR ingresses.guard_cn_source_block IS DISTINCT FROM EXCLUDED.guard_cn_source_block
             OR (EXCLUDED.vless_encryption_port IS NOT NULL AND ingresses.vless_encryption_private_key IS NULL)
             OR (EXCLUDED.anytls_enabled AND ingresses.anytls_reality_private_key IS NULL)
          RETURNING reality_private_key,
@@ -2792,6 +2785,7 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(serde_json::to_value(encryption.map(|settings| settings.options.clone()).unwrap_or_default())?)
     .bind(serde_json::to_value(&projection)?)
     .bind(request.wires.mtproto.map(|settings| i32::from(settings.port)))
+    .bind(request.guard.cn_source_block.as_str())
     .fetch_optional(&mut **tx)
     .await?;
     let client_changed = sqlx::query(
@@ -3132,6 +3126,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.tenant_id,
                 n.name,
                 n.public_ipv4,
+                region.country_code AS public_ipv4_country_override,
                 n.public_ipv6,
                 n.public_ipv4_nat,
                 n.public_ipv6_nat,
@@ -3189,8 +3184,10 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                         < now() - interval '30 minutes',
                     FALSE
                 ) AS vpngate_probe_data_stale,
+                catalog.node_id IS NOT NULL AS vpngate_catalog_enabled,
                 intel.node_id IS NOT NULL AS vpngate_intelligence_enabled,
                 COALESCE(s.runtime_versions, '{}'::jsonb) AS runtime_versions,
+                s.xray_upgrade,
                 COALESCE(s.spool_backlog, '{}'::jsonb) AS spool_backlog,
                 s.last_local_reconcile,
                 COALESCE(s.wireguard_health, '{}'::jsonb) AS wireguard_health,
@@ -3213,6 +3210,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 a.source_deployment_id,
                 a.observed_at::text AS observed_at
          FROM nodes n
+         LEFT JOIN node_region_overrides region ON region.node_id = n.id
          LEFT JOIN node_agent_state s ON s.node_id = n.id
          LEFT JOIN node_public_ip_state p4 ON p4.node_id = n.id AND p4.family = 4
          LEFT JOIN node_public_ip_state p6 ON p6.node_id = n.id AND p6.family = 6
@@ -3220,6 +3218,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
          LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
          LEFT JOIN vpngate_probe_nodes vpn ON vpn.node_id = n.id
+         LEFT JOIN vpngate_catalog_nodes catalog ON catalog.node_id = n.id
          LEFT JOIN vpngate_intelligence_nodes intel ON intel.node_id = n.id
          LEFT JOIN LATERAL (
              SELECT MAX(sample.received_at) AS last_received_at
@@ -3244,6 +3243,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.tenant_id,
                 n.name,
                 n.public_ipv4,
+                region.country_code AS public_ipv4_country_override,
                 n.public_ipv6,
                 n.public_ipv4_nat,
                 n.public_ipv6_nat,
@@ -3301,8 +3301,10 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                         < now() - interval '30 minutes',
                     FALSE
                 ) AS vpngate_probe_data_stale,
+                catalog.node_id IS NOT NULL AS vpngate_catalog_enabled,
                 intel.node_id IS NOT NULL AS vpngate_intelligence_enabled,
                 COALESCE(s.runtime_versions, '{}'::jsonb) AS runtime_versions,
+                s.xray_upgrade,
                 COALESCE(s.spool_backlog, '{}'::jsonb) AS spool_backlog,
                 s.last_local_reconcile,
                 COALESCE(s.wireguard_health, '{}'::jsonb) AS wireguard_health,
@@ -3325,6 +3327,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 a.source_deployment_id,
                 a.observed_at::text AS observed_at
          FROM nodes n
+         LEFT JOIN node_region_overrides region ON region.node_id = n.id
          LEFT JOIN node_agent_state s ON s.node_id = n.id
          LEFT JOIN node_public_ip_state p4 ON p4.node_id = n.id AND p4.family = 4
          LEFT JOIN node_public_ip_state p6 ON p6.node_id = n.id AND p6.family = 6
@@ -3332,6 +3335,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
          LEFT JOIN node_lifecycle_state l ON l.node_id = n.id
          LEFT JOIN node_operational_isolations oi ON oi.node_id = n.id
          LEFT JOIN vpngate_probe_nodes vpn ON vpn.node_id = n.id
+         LEFT JOIN vpngate_catalog_nodes catalog ON catalog.node_id = n.id
          LEFT JOIN vpngate_intelligence_nodes intel ON intel.node_id = n.id
          LEFT JOIN LATERAL (
              SELECT MAX(sample.received_at) AS last_received_at
@@ -3481,6 +3485,8 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         name: row.try_get("name")?,
         public_ipv4: row.try_get("public_ipv4")?,
         public_ipv4_country: None,
+        public_ipv4_country_detected: None,
+        public_ipv4_country_override: row.try_get("public_ipv4_country_override")?,
         public_ipv6: row.try_get("public_ipv6")?,
         public_ipv4_nat: row.try_get("public_ipv4_nat")?,
         public_ipv6_nat: row.try_get("public_ipv6_nat")?,
@@ -3498,9 +3504,11 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         vpngate_probe_workers: row.try_get("vpngate_probe_workers")?,
         vpngate_probe_reported_at: row.try_get("vpngate_probe_reported_at")?,
         vpngate_probe_data_stale: row.try_get("vpngate_probe_data_stale")?,
+        vpngate_catalog_enabled: row.try_get("vpngate_catalog_enabled")?,
         vpngate_intelligence_enabled: row.try_get("vpngate_intelligence_enabled")?,
         // A newly enrolled machine starts with an empty object until its first runtime report.
         runtime_versions: non_empty_json(row.try_get("runtime_versions")?),
+        xray_upgrade: row.try_get("xray_upgrade")?,
         spool_backlog: non_empty_json(row.try_get("spool_backlog")?),
         last_local_reconcile: row.try_get("last_local_reconcile")?,
         wireguard_health: non_empty_json(row.try_get("wireguard_health")?),
@@ -3618,6 +3626,9 @@ fn user_item_from_row(row: &sqlx::postgres::PgRow) -> Result<UserListItem> {
         uuid: row.try_get("uuid")?,
         status: row.try_get("status")?,
         account_type: parse_user_account_type(row.try_get("account_type")?)?,
+        traffic_accounting_mode: parse_user_traffic_accounting_mode(
+            row.try_get("traffic_accounting_mode")?,
+        )?,
         login_enabled: row.try_get("login_enabled")?,
         direct_login_enabled: row.try_get("direct_login_enabled")?,
         created_at: row.try_get("created_at")?,
@@ -3631,6 +3642,7 @@ fn user_item_from_row(row: &sqlx::postgres::PgRow) -> Result<UserListItem> {
 async fn load_user_item(pool: &PgPool, tenant_id: &str, user_id: &str) -> Result<UserListItem> {
     let row = sqlx::query(
         "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
+                traffic_accounting_mode,
                 EXISTS (
                     SELECT 1 FROM admin_operators o
                     WHERE o.role = 'user'
@@ -4518,6 +4530,16 @@ fn parse_user_account_type(value: String) -> Result<UserAccountType> {
         "test" => Ok(UserAccountType::Test),
         _ => Err(StoreError::InvalidData(format!(
             "unknown user account type {value}"
+        ))),
+    }
+}
+
+fn parse_user_traffic_accounting_mode(value: String) -> Result<UserTrafficAccountingMode> {
+    match value.as_str() {
+        "single" => Ok(UserTrafficAccountingMode::Single),
+        "double" => Ok(UserTrafficAccountingMode::Double),
+        _ => Err(StoreError::InvalidData(format!(
+            "unknown user traffic accounting mode {value}"
         ))),
     }
 }

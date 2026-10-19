@@ -71,6 +71,12 @@ pub struct ForwardingEntitlementView {
     pub applied_generation: Option<i64>,
     pub reconcile_status: String,
     pub last_error: Option<String>,
+    pub monthly_limit_bytes: Option<u64>,
+    pub monthly_used_bytes: u64,
+    pub quota_suspended: bool,
+    pub quota_job_id: Option<i64>,
+    pub quota_job_status: Option<String>,
+    pub quota_job_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +122,11 @@ pub struct ForwardingOverview {
     pub rules: Vec<ForwardingRuleView>,
 }
 
-fn require_user_access(actor: &AdminContext, tenant_id: &str, user_id: &str) -> Result<()> {
+pub(crate) fn require_user_access(
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<()> {
     if actor.role() == AdminRole::User {
         let own = actor
             .self_user()
@@ -131,7 +141,11 @@ fn require_user_access(actor: &AdminContext, tenant_id: &str, user_id: &str) -> 
     actor.require_tenant_access(tenant_id, "forwarding user")
 }
 
-fn require_rule_write_access(actor: &AdminContext, tenant_id: &str, user_id: &str) -> Result<()> {
+pub(crate) fn require_rule_write_access(
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<()> {
     if actor.role() == AdminRole::User {
         return require_user_access(actor, tenant_id, user_id);
     }
@@ -146,7 +160,7 @@ fn require_rule_write_access(actor: &AdminContext, tenant_id: &str, user_id: &st
     actor.require_tenant_access(tenant_id, "forwarding rule")
 }
 
-fn require_entitlement_admin(actor: &AdminContext, tenant_id: &str) -> Result<()> {
+pub(crate) fn require_entitlement_admin(actor: &AdminContext, tenant_id: &str) -> Result<()> {
     if !matches!(
         actor.role(),
         AdminRole::TenantAdmin | AdminRole::SystemAdmin
@@ -217,7 +231,10 @@ fn validate_rule_shape(write: &ForwardingRuleWrite) -> Result<()> {
     Ok(())
 }
 
-async fn bump_node_generation(tx: &mut Transaction<'_, Postgres>, node_id: &str) -> Result<i64> {
+pub(crate) async fn bump_node_generation(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+) -> Result<i64> {
     Ok(sqlx::query_scalar(
         "INSERT INTO forwarding_node_state (node_id, desired_generation, reconcile_status)
          VALUES ($1, 1, 'pending')
@@ -401,6 +418,7 @@ pub async fn delete_entitlement(
     .execute(&mut *tx)
     .await?;
     bump_node_generation(&mut tx, node_id).await?;
+    crate::forwarding_quota::cancel_jobs_tx(&mut tx, tenant_id, user_id, node_id).await?;
     tx.commit().await?;
     overview(pool, actor, tenant_id, user_id).await
 }
@@ -412,26 +430,31 @@ pub async fn overview(
     user_id: &str,
 ) -> Result<ForwardingOverview> {
     require_user_access(actor, tenant_id, user_id)?;
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT e.node_id, n.name AS node_name, n.public_ipv4, n.public_ipv6,
                 e.enabled, e.tcp_allowed, e.udp_allowed, e.listen_port_start,
                 e.listen_port_end, e.max_rules, e.allow_private_targets,
                 count(r.id) FILTER (WHERE r.deleted_at IS NULL)::bigint AS rule_count,
                 COALESCE(s.desired_generation, 0) AS desired_generation,
                 s.applied_generation, COALESCE(s.reconcile_status, 'pending') AS reconcile_status,
-                s.last_error
+                s.last_error, q.limit_bytes AS monthly_limit_bytes,
+                {month_used} AS monthly_used_bytes, COALESCE(q.suspended,false) AS quota_suspended,
+                q.last_job_id AS quota_job_id, j.status AS quota_job_status, j.last_error AS quota_job_error
            FROM forwarding_entitlements e
            JOIN nodes n ON n.id = e.node_id
            LEFT JOIN forwarding_rules r
              ON r.tenant_id = e.tenant_id AND r.user_id = e.user_id AND r.node_id = e.node_id
            LEFT JOIN forwarding_node_state s ON s.node_id = e.node_id
+           LEFT JOIN forwarding_node_quotas q ON q.tenant_id=e.tenant_id AND q.user_id=e.user_id AND q.node_id=e.node_id
+           LEFT JOIN jobs j ON j.id=q.last_job_id
           WHERE e.tenant_id = $1 AND e.user_id = $2
-          GROUP BY e.node_id, n.name, n.public_ipv4, n.public_ipv6,
+          GROUP BY e.tenant_id,e.user_id,e.node_id, n.name, n.public_ipv4, n.public_ipv6,
                    e.enabled, e.tcp_allowed, e.udp_allowed, e.listen_port_start,
                    e.listen_port_end, e.max_rules, e.allow_private_targets,
-                   s.desired_generation, s.applied_generation, s.reconcile_status, s.last_error
-          ORDER BY n.name, e.node_id",
-    )
+                   s.desired_generation, s.applied_generation, s.reconcile_status, s.last_error,
+                   q.tenant_id,q.user_id,q.node_id,j.id
+          ORDER BY n.name, e.node_id", month_used=crate::forwarding_quota::MONTH_USED
+    ))
     .bind(tenant_id)
     .bind(user_id)
     .fetch_all(pool)
@@ -456,6 +479,20 @@ pub async fn overview(
                 applied_generation: row.try_get("applied_generation")?,
                 reconcile_status: row.try_get("reconcile_status")?,
                 last_error: row.try_get("last_error")?,
+                monthly_limit_bytes: row
+                    .try_get::<Option<i64>, _>("monthly_limit_bytes")?
+                    .map(|n| {
+                        u64::try_from(n).map_err(|_| {
+                            StoreError::InvalidData("negative forwarding quota".to_owned())
+                        })
+                    })
+                    .transpose()?,
+                monthly_used_bytes: u64::try_from(row.try_get::<i64, _>("monthly_used_bytes")?)
+                    .map_err(|_| StoreError::InvalidData("negative forwarding usage".to_owned()))?,
+                quota_suspended: row.try_get("quota_suspended")?,
+                quota_job_id: row.try_get("quota_job_id")?,
+                quota_job_status: row.try_get("quota_job_status")?,
+                quota_job_error: row.try_get("quota_job_error")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -468,6 +505,7 @@ pub async fn overview(
                 COALESCE(sum(s.downlink_bytes), 0)::bigint AS downlink_bytes,
                 CASE
                   WHEN NOT e.enabled OR NOT r.enabled THEN 'disabled'
+                  WHEN COALESCE(q.suspended,false) THEN 'quota-paused'
                   WHEN state.reconcile_status = 'error' THEN 'error'
                   WHEN state.applied_generation = state.desired_generation
                        AND state.applied_rule_ids @> jsonb_build_array(r.id) THEN 'active'
@@ -477,9 +515,10 @@ pub async fn overview(
            JOIN forwarding_entitlements e
              ON e.tenant_id = r.tenant_id AND e.user_id = r.user_id AND e.node_id = r.node_id
            LEFT JOIN forwarding_node_state state ON state.node_id = r.node_id
+           LEFT JOIN forwarding_node_quotas q ON q.tenant_id=r.tenant_id AND q.user_id=r.user_id AND q.node_id=r.node_id
            LEFT JOIN forwarding_usage_rollups s ON s.rule_id = r.id
           WHERE r.tenant_id = $1 AND r.user_id = $2 AND r.deleted_at IS NULL
-          GROUP BY r.id, e.enabled, state.reconcile_status,
+          GROUP BY r.id, e.enabled, q.suspended, state.reconcile_status,
                    state.applied_generation, state.desired_generation, state.applied_rule_ids
           ORDER BY r.created_at, r.id",
     )
@@ -665,6 +704,23 @@ async fn validate_rule_against_entitlement(
         )));
     }
     if write.enabled {
+        let exhausted: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM forwarding_entitlements e
+            JOIN forwarding_node_quotas q USING(tenant_id,user_id,node_id)
+            WHERE e.tenant_id=$1 AND e.user_id=$2 AND e.node_id=$3 AND q.limit_bytes IS NOT NULL
+            AND {} >= q.limit_bytes)",
+            crate::forwarding_quota::MONTH_USED
+        ))
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(&write.node_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if exhausted {
+            return Err(StoreError::Conflict(
+                "forwarding monthly quota is exhausted; raise or remove the quota first".to_owned(),
+            ));
+        }
         ensure_static_port_available(tx, &write.node_id, write.protocol, write.listen_port).await?;
     }
     let count: i64 = row.try_get("rule_count")?;
@@ -765,13 +821,24 @@ fn map_port_conflict<T>(result: std::result::Result<T, sqlx::Error>) -> Result<T
 }
 
 pub async fn desired_for_node(pool: &PgPool, node_id: &str) -> Result<ForwardingDesiredState> {
+    let mut tx = pool.begin().await?;
+    let desired = desired_for_node_tx(&mut tx, node_id).await?;
+    crate::forwarding_quota::dispatched_tx(&mut tx, node_id, desired.generation).await?;
+    tx.commit().await?;
+    Ok(desired)
+}
+
+async fn desired_for_node_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+) -> Result<ForwardingDesiredState> {
     let generation = sqlx::query_scalar(
         "INSERT INTO forwarding_node_state (node_id) VALUES ($1)
          ON CONFLICT (node_id) DO UPDATE SET node_id = EXCLUDED.node_id
          RETURNING desired_generation",
     )
     .bind(node_id)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     let rows = sqlx::query(
         "SELECT r.id, r.protocol, r.listen_port, r.target_host, r.target_port
@@ -780,15 +847,16 @@ pub async fn desired_for_node(pool: &PgPool, node_id: &str) -> Result<Forwarding
              ON e.tenant_id = r.tenant_id AND e.user_id = r.user_id AND e.node_id = r.node_id
            JOIN users u ON u.tenant_id = r.tenant_id AND u.id = r.user_id
            JOIN nodes n ON n.id = r.node_id
+           LEFT JOIN forwarding_node_quotas q ON q.tenant_id=r.tenant_id AND q.user_id=r.user_id AND q.node_id=r.node_id
           WHERE r.node_id = $1 AND r.deleted_at IS NULL AND r.enabled
-            AND e.enabled AND u.status = 'active' AND n.retired_at IS NULL
+            AND e.enabled AND NOT COALESCE(q.suspended,false) AND u.status = 'active' AND n.retired_at IS NULL
             AND r.listen_port BETWEEN e.listen_port_start AND e.listen_port_end
             AND (r.protocol NOT IN ('tcp', 'tcp_udp') OR e.tcp_allowed)
             AND (r.protocol NOT IN ('udp', 'tcp_udp') OR e.udp_allowed)
           ORDER BY r.id",
     )
     .bind(node_id)
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await?;
     let rules = rows
         .into_iter()
@@ -826,7 +894,8 @@ pub async fn record_reconcile(
             "forwarding reconcile error is too long".to_owned(),
         ));
     }
-    let desired = desired_for_node(pool, node_id).await?;
+    let mut tx = pool.begin().await?;
+    let desired = desired_for_node_tx(&mut tx, node_id).await?;
     if desired.generation == report.generation {
         let wanted = desired
             .rules
@@ -863,25 +932,39 @@ pub async fn record_reconcile(
         .bind(report.generation)
         .bind(report.error.as_deref())
         .bind(json!(report.applied_rule_ids))
-        .execute(pool)
+        .execute(&mut *tx)
+        .await?;
+        crate::forwarding_quota::acknowledged_tx(
+            &mut tx,
+            node_id,
+            report.generation,
+            report.error.as_deref(),
+        )
         .await?;
     }
+    tx.commit().await?;
     Ok(desired)
 }
 
 pub async fn prune_usage_report_receipts(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    if retain_days == 0 {
+    prune_usage_report_receipts_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_usage_report_receipts_hours(
+    pool: &PgPool,
+    retain_hours: u32,
+) -> Result<u64> {
+    if retain_hours == 0 {
         return Err(StoreError::InvalidData(
-            "forwarding usage receipt retention must be at least one day".to_owned(),
+            "forwarding usage receipt retention must be at least one hour".to_owned(),
         ));
     }
+    let retain_secs = i64::from(retain_hours.min(crate::MAX_RETENTION_HOURS)) * 3_600;
     Ok(sqlx::query(
         "DELETE FROM forwarding_usage_report_receipts
-          WHERE received_at < now() - make_interval(days => $1)",
+          WHERE received_at < now() - make_interval(secs => $1::double precision)",
     )
-    .bind(i32::try_from(retain_days).map_err(|_| {
-        StoreError::InvalidData("forwarding usage receipt retention is too large".to_owned())
-    })?)
+    .bind(retain_secs)
     .execute(pool)
     .await?
     .rows_affected())
@@ -889,9 +972,24 @@ pub async fn prune_usage_report_receipts(pool: &PgPool, retain_days: u32) -> Res
 
 /// Fine windows are bounded; durable daily rollups and counter heads never expire here.
 pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let days = i32::try_from(retain_days)
-        .ok()
-        .filter(|days| *days > 0)
+    let retain_hours = retain_days.saturating_mul(24);
+    prune_usage_samples_hours(pool, retain_hours, retain_hours).await
+}
+
+pub(crate) async fn prune_usage_samples_hours(
+    pool: &PgPool,
+    sample_retain_hours: u32,
+    window_retain_hours: u32,
+) -> Result<u64> {
+    let sample_secs = i64::from(sample_retain_hours.min(crate::MAX_RETENTION_HOURS));
+    let sample_secs = sample_secs
+        .checked_mul(3_600)
+        .filter(|_| sample_retain_hours > 0)
+        .ok_or_else(|| StoreError::InvalidData("invalid forwarding retention".to_owned()))?;
+    let window_secs = i64::from(window_retain_hours.min(crate::MAX_RETENTION_HOURS));
+    let window_secs = window_secs
+        .checked_mul(3_600)
+        .filter(|_| window_retain_hours > 0)
         .ok_or_else(|| StoreError::InvalidData("invalid forwarding retention".to_owned()))?;
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL statement_timeout='10s'")
@@ -899,19 +997,19 @@ pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64>
         .await?;
     let samples = sqlx::query(
         "DELETE FROM forwarding_usage_samples WHERE id IN (
-        SELECT id FROM forwarding_usage_samples WHERE read_at<now()-make_interval(days=>$1)
+        SELECT id FROM forwarding_usage_samples WHERE read_at<now()-make_interval(secs=>$1::double precision)
         ORDER BY id LIMIT 10000 FOR UPDATE SKIP LOCKED)",
     )
-    .bind(days)
+    .bind(sample_secs)
     .execute(&mut *tx)
     .await?
     .rows_affected();
     let windows = sqlx::query(
         "DELETE FROM forwarding_usage_windows WHERE ctid IN (
-        SELECT ctid FROM forwarding_usage_windows WHERE window_end<now()-make_interval(days=>$1)
+        SELECT ctid FROM forwarding_usage_windows WHERE window_end<now()-make_interval(secs=>$1::double precision)
         ORDER BY window_end LIMIT 10000 FOR UPDATE SKIP LOCKED)",
     )
-    .bind(days)
+    .bind(window_secs)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -1247,6 +1345,18 @@ fn i64_to_u64(value: i64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{address_is_private, validate_entitlement, ForwardingEntitlementWrite};
+
+    #[test]
+    fn tcp_ping_uses_rule_write_permissions_not_read_permissions() {
+        use crate::{AdminContext, AdminRole};
+        for role in [AdminRole::Readonly, AdminRole::User] {
+            let actor = AdminContext::new("viewer", role, Some("t".to_owned()));
+            assert!(super::require_rule_write_access(&actor, "t", "alice").is_err());
+        }
+        let editor = AdminContext::new("editor", AdminRole::Editor, Some("t".to_owned()));
+        assert!(super::require_rule_write_access(&editor, "t", "alice").is_ok());
+        assert!(super::require_rule_write_access(&editor, "other", "alice").is_err());
+    }
 
     #[test]
     fn special_targets_are_private() {

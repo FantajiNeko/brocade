@@ -1180,7 +1180,6 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             let mut settings = json!({ "domainStrategy": domain_strategy });
             match address_policy {
                 XrayFreedomAddressPolicy::Default => {}
-                XrayFreedomAddressPolicy::AllowPrivate => settings["ipsBlocked"] = json!([]),
                 XrayFreedomAddressPolicy::BlockPrivate => {
                     settings["ipsBlocked"] = json!(crate::forwarding::BLOCKED_TARGET_CIDRS);
                 }
@@ -1564,6 +1563,9 @@ fn put_condition(object: &mut Map<String, Value>, condition: &XrayMatchCondition
     if !condition.ip.is_empty() {
         object.insert("ip".to_owned(), json!(condition.ip));
     }
+    if !condition.source_ip.is_empty() {
+        object.insert("sourceIP".to_owned(), json!(condition.source_ip));
+    }
     if let Some(port) = &condition.port {
         object.insert("port".to_owned(), json!(port));
     }
@@ -1610,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn forwarding_guard_is_explicit_and_internal_default_is_preserved() {
+    fn freedom_blocks_addresses_only_when_the_policy_is_explicit() {
         for (policy, expected) in [
             (
                 XrayFreedomAddressPolicy::BlockPrivate,
@@ -1626,18 +1628,6 @@ mod tests {
             });
             assert_eq!(value["settings"].get("ipsBlocked"), expected.as_ref());
         }
-    }
-
-    #[test]
-    fn business_egress_can_honor_an_ingress_that_allows_private_targets() {
-        let value = outbound(&XrayOutbound::Freedom {
-            tag: "out:egress".to_owned(),
-            send_through: None,
-            domain_strategy: "UseIP".to_owned(),
-            address_policy: XrayFreedomAddressPolicy::AllowPrivate,
-        });
-
-        assert_eq!(value["settings"]["ipsBlocked"], json!([]));
     }
 
     #[test]

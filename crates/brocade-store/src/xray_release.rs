@@ -26,6 +26,12 @@ pub struct CreateXrayReleaseRequest {
     pub nodes: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Missing values come from pre-handoff Console/API clients and keep the historical
+    /// destructive-restart behavior. Handoff is never inferred implicitly.
+    #[serde(default)]
+    pub xray_strategy: brocade_deployment::protocol::XrayReleaseStrategy,
+    #[serde(default)]
+    pub xray_drain_timeout_secs: Option<u32>,
 }
 pub async fn list_xray_releases(pool: &PgPool, limit: u32) -> Result<XrayReleaseList> {
     ledger::list_binary_releases(pool, Xray, limit).await
@@ -57,6 +63,8 @@ pub async fn create_xray_release(
             build_id: r.release_id,
             nodes: r.nodes,
             note: r.note,
+            xray_strategy: Some(r.xray_strategy),
+            xray_drain_timeout_secs: r.xray_drain_timeout_secs,
         },
         ledger::BinaryBuildInfo {
             component: Xray,

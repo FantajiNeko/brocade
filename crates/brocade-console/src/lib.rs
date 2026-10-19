@@ -3,6 +3,7 @@ pub mod assets;
 pub mod certs;
 pub mod dns;
 mod embedded_xray;
+mod forwarding_probe;
 pub mod geoip;
 mod grant_probe;
 pub mod http;

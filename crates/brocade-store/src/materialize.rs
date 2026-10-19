@@ -1567,7 +1567,7 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud, \
             hy2_masquerade_kind, hy2_masquerade_url, \
             guard_no_private, guard_no_bittorrent, guard_no_mail, \
-            guard_no_udp_amplification, guard_tcp_and_quic_only, \
+            guard_no_udp_amplification, guard_tcp_and_quic_only, guard_cn_source_block, \
             projection_v4_host, projection_v4_port, \
             projection_v6_host, projection_v6_port, \
             protocol_projection, mtproto_port, \
@@ -1615,7 +1615,7 @@ async fn load_ingresses_tx(
             hy2_quic_max_incoming_streams, hy2_quic_disable_pmtud, \
             hy2_masquerade_kind, hy2_masquerade_url, \
             guard_no_private, guard_no_bittorrent, guard_no_mail, \
-            guard_no_udp_amplification, guard_tcp_and_quic_only, \
+            guard_no_udp_amplification, guard_tcp_and_quic_only, guard_cn_source_block, \
             projection_v4_host, projection_v4_port, \
             projection_v6_host, projection_v6_port, \
             protocol_projection, mtproto_port, \
@@ -1926,6 +1926,16 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
             no_mail: row.try_get("guard_no_mail")?,
             no_udp_amplification: row.try_get("guard_no_udp_amplification")?,
             tcp_and_quic_only: row.try_get("guard_tcp_and_quic_only")?,
+            cn_source_block: match text(row, "guard_cn_source_block")?.as_str() {
+                "off" => brocade_core::model::CnSourceBlock::Off,
+                "ipv4" => brocade_core::model::CnSourceBlock::Ipv4,
+                "ipv4-and-ipv6" => brocade_core::model::CnSourceBlock::Ipv4AndIpv6,
+                value => {
+                    return invalid(format!(
+                        "ingresses.guard_cn_source_block has unknown value {value}"
+                    ));
+                }
+            },
         },
     })
 }

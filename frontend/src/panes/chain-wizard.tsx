@@ -1,10 +1,11 @@
 import { useId, useMemo, useState, type ReactNode } from 'react';
 import type { HopWireKind } from '../ui/format';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   createApp,
   createChain,
   createIngress,
+  createUser,
   setNodeEgressDns,
   upsertExternalOutbound,
   fetchCompileView,
@@ -12,6 +13,7 @@ import {
   fetchRevisions,
   fetchSettings,
   fetchSnapshot,
+  fetchTenants,
   fetchUsers,
   putStep,
   stageGrant,
@@ -23,6 +25,7 @@ import {
   type NodeAgentStateItem,
   type SnapshotApp,
   type RealityFallbackMode,
+  type UserListItem,
   type Wires,
 } from '../api';
 import { nodeCertificateLabel } from '../certificate';
@@ -44,9 +47,11 @@ import { DEFAULT_VLESS_ENCRYPTION } from '../vless-encryption';
 import { newRealityFallbackLimits } from '../reality-fallback';
 import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader } from '../ui/wizard-paper';
 import { Icon, type IconName } from '../ui/icons';
-import { SUBSCRIPTION_COUNTRY_CODES, subscriptionCountryLabel } from '../ui/subscription-country';
+import { RegionFlag } from '../ui/region-flag';
+import { GeneratedUserAvatar } from '../ui/user-avatar';
+import { useInitialReady } from '../ui/use-initial-ready';
 import { vpngateNodeEligibility } from '../vpngate-capability';
-import { mtprotoNodeEligibility } from '../mtproto-capability';
+import { MTPROTO_DESCRIPTION, mtprotoNodeEligibility } from '../mtproto-capability';
 import { useUnsavedChanges } from '../ui/navigation-guard';
 import {
   wizardDefaultListenerWire,
@@ -228,6 +233,41 @@ export function defaultListenerHopWire(spine: string[], host: string, dialAt: (i
   return usedOverOverlay ? 'none' : 'encryption';
 }
 
+function WizardPortInput({
+  label,
+  value,
+  disabled,
+  invalid,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  disabled: boolean;
+  invalid: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <input
+      className="f mono"
+      inputMode="numeric"
+      aria-label={label}
+      value={value}
+      disabled={disabled}
+      aria-invalid={invalid || undefined}
+      onChange={event => onChange(event.target.value)}
+    />
+  );
+}
+
+/** 手填过的端口才出现：回到按占用自动分配。端口范围共用一个，两端一起恢复。 */
+function WizardPortAuto({ label, onReset }: { label: string; onReset: () => void }) {
+  return (
+    <button type="button" className="btn sm" aria-label={`${label}恢复自动分配`} onClick={onReset}>
+      自动
+    </button>
+  );
+}
+
 function WizardProtocolTile({
   name,
   note,
@@ -239,7 +279,8 @@ function WizardProtocolTile({
   expanded,
   onExpand,
   portRange = false,
-  disabled = false,
+  issues = [],
+  requirement,
 }: {
   name: string;
   note: string;
@@ -251,7 +292,8 @@ function WizardProtocolTile({
   expanded?: boolean;
   onExpand?: () => void;
   portRange?: boolean;
-  disabled?: boolean;
+  issues?: string[];
+  requirement?: string;
 }) {
   const checkboxId = useId();
   return (
@@ -261,7 +303,6 @@ function WizardProtocolTile({
         type="checkbox"
         aria-label={name}
         checked={enabled}
-        disabled={disabled}
         onChange={event => onToggle(event.target.checked)}
       />
       <label className="protocol-choice-copy" htmlFor={checkboxId}>
@@ -270,6 +311,7 @@ function WizardProtocolTile({
           {name}
         </b>
         <span className="note">{note}</span>
+        {requirement && <span className="note">{requirement}</span>}
       </label>
       <span className="wzp-port">{port}</span>
       {params && (
@@ -277,6 +319,11 @@ function WizardProtocolTile({
           {expanded ? '收起参数' : '参数'}
         </button>
       )}
+      {issues.map(issue => (
+        <p className="note bad wzp-issue" role="alert" key={issue}>
+          {issue}
+        </p>
+      ))}
       {expanded && params && <div className="wzp-body">{params}</div>}
     </div>
   );
@@ -294,7 +341,7 @@ export function ChainWizard({
   // 从线路页进入时线路已确定：该项已在进入前指定，此处再次询问
   // （且提供新建选项）会造成对当前位置的误判。
   fixedApp?: { id: string; label: string };
-  onDone: () => void;
+  onDone: (created?: { appId: string; chainId: string; ingressId: string }) => void;
 }) {
   const { who } = useSession();
   const qc = useQueryClient();
@@ -325,7 +372,6 @@ export function ChainWizard({
   const appMode: 'new' | 'existing' = fixedApp ? 'existing' : (appModeRaw ?? (apps.length > 0 ? 'existing' : 'new'));
   const pickedApp = fixedApp?.id ?? pickedAppRaw ?? apps[0]?.id ?? '';
   const [chainNameRaw, setChainName] = useState<string | null>(null);
-  const [subscriptionCountry, setSubscriptionCountry] = useState('');
   // 与链详情共用 Rule 的语义：主干和支路均从显式转发规则推导，不保存第二份路径顺序。
   const [headId, setHeadId] = useState<string | null>(node?.node_id ?? null);
   const [pathRules, setPathRules] = useState<WizardRuleTables>(node ? { [node.node_id]: [wizardEgressRule()] } : {});
@@ -375,7 +421,7 @@ export function ChainWizard({
   const headCertificateNode = snapshot.data?.snapshot.nodes?.find(candidate => candidate.id === head?.node_id);
   const headCertificate = headCertificateNode?.certificate_name ?? null;
   const headCertificateLabel = nodeCertificateLabel(headCertificateNode?.certificate_track);
-  const mtprotoUnavailable = head ? mtprotoNodeEligibility(head).reason : '先选择入口节点';
+  const mtprotoUnavailable = head ? mtprotoNodeEligibility(head).reason : null;
   // The ordinary case requires no extra choice: a managed node already belongs to the default
   // certificate group, so REALITY borrows that exact local identity. The selector remains visible
   // for an operator who wants the global/custom target instead.
@@ -397,9 +443,15 @@ export function ChainWizard({
       realityFingerprintIsValid(customRealityFingerprint));
   const [appId] = useState(() => randomAppId());
   const appLabel = appLabelRaw ?? headLabel;
-  const chainName = chainNameRaw ?? '';
+  const chainName =
+    chainNameRaw ??
+    (!head ? '' : spine.length === 1 ? `${headLabel} 直出` : `${headLabel} → ${nameOf(spine.at(-1) ?? '')}`);
   /* 选择连接方式需要读取对端的公网地址，因此此处需要完整的节点数据而非只有名称。 */
   const nodeOf = (id: string) => (nodes.data?.nodes ?? []).find(n => n.node_id === id) ?? null;
+  // 订阅地区只描述主链最终从哪里出网，因此跟随 Any 转发主干的末尾节点；例外支路不改变
+  // 这条链的默认出口标识。节点地区已经合并了 GeoIP 探测和人工纠正，不再让建链者重复选择。
+  const tail = nodeOf(spine.at(-1) ?? '');
+  const exitCountry = tail?.public_ipv4_country?.trim().toUpperCase() || null;
 
   // 系统层的端口（WireGuard）只存在于编译产生的 IR 中。查询键与顶栏角标、检视窗相同，
   // 因此通常命中缓存。
@@ -409,6 +461,7 @@ export function ChainWizard({
     queryKey: ['compile', current],
     queryFn: () => fetchCompileView(current!),
     enabled: !!current,
+    placeholderData: keepPreviousData,
   });
 
   // 技术 ID 在向导的整个生命周期中保持不变：后续的链、接入面、授权与规则操作都引用
@@ -557,6 +610,45 @@ export function ChainWizard({
       if (clash) entryPortIssues.push(`Hysteria 2：${clash}`);
     }
   }
+  const tcpIssuesFor = (label: string) => {
+    const listener = entryTcpListeners.find(choice => choice.label === label);
+    return [
+      ...entryPortIssues.filter(issue => issue.startsWith(`${label}：`) || issue.startsWith(`${label} 端口`)),
+      ...(entryPortCollision &&
+      listener &&
+      entryTcpListeners.some(choice => choice.label !== label && choice.port === listener.port)
+        ? [entryPortCollision]
+        : []),
+    ];
+  };
+  const certificateIssue = head && !headCertificate ? `入口尚未分配${headCertificateLabel}` : null;
+  const protocolIssues = {
+    vless: vlessEnabled
+      ? [...tcpIssuesFor('VLESS · REALITY'), ...(!realityTargetReady ? ['补全 REALITY 伪装目标'] : [])]
+      : [],
+    encryption: encryptionEnabled ? tcpIssuesFor('VLESS · Encryption') : [],
+    anytls: anyTlsEnabled
+      ? [
+          ...tcpIssuesFor('AnyTLS'),
+          ...(certificateIssue ? [certificateIssue] : []),
+          ...(paddingMode === 'custom' && !customPadding.trim() ? ['填写自定义 Padding 规则'] : []),
+        ]
+      : [],
+    hy2: hy2Enabled
+      ? [
+          ...entryPortIssues.filter(issue => issue.startsWith('Hysteria 2')),
+          ...(certificateIssue ? [certificateIssue] : []),
+          ...(Boolean(hy2Up.trim()) !== Boolean(hy2Down.trim()) ? ['上下行带宽需同时填写'] : []),
+        ]
+      : [],
+    mtproto: mtprotoEnabled ? [...tcpIssuesFor('MTProxy'), ...(mtprotoUnavailable ? [mtprotoUnavailable] : [])] : [],
+  };
+  // AnyTLS 与 Hysteria 2 的 TLS 用入口的证书。没有证书时这一行不出现，原因由协议卡的问题行说明。
+  const certificateField = headCertificate && (
+    <WizardField label="证书">
+      <span className="mono">{headCertificate}</span>
+    </WizardField>
+  );
 
   const edges = wizardForwardEdges(headId, pathRules);
   const listeners = [...new Set(edges.map(edge => edge.listener))];
@@ -705,8 +797,11 @@ export function ChainWizard({
   // 切换到用户页逐个授权——而该过程中没有新的决策，创建链时已确定授权对象。
   // 选中的用户各生成一条 `upsert_grant`，与链和接入面进入同一批草稿。
   const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
+  const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
   /* 键使用 `租户/用户`：用户 id 只在租户内唯一（user.dup 只在单个租户内查重）。 */
   const [pickedUsers, setPickedUsers] = useState<Set<string>>(new Set());
+  const [newUser, setNewUser] = useState<{ id: string; tenant: string } | null>(null);
+  const [userQuery, setUserQuery] = useState('');
   const guardScope = node ? `chain-wizard:node:${node.node_id}` : `chain-wizard:app:${fixedApp?.id ?? 'new'}`;
   const initialPathRules: WizardRuleTables = node ? { [node.node_id]: [wizardEgressRule()] } : {};
   const dirty =
@@ -714,7 +809,6 @@ export function ChainWizard({
     appLabelRaw !== null ||
     pickedAppRaw !== null ||
     chainNameRaw !== null ||
-    subscriptionCountry !== '' ||
     headId !== (node?.node_id ?? null) ||
     JSON.stringify(pathRules) !== JSON.stringify(initialPathRules) ||
     activeDnsChanges.length > 0 ||
@@ -739,7 +833,8 @@ export function ChainWizard({
     mtprotoPortRaw !== null ||
     hy2StartRaw !== null ||
     hy2EndRaw !== null ||
-    pickedUsers.size > 0;
+    pickedUsers.size > 0 ||
+    Boolean(newUser?.id.trim());
   const clearUnsavedChanges = useUnsavedChanges(dirty, '新链向导', guardScope);
 
   // 用户可以先于入口选择；入口确定后再依据接入面租户校验授权范围
@@ -775,7 +870,42 @@ export function ChainWizard({
       else next.add(key);
       return next;
     });
-  const selectableUsers = userRows.filter(u => !u.blocked);
+  const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
+  const tenantName = (id: string) => tenantOptions.find(tenant => tenant.id === id)?.name || id;
+  const normalizedUserQuery = userQuery.trim().toLowerCase();
+  const visibleUsers = userRows.filter(
+    user =>
+      !normalizedUserQuery ||
+      `${user.id} ${user.tenant_id} ${tenantName(user.tenant_id)}`.toLowerCase().includes(normalizedUserQuery),
+  );
+  const visibleSelectableUsers = visibleUsers.filter(user => !user.blocked);
+  const userGroups = [...new Set(visibleUsers.map(user => user.tenant_id))];
+  const defaultNewUserTenant =
+    (head && tenantOptions.some(tenant => tenant.id === head.tenant_id) ? head.tenant_id : '') ||
+    (tenantOptions.length === 1 ? tenantOptions[0].id : '');
+  const newUserTenant = newUser?.tenant || defaultNewUserTenant;
+  const newUserId = newUser?.id.trim() ?? '';
+  const newUserBadSlug = newUserId && !isValidSlug(newUserId) ? 'ID 只能用 a-z 0-9 . _ -，最长 32' : null;
+  const newUserDuplicate = userRows.some(user => user.tenant_id === newUserTenant && user.id === newUserId)
+    ? `用户 ID ${newUserId} 已存在`
+    : null;
+  const newUserReady = Boolean(newUserId && newUserTenant && !newUserBadSlug && !newUserDuplicate);
+  const addUser = useMutation({
+    mutationFn: (user: { tenant_id: string; id: string }) => createUser(user),
+    onSuccess: (result, user) => {
+      qc.setQueryData<{ users: UserListItem[] }>(['users'], current => ({
+        users: [
+          ...(current?.users ?? []).filter(item => !(item.tenant_id === user.tenant_id && item.id === user.id)),
+          result.user,
+        ],
+      }));
+      setPickedUsers(previous => new Set(previous).add(`${user.tenant_id}/${user.id}`));
+      setNewUser(null);
+      setUserQuery('');
+      void qc.invalidateQueries({ queryKey: ['revisions'] });
+      void qc.invalidateQueries({ queryKey: ['snapshot'] });
+    },
+  });
 
   const targeted = new Set(edges.map(edge => edge.target));
   const stepBodies: Array<{ id: string; body: Parameters<typeof putStep>[3] }> = members.map(id => {
@@ -875,7 +1005,7 @@ export function ChainWizard({
         id: chainId.trim(),
         tenant_id: head?.tenant_id ?? '',
         name: chainName.trim() || chainId.trim(),
-        subscription_country: subscriptionCountry || null,
+        subscription_country: exitCountry,
       });
       await createIngress(app, {
         id: ingressId.trim(),
@@ -911,6 +1041,7 @@ export function ChainWizard({
           no_mail: true,
           no_udp_amplification: true,
           tcp_and_quic_only: false,
+          cn_source_block: 'off',
         },
       });
 
@@ -948,7 +1079,7 @@ export function ChainWizard({
       // 成功后回到进入向导前的上下文。草稿条已经承担待提交状态，不再停留展示一份
       // 与提交前预览重复的“改了什么”结果页。
       clearUnsavedChanges();
-      onDone();
+      onDone({ appId: app, chainId: chainId.trim(), ingressId: ingressId.trim() });
     } catch (e) {
       setError(e);
     } finally {
@@ -959,20 +1090,29 @@ export function ChainWizard({
   // 向导的默认端口、可选机器、线路冲突、授权对象和 REALITY 站点分别来自这些查询。
   // 任何一项失败都不能以空数组/工厂默认值继续，否则“创建成功”的结果可能少授权、撞端口
   // 或写入错误的站点。
-  if (
+  const dependenciesPending =
     snapshot.isPending ||
+    snapshot.isFetching ||
     settings.isPending ||
+    settings.isFetching ||
     nodes.isPending ||
+    nodes.isFetching ||
     revisions.isPending ||
+    revisions.isFetching ||
     users.isPending ||
-    (current != null && compile.isPending)
-  )
-    return <Loading variant="form" />;
+    users.isFetching ||
+    tenants.isPending ||
+    tenants.isFetching ||
+    (current != null && (compile.isPending || compile.isFetching || compile.isPlaceholderData));
   const dependencyError =
-    snapshot.error ?? settings.error ?? nodes.error ?? revisions.error ?? users.error ?? compile.error;
-  if (dependencyError) return <ErrorBox error={dependencyError} />;
+    snapshot.error ?? settings.error ?? nodes.error ?? revisions.error ?? users.error ?? tenants.error ?? compile.error;
+  const dependenciesReady = !dependenciesPending && !dependencyError;
+  const initialReady = useInitialReady(Boolean(dependenciesReady), guardScope);
+  if (!initialReady) return dependencyError ? <ErrorBox error={dependencyError} /> : <Loading variant="form" />;
 
   const blockers = [
+    dependenciesPending ? '等待最新配置加载完成' : null,
+    dependencyError ? '配置读取失败，请重试' : null,
     !head ? '选择入口节点' : null,
     !targetApp ? '没有可用的分组' : null,
     appMode === 'new' && !appLabel.trim() ? '填写新分组名称' : null,
@@ -1008,6 +1148,7 @@ export function ChainWizard({
     listeners.some(host => hostSecOf(host) === 'reality') && !globalRealityReady
       ? '中转协议使用 REALITY 前，先配置全局伪装站点'
       : null,
+    addUser.isPending ? '等待新增用户完成' : null,
   ].filter((message): message is string => !!message);
   const ready = blockers.length === 0;
 
@@ -1037,469 +1178,561 @@ export function ChainWizard({
         aside={<span className="st st-gold">写入草稿</span>}
       />
       <div className="nd-paper-body pv-body">
-        <fieldset className="pv-fields pv-chain-fields" disabled={submitting}>
+        <fieldset className="pv-fields pv-chain-fields" disabled={submitting || !dependenciesReady}>
           <div className="nd-tab-config">
-            <WizardCard title="基本信息" icon="identity" hint={`${selectedUsers.length} 人已选`}>
-              <div className="wzi">
-                <div className="wzi-col">
-                  <p className="eyebrow">这条链</p>
-                  <div className="fgrid one">
-                    <WizardField label="分组" htmlFor="chain-wizard-app">
-                      {/* 下拉框与新建的两个输入框在同一行：它们对应同一项输入——选择哪个线路，
-              取值要么是已有分组，要么是新建分组的名称；技术 ID 自动生成。
-              分为两行会被理解为两个问题，且第二行需要依靠缩进和竖线表明其从属关系。
-
-              选择新建时下拉框收窄：此时它只显示「＋ 新建分组…」，
-              占用半行宽度没有必要——宽度分配给需要填写的名称。 */}
-                      <div className="wz-app">
-                        {/* 始终使用下拉框，即使只有一个选项。从线路页进入时它只包含该线路——
-                改为只读文本时，同一字段在两个入口下是两种控件，需要先判断当前是否可修改。
-                只有一个选项的下拉框本身即表明取值唯一。 */}
-                        <select
-                          id="chain-wizard-app"
-                          className={`f${appMode === 'new' && !fixedApp ? ' narrow' : ''}`}
-                          value={appMode === 'new' ? NEW_APP : pickedApp}
-                          // 只有一项时不禁用：禁用的下拉框与异常状态使用同一视觉信号，
-                          // 而此处的实际情况是没有其他选项——该情况由选项数量本身表达。
-                          onChange={e => {
-                            if (e.target.value === NEW_APP) setAppMode('new');
-                            else {
-                              setAppMode('existing');
-                              setPickedApp(e.target.value);
-                            }
-                          }}
-                        >
-                          {fixedApp ? (
-                            <option value={fixedApp.id}>
-                              {fixedApp.label || fixedApp.id}（{fixedApp.id}）
-                            </option>
-                          ) : (
-                            <>
-                              {/* 不提供空选项。该字段始终有取值：第一个已有线路，没有任何线路时为新建。
-                      空选项会增加一次点击以选择本应默认选中的项，且选中空选项时
-                      `ready` 仍为禁用状态，会被理解为填写有误。 */}
-                              {apps.map(a => (
-                                <option key={a.id} value={a.id}>
-                                  {a.label || a.id}（{a.id}）
-                                </option>
-                              ))}
-                              {/* 新建作为下拉框的最后一项，不再使用独立的单选组：它与其他选项是
-                      同一问题的不同取值，使用两种控件相当于重复询问。
-                      建分组要 system-admin，但该项照常列出、只是禁用——按角色隐藏时，
-                      没有任何线路的只读视角会看到一个空下拉框。 */}
-                              <option value={NEW_APP} disabled={!system}>
-                                ＋ 新建分组…
-                              </option>
-                            </>
-                          )}
-                        </select>
-                        {appMode === 'new' && !fixedApp && (
-                          <input
-                            id="chain-wizard-app-name"
-                            className="f"
-                            value={appLabel}
-                            onChange={e => setAppLabel(e.target.value)}
-                            placeholder="分组名称"
-                            aria-label="新分组名称"
-                            aria-invalid={attempted && !appLabel.trim()}
-                          />
-                        )}
-                      </div>
-                      {/* 说明该字段的含义——「线路」一词本身不体现它是计费单元。 */}
-                      <span className={`sub${attempted && appMode === 'new' && !appLabel.trim() ? ' bad' : ''}`}>
-                        {attempted && appMode === 'new' && !appLabel.trim()
-                          ? '填写一个便于识别的分组名称。'
-                          : '线路分组，也是计费单元。'}
-                      </span>
-                    </WizardField>
-                    <WizardField label="链名称" htmlFor="chain-wizard-name">
-                      <input
-                        id="chain-wizard-name"
-                        className="f"
-                        value={chainName}
-                        placeholder="给这条链起个名字"
-                        onChange={e => setChainName(e.target.value)}
-                        aria-invalid={attempted && !chainName.trim()}
-                      />
-                      {attempted && !chainName.trim() && <span className="sub bad">填写一个便于识别的链名称。</span>}
-                    </WizardField>
-                    <WizardField label="订阅地区" htmlFor="chain-wizard-country">
-                      <select
-                        id="chain-wizard-country"
-                        className="f"
-                        value={subscriptionCountry}
-                        onChange={event => setSubscriptionCountry(event.target.value)}
-                      >
-                        <option value="">按出口探测自动识别</option>
-                        {SUBSCRIPTION_COUNTRY_CODES.map(code => (
-                          <option value={code} key={code}>
-                            {subscriptionCountryLabel(code)}
-                          </option>
-                        ))}
-                      </select>
-                    </WizardField>
-                  </div>
-                </div>
-                <div className="wzi-col">
-                  <p className="eyebrow">谁能用</p>
-                  {userRows.length === 0 ? (
-                    <p className="note">还没有用户；建链后仍可回来授权。</p>
-                  ) : (
-                    <>
-                      <select
-                        className="f wzg-add"
-                        aria-label="添加可用用户"
-                        value=""
-                        disabled={selectableUsers.every(user => pickedUsers.has(user.key))}
-                        onChange={event => {
-                          if (event.target.value) toggleUser(event.target.value);
-                        }}
-                      >
-                        <option value="">＋ 添加用户…</option>
-                        {userRows
-                          .filter(user => !user.blocked && !pickedUsers.has(user.key))
-                          .map(user => (
-                            <option key={user.key} value={user.key}>
-                              {user.id} · {user.tenant_id}
+            <div>
+              <WizardCard title="基本信息" icon="identity" className="cc-basic">
+                <div className="fgrid one">
+                  <WizardField label="分组" htmlFor="chain-wizard-app">
+                    <select
+                      id="chain-wizard-app"
+                      className="f"
+                      value={appMode === 'new' ? NEW_APP : pickedApp}
+                      onChange={event => {
+                        if (event.target.value === NEW_APP) setAppMode('new');
+                        else {
+                          setAppMode('existing');
+                          setPickedApp(event.target.value);
+                        }
+                      }}
+                    >
+                      {fixedApp ? (
+                        <option value={fixedApp.id}>{fixedApp.label || fixedApp.id}</option>
+                      ) : (
+                        <>
+                          {apps.map(app => (
+                            <option key={app.id} value={app.id}>
+                              {app.label || app.id}
                             </option>
                           ))}
-                      </select>
-                      <div className="wzg">
-                        {selectedUsers.map(user => (
-                          <div className="wzg-row" key={user.key} title={user.blocked ?? undefined}>
-                            <span>
-                              {user.id}
-                              {user.blocked ? ` · ${user.blocked}` : ''}
-                            </span>
-                            <button
-                              type="button"
-                              className="del-ctl"
-                              aria-label={`撤销 ${user.id} 的授权`}
-                              onClick={() => toggleUser(user.key)}
-                            >
-                              ×
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                      {selectedUsers.length === 0 && <p className="note">还没有选择用户，建完也可以再加。</p>}
-                      <div className="wzg-actions">
-                        <button
-                          type="button"
-                          className="btn sm"
-                          disabled={
-                            selectableUsers.length === 0 || selectableUsers.every(user => pickedUsers.has(user.key))
-                          }
-                          onClick={() =>
-                            setPickedUsers(prev => new Set([...prev, ...selectableUsers.map(user => user.key)]))
-                          }
-                        >
-                          全选
-                        </button>
-                        <button
-                          type="button"
-                          className="btn sm"
-                          disabled={selectedUsers.length === 0}
-                          onClick={() => setPickedUsers(new Set())}
-                        >
-                          全不选
-                        </button>
-                      </div>
-                      {userRows
-                        .filter(user => user.blocked && !pickedUsers.has(user.key))
-                        .map(user => (
-                          <button
-                            type="button"
-                            key={user.key}
-                            className="wzg-blocked"
-                            disabled
-                            title={user.blocked ?? undefined}
-                          >
-                            {user.id} · {user.blocked}
-                          </button>
-                        ))}
-                      {droppedUsers.length > 0 && (
-                        <p className="note warn">
-                          {droppedUsers.map(user => user.id).join('、')} 当前不可授权，本次不会写入。
-                        </p>
+                          <option value={NEW_APP} disabled={!system}>
+                            ＋ 新建分组…
+                          </option>
+                        </>
                       )}
-                    </>
+                    </select>
+                  </WizardField>
+                  {appMode === 'new' && !fixedApp && (
+                    <WizardField label="分组名称" htmlFor="chain-wizard-app-name">
+                      <input
+                        id="chain-wizard-app-name"
+                        className="f"
+                        value={appLabel}
+                        onChange={event => setAppLabel(event.target.value)}
+                        placeholder="给分组起个名字"
+                        aria-label="新分组名称"
+                        aria-invalid={attempted && !appLabel.trim()}
+                      />
+                    </WizardField>
+                  )}
+                  <WizardField label="链名称" htmlFor="chain-wizard-name">
+                    <input
+                      id="chain-wizard-name"
+                      className="f"
+                      value={chainName}
+                      placeholder="给这条链起个名字"
+                      onChange={event => setChainName(event.target.value)}
+                      aria-invalid={attempted && !chainName.trim()}
+                    />
+                  </WizardField>
+                </div>
+              </WizardCard>
+              <WizardCard title="授权用户" icon="users" hint={`${grantedUsers.length} 人已选`}>
+                <div className="toolbar cc-users-tools">
+                  <span className="user-list-search">
+                    <Icon of="search" size={13} className="user-list-search-icon" />
+                    <input
+                      type="search"
+                      value={userQuery}
+                      aria-label="搜索授权用户"
+                      placeholder="搜索用户"
+                      autoComplete="off"
+                      spellCheck={false}
+                      onChange={event => setUserQuery(event.target.value)}
+                    />
+                    {userQuery && (
+                      <button type="button" aria-label="清空搜索" title="清空" onClick={() => setUserQuery('')}>
+                        <Icon of="close" size={13} />
+                      </button>
+                    )}
+                  </span>
+                  <span className="sp" />
+                  <button
+                    type="button"
+                    className="btn sm"
+                    disabled={
+                      !visibleSelectableUsers.length || visibleSelectableUsers.every(user => pickedUsers.has(user.key))
+                    }
+                    onClick={() =>
+                      setPickedUsers(
+                        previous => new Set([...previous, ...visibleSelectableUsers.map(user => user.key)]),
+                      )
+                    }
+                  >
+                    全选
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    disabled={!pickedUsers.size}
+                    onClick={() => setPickedUsers(new Set())}
+                  >
+                    清空
+                  </button>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    aria-label="新增用户"
+                    aria-expanded={Boolean(newUser)}
+                    disabled={addUser.isPending}
+                    onClick={() => {
+                      addUser.reset();
+                      setNewUser(current => (current ? null : { id: '', tenant: defaultNewUserTenant }));
+                    }}
+                  >
+                    ＋ 新增用户
+                  </button>
+                </div>
+                {newUser && (
+                  <div
+                    className="user-new-row"
+                    role="group"
+                    aria-label="新增用户"
+                    aria-busy={addUser.isPending}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (newUserReady && !addUser.isPending)
+                          addUser.mutate({ tenant_id: newUserTenant, id: newUserId });
+                      }
+                      if (event.key === 'Escape') {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (!addUser.isPending) {
+                          addUser.reset();
+                          setNewUser(null);
+                        }
+                      }
+                    }}
+                  >
+                    <span className="user-new-intro">
+                      <span className="user-avatar user-new-avatar" aria-hidden="true">
+                        ＋
+                      </span>
+                      <span className="user-new-copy">
+                        <b>新增用户</b>
+                        <small>用户会立即创建；链与授权在「加入草稿」后暂存。</small>
+                      </span>
+                    </span>
+                    <label className="user-new-field">
+                      <span>用户 ID</span>
+                      <input
+                        className="f mono"
+                        autoFocus
+                        aria-label="新用户 ID"
+                        value={newUser.id}
+                        placeholder="例如 alice"
+                        disabled={addUser.isPending}
+                        onChange={event => setNewUser({ ...newUser, id: event.target.value })}
+                      />
+                    </label>
+                    {tenantOptions.length > 1 && (
+                      <label className="user-new-field">
+                        <span>所属租户</span>
+                        <select
+                          className="f"
+                          aria-label="新用户所属租户"
+                          value={newUserTenant}
+                          disabled={addUser.isPending}
+                          onChange={event => setNewUser({ ...newUser, tenant: event.target.value })}
+                        >
+                          <option value="">— 选择租户 —</option>
+                          {tenantOptions.map(tenant => (
+                            <option key={tenant.id} value={tenant.id}>
+                              {tenant.name || tenant.id}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    {(newUserBadSlug || newUserDuplicate || !tenantOptions.length) && (
+                      <p className="user-new-error" role="alert">
+                        {newUserBadSlug || newUserDuplicate || '没有可用租户'}
+                      </p>
+                    )}
+                    {addUser.error && <ErrorBox error={addUser.error} />}
+                    <footer className="user-new-actions">
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={addUser.isPending}
+                        onClick={() => {
+                          addUser.reset();
+                          setNewUser(null);
+                        }}
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        className="btn primary"
+                        disabled={!newUserReady || addUser.isPending}
+                        onClick={() => addUser.mutate({ tenant_id: newUserTenant, id: newUserId })}
+                      >
+                        {addUser.isPending ? '新增中…' : '新增并选中'}
+                      </button>
+                    </footer>
+                  </div>
+                )}
+                <div className="cc-user-list" role="group" aria-label="选择可用用户">
+                  {userGroups.map(tenant => {
+                    const tenantUsers = visibleUsers.filter(user => user.tenant_id === tenant);
+                    return (
+                      <section key={tenant} aria-label={`${tenantName(tenant)}的用户`}>
+                        {userGroups.length > 1 && (
+                          <h4 className="sec">
+                            {tenantName(tenant)}
+                            <span className="wz-sec-note">{tenantUsers.length}</span>
+                          </h4>
+                        )}
+                        <div className="cc-user-grid">
+                          {tenantUsers.map(user => {
+                            const selected = pickedUsers.has(user.key);
+                            return (
+                              <button
+                                type="button"
+                                key={user.key}
+                                className="grant-card cc-user"
+                                aria-pressed={selected}
+                                disabled={Boolean(user.blocked) && !selected}
+                                title={`${user.id}${user.blocked ? ` · ${user.blocked}` : ''}`}
+                                onClick={() => toggleUser(user.key)}
+                              >
+                                <GeneratedUserAvatar id={user.id} variant="cell" />
+                                <span className="cc-user-copy">
+                                  <span className="gc-app">{user.id}</span>
+                                  {user.blocked && (
+                                    <span className="gc-at">{user.status !== 'active' ? '已停用' : '不可授权'}</span>
+                                  )}
+                                </span>
+                                <span className="gc-mark" aria-hidden="true">
+                                  {selected ? '✓' : ''}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </section>
+                    );
+                  })}
+                  {!visibleUsers.length && (
+                    <p className="note">{normalizedUserQuery ? '没有匹配的用户' : '还没有用户，可以在这里新增。'}</p>
                   )}
                 </div>
-              </div>
-            </WizardCard>
-            <WizardCard title="接入协议" icon="ingress" hint={`${enabledProtocolCount} 种 · 端口自动避让`}>
-              <div className="wzp" aria-label="接入协议">
-                <WizardProtocolTile
-                  name="VLESS · REALITY"
-                  note="TCP / XHTTP 入站；使用 REALITY 保护传输。"
-                  icon="xray"
-                  enabled={vlessEnabled}
-                  onToggle={setVlessEnabled}
-                  port={
-                    <>
-                      <span>TCP</span>
-                      <input
-                        className="f mono"
-                        inputMode="numeric"
-                        aria-label="VLESS 监听端口"
-                        value={portText}
-                        onChange={event => setPort(event.target.value)}
-                      />
-                    </>
-                  }
-                  params={
-                    <div className="fgrid one">
-                      <WizardField label="伪装目标" htmlFor="chain-wizard-reality">
-                        <select
-                          id="chain-wizard-reality"
-                          className="f"
-                          aria-label="REALITY 目标来源"
-                          value={realityTarget}
-                          onChange={event => setRealityTarget(event.target.value as RealityFallbackMode | '')}
-                        >
-                          <option value="">— 选择 REALITY 目标 —</option>
-                          <option value="node-certificate" disabled={!headCertificate}>
-                            {headCertificateLabel}
-                            {headCertificate ? ` · ${headCertificate}` : '（尚未签发）'}
-                          </option>
-                          <option value="global-site" disabled={!globalRealityReady}>
-                            全局站点{globalRealityReady ? ` · ${realitySite.dest}` : '（尚未配置）'}
-                          </option>
-                          <option value="custom-site">自定义站点…</option>
-                        </select>
-                      </WizardField>
-                      {realityTarget === 'custom-site' && (
-                        <div className="wzp-reality-custom">
-                          <input
-                            className="f mono"
-                            value={customRealityDest}
-                            placeholder="example.com:443"
-                            aria-label="自定义 REALITY 目标"
-                            onChange={event => setCustomRealityDest(event.target.value)}
-                          />
-                          <input
-                            className="f mono"
-                            value={customRealityNames}
-                            placeholder="example.com"
-                            aria-label="自定义 REALITY SNI"
-                            onChange={event => setCustomRealityNames(event.target.value)}
-                          />
-                          <select
-                            className="f"
-                            aria-label="自定义 REALITY 指纹"
-                            value={customRealityFingerprint}
-                            onChange={event => setCustomRealityFingerprint(event.target.value)}
-                          >
-                            {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
-                              <option value={value} key={value}>
-                                {label}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
-                      {!realityTargetReady && <p className="note warn">补全 REALITY 伪装目标后才能加入草稿。</p>}
-                      <p className="note">其余参数用默认值，建成后在线路详情里调。</p>
-                    </div>
-                  }
-                  expanded={openProtocol === 'vless' || !realityTargetReady}
-                  onExpand={() => setOpenProtocol(openProtocol === 'vless' ? null : 'vless')}
-                />
-                <WizardProtocolTile
-                  name="VLESS · Encryption"
-                  note="TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。"
-                  icon="xray"
-                  enabled={encryptionEnabled}
-                  onToggle={setEncryptionEnabled}
-                  port={
-                    <>
-                      <span>TCP</span>
-                      <input
-                        className="f mono"
-                        inputMode="numeric"
-                        aria-label="VLESS Encryption 监听端口"
-                        value={encryptionPortText}
-                        onChange={event => setEncryptionPort(event.target.value)}
-                        disabled={!encryptionEnabled}
-                      />
-                    </>
-                  }
-                  params={
-                    <div className="fgrid one">
-                      <WizardField label="握手档位" htmlFor="chain-wizard-encryption-profile">
-                        <select
-                          id="chain-wizard-encryption-profile"
-                          className="f"
-                          value={encryptionProfile}
-                          onChange={event => setEncryptionProfile(event.target.value as 'default' | 'native')}
-                        >
-                          <option value="default">默认 · random · 600s</option>
-                          <option value="native">native · 600s</option>
-                        </select>
-                      </WizardField>
-                      <p className="note">其余参数用默认值，建成后在线路详情里调。</p>
-                    </div>
-                  }
-                  expanded={openProtocol === 'encryption'}
-                  onExpand={() => setOpenProtocol(openProtocol === 'encryption' ? null : 'encryption')}
-                />
-                <WizardProtocolTile
-                  name="AnyTLS"
-                  note="TCP 入站；支持 TLS / REALITY、Padding 与连接复用。"
-                  icon="bolt"
-                  enabled={anyTlsEnabled}
-                  onToggle={setAnyTlsEnabled}
-                  port={
-                    <>
-                      <span>TCP</span>
-                      <input
-                        className="f mono"
-                        inputMode="numeric"
-                        aria-label="AnyTLS 监听端口"
-                        value={anyTlsPortText}
-                        onChange={event => setAnyTlsPort(event.target.value)}
-                        disabled={!anyTlsEnabled}
-                      />
-                    </>
-                  }
-                  params={
-                    <div className="fgrid one">
-                      <WizardField label="Padding" htmlFor="chain-wizard-padding">
-                        <select
-                          id="chain-wizard-padding"
-                          className="f"
-                          value={paddingMode}
-                          onChange={event => setPaddingMode(event.target.value as 'default' | 'custom')}
-                        >
-                          <option value="default">默认方案</option>
-                          <option value="custom">自定义…</option>
-                        </select>
-                      </WizardField>
-                      {paddingMode === 'custom' && (
-                        <textarea
-                          className="f wzp-padding-custom"
-                          aria-label="AnyTLS 自定义 Padding"
-                          value={customPadding}
-                          placeholder="每行一条 Padding 规则"
-                          onChange={event => setCustomPadding(event.target.value)}
+                {droppedUsers.length > 0 && (
+                  <p className="note warn">
+                    {droppedUsers.map(user => user.id).join('、')} 当前不可授权，本次不会写入。
+                  </p>
+                )}
+              </WizardCard>
+            </div>
+            <div>
+              <WizardCard title="接入协议" icon="ingress" hint={`${enabledProtocolCount} 种 · 端口自动避让`}>
+                <div className="wzp" aria-label="接入协议">
+                  <WizardProtocolTile
+                    name="VLESS · REALITY"
+                    issues={protocolIssues.vless}
+                    note="TCP / XHTTP 入站；使用 REALITY 保护传输。"
+                    icon="xray"
+                    enabled={vlessEnabled}
+                    onToggle={setVlessEnabled}
+                    port={
+                      <>
+                        <span>TCP</span>
+                        <WizardPortInput
+                          label="VLESS 监听端口"
+                          value={portText}
+                          disabled={!vlessEnabled}
+                          invalid={tcpIssuesFor('VLESS · REALITY').length > 0}
+                          onChange={setPort}
                         />
-                      )}
-                      <p className="note">使用{headCertificateLabel}；其余参数用默认值，建成后在线路详情里调。</p>
-                    </div>
-                  }
-                  expanded={openProtocol === 'anytls'}
-                  onExpand={() => setOpenProtocol(openProtocol === 'anytls' ? null : 'anytls')}
-                />
-                <WizardProtocolTile
-                  name="Hysteria 2"
-                  portRange
-                  note="QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。"
-                  icon="hysteria"
-                  enabled={hy2Enabled}
-                  onToggle={setHy2Enabled}
-                  port={
-                    <>
-                      <span>UDP</span>
-                      <input
-                        className="f mono"
-                        inputMode="numeric"
-                        aria-label="Hysteria 2 起始端口"
-                        value={hy2StartText}
-                        onChange={event => setHy2Start(event.target.value)}
-                        disabled={!hy2Enabled}
-                      />
-                      <span>–</span>
-                      <input
-                        className="f mono"
-                        inputMode="numeric"
-                        aria-label="Hysteria 2 结束端口"
-                        value={hy2EndText}
-                        onChange={event => setHy2End(event.target.value)}
-                        disabled={!hy2Enabled}
-                      />
-                    </>
-                  }
-                  params={
-                    <div className="fgrid one">
-                      <WizardField label="端口跳跃">
-                        <span className="wzp-hop-summary mono">
-                          {hy2StartText}–{hy2EndText}（{hy2End - hy2Start + 1} 个）
-                        </span>
-                        <button
-                          type="button"
-                          className="btn sm"
-                          onClick={() => {
-                            setHy2Start(null);
-                            setHy2End(null);
-                          }}
-                        >
-                          重新分配
-                        </button>
-                      </WizardField>
-                      <WizardField label="带宽">
-                        <span className="wzp-bandwidth">
+                        {vlessEnabled && portRaw !== null && (
+                          <WizardPortAuto label="VLESS 监听端口" onReset={() => setPort(null)} />
+                        )}
+                      </>
+                    }
+                    params={
+                      <div className="fgrid one">
+                        <WizardField label="伪装目标" htmlFor="chain-wizard-reality">
+                          <select
+                            id="chain-wizard-reality"
+                            className="f"
+                            aria-label="REALITY 目标来源"
+                            value={realityTarget}
+                            onChange={event => setRealityTarget(event.target.value as RealityFallbackMode | '')}
+                          >
+                            <option value="">— 选择 REALITY 目标 —</option>
+                            <option value="node-certificate" disabled={!headCertificate}>
+                              {headCertificate
+                                ? `${headCertificateLabel} ${headCertificate}`
+                                : `${headCertificateLabel}（尚未签发）`}
+                            </option>
+                            <option value="global-site" disabled={!globalRealityReady}>
+                              {globalRealityReady ? `全局站点 ${realitySite.dest}` : '全局站点（尚未配置）'}
+                            </option>
+                            <option value="custom-site">自定义站点</option>
+                          </select>
+                          {realityTarget === 'node-certificate' && headCertificate && (
+                            <span className="sub">
+                              客户端 SNI 使用 <span className="mono">{headCertificate}</span>
+                            </span>
+                          )}
+                          {realityTarget === 'global-site' && (
+                            <span className="sub">
+                              <span className="mono">{realitySite.dest}</span> · SNI{' '}
+                              <span className="mono">{realitySite.names.join(' · ')}</span>
+                            </span>
+                          )}
+                        </WizardField>
+                        {realityTarget === 'custom-site' && (
+                          <>
+                            <WizardField label="目标地址" htmlFor="chain-wizard-reality-dest">
+                              <input
+                                id="chain-wizard-reality-dest"
+                                className="f mono"
+                                value={customRealityDest}
+                                placeholder="example.com:443"
+                                aria-label="自定义 REALITY 目标"
+                                onChange={event => setCustomRealityDest(event.target.value)}
+                              />
+                            </WizardField>
+                            <WizardField label="SNI" htmlFor="chain-wizard-reality-names">
+                              <input
+                                id="chain-wizard-reality-names"
+                                className="f mono"
+                                value={customRealityNames}
+                                placeholder="example.com"
+                                aria-label="自定义 REALITY SNI"
+                                onChange={event => setCustomRealityNames(event.target.value)}
+                              />
+                            </WizardField>
+                            <WizardField label="指纹" htmlFor="chain-wizard-reality-fingerprint">
+                              <select
+                                id="chain-wizard-reality-fingerprint"
+                                className="f"
+                                aria-label="自定义 REALITY 指纹"
+                                value={customRealityFingerprint}
+                                onChange={event => setCustomRealityFingerprint(event.target.value)}
+                              >
+                                {REALITY_FINGERPRINT_OPTIONS.map(([value, label]) => (
+                                  <option value={value} key={value}>
+                                    {label}
+                                  </option>
+                                ))}
+                              </select>
+                            </WizardField>
+                          </>
+                        )}
+                      </div>
+                    }
+                    expanded={openProtocol === 'vless' || !realityTargetReady}
+                    onExpand={() => setOpenProtocol(openProtocol === 'vless' ? null : 'vless')}
+                  />
+                  <WizardProtocolTile
+                    name="VLESS · Encryption"
+                    issues={protocolIssues.encryption}
+                    note="TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。"
+                    icon="xray"
+                    enabled={encryptionEnabled}
+                    onToggle={setEncryptionEnabled}
+                    port={
+                      <>
+                        <span>TCP</span>
+                        <WizardPortInput
+                          label="VLESS Encryption 监听端口"
+                          value={encryptionPortText}
+                          disabled={!encryptionEnabled}
+                          invalid={protocolIssues.encryption.length > 0}
+                          onChange={setEncryptionPort}
+                        />
+                        {encryptionEnabled && encryptionPortRaw !== null && (
+                          <WizardPortAuto label="VLESS Encryption 监听端口" onReset={() => setEncryptionPort(null)} />
+                        )}
+                      </>
+                    }
+                    params={
+                      <div className="fgrid one">
+                        <WizardField label="握手档位" htmlFor="chain-wizard-encryption-profile">
+                          <select
+                            id="chain-wizard-encryption-profile"
+                            className="f"
+                            value={encryptionProfile}
+                            onChange={event => setEncryptionProfile(event.target.value as 'default' | 'native')}
+                          >
+                            <option value="default">默认 · random</option>
+                            <option value="native">native</option>
+                          </select>
+                          <span className="sub">
+                            会话票据有效期 <span className="mono">600s</span>
+                          </span>
+                        </WizardField>
+                      </div>
+                    }
+                    expanded={openProtocol === 'encryption'}
+                    onExpand={() => setOpenProtocol(openProtocol === 'encryption' ? null : 'encryption')}
+                  />
+                  <WizardProtocolTile
+                    name="AnyTLS"
+                    issues={protocolIssues.anytls}
+                    note="TCP 入站；支持 TLS / REALITY、Padding 与连接复用。"
+                    icon="bolt"
+                    enabled={anyTlsEnabled}
+                    onToggle={setAnyTlsEnabled}
+                    port={
+                      <>
+                        <span>TCP</span>
+                        <WizardPortInput
+                          label="AnyTLS 监听端口"
+                          value={anyTlsPortText}
+                          disabled={!anyTlsEnabled}
+                          invalid={tcpIssuesFor('AnyTLS').length > 0}
+                          onChange={setAnyTlsPort}
+                        />
+                        {anyTlsEnabled && anyTlsPortRaw !== null && (
+                          <WizardPortAuto label="AnyTLS 监听端口" onReset={() => setAnyTlsPort(null)} />
+                        )}
+                      </>
+                    }
+                    params={
+                      <div className="fgrid one">
+                        <WizardField label="Padding" htmlFor="chain-wizard-padding">
+                          <select
+                            id="chain-wizard-padding"
+                            className="f"
+                            value={paddingMode}
+                            onChange={event => setPaddingMode(event.target.value as 'default' | 'custom')}
+                          >
+                            <option value="default">默认方案</option>
+                            <option value="custom">自定义…</option>
+                          </select>
+                          {paddingMode === 'custom' && (
+                            <textarea
+                              className="f wzp-padding-custom"
+                              aria-label="AnyTLS 自定义 Padding"
+                              value={customPadding}
+                              placeholder="每行一条 Padding 规则"
+                              onChange={event => setCustomPadding(event.target.value)}
+                            />
+                          )}
+                        </WizardField>
+                        {certificateField}
+                      </div>
+                    }
+                    expanded={openProtocol === 'anytls'}
+                    onExpand={() => setOpenProtocol(openProtocol === 'anytls' ? null : 'anytls')}
+                  />
+                  <WizardProtocolTile
+                    name="Hysteria 2"
+                    issues={protocolIssues.hy2}
+                    portRange
+                    note="QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。"
+                    icon="hysteria"
+                    enabled={hy2Enabled}
+                    onToggle={setHy2Enabled}
+                    port={
+                      <>
+                        <span>UDP</span>
+                        <WizardPortInput
+                          label="Hysteria 2 起始端口"
+                          value={hy2StartText}
+                          disabled={!hy2Enabled}
+                          invalid={entryPortIssues.some(issue => issue.startsWith('Hysteria 2'))}
+                          onChange={setHy2Start}
+                        />
+                        <span>–</span>
+                        <WizardPortInput
+                          label="Hysteria 2 结束端口"
+                          value={hy2EndText}
+                          disabled={!hy2Enabled}
+                          invalid={entryPortIssues.some(issue => issue.startsWith('Hysteria 2'))}
+                          onChange={setHy2End}
+                        />
+                        {hy2Enabled && (hy2StartRaw !== null || hy2EndRaw !== null) && (
+                          <WizardPortAuto
+                            label="Hysteria 2 端口范围"
+                            onReset={() => {
+                              setHy2Start(null);
+                              setHy2End(null);
+                            }}
+                          />
+                        )}
+                      </>
+                    }
+                    params={
+                      <div className="fgrid one">
+                        <WizardField label="上行带宽" htmlFor="chain-wizard-hy2-up">
                           <input
+                            id="chain-wizard-hy2-up"
                             className="f mono"
                             aria-label="Hysteria 2 上行带宽"
-                            placeholder="上行自动"
+                            placeholder="留空用 BBR"
                             value={hy2Up}
                             onChange={event => setHy2Up(event.target.value)}
                           />
-                          <span>·</span>
+                        </WizardField>
+                        <WizardField label="下行带宽" htmlFor="chain-wizard-hy2-down">
                           <input
+                            id="chain-wizard-hy2-down"
                             className="f mono"
                             aria-label="Hysteria 2 下行带宽"
-                            placeholder="下行自动"
+                            placeholder="留空用 BBR"
                             value={hy2Down}
                             onChange={event => setHy2Down(event.target.value)}
                           />
-                        </span>
-                      </WizardField>
-                      <p className="note">使用{headCertificateLabel}；其余参数用默认值，建成后在线路详情里调。</p>
-                    </div>
-                  }
-                  expanded={openProtocol === 'hy2'}
-                  onExpand={() => setOpenProtocol(openProtocol === 'hy2' ? null : 'hy2')}
-                />
-                <WizardProtocolTile
-                  name="MTProxy"
-                  note={mtprotoUnavailable ?? 'Telegram 代理；要求网卡直配公网 IPv4。'}
-                  icon="telegram"
-                  enabled={mtprotoEnabled}
-                  disabled={!mtprotoEnabled && mtprotoUnavailable !== null}
-                  onToggle={setMtProtoEnabled}
-                  port={
-                    <>
-                      <span>TCP</span>
-                      <input
-                        className="f mono"
-                        inputMode="numeric"
-                        aria-label="MTProxy 监听端口"
-                        value={mtprotoPortText}
-                        onChange={event => setMtProtoPort(event.target.value)}
-                        disabled={!mtprotoEnabled}
-                      />
-                    </>
-                  }
-                />
-              </div>
-              {enabledProtocolCount === 0 && (
-                <p className="note warn wz-inline-alert" role="alert">
-                  至少开启一个接入协议。
-                </p>
-              )}
-              {(entryPortCollision || entryPortIssues.length > 0) && (
-                <p className="note warn wz-inline-alert" role="alert">
-                  {entryPortCollision ?? entryPortIssues[0]}。
-                </p>
-              )}
-              {(anyTlsEnabled || hy2Enabled) && !headCertificate && head && (
-                <p className="note warn wz-inline-alert" role="alert">
-                  AnyTLS（TLS）和 Hysteria 2 需要{headCertificateLabel}；先为 {headLabel} 分配证书组。
-                </p>
-              )}
-            </WizardCard>
+                          <span className="sub">
+                            留空使用 BBR；固定带宽需成对填写，如 <span className="mono">200 mbps</span>。
+                          </span>
+                        </WizardField>
+                        {certificateField}
+                      </div>
+                    }
+                    expanded={openProtocol === 'hy2'}
+                    onExpand={() => setOpenProtocol(openProtocol === 'hy2' ? null : 'hy2')}
+                  />
+                  <WizardProtocolTile
+                    name="MTProxy"
+                    requirement="入口需有直接配置在网卡上的公网 IPv4。"
+                    issues={protocolIssues.mtproto}
+                    note={MTPROTO_DESCRIPTION}
+                    icon="telegram"
+                    enabled={mtprotoEnabled}
+                    onToggle={setMtProtoEnabled}
+                    port={
+                      <>
+                        <span>TCP</span>
+                        <WizardPortInput
+                          label="MTProxy 监听端口"
+                          value={mtprotoPortText}
+                          disabled={!mtprotoEnabled}
+                          invalid={tcpIssuesFor('MTProxy').length > 0}
+                          onChange={setMtProtoPort}
+                        />
+                        {mtprotoEnabled && mtprotoPortRaw !== null && (
+                          <WizardPortAuto label="MTProxy 监听端口" onReset={() => setMtProtoPort(null)} />
+                        )}
+                      </>
+                    }
+                  />
+                </div>
+                {enabledProtocolCount === 0 && (
+                  <p className="note bad" role="alert">
+                    至少开启一个接入协议。
+                  </p>
+                )}
+                <p className="note">其余参数使用默认值，建成后可在线路详情调整。</p>
+              </WizardCard>
+            </div>
           </div>
           <WizardCard
             title="路径"
@@ -1512,6 +1745,23 @@ export function ChainWizard({
                   }`
             }
           >
+            {spine.length > 0 && (
+              <div className="chain-path cc-route" role="group" aria-label="当前链路径">
+                {spine.map((id, index) => (
+                  <span key={id} className="cp-seg">
+                    {index > 0 && <i className="cp-wire" aria-hidden="true" />}
+                    <span
+                      className="cp-hop"
+                      data-role={index === 0 ? 'entry' : index === spine.length - 1 ? 'exit' : 'relay'}
+                      title={id}
+                    >
+                      <RegionFlag code={nodeOf(id)?.public_ipv4_country} />
+                      {nameOf(id)}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            )}
             <WizardPathEditor
               root={headId}
               tables={pathRules}
@@ -1545,42 +1795,57 @@ export function ChainWizard({
               onDnsChange={patchDns}
             />
           </WizardCard>
+          {showOps && (
+            <WizardCard title="配置预览" icon="artifacts">
+              <ul className="wz-ops" id="chain-wizard-ops">
+                {ops.map((o, i) => (
+                  <li key={i}>
+                    <span className="op">{o.op}</span>
+                    <span className="arg">{o.arg}</span>
+                  </li>
+                ))}
+              </ul>
+            </WizardCard>
+          )}
         </fieldset>
         {(chainClash || ingressClash) && <div className="callout err">{chainClash || ingressClash}</div>}
-
-        {error != null && <ErrorBox error={error} />}
-
-        {showOps && (
-          <WizardCard title="草稿操作" icon="artifacts">
-            <ul className="wz-ops" id="chain-wizard-ops">
-              {ops.map((o, i) => (
-                <li key={i}>
-                  <span className="op">{o.op}</span>
-                  <span className="arg">{o.arg}</span>
-                </li>
-              ))}
-            </ul>
-          </WizardCard>
+        {dependencyError && (
+          <>
+            <ErrorBox error={dependencyError} />
+            <div className="toolbar">
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => {
+                  for (const query of [snapshot, settings, nodes, revisions, users, tenants]) void query.refetch();
+                  if (current != null) void compile.refetch();
+                }}
+              >
+                重试读取配置
+              </button>
+            </div>
+          </>
         )}
+        {error != null && <ErrorBox error={error} />}
       </div>
       <WizardFooter
         id="chain-wizard-submit-note"
         tone={submitting ? 'busy' : ready ? 'ready' : 'idle'}
-        title={submitting ? '加入草稿中…' : ready ? '配置完整' : '还不能加入草稿'}
-        description={ready ? '这里只暂存改动；顶栏按「提交」后才写入修订。' : blockers[0]}
+        title={submitting ? '加入草稿中…' : ready ? '配置完整' : blockers[0]}
+        description={null}
       >
         {head && (
           <button
             type="button"
-            className="btn sm"
+            className="btn"
             aria-expanded={showOps}
             aria-controls="chain-wizard-ops"
             onClick={() => setShowOps(v => !v)}
           >
-            {showOps ? '▾' : '▸'} 预览 {ops.length} 条草稿操作
+            配置预览
           </button>
         )}
-        <button type="button" className="btn" disabled={submitting} onClick={onDone}>
+        <button type="button" className="btn" disabled={submitting} onClick={() => onDone()}>
           取消
         </button>
         <button

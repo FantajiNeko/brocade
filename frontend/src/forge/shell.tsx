@@ -4,6 +4,7 @@
 import {
   Fragment,
   lazy,
+  Suspense,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -39,7 +40,7 @@ import { draft } from '../draft';
 import { DraftBar } from './draft-bar';
 import { ArtifactRail, blastRadius, useChangedArtifacts } from './artifacts';
 import { navigate, returnTo, startRouting, type Loc } from './route';
-import { can, isPublic, isVisitor } from '../session';
+import { can, isPublic, isVisitor, type Session } from '../session';
 import { forge, useForge, type NavKey } from './state';
 import { theme } from './theme';
 import { palette, PALETTES } from './palette';
@@ -54,6 +55,7 @@ import { MachineNotifications } from '../ui/machine-notifications';
 import { routeForViewer } from './access';
 
 const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
+const OnboardingGuide = lazy(() => import('../panes/onboarding').then(module => ({ default: module.OnboardingGuide })));
 
 interface Face {
   key: NavKey;
@@ -69,11 +71,22 @@ interface Face {
 // 顶栏只显示当前主工作流。规则负责选择转发目标；隧道资源本身的生命周期统一在隧道页管理。
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
-  { key: 'tunnels', label: '隧道', icon: 'tunnels' },
   { key: 'chains', label: '线路', icon: 'chains' },
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },
+];
+
+/* 手机端保留机器、线路、用户和用量。发布仍使用同一份 Face 定义，只是移动到账户牌菜单，
+   避免两套角色权限和名称逐渐分叉。 */
+const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'users' || f.key === 'usage');
+const MOBILE_MORE = NAV.filter(f => f.key === 'deploy');
+
+// 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
+// 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
+const MORE: Face[] = [
+  { key: 'settings', label: '设置', icon: 'settings', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
+  { key: 'tunnels', label: '隧道', icon: 'tunnels' },
   {
     key: 'capacity',
     label: '预测',
@@ -81,19 +94,6 @@ const NAV: Face[] = [
     roles: ['readonly', 'editor', 'publisher', 'tenant-admin', 'system-admin'],
     hideFromPublic: true,
   },
-];
-
-/* 手机端把日常查看的机器、线路和用量留在顶栏。用户、隧道与发布仍使用同一份 Face
-   定义，只是移动到账户牌菜单，避免两套角色权限和名称逐渐分叉。 */
-const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'usage');
-const MOBILE_MORE = NAV.filter(
-  f => f.key === 'tunnels' || f.key === 'users' || f.key === 'deploy' || f.key === 'capacity',
-);
-
-// 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
-// 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
-const MORE: Face[] = [
-  { key: 'settings', label: '设置', icon: 'settings', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'topo', label: '拓扑', icon: 'topology' },
 ];
 
@@ -129,7 +129,7 @@ export function ForgeShell({
   onLogout,
 }: {
   branding: BrandingSettings;
-  session: { who: Whoami };
+  session: Session;
   onLogout: () => void;
 }) {
   const st = useForge();
@@ -290,7 +290,6 @@ export function ForgeShell({
             who={session.who}
             narrow={narrow}
             nav={nav}
-            summary={compile.data?.summary}
             diagnostics={diagnostics}
             diagNames={diagNames}
             diagnosticsPending={revisions.isPending || (current != null && compile.isPending)}
@@ -299,6 +298,11 @@ export function ForgeShell({
             activeDeploy={activeDeploy}
             awaitingDeploy={awaitingDeploy}
             railOpen={panel.open}
+            onboardingAvailable={
+              session.who.role === 'system-admin' &&
+              session.initial.onboarding !== undefined &&
+              session.initial.onboarding !== 'not-applicable'
+            }
             onLogout={() => confirmDiscardChanges() && onLogout()}
           />
 
@@ -346,6 +350,13 @@ export function ForgeShell({
           拓扑的检视此前也经由此处，现已改为台面右侧的常驻栏：浮窗会遮挡刚点击的图形区域，
           且每点击一个对象就增加一个窗口。 */}
       {nav === 'topo' && <WinLayer filter={w => !w.key.startsWith('tab:')} render={win => <Pane win={win} />} />}
+      {session.who.role === 'system-admin' &&
+        session.initial.onboarding !== undefined &&
+        session.initial.onboarding !== 'not-applicable' && (
+          <Suspense fallback={null}>
+            <OnboardingGuide />
+          </Suspense>
+        )}
     </div>
   );
 }
@@ -439,7 +450,6 @@ function TopBar({
   who,
   narrow,
   nav,
-  summary,
   diagnostics,
   diagNames,
   diagnosticsPending,
@@ -448,6 +458,7 @@ function TopBar({
   activeDeploy,
   awaitingDeploy,
   railOpen,
+  onboardingAvailable,
   onLogout,
 }: {
   branding: BrandingSettings;
@@ -455,7 +466,6 @@ function TopBar({
   /* 窄屏使用另一套结构：品牌与页面导航并入一行，不是压缩桌面顶栏。 */
   narrow: boolean;
   nav: NavKey;
-  summary: { errors: number; warnings: number; infos: number; can_publish: boolean } | undefined;
   diagnostics: Diagnostic[];
   /* 用于将 location 中的 id 转换为名称。查找不到时回退到 id，见 formatLocation。 */
   diagNames: DiagNames;
@@ -468,6 +478,7 @@ function TopBar({
   // 此处只是改变角标的文案——红色角标显示发布编号时会被理解为正在自动推进。
   awaitingDeploy: { id: number } | undefined;
   railOpen: boolean;
+  onboardingAvailable: boolean;
   onLogout: () => void;
 }) {
   const st = useForge();
@@ -527,13 +538,6 @@ function TopBar({
     };
   }, [more, notificationsOpen, st.diag]);
 
-  // 三个级别分别统计，数值取自服务端的 summary 而非从列表反推：此前使用
-  // `warnings = diagnostics.length - errors`，在只有两个级别时等价，引入 info 后会将提示
-  // 全部计为警告——表现为服务端返回 `warnings: 0` 而角标显示「2 警」。相同的计算在
-  // 概览页也有一份，两处需要同步修改（`panes/index.tsx`）。顶栏角标只统计错误和警告，
-  // 提示不计入：它只列出可能被忽略的配置细节，在全局位置显示会与分级的目的相悖。
-  const errors = summary?.errors ?? 0;
-  const warnings = summary?.warnings ?? 0;
   const rest = visible(narrow ? [...MOBILE_MORE, ...MORE] : MORE, who);
   const deploymentMenuHint = awaitingDeploy
     ? `发布 #${awaitingDeploy.id} 等待确认`
@@ -542,13 +546,6 @@ function TopBar({
       : (pendingTargets ?? 0) > 0
         ? `${pendingTargets} 台待发布`
         : undefined;
-  const diagnosticsMenuHint = diagnosticsError
-    ? '读取失败'
-    : diagnosticsPending
-      ? '正在检查'
-      : errors || warnings
-        ? `${errors} 错 · ${warnings} 警`
-        : '没有阻断项';
 
   const focusMenuEdge = (edge: 'first' | 'last') => {
     requestAnimationFrame(() => {
@@ -666,6 +663,19 @@ function TopBar({
         </div>
       )}
       <hr />
+      {onboardingAvailable && (
+        <button
+          type="button"
+          role="menuitem"
+          className="fg-menu-item"
+          onClick={() => void import('../panes/onboarding').then(module => module.openOnboardingGuide())}
+        >
+          <Icon of="chains" size={14} className="fg-menu-icon" />
+          <span className="fg-menu-copy">
+            入门向导<small>继续首次上线流程</small>
+          </span>
+        </button>
+      )}
       {rest.map(f => (
         <button
           key={f.key}
@@ -683,9 +693,8 @@ function TopBar({
           {nav === f.key && <Icon of="check" size={13} className="fg-menu-check" />}
         </button>
       ))}
-      {rest.length > 0 && <hr />}
-      {/* 产物和诊断都是低频辅助面板。收入同一个更多菜单后，桌面与手机的顶栏都不再为
-          一次性查看动作各占一个常驻按钮；状态仍直接写在菜单项中。 */}
+      {(rest.length > 0 || onboardingAvailable) && <hr />}
+      {/* 产物和诊断共用紧凑的菜单入口，详细状态由打开后的面板呈现。 */}
       <button
         type="button"
         role="menuitem"
@@ -694,10 +703,7 @@ function TopBar({
         onClick={() => artifactPanel.toggle()}
       >
         <Icon of="artifactFolder" size={14} className="fg-menu-icon" />
-        <span className="fg-menu-copy">
-          产物
-          <small>{!artifacts ? '当前身份无权查看' : railOpen ? '产物栏已展开' : '这一版编译出了什么'}</small>
-        </span>
+        <span className="fg-menu-copy">产物</span>
         {railOpen && artifacts && <Icon of="check" size={13} className="fg-menu-check" />}
       </button>
       {!isVisitor(who) && (
@@ -714,9 +720,7 @@ function TopBar({
           }}
         >
           <Icon of="diag" size={14} className="fg-menu-icon" />
-          <span className="fg-menu-copy">
-            诊断<small>{diagnosticsMenuHint}</small>
-          </span>
+          <span className="fg-menu-copy">诊断</span>
         </button>
       )}
       {/* 页面入口与即时外观控制分组。明暗模式使用明确的二选一，色调单独一行并显示当前名称；
@@ -811,8 +815,8 @@ function TopBar({
   );
 
   if (narrow) {
-    /* 窄屏只有这一行：品牌 + 机器 / 线路 / 用量 + 通知 + 账户牌。其他页面、产物和诊断收入账户
-       菜单，状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
+    /* 窄屏只有这一行：品牌 + 机器 / 线路 / 用户 / 用量 + 通知 + 账户牌。其他页面、产物和诊断
+       收入账户菜单。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
     return (
       <div className="fg-top fg-navrow">
         <BrandHome branding={branding} />

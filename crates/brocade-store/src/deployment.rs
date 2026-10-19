@@ -14,12 +14,14 @@ use brocade_deployment::plan::{
     PlanDiagnostic, PlannedAction, PlannedTarget, PlannedTargetStatus,
 };
 use brocade_deployment::protocol::{
-    CreateDeploymentRequest, CreateDeploymentResult, CreateRollbackRequest,
-    DeploymentCommandResult, DeploymentDetail, DeploymentList, DeploymentListItem,
-    DeploymentTargetDetail, DeploymentWaveConfirmationResult, DeploymentWaveProgress,
-    IsolateDeploymentTargetRequest, IsolateNodeRequest, NodeDesiredDeployment,
-    NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState, TargetApplyResult,
-    TargetConvergenceReport, MIN_AGENT_PROTOCOL_VERSION,
+    ConfigXrayForceRetirementResult, CreateDeploymentRequest, CreateDeploymentResult,
+    CreateRollbackRequest, DeploymentCommandResult, DeploymentDetail, DeploymentList,
+    DeploymentListItem, DeploymentTargetDetail, DeploymentWaveConfirmationResult,
+    DeploymentWaveProgress, IsolateDeploymentTargetRequest, IsolateNodeRequest,
+    NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState,
+    TargetApplyResult, TargetConvergenceReport, XrayReleaseStrategy, XrayUpgradePhase,
+    XrayUpgradeRuntime, XrayUpgradeSource, CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION,
+    MIN_AGENT_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
@@ -3888,6 +3890,185 @@ pub async fn retry_target(
     })
 }
 
+/// Authorize the Agent to end the old process of one exact configuration handoff.
+///
+/// The control plane never turns this into a new Xray release and never authorizes a blind PID
+/// signal. Both sides fence the action by deployment and claim generation; the Agent additionally
+/// rechecks the candidate and the local process identities immediately before termination.
+pub async fn force_config_xray_retirement(
+    pool: &PgPool,
+    actor: &AdminContext,
+    deployment_id: i64,
+    node_id: &str,
+) -> Result<ConfigXrayForceRetirementResult> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can force an old Xray configuration generation to retire".to_owned(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT deployment.kind,
+                target.status,
+                target_state.claim_generation,
+                agent.agent_protocol_version,
+                COALESCE(agent.runtime_reported_at >= now() - interval '2 minutes', FALSE)
+                    AS runtime_fresh,
+                agent.xray_upgrade,
+                lifecycle.phase AS lifecycle_phase,
+                extract(epoch FROM clock_timestamp())::bigint AS server_now
+           FROM deployments deployment
+           JOIN deployment_targets target ON target.deployment_id = deployment.id
+           JOIN deployment_target_state target_state
+             ON target_state.deployment_id = target.deployment_id
+            AND target_state.node_id = target.node_id
+           JOIN node_agent_state agent ON agent.node_id = target.node_id
+           JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = target.node_id
+          WHERE deployment.id = $1 AND target.node_id = $2
+          FOR UPDATE OF target, target_state, agent, lifecycle",
+    )
+    .bind(deployment_id)
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("deployment target {deployment_id}/{node_id}")))?;
+
+    let kind: String = row.try_get("kind")?;
+    if kind != DeploymentKind::Config.as_str() {
+        return Err(StoreError::Unsupported(
+            "only configuration deployments own configuration-generation handoffs".to_owned(),
+        ));
+    }
+    let lifecycle_phase: String = row.try_get("lifecycle_phase")?;
+    if lifecycle_phase != NodeLifecyclePhase::Active.as_str() {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} is {lifecycle_phase}; its configuration handoff cannot be forced"
+        )));
+    }
+    let protocol = row.try_get::<Option<i32>, _>("agent_protocol_version")?;
+    let minimum = i32::try_from(CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION)
+        .expect("agent protocol version fits i32");
+    if protocol.is_none_or(|version| version < minimum) {
+        return Err(StoreError::Unsupported(format!(
+            "node {node_id} requires Agent protocol v{CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION} before an old Xray generation can be forced to retire"
+        )));
+    }
+    if !row.try_get::<bool, _>("runtime_fresh")? {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} has no fresh Xray runtime observation"
+        )));
+    }
+    let runtime_value = row
+        .try_get::<Option<Value>, _>("xray_upgrade")?
+        .ok_or_else(|| {
+            StoreError::Conflict(format!("node {node_id} has no active Xray handoff"))
+        })?;
+    let runtime: XrayUpgradeRuntime = serde_json::from_value(runtime_value).map_err(|error| {
+        StoreError::InvalidData(format!(
+            "node {node_id} reported invalid Xray handoff state: {error}"
+        ))
+    })?;
+    let claim_generation = match runtime.source {
+        XrayUpgradeSource::ConfigDeployment {
+            deployment_id: source_deployment_id,
+            claim_generation,
+        } if source_deployment_id == deployment_id => claim_generation,
+        XrayUpgradeSource::ConfigDeployment {
+            deployment_id: source_deployment_id,
+            ..
+        } => {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is handing off configuration deployment {source_deployment_id}, not {deployment_id}"
+            )))
+        }
+        XrayUpgradeSource::BinaryRelease => {
+            return Err(StoreError::Conflict(format!(
+                "node {node_id} is executing an Xray binary release, not a configuration handoff"
+            )))
+        }
+    };
+    let stored_claim = u64::try_from(row.try_get::<i64, _>("claim_generation")?).map_err(|_| {
+        StoreError::InvalidData(format!(
+            "deployment target {deployment_id}/{node_id} has a negative claim generation"
+        ))
+    })?;
+    if claim_generation != stored_claim {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} handoff claim generation {claim_generation} does not match target generation {stored_claim}"
+        )));
+    }
+
+    let already_authorized = runtime.strategy == XrayReleaseStrategy::HandoffForce
+        && runtime.phase == XrayUpgradePhase::Forcing;
+    if !already_authorized && runtime.phase != XrayUpgradePhase::Blocked {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} Xray handoff is not blocked after its drain deadline"
+        )));
+    }
+    let active_connections = runtime.old.active_connections.unwrap_or(0);
+    if !runtime.old.alive || active_connections == 0 {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} old Xray generation has no live connection to force"
+        )));
+    }
+    let candidate_healthy = runtime
+        .candidate
+        .as_ref()
+        .is_some_and(|candidate| candidate.alive && candidate.accepting == Some(true));
+    if !candidate_healthy {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} candidate Xray generation is not accepting new connections"
+        )));
+    }
+    let server_now: i64 = row.try_get("server_now")?;
+    if runtime
+        .drain_deadline_unix_secs
+        .is_none_or(|deadline| deadline > server_now)
+    {
+        return Err(StoreError::Conflict(format!(
+            "node {node_id} Xray drain tolerance has not expired"
+        )));
+    }
+
+    // A terminal report normally settles the preceding row. Repair a stale unfinished ledger row
+    // here as well, so it cannot block an exact newer handoff after a Console outage.
+    sqlx::query(
+        "UPDATE config_xray_force_retirements
+            SET settled_at = COALESCE(settled_at, now())
+          WHERE node_id = $1
+            AND settled_at IS NULL
+            AND (deployment_id, claim_generation) <> ($2, $3)",
+    )
+    .bind(node_id)
+    .bind(deployment_id)
+    .bind(i64::try_from(claim_generation).map_err(|_| {
+        StoreError::Conflict("claim generation is out of PostgreSQL bigint range".to_owned())
+    })?)
+    .execute(&mut *tx)
+    .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO config_xray_force_retirements (
+             deployment_id, node_id, claim_generation, requested_by
+         ) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (deployment_id, node_id, claim_generation) DO NOTHING",
+    )
+    .bind(deployment_id)
+    .bind(node_id)
+    .bind(i64::try_from(claim_generation).expect("claim generation was checked above"))
+    .bind(actor.operator_id())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(ConfigXrayForceRetirementResult {
+        deployment_id,
+        node_id: node_id.to_owned(),
+        claim_generation,
+        active_connections,
+        reused: inserted.rows_affected() == 0,
+    })
+}
+
 async fn scope_plan(
     pool: &PgPool,
     actor: &AdminContext,
@@ -4878,7 +5059,7 @@ async fn restore_app_tx(
                 anytls_security, anytls_reality,
                 anytls_reality_private_key, anytls_reality_public_key,
                 anytls_reality_short_ids, vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options,
-                protocol_projection, mtproto_port
+                protocol_projection, mtproto_port, guard_cn_source_block
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
@@ -4897,7 +5078,7 @@ async fn restore_app_tx(
                 $45, $46, $47, $48,
                 $49, $50, $51,
                 $52, $53, $54, $55, $56, $57, $58, $59, $60,
-                $61, $62, $63, $64, $65, $66, $67, $68, $69
+                $61, $62, $63, $64, $65, $66, $67, $68, $69, $70
              )",
         )
         .bind(&ingress.id)
@@ -5000,6 +5181,7 @@ async fn restore_app_tx(
         .bind(serde_json::to_value(ingress.wires.vless_encryption().map(|wire| wire.options.clone()).unwrap_or_default())?)
         .bind(serde_json::to_value(projection)?)
         .bind(ingress.wires.mtproto().map(|wire| i32::from(wire.port)))
+        .bind(ingress.guard.cn_source_block.as_str())
         .execute(&mut **tx)
         .await?;
 
@@ -7033,6 +7215,67 @@ pub struct DiscardPendingResult {
     pub restored_from_revision: u64,
 }
 
+async fn stage_discard_chain_probe_observations_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    retained_chain_ids: &[String],
+) -> Result<()> {
+    // Restoring a model currently replaces every chain row. Both probe tables intentionally
+    // cascade from chains, so keep the observations in transaction-local tables while that
+    // replacement happens. Restrict the copy to chains in the restored model: observations for
+    // a chain created only by the discarded revisions must disappear with that chain.
+    sqlx::query(
+        "CREATE TEMPORARY TABLE discard_pending_e2e_probes
+         ON COMMIT DROP AS
+         SELECT probe.*
+         FROM e2e_probes probe
+         WHERE probe.chain_id = ANY($1)",
+    )
+    .bind(retained_chain_ids)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "CREATE TEMPORARY TABLE discard_pending_e2e_probe_samples
+         ON COMMIT DROP AS
+         SELECT sample.*
+         FROM e2e_probe_samples sample
+         WHERE sample.chain_id = ANY($1)",
+    )
+    .bind(retained_chain_ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn restore_discarded_chain_probe_observations_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO e2e_probe_samples (chain_id, probed_at, status, ttfb_ms)
+         SELECT saved.chain_id, saved.probed_at, saved.status, saved.ttfb_ms
+         FROM discard_pending_e2e_probe_samples saved
+         JOIN chains chain ON chain.id = saved.chain_id
+         ON CONFLICT (chain_id, probed_at) DO NOTHING",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO e2e_probes (
+             chain_id, app_id, node_id, status, ttfb_ms, exit_ip, exit_loc,
+             exit_verdict, detail, probed_at, updated_at
+         )
+         SELECT saved.chain_id, chain.app_id, saved.node_id, saved.status, saved.ttfb_ms,
+                saved.exit_ip, saved.exit_loc, saved.exit_verdict, saved.detail,
+                saved.probed_at, saved.updated_at
+         FROM discard_pending_e2e_probes saved
+         JOIN chains chain ON chain.id = saved.chain_id
+         JOIN nodes node ON node.id = saved.node_id
+         ON CONFLICT (chain_id) DO NOTHING",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn discard_pending_changes(
     pool: &PgPool,
     actor: &AdminContext,
@@ -7136,8 +7379,15 @@ pub async fn discard_pending_changes(
         .config;
     let restore_snapshot =
         preserve_immediate_fields(restore_snapshot, &current_snapshot, &client_config);
+    let retained_chain_ids = restore_snapshot
+        .apps
+        .iter()
+        .flat_map(|app| app.chains.iter().map(|chain| chain.id.clone()))
+        .collect::<Vec<_>>();
+    stage_discard_chain_probe_observations_tx(&mut tx, &retained_chain_ids).await?;
     let new_revision = console::insert_revision(&mut tx, &actor_id, &note).await?;
     restore_model_snapshot_tx(&mut tx, new_revision, &restore_snapshot).await?;
+    restore_discarded_chain_probe_observations_tx(&mut tx).await?;
     // Restoring the last published snapshot does not need a new permission release: those are
     // exactly the grants already represented by the published baseline.  The discarded
     // revisions' queued jobs are canceled below under the same automation lock.

@@ -27,6 +27,74 @@ pub struct UserRealtimeTarget {
     pub forwarding: Vec<RealtimeForwardingTarget>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FleetRealtimeUser {
+    pub tenant_id: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetRealtimeTarget {
+    pub node_id: String,
+    pub users: Vec<FleetRealtimeUser>,
+    pub forwarding: Vec<RealtimeForwardingTarget>,
+}
+
+/// Resolve every currently entitled user by active entry machine for the fleet traffic view.
+///
+/// The Agent's `All` selector deliberately omits idle rows. Keeping this authorization model next
+/// to the single-user resolver is what lets the UI distinguish an entitled user with zero traffic
+/// from a user who is not routed through that machine at all. The matrix is a read-only public
+/// surface; signed-in tenant-scoped viewers remain restricted to their tenant subtree by the
+/// query below. Machine detail and per-user history keep their separate administrator gate.
+pub async fn fleet_realtime_targets(
+    pool: &PgPool,
+    actor: &AdminContext,
+) -> Result<Vec<FleetRealtimeTarget>> {
+    let rows = sqlx::query(
+        "SELECT ingress.node_id, grant_row.tenant_id, grant_row.user_id
+           FROM grants grant_row
+           JOIN ingresses ingress ON ingress.id = grant_row.ingress_id
+           JOIN nodes node ON node.id = ingress.node_id
+          WHERE node.retired_at IS NULL
+            AND ($1::text IS NULL OR grant_row.tenant_id = $1 OR grant_row.tenant_id LIKE $2 ESCAPE '\\')
+          GROUP BY ingress.node_id, grant_row.tenant_id, grant_row.user_id
+          ORDER BY ingress.node_id, grant_row.tenant_id, grant_row.user_id",
+    )
+    .bind(actor.tenant_scope())
+    .bind(actor.tenant_scope_like_pattern())
+    .fetch_all(pool)
+    .await?;
+    let mut grouped =
+        BTreeMap::<String, (BTreeSet<FleetRealtimeUser>, Vec<RealtimeForwardingTarget>)>::new();
+    for row in rows {
+        grouped
+            .entry(row.try_get("node_id")?)
+            .or_default()
+            .0
+            .insert(FleetRealtimeUser {
+                tenant_id: row.try_get("tenant_id")?,
+                user_id: row.try_get("user_id")?,
+            });
+    }
+    for (node_id, target) in read_forwarding_realtime_targets(pool, actor, None, None).await? {
+        let entry = grouped.entry(node_id).or_default();
+        entry.0.insert(FleetRealtimeUser {
+            tenant_id: target.tenant_id.clone(),
+            user_id: target.user_id.clone(),
+        });
+        entry.1.push(target);
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(node_id, (users, forwarding))| FleetRealtimeTarget {
+            node_id,
+            users: users.into_iter().collect(),
+            forwarding,
+        })
+        .collect())
+}
+
 /// Resolve current grant labels and entitled forwarding rules, grouped by active entry machine.
 /// This is live authorization, not revision history: revoked sources leave the next live lease.
 pub async fn user_realtime_targets(
@@ -37,7 +105,7 @@ pub async fn user_realtime_targets(
 ) -> Result<Vec<UserRealtimeTarget>> {
     if !actor.can_view_user_realtime_traffic() {
         return Err(StoreError::Forbidden(
-            "user realtime traffic requires an administrator".to_owned(),
+            "user realtime traffic requires a signed-in operator".to_owned(),
         ));
     }
     actor.require_tenant_access(tenant_id, "user realtime traffic")?;
@@ -112,9 +180,18 @@ pub async fn forwarding_realtime_targets(
 ) -> Result<Vec<(String, RealtimeForwardingTarget)>> {
     if !actor.can_view_user_realtime_traffic() {
         return Err(StoreError::Forbidden(
-            "forwarding realtime requires an administrator".to_owned(),
+            "forwarding realtime requires a signed-in operator".to_owned(),
         ));
     }
+    read_forwarding_realtime_targets(pool, actor, node_id, user).await
+}
+
+async fn read_forwarding_realtime_targets(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: Option<&str>,
+    user: Option<(&str, &str)>,
+) -> Result<Vec<(String, RealtimeForwardingTarget)>> {
     if let Some((tenant_id, _)) = user {
         actor.require_tenant_access(tenant_id, "forwarding realtime")?;
     }
@@ -161,10 +238,11 @@ const USER_TRAFFIC_HISTORY_MAX_SECS: u32 = 3_600;
 
 /// Recent per-user accounting windows for the realtime user-traffic card.
 ///
-/// Authorization matches the live user rates: only system and tenant administrators, with tenant
-/// administrators limited to their scope. Window existence comes from `usage_node_windows`, which
-/// records every delivered report including idle ones; it carries timestamps only and is limited
-/// to machines the caller already resolved, so it is read without a tenant filter.
+/// Authorization matches the live user rates: signed-in operators can read them, with
+/// tenant-scoped operators limited to their subtree. Window existence comes from
+/// `usage_node_windows`, which records every delivered report including idle ones; it carries
+/// timestamps only and is limited to machines the caller already resolved, so it is read without
+/// a tenant filter.
 pub async fn list_user_traffic_history(
     pool: &PgPool,
     actor: &AdminContext,
@@ -173,7 +251,7 @@ pub async fn list_user_traffic_history(
 ) -> Result<UserTrafficHistory> {
     if !actor.can_view_user_realtime_traffic() {
         return Err(StoreError::Forbidden(
-            "user traffic history requires an administrator".to_owned(),
+            "user traffic history requires a signed-in operator".to_owned(),
         ));
     }
     let window_secs = window_secs.clamp(60, USER_TRAFFIC_HISTORY_MAX_SECS);
@@ -997,6 +1075,24 @@ fn frozen_bindings(
     bindings
 }
 
+pub(crate) async fn other_domain_owners(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    generation_id: i64,
+) -> Result<BTreeMap<String, (String, String)>> {
+    let generation = resolve_usage_generation(tx, node_id, generation_id).await?;
+    Ok(generation
+        .bindings
+        .iter()
+        .filter_map(|(label, binding)| match binding.to_counter_owner(label) {
+            Some(CounterOwner::User(grant)) => {
+                Some((label.clone(), (grant.tenant_id, grant.user_id)))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
 async fn resolve_usage_generation(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
@@ -1094,7 +1190,16 @@ pub async fn record_usage_report(
         )));
     }
 
+    // Keep the receipt identity identical to pre-site-statistics Console builds.
+    // Observations are accepted only with the first billing transaction; retries
+    // never enrich them. Including this optional dimension in the identity would
+    // block lost-ACK billing retries after rolling Console back to an older build.
+    let site_usage = request.site_usage.take();
     let payload_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
+    request.site_usage = site_usage;
+    if let Some(report) = &request.site_usage {
+        crate::site_usage::validate(report)?;
+    }
     let (agent_instance_id, sequence) = report_identity(&request)?;
     let sequence_i64 = u64_to_i64("sequence", sequence)?;
     let xray_epoch = request.xray_epoch.clone();
@@ -1156,6 +1261,42 @@ pub async fn record_usage_report(
         revision_id: generation.revision_id,
         deployment_id: generation.deployment_id,
     };
+    let collect_sites = request.site_usage.is_some()
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT site_usage_enabled FROM control_state WHERE id=TRUE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+    if let Some(report) = request.site_usage.as_ref().filter(|_| collect_sites) {
+        let owners = generation
+            .bindings
+            .iter()
+            .filter_map(|(label, binding)| match binding.to_counter_owner(label) {
+                Some(CounterOwner::User(grant)) => {
+                    Some((label.clone(), (grant.tenant_id, grant.user_id)))
+                }
+                _ => None,
+            })
+            .collect();
+        crate::site_usage::record(
+            &mut tx,
+            node_id,
+            generation.id,
+            request.read_at_unix_secs,
+            report,
+            &owners,
+        )
+        .await?;
+    } else {
+        // Missing observations (old Agent/Xray or an explicit collection failure)
+        // break coverage, not billing. The next supported report establishes a
+        // fresh site baseline instead of spreading unknown traffic across the gap.
+        sqlx::query("DELETE FROM node_site_usage_state WHERE node_id=$1 AND read_at <= $2")
+            .bind(node_id)
+            .bind(request.read_at_unix_secs)
+            .execute(&mut *tx)
+            .await?;
+    }
     let previous_read: Option<i64> = sqlx::query_scalar(
         "SELECT extract(epoch FROM read_at)::bigint FROM usage_report_receipts
          WHERE node_id = $1 AND agent_instance_id = $2 ORDER BY sequence DESC LIMIT 1",
@@ -1265,6 +1406,17 @@ pub async fn record_usage_report(
                 // any same-second counter growth. A strictly older timestamp remains a rejection
                 // above; treating equality as one made a healthy grants hot-swap surface as
                 // "out of order" in the node health UI.
+                update_head = false;
+            } else if previous.xray_epoch.starts_with("journal:")
+                && !xray_epoch.starts_with("journal:")
+                && request.xray_started_at_unix_secs <= previous.read_at_unix_secs
+            {
+                // Older Agents can briefly lose journal-writer confirmation during handoff.
+                // An already-running candidate is not a fresh legacy counter namespace. Keep
+                // the durable journal baseline until identity recovers; its next cumulative
+                // reading includes every byte collected in the meantime. A genuine legacy
+                // restart after the previous reading still follows the normal reset path.
+                rejected_counters += 1;
                 update_head = false;
             } else if previous.xray_epoch == xray_epoch
                 && (uplink_bytes < previous.uplink_bytes
@@ -1744,7 +1896,11 @@ async fn list_usage_node_series_selected(
 /// must not change a retry's response. Concurrent cleaners skip locked rows; the batch and SQL
 /// time limits prevent first-run catch-up from deleting days of history in one transaction.
 pub async fn prune_usage_readings(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_secs = f64::from(retain_days.clamp(1, 365)) * 86_400.0;
+    prune_usage_readings_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_usage_readings_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
+    let retain_secs = f64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600.0;
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL lock_timeout = '1s'")
         .execute(&mut *tx)
@@ -1773,12 +1929,19 @@ pub async fn prune_usage_readings(pool: &PgPool, retain_days: u32) -> Result<u64
 /// Expire replay responses separately from raw readings. The permanent cursor still rejects an
 /// older sequence after its response expires; the durable counter baseline is never pruned here.
 pub async fn prune_usage_report_receipts(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
+    prune_usage_report_receipts_hours(pool, retain_days.saturating_mul(24)).await
+}
+
+pub(crate) async fn prune_usage_report_receipts_hours(
+    pool: &PgPool,
+    retain_hours: u32,
+) -> Result<u64> {
+    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let result = sqlx::query(
         "DELETE FROM usage_report_receipts
-         WHERE received_at < now() - make_interval(days => $1::int)",
+         WHERE received_at < now() - make_interval(secs => $1::double precision)",
     )
-    .bind(retain_days)
+    .bind(retain_secs)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -1790,13 +1953,28 @@ pub async fn prune_usage_report_receipts(pool: &PgPool, retain_days: u32) -> Res
 /// for incident reconstruction while keeping details and exact machine windows bounded. One chunk per table
 /// and hour lets an installation catch up without a long transaction or a sudden WAL spike.
 pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
+    let retain_hours = retain_days.saturating_mul(24);
+    prune_usage_samples_hours(pool, retain_hours, retain_hours, retain_hours).await
+}
+
+pub(crate) async fn prune_usage_samples_hours(
+    pool: &PgPool,
+    user_retain_hours: u32,
+    chain_retain_hours: u32,
+    node_window_retain_hours: u32,
+) -> Result<u64> {
+    let user_retain_secs =
+        i64::from(user_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
+    let chain_retain_secs =
+        i64::from(chain_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
+    let node_window_retain_secs =
+        i64::from(node_window_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let mut tx = pool.begin().await?;
     let user_rows = sqlx::query_scalar::<_, i64>(
         "WITH expired AS MATERIALIZED (
              SELECT ctid
                FROM usage_samples
-              WHERE window_end < now() - make_interval(days => $1)
+              WHERE window_end < now() - make_interval(secs => $1::double precision)
               ORDER BY window_end
               LIMIT $2
          ), deleted AS (
@@ -1807,7 +1985,7 @@ pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64>
          )
          SELECT count(*) FROM deleted",
     )
-    .bind(retain_days)
+    .bind(user_retain_secs)
     .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
     .fetch_one(&mut *tx)
     .await?;
@@ -1815,7 +1993,7 @@ pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64>
         "WITH expired AS MATERIALIZED (
              SELECT ctid
                FROM usage_chain_samples
-              WHERE window_end < now() - make_interval(days => $1)
+              WHERE window_end < now() - make_interval(secs => $1::double precision)
               ORDER BY window_end
               LIMIT $2
          ), deleted AS (
@@ -1826,21 +2004,21 @@ pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64>
          )
          SELECT count(*) FROM deleted",
     )
-    .bind(retain_days)
+    .bind(chain_retain_secs)
     .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
     .fetch_one(&mut *tx)
     .await?;
     let window_rows = sqlx::query_scalar::<_, i64>(
         "WITH expired AS MATERIALIZED (
              SELECT ctid FROM usage_node_windows
-              WHERE window_end < now() - make_interval(days => $1)
+              WHERE window_end < now() - make_interval(secs => $1::double precision)
               ORDER BY window_end LIMIT $2
          ), deleted AS (
              DELETE FROM usage_node_windows history USING expired
               WHERE history.ctid = expired.ctid RETURNING 1
          ) SELECT count(*) FROM deleted",
     )
-    .bind(retain_days)
+    .bind(node_window_retain_secs)
     .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
     .fetch_one(&mut *tx)
     .await?;
@@ -2471,6 +2649,16 @@ async fn insert_usage_sample(
         .bind(&grant.tenant_id).bind(&grant.user_id).bind(&grant.app_id)
         .bind(sample.window_start_unix_secs as f64).bind(sample.node_id)
         .execute(&mut **tx).await?;
+        crate::user_machine_usage::record(
+            tx,
+            sample.node_id,
+            &grant.tenant_id,
+            &grant.user_id,
+            sample.window_start_unix_secs,
+            (0, 0),
+            false,
+        )
+        .await?;
         return Ok(true);
     }
     // app_id is looked up from ingresses once at insert and frozen, no longer following the
@@ -2557,6 +2745,33 @@ async fn insert_usage_sample(
     .bind(sample.generation_id)
     .fetch_optional(&mut **tx)
     .await?;
+    if inserted.is_some() {
+        crate::user_machine_usage::record(
+            tx,
+            sample.node_id,
+            &grant.tenant_id,
+            &grant.user_id,
+            sample.window_start_unix_secs,
+            (sample.uplink_bytes, sample.downlink_bytes),
+            sample.has_gap,
+        )
+        .await?;
+        crate::node_inflow_usage::record(
+            tx,
+            crate::node_inflow_usage::IngressWindow {
+                node_id: sample.node_id,
+                tenant_id: &grant.tenant_id,
+                user_id: &grant.user_id,
+                ingress_id: &grant.ingress_id,
+                app_id: &grant.app_id,
+                window_start_unix_secs: sample.window_start_unix_secs,
+                uplink_bytes: sample.uplink_bytes,
+                downlink_bytes: sample.downlink_bytes,
+                has_gap: sample.has_gap,
+            },
+        )
+        .await?;
+    }
     Ok(inserted.is_some())
 }
 
