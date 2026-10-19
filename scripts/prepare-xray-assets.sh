@@ -5,10 +5,12 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 xray_root="$repo_root/components/xray-core"
 asset_dir="${XRAY_ASSET_DIR:-$xray_root/resources}"
 cache_dir="${XRAY_ASSET_CACHE_DIR:-$repo_root/.tools}"
-geodata_base="${BROCADE_GEODATA_BASE:-https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release}"
+geodata_base="${BROCADE_GEODATA_BASE:-https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/202609022346}"
 
 # These are the assets currently used by the v26.4.25 fork checkout. Change them only together
 # with an intentional rule-data refresh; the files themselves stay ignored by the Xray fork.
+# Fetch the matching dated release: the moving release branch cannot satisfy pinned digests
+# after upstream publishes its next daily update.
 geoip_sha256=0d5d2ba0c5a5c58027fd1347a6afd57c9470799b6bb3cbc274fd4657ed8de382
 geosite_sha256=7774ebc22c0a5acc718a4ee8635a96475021656937725551945d9a446591bf54
 
