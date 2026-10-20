@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use postgresql_embedded::{PostgreSQL, Settings, VersionReq};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
@@ -15,7 +16,6 @@ use std::{
 
 pub(crate) const POSTGRES_VERSION: &str = "17.11.0";
 const POSTGRES_MAJOR: &str = "17";
-const POSTGRES_VERSION_NUM: u32 = 170_011;
 const ZONKY_RELEASES: &str = "https://github.com/zonkyio/embedded-postgres-binaries";
 const MAVEN_CENTRAL: &str = "https://repo.maven.apache.org/maven2/io/zonky/test/postgres";
 const MAX_POSTGRES_TXZ_BYTES: u64 = 128 * 1024 * 1024;
@@ -106,8 +106,7 @@ impl ManagedPostgres {
 
         ensure_private_dir(data_root)?;
         let data_root = fs::canonicalize(data_root)?;
-        ensure_safe_socket_root(&data_root)?;
-        let socket = data_root.join("run");
+        let socket = postgres_socket_dir(&data_root);
         ensure_private_dir(&socket)?;
 
         let lock = private_file(&data_root.join("owner.lock"), false)?;
@@ -416,30 +415,45 @@ async fn verify_server(pool: &sqlx::PgPool) -> Result<()> {
     )
     .fetch_one(pool)
     .await?;
+    validate_server_settings(&settings)
+}
+
+fn validate_server_settings(settings: &(String, String, String, String, String)) -> Result<()> {
     if settings.0 != "on"
         || settings.1 != "on"
         || settings.2 != "on"
         || !settings.3.is_empty()
-        || settings.4.parse::<u32>()? != POSTGRES_VERSION_NUM
+        || settings.4.parse::<u32>()? / 10_000 != POSTGRES_MAJOR.parse::<u32>()?
     {
         bail!("受管 PostgreSQL 的版本、持久性或监听配置与 launcher 不一致");
     }
     Ok(())
 }
 
-fn ensure_safe_socket_root(path: &Path) -> Result<()> {
-    if path.as_os_str().as_encoded_bytes().len() > 76 {
-        bail!("受管 PostgreSQL 目录过长，无法安全创建 Unix socket");
-    }
-    if !path
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(byte))
+fn postgres_socket_dir(data_root: &Path) -> PathBuf {
+    let directory = data_root.join("run");
+    let socket_path = directory.join(".s.PGSQL.5432");
+    // pg_ctl forwards an unquoted `-k` through postgresql_embedded. Keep the existing path
+    // when it fits the actual sockaddr and command syntax; otherwise use a short private
+    // ASCII directory. Data/cache paths remain unrestricted and no SQL/shell quoting is guessed.
+    let socket_capacity = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    if socket_path.as_os_str().as_encoded_bytes().len() < socket_capacity
+        && directory
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(byte))
     {
-        bail!("受管 PostgreSQL 目录只能包含 ASCII 字母、数字以及 / . _ -");
+        return directory;
     }
-    Ok(())
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(data_root.as_os_str().as_encoded_bytes())
+    );
+    // SAFETY: geteuid has no preconditions and does not change process credentials.
+    let uid = unsafe { libc::geteuid() };
+    PathBuf::from(format!("/tmp/brocade-pg-{uid}-{}", &digest[..32]))
 }
 
 fn validate_state(state: Option<&str>) -> Result<()> {
@@ -662,6 +676,96 @@ mod tests {
             let asset = postgres_asset(Platform { arch, libc });
             assert_eq!(asset.sha256.len(), 64);
             assert!(asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn socket_directory_does_not_restrict_data_directory_names_or_length() {
+        let ordinary = Path::new("/var/lib/brocade/postgres");
+        assert_eq!(postgres_socket_dir(ordinary), ordinary.join("run"));
+        for root in [
+            "/data/含空格 PostgreSQL",
+            "/data/user's-db",
+            &format!("/data/{}", "x".repeat(160)),
+        ] {
+            let chosen = postgres_socket_dir(Path::new(root));
+            assert!(chosen.starts_with("/tmp"));
+            assert!(chosen
+                .to_str()
+                .unwrap()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)));
+            assert_eq!(postgres_socket_dir(Path::new(root)), chosen);
+            assert!(
+                chosen
+                    .join(".s.PGSQL.5432")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+                    < 104
+            );
+        }
+        assert_ne!(
+            postgres_socket_dir(Path::new("/data/a b")),
+            postgres_socket_dir(Path::new("/data/a c"))
+        );
+    }
+
+    #[test]
+    fn compatible_postgres_patch_releases_preserve_the_durability_contract() {
+        let mut settings = (
+            "on".into(),
+            "on".into(),
+            "on".into(),
+            String::new(),
+            "170012".into(),
+        );
+        validate_server_settings(&settings).unwrap();
+        settings.4 = "170000".into();
+        validate_server_settings(&settings).unwrap();
+        for version in ["160012", "180000", "unknown"] {
+            settings.4 = version.into();
+            assert!(validate_server_settings(&settings).is_err());
+        }
+        settings.4 = "170012".into();
+        settings.0 = "off".into();
+        assert!(validate_server_settings(&settings).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BROCADE_RUN_LAUNCHER_PG_TESTS=1, an unprivileged user and pinned PostgreSQL download"]
+    async fn managed_postgres_accepts_unicode_spaces_and_quotes_in_its_data_root() {
+        if std::env::var("BROCADE_RUN_LAUNCHER_PG_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("数据库 user's data");
+        let cache = root.path().join("cache");
+        let platform = Platform::current().unwrap();
+        let client = download::client().unwrap();
+        let mut original_identity = None;
+        let mut socket = None;
+        for _ in 0..2 {
+            let server = ManagedPostgres::start(&data, &cache, platform, &client)
+                .await
+                .unwrap();
+            let pool = sqlx::PgPool::connect(&server.database_url()).await.unwrap();
+            let identity: String =
+                sqlx::query_scalar("SELECT system_identifier::text FROM pg_control_system()")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if let Some(expected) = &original_identity {
+                assert_eq!(expected, &identity);
+            }
+            original_identity = Some(identity);
+            socket = server.server.settings().socket_dir.clone();
+            assert!(socket.as_ref().unwrap().starts_with("/tmp"));
+            pool.close().await;
+            server.stop().await.unwrap();
+        }
+        if let Some(path) = socket {
+            fs::remove_dir(path).unwrap();
         }
     }
 
