@@ -229,6 +229,10 @@ jobs:
         working-directory: frontend
         run: npm audit --package-lock-only --audit-level=high
 
+      - name: Install the browser used by front-end tests
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
       - name: Read Xray compiler release line
         id: xray-go
         run: |
