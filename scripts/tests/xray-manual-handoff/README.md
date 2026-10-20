@@ -2,9 +2,8 @@
 
 The legacy fixtures below are **local experiments, not production deployment
 tools**. They do not adopt an existing production PID, update Console/Agent, or
-certify fleet readiness. The separately described WAN utilities were also used
-for an explicitly authorized, narrowly scoped manual canary; they are not a
-general production release mechanism.
+certify fleet readiness. The separately described WAN utilities support manually
+supervised experiments; they are not a general production release mechanism.
 
 `legacy-resident-fixture.py` starts two owned Xray children with different local
 origins. The old generation owns TCP and UDP on one loopback endpoint. The new
@@ -113,24 +112,19 @@ limits and a 120-second cgroup lifetime. The bundle README documents the exact
 command. This mode is still a private-loopback experiment, not public-interface
 adoption, safe retirement, or a production release tool.
 
-## Scope of the October 15 experiment
+## Evidence and scope
 
-The experiment uses the actual old executable digest
-`9f83bcb21a17301e4ea3fdb9cb94dd2f66cc9a62a589f8d445464e528b46e293`
-and a separate build of commit `cba5c1dbaf1b24b452f7b600464d54823b9c4c9b`,
-candidate digest
-`49b0f25a6637022b0b99acaa119a284a6b6ac17a7d09e7cff6231aa847a4bd18`.
-Evidence belongs in ignored `target/manual-handoff-20261015/` and records the
-fixture hash, kernel, executable hashes, per-stream bytes/hash/token, gate
-statistics, and UDP counts.
+Store generated evidence under an ignored directory such as `target/manual-handoff/`.
+Record the fixture hash, kernel, executable hashes, per-stream bytes/hash/token,
+gate statistics, and UDP counts for each run. Keep operational records about real
+hosts in a private directory outside the repository.
 
-This validates local IPv4/IPv6 loopback on kernel `7.0.0-38-generic`. It does not
-validate the production NIC, public or wildcard binding, a different kernel,
-existing firewall/mark policies, throughput, multi-path `MP_JOIN`, or accounting
-handoff. It deliberately keeps the old generation resident and its UDP service
-running: **it does not complete an upgrade or certify safe old-process exit**.
-The older H6 safe-retirement proof is bound to another binary digest/configuration
-and must not be applied to this executable.
+Loopback results apply only to the binaries, configuration, and kernel tested.
+They do not validate public or wildcard binding, existing firewall/mark policies,
+throughput, multi-path `MP_JOIN`, or accounting handoff. The fixture deliberately
+keeps the old generation resident and its UDP service running: **it does not
+complete an upgrade or certify safe old-process exit**. A safe-retirement result
+from another executable or configuration must not be reused as evidence.
 
 ## Real-network manual canary utilities
 
@@ -146,29 +140,20 @@ and must not be applied to this executable.
   original tuples. It cannot flush or delete entries. An empty dump is not an
   atomic lifetime proof; withdraw admission and also inspect actual sockets.
 
-The October 15 WAN canary used a real public IPv6 forwarding endpoint and a
-separate VPS client, not a network namespace. Exact client source ports selected
-three ordinary-TCP test flows to a protected candidate port. An existing MPTCP
-flow was excluded from selection. A and B shared the same candidate listener FD;
-both forwarded through the unchanged legacy process for accounting. This proves
-the tested relay upgrade path, **not replacement or retirement of the production
-legacy process, full MPTCP bootstrap, or direct multi-generation accounting**.
+The relay experiment covers ordinary TCP with a shared candidate listener FD and
+a single downstream accounting owner. It does not establish replacement or
+retirement of an existing production process, MPTCP bootstrap, direct
+multi-generation accounting, or Agent/Console/PostgreSQL integration.
 
-Four downloads totaling 600 MiB passed with one connect each and no reconnect.
-Independently regenerated frame hashes matched. The sole legacy journal advanced
-by exactly 603 request bytes and 629,146,311 response bytes (payload plus 711
-header bytes); its writer and header remained unchanged. This is not a fresh
-Agent/Console/PostgreSQL cross-generation certification.
-
-### Deployment lessons from the real network
+### Experiment constraints
 
 1. Verify actual protocol, wildcard/v6-only binding, socket identity, existing
    NOTRACK rules, and accounting owner before choosing a first-adoption method.
    Do not apply the local MPTCP gate to a public interface by removing its guards.
 2. Exact-tuple NAT is a narrow test mechanism, not a general MPTCP migration:
-   MP_JOIN and path-MTU error handling need separate treatment. This canary's
-   ordinary TCP sockets used MSS 1200 because existing ICMPv6 NOTRACK rules were
-   intentionally left unchanged. The MPTCP baseline used its normal MSS.
+   MP_JOIN and path-MTU error handling need separate treatment. TCP MSS and
+   existing ICMPv6 NOTRACK rules must be checked independently for each
+   environment.
 3. Protect the candidate port before startup. Withdraw only new-flow selection
    first; preserve NAT hooks and candidates until sockets and conntrack drain.
    Never flush conntrack or kill a candidate to make cleanup appear successful.
@@ -176,16 +161,12 @@ Agent/Console/PostgreSQL cross-generation certification.
    generation-aware accounting path is enabled. Do not open the same normal
    journal in a second owner or alternate cumulative-counter epochs.
 5. Stage and verify artifacts before pausing admission. The simple manual
-   controller currently copies/hashes/spawns after pause: server event logs show
-   about 1.91 seconds between pause and successor resume. Established downloads
-   succeeded, but new connections during that interval were not measured. This
-   controller is therefore not ready to back an automatic zero-wait release.
-6. Save process/socket evidence and use per-host monotonic durations. The two
-   VPS wall clocks differed materially; do not derive handoff delay by subtracting
-   timestamps from different hosts. The paced frame gaps are not RTT, maximum
-   throughput, or a zero-stall certification.
+   controller currently copies/hashes/spawns after pause; measure admission
+   latency separately before considering automatic releases.
+6. Save process/socket evidence and use per-host monotonic durations. Do not
+   derive handoff delay by subtracting timestamps from different hosts. Paced
+   frame gaps are not RTT, maximum throughput, or a zero-stall certification.
 
-Evidence is in ignored `target/wawo-manual-canary-20261015/` and
-`target/wan-independent-review.json`. The hand-edited runtime target is not a
-Console desired-state release. Production integration must separately implement
-safe preparation/admission, mutation interlocks, recovery, and retirement.
+Production integration must separately implement safe preparation/admission,
+mutation interlocks, recovery, and retirement through the managed desired-state
+release path.

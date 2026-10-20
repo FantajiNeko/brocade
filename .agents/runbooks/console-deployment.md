@@ -10,11 +10,11 @@
 
 - 明确目标环境、主机、CPU 架构、域名和维护窗口。
 - 具备受控的 SSH、systemd、Nginx 和 PostgreSQL 管理权限。
-- 按 `README.md` 的构建前置条件安装 Node.js、Go、Zig、Rust 工具链和目标架构。
+- 按 `docs/build.md` 的构建前置条件安装 Node.js、Go、Zig、Rust 工具链和目标架构。
 - 准备与 `console.env.example` 同步的环境文件；真实秘密只存在于目标机器的受限文件或秘密管理系统。
 - 确认数据库备份位置有足够空间，并验证恢复责任人和停机边界。
 
-首次部署的系统账号、PostgreSQL、systemd、Nginx 与 TLS 示例见 `../../README.md` 的“部署 brocade-console”。本手册是操作检查表；配置清单的权威来源是 `../../console.env.example`。
+首次部署的系统账号、PostgreSQL、systemd、Nginx 与 TLS 示例见 `../../docs/manual-deployment.md`。本手册是操作检查表；配置清单的权威来源是 `../../console.env.example`。
 
 ## 发布前预检
 
@@ -50,6 +50,26 @@ sha256sum /opt/brocade/brocade-console
 确认备份命令成功、文件非空，并把旧二进制摘要写入发布记录。涉及不可逆数据库变化时，仅有备份文件不算完成预检；必须在隔离环境验证恢复。
 
 ## 数据库兼容
+
+### 校验范围精简
+
+`scripts/compat-validation-limits.sql` 将 geodata cron 的五段形状限制改为非空检查，
+并将 REALITY 时间容差上限从一天改为 Xray signed duration 能表示的
+`9223372036854` 毫秒。cron 语法由实际 Xray 解析器处理；更大的时间容差仍会导致
+Go duration 溢出，不应接受。
+
+该脚本可重复执行，只替换两个命名 CHECK，不改配置值、修订、计费状态和迁移记录。
+先在隔离恢复库执行并核对数据；停写及备份后，以应用角色执行：
+
+```sh
+psql -X -v ON_ERROR_STOP=1 -v app_role=<应用角色> -d brocade \
+  -f scripts/compat-validation-limits.sql
+```
+
+脚本不自动更新 SQLx checksum。核对目标 `0001_init.sql` 的其余差异均已兼容后，再按
+本手册既有流程单独更新 version 1 的 SHA-384；仅执行 ALTER 并不能消除二进制的迁移
+checksum 差异。回退旧二进制前先将 `@daily` 等新 cron 形式恢复成旧版接受的五段表达式，
+并恢复旧 checksum；超过一天的时间容差也要先调整回旧版本能接受的值。
 
 ### 首次上线向导
 
@@ -108,10 +128,22 @@ psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
 
 ### 机器流入统计
 
+来源表格明细另需新增观测表：停写、备份并在隔离恢复库验证后，以应用角色执行
+`scripts/compat-source-traffic.sql`。脚本创建来源窗口、来源日汇总、采集状态及时段查询索引，不回填历史 IP，
+拒绝重复执行，也不修改 SQLx checksum。审查本次 `0001_init.sql` 的所有差异后，沿用下述 checksum
+核对步骤。先升级 schema/Console，再升级 Agent/Xray；Console 通过 `x-brocade-source-traffic: 1`
+声明接收能力，新 Agent 连接旧 Console 时停止该观测，新 Console 连接旧 Agent/Xray 时保留未归属合计。
+旧用量统计和计费不依赖此来源观测，回退旧二进制可以保留新增表。
+
 机器详情「流量」页签的流入统计使用新增 `usage_user_ingress_rollups`：按机器、+08 日、用户与入口
 累计接入流量，在接受记账窗口的同一事务中写入，并冻结写入时入口所属的接入链。同时为
 `user_site_usage_hourly` 增加 `(node_id, bucket)` 索引，供流出统计读取单台机器。端口转发复用
 已有日汇总；不修改计费、Agent/Xray 或协议。
+
+机器用量「流出统计」也以独立「端口转发」类型读取该账本，与站点统计在同一只读快照中汇总。
+转发总量和主要用户读取日汇总，当天/当周的小时分布读取保留明细并按窗口起点归属（首次读数用
+读取时间），当月读取日汇总。已清理的小时明细不均摊，页面提示未分配到图中的账本流量。
+站点采集开关、上报覆盖与观测起点只描述认证代理入口；转发账本独立显示，无需额外 schema 或节点升级。
 
 停写并备份后，以应用角色运行（先在生产备份的隔离恢复库验证）：
 

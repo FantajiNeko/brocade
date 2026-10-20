@@ -14,3 +14,10 @@ __pycache__/
 /handbook/
 /incident-reports/
 .gstack/
+
+# Local execution plans and generated evidence are not source artifacts.
+/.agents/plans/*
+!/.agents/plans/TEMPLATE.md
+/.agents/local/
+/.codex/visualizations/
+/scripts/tests/site-usage/results/
