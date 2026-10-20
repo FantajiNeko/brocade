@@ -11,6 +11,11 @@ type DetailUsageStat struct {
 }
 type OtherDomainStat = DetailUsageStat
 
+type DetailCheckpoint struct {
+	ID       uint64
+	Up, Down int64
+}
+
 const SniffingFailedPattern = "sniffingfailed>>>"
 
 func validDetailLabel(label string) bool {

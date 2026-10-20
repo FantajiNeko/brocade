@@ -198,6 +198,23 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 }
 
 func (s *statsServer) QueryStats(ctx context.Context, request *QueryStatsRequest) (*QueryStatsResponse, error) {
+	if strings.HasPrefix(request.Pattern, feature_stats.OtherDomainPattern+"ack>>>") || strings.HasPrefix(request.Pattern, feature_stats.SniffingFailedPattern+"ack>>>") {
+		return s.acknowledgeDetail(request)
+	}
+	if request.Pattern == feature_stats.OtherDomainPattern+"v2" || request.Pattern == feature_stats.SniffingFailedPattern+"v2" {
+		if request.Reset_ {
+			return nil, status.Error(codes.InvalidArgument, "detail observations are read-only")
+		}
+		response := &QueryStatsResponse{}
+		if provider, ok := s.stats.(interface {
+			DetailCheckpointSnapshot(string) []feature_stats.DetailUsageStat
+		}); ok {
+			for _, stat := range provider.DetailCheckpointSnapshot(strings.TrimSuffix(request.Pattern, "v2")) {
+				response.Stat = append(response.Stat, &Stat{Name: stat.Name, Value: stat.Value})
+			}
+		}
+		return response, nil
+	}
 	if request.Pattern == feature_stats.SourceTrafficPattern {
 		if request.Reset_ {
 			return nil, status.Error(codes.InvalidArgument, "source observations are read-only")

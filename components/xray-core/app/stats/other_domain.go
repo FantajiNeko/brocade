@@ -88,9 +88,14 @@ func readDetailPolicy(environment string, targets bool) (otherDomainPolicy, erro
 }
 
 type domainPair struct {
-	windowID      uint64
-	label, domain string
-	up, down      atomic.Int64
+	windowID                     uint64
+	id                           uint64
+	label, domain                string
+	up, down                     atomic.Int64
+	checkpointUp, checkpointDown atomic.Int64
+	lastSeen                     atomic.Int64
+	// Nonnegative values count writers; -1 permanently retires this counter segment.
+	writers atomic.Int64
 }
 type domainWindow struct {
 	bucket int64
@@ -99,18 +104,22 @@ type domainWindow struct {
 	count  int
 }
 type otherDomainCollector struct {
-	bucketSeconds int64 // Zero preserves the existing hourly detail dimensions.
-	mu            sync.Mutex
-	current       atomic.Pointer[domainWindow]
-	previous      *domainWindow
-	limited       atomic.Bool
-	closed        atomic.Bool
-	clock         atomic.Int64
-	epoch         string
-	activation    int64
-	serial        uint64
-	policy        otherDomainPolicy
-	// Persistent candidate registry survives hour changes, but expires idle names.
+	durableEviction bool
+	nextCounterID   uint64
+	segments        map[uint64]*domainPair // Derived index, bounded by current + previous windows.
+	bucketSeconds   int64                  // Zero preserves the existing hourly detail dimensions.
+	mu              sync.Mutex
+	current         atomic.Pointer[domainWindow]
+	previous        *domainWindow
+	limited         atomic.Bool
+	closed          atomic.Bool
+	clock           atomic.Int64
+	epoch           string
+	activation      int64
+	serial          uint64
+	policy          otherDomainPolicy
+	// Checkpointed details track current residents. The separate v1 source-IP dimension
+	// retains its existing candidate-expiry behavior across windows.
 	candidates     map[string]map[string]int64
 	candidateCount int
 }
@@ -140,6 +149,7 @@ func (c *otherDomainCollector) update(policy otherDomainPolicy, now int64) {
 		c.previous = nil
 		c.candidates = nil
 		c.candidateCount = 0
+		c.segments = nil
 		c.policy = policy
 		return
 	}
@@ -148,9 +158,12 @@ func (c *otherDomainCollector) update(policy otherDomainPolicy, now int64) {
 		c.previous = nil
 		c.candidates = nil
 		c.candidateCount = 0
+		c.segments = nil
 	}
 	c.policy = policy
 	if w == nil {
+		// A failed identity refresh must not expose an old window with cleared indexes.
+		c.current.Store(nil)
 		var identity [16]byte
 		if _, err := rand.Read(identity[:]); err != nil {
 			errors.LogWarning(context.Background(), "other-domain identity unavailable; collection disabled")
@@ -160,8 +173,20 @@ func (c *otherDomainCollector) update(policy otherDomainPolicy, now int64) {
 		c.activation = now
 		c.limited.Store(false)
 		c.candidates = make(map[string]map[string]int64)
+		if c.durableEviction {
+			c.segments = make(map[uint64]*domainPair)
+		}
 	} else if w.bucket == bucket {
 		return
+	}
+	if c.durableEviction {
+		c.forgetWindow(c.previous)
+		if w != nil && w.bucket != bucket-seconds {
+			c.forgetWindow(w)
+		}
+		// Candidate capacity is the resident set, rather than a 24-hour admission ban.
+		c.candidates = make(map[string]map[string]int64)
+		c.candidateCount = 0
 	}
 	c.previous = w
 	if w != nil && w.bucket != bucket-seconds {
@@ -204,9 +229,28 @@ func (c *otherDomainCollector) get(label, domain string) (*domainPair, bool) {
 	if pair, ok := w.pairs.Load(key); ok {
 		return pair.(*domainPair), false
 	}
+	if c.durableEviction && c.nextCounterID >= 1<<63-1 {
+		c.limited.Store(true)
+		return nil, true
+	}
 	user, _, _ := strings.Cut(label, "#")
 	domains := c.candidates[user]
 	_, known := domains[domain]
+	if c.durableEviction && !known && len(domains) >= c.policy.MaxDomainsPerUser {
+		if !c.evictIdle(w, user, true) {
+			c.limited.Store(true)
+			return nil, false
+		}
+		domains = c.candidates[user]
+	}
+	if c.durableEviction && (w.count >= c.policy.NodeCapacity || (!known && c.candidateCount >= c.policy.NodeCapacity)) {
+		if !c.evictIdle(w, "", !known && c.candidateCount >= c.policy.NodeCapacity) {
+			c.limited.Store(true)
+			return nil, false
+		}
+		domains = c.candidates[user]
+	}
+	_, known = domains[domain]
 	if w.count >= c.policy.NodeCapacity || (!known && (len(domains) >= c.policy.MaxDomainsPerUser || c.candidateCount >= c.policy.NodeCapacity)) {
 		c.limited.Store(true)
 		return nil, true
@@ -220,6 +264,12 @@ func (c *otherDomainCollector) get(label, domain string) (*domainPair, bool) {
 	}
 	domains[domain] = w.bucket
 	p := &domainPair{windowID: w.id, label: label, domain: domain}
+	if c.durableEviction {
+		c.nextCounterID++
+		p.id = c.nextCounterID
+		p.lastSeen.Store(c.clock.Load())
+		c.segments[p.id] = p
+	}
 	w.pairs.Store(key, p)
 	w.count++
 	return p, false
@@ -242,6 +292,9 @@ func (c *otherDomainCounter) Value() int64 {
 }
 func (c *otherDomainCounter) Set(int64) int64 { return c.Value() }
 func (c *otherDomainCounter) Add(v int64) int64 {
+	if c.collector.durableEviction {
+		return c.addCheckpointed(v)
+	}
 	w := c.collector.current.Load()
 	if w == nil || v <= 0 {
 		return c.Value()
@@ -296,6 +349,12 @@ func (m *Manager) SniffingFailedCounters(label, target string) (featurestats.Cou
 // Both optional dimensions share bounded admission, rollover and allocation-free hot handles.
 func (c *otherDomainCollector) counters(label, key string) (featurestats.Counter, featurestats.Counter) {
 	pair, _ := c.get(label, key)
+	deferred := pair == nil && c.durableEviction
+	if deferred {
+		// A failed first admission must not disable observations for the entire lifetime
+		// of a long connection. Retry later through this connection's bounded handle.
+		pair = &domainPair{label: label, domain: key}
+	}
 	if pair == nil {
 		return nil, nil
 	}
@@ -303,6 +362,10 @@ func (c *otherDomainCollector) counters(label, key string) (featurestats.Counter
 	down := &otherDomainCounter{collector: c}
 	up.pair.Store(pair)
 	down.pair.Store(pair)
+	if deferred {
+		up.retryAt.Store(c.clock.Load() + 5)
+		down.retryAt.Store(c.clock.Load() + 5)
+	}
 	return up, down
 }
 
@@ -313,8 +376,27 @@ func (m *Manager) SniffingFailedSnapshot() []featurestats.DetailUsageStat {
 	return m.failedTargets.snapshot(featurestats.SniffingFailedPattern)
 }
 func (c *otherDomainCollector) snapshot(pattern string) []featurestats.DetailUsageStat {
+	return c.snapshotVersion(pattern, false)
+}
+
+func (m *Manager) DetailCheckpointSnapshot(pattern string) []featurestats.DetailUsageStat {
+	switch pattern {
+	case featurestats.OtherDomainPattern:
+		return m.otherDomains.snapshotVersion(pattern, true)
+	case featurestats.SniffingFailedPattern:
+		return m.failedTargets.snapshotVersion(pattern, true)
+	default:
+		return nil
+	}
+}
+
+func (c *otherDomainCollector) snapshotVersion(pattern string, checkpointed bool) []featurestats.DetailUsageStat {
 	c.mu.Lock()
-	result := []featurestats.OtherDomainStat{{Name: pattern + "version", Value: 1}}
+	version := int64(1)
+	if checkpointed {
+		version = 2
+	}
+	result := []featurestats.OtherDomainStat{{Name: pattern + "version", Value: version}}
 	w := c.current.Load()
 	previous, epoch, activation := c.previous, c.epoch, c.activation
 	sampledAt := c.clock.Load()
@@ -340,6 +422,9 @@ func (c *otherDomainCollector) snapshot(pattern string) []featurestats.DetailUsa
 		window.pairs.Range(func(_, value any) bool {
 			p := value.(*domainPair)
 			prefix := fmt.Sprintf("%s%d>>>%s>>>%s>>>", pattern, window.bucket, p.label, p.domain)
+			if checkpointed {
+				prefix += fmt.Sprintf("%d>>>", p.id)
+			}
 			result = append(result, featurestats.OtherDomainStat{Name: prefix + "uplink", Value: p.up.Load()}, featurestats.OtherDomainStat{Name: prefix + "downlink", Value: p.down.Load()})
 			return true
 		})
@@ -375,6 +460,7 @@ func (m *Manager) watchOtherDomains(stop <-chan struct{}) {
 
 func (m *Manager) initOtherDomains() {
 	for i, entry := range m.detailCollectors() {
+		entry.collector.durableEviction = true
 		policy, err := readDetailPolicy(entry.environment, i == 1)
 		if err != nil {
 			errors.LogWarning(context.Background(), "other-domain policy unavailable; collection disabled")
