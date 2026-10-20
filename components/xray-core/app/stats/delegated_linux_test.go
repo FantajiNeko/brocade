@@ -441,7 +441,7 @@ func TestDelegatedOwnerDeathReportsBlockedButKeepsTailMapping(t *testing.T) {
 	}
 }
 
-func TestDelegatedManifestStrictAndMutuallyExclusive(t *testing.T) {
+func TestDelegatedManifestBoundedAndMutuallyExclusive(t *testing.T) {
 	_, manifest := delegatedFixture(t)
 	file := filepath.Join(t.TempDir(), "manifest.json")
 	data, _ := json.Marshal(manifest)
@@ -459,7 +459,15 @@ func TestDelegatedManifestStrictAndMutuallyExclusive(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeDelegated(j.(*delegatedMappedJournal))
-	for name, value := range map[string][]byte{"unknown field": append([]byte(`{"unexpected":true,`), data[1:]...), "trailing JSON": append(bytes.Clone(data), []byte(`{}`)...), "oversize": bytes.Repeat([]byte(" "), 4097)} {
+	if err := os.WriteFile(file, append([]byte(`{"future_field":true,`), data[1:]...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	j, err = openCounterJournal()
+	if err != nil {
+		t.Fatalf("additional manifest fields rejected: %v", err)
+	}
+	closeDelegated(j.(*delegatedMappedJournal))
+	for name, value := range map[string][]byte{"trailing JSON": append(bytes.Clone(data), []byte(`{}`)...), "oversize": bytes.Repeat([]byte(" "), 4097)} {
 		t.Run(name, func(t *testing.T) {
 			if err := os.WriteFile(file, value, 0600); err != nil {
 				t.Fatal(err)

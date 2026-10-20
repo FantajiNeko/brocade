@@ -198,6 +198,20 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 }
 
 func (s *statsServer) QueryStats(ctx context.Context, request *QueryStatsRequest) (*QueryStatsResponse, error) {
+	if request.Pattern == feature_stats.SourceTrafficPattern {
+		if request.Reset_ {
+			return nil, status.Error(codes.InvalidArgument, "source observations are read-only")
+		}
+		response := &QueryStatsResponse{}
+		if provider, ok := s.stats.(interface {
+			SourceTrafficSnapshot() []feature_stats.DetailUsageStat
+		}); ok {
+			for _, stat := range provider.SourceTrafficSnapshot() {
+				response.Stat = append(response.Stat, &Stat{Name: stat.Name, Value: stat.Value})
+			}
+		}
+		return response, nil
+	}
 	if request.Pattern == feature_stats.SniffingFailedPattern {
 		if request.Reset_ {
 			return nil, status.Error(codes.InvalidArgument, "failed-sniff observations are read-only")

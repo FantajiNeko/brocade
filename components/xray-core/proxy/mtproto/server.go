@@ -328,6 +328,7 @@ func accountConnection(
 					stopAccounting = func() { online.RemoveIP(sourceIP) }
 				}
 				sourceUplink, sourceDownlink = sourceTrafficCounters(online, sourceIP)
+				sourceUplink, sourceDownlink = featurestats.WithSourceTraffic(manager, email, sourceIP, sourceUplink, sourceDownlink)
 			}
 		}
 	}

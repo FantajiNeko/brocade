@@ -8,10 +8,17 @@ import (
 	"testing"
 )
 
-func TestFailedTargetPolicyRejectsWrongDimensionAndUnsafeFiles(t *testing.T) {
+func TestFailedTargetPolicyIgnoresOtherDimensionsAndRejectsInvalidValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "policy.json")
 	t.Setenv("XRAY_BROCADE_SNIFFING_FAILED_CONTROL_FILE", path)
-	for _, value := range []string{`{"enabled":true,"max_domains_per_user":2}`, `{"enabled":true} {}`, `{"enabled":true,"max_targets_per_user":5000}`} {
+	if err := os.WriteFile(path, []byte(`{"enabled":true,"max_domains_per_user":2}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := readDetailPolicy("XRAY_BROCADE_SNIFFING_FAILED_CONTROL_FILE", true)
+	if err != nil || !policy.Enabled || policy.MaxDomainsPerUser != 1024 {
+		t.Fatalf("additional dimension changed target policy: %+v, %v", policy, err)
+	}
+	for _, value := range []string{`{"enabled":true} {}`, `{"enabled":true,"max_targets_per_user":5000}`} {
 		if err := os.WriteFile(path, []byte(value), 0600); err != nil {
 			t.Fatal(err)
 		}

@@ -291,15 +291,15 @@ func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip, protocol st
 			if traffic, ok := om.(stats.SessionTrafficOnlineMap); ok {
 				uplink, downlink, found := traffic.TrafficCounters(ip)
 				if found {
-					return uplink, downlink
+					return stats.WithSourceTraffic(sm, email, ip, uplink, downlink)
 				}
 			}
-			return nil, nil
+			return stats.WithSourceTraffic(sm, email, ip, nil, nil)
 		}
 		om.AddIP(ip)
 		context.AfterFunc(ctx, func() { om.RemoveIP(ip) })
 	}
-	return nil, nil
+	return stats.WithSourceTraffic(sm, email, ip, nil, nil)
 }
 
 func (d *DefaultDispatcher) sniffOverrideReason(ctx context.Context, result SniffResult, request session.SniffingRequest, destination net.Destination) string {

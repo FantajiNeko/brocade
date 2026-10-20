@@ -3,9 +3,26 @@ package stats
 import (
 	"fmt"
 	"github.com/xtls/xray-core/features/stats"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 )
+
+func TestDetailPoliciesAcceptAdditionalFields(t *testing.T) {
+	for _, targets := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "policy.json")
+		body := []byte(`{"enabled":true,"future_metadata":1}`)
+		if err := os.WriteFile(path, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BROCADE_TEST_DETAIL_POLICY", path)
+		policy, err := readDetailPolicy("BROCADE_TEST_DETAIL_POLICY", targets)
+		if err != nil || !policy.Enabled || policy.NodeCapacity != 4096 {
+			t.Fatalf("additional field changed policy: %+v, %v", policy, err)
+		}
+	}
+}
 
 func domainTestManager() *Manager {
 	m := new(Manager)

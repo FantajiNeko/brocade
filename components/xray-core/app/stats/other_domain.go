@@ -62,7 +62,6 @@ func readDetailPolicy(environment string, targets bool) (otherDomainPolicy, erro
 		return p, fmt.Errorf("invalid domain policy size")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	if targets {
 		var wire struct {
 			Enabled            bool `json:"enabled"`
@@ -100,19 +99,27 @@ type domainWindow struct {
 	count  int
 }
 type otherDomainCollector struct {
-	mu         sync.Mutex
-	current    atomic.Pointer[domainWindow]
-	previous   *domainWindow
-	limited    atomic.Bool
-	closed     atomic.Bool
-	clock      atomic.Int64
-	epoch      string
-	activation int64
-	serial     uint64
-	policy     otherDomainPolicy
+	bucketSeconds int64 // Zero preserves the existing hourly detail dimensions.
+	mu            sync.Mutex
+	current       atomic.Pointer[domainWindow]
+	previous      *domainWindow
+	limited       atomic.Bool
+	closed        atomic.Bool
+	clock         atomic.Int64
+	epoch         string
+	activation    int64
+	serial        uint64
+	policy        otherDomainPolicy
 	// Persistent candidate registry survives hour changes, but expires idle names.
 	candidates     map[string]map[string]int64
 	candidateCount int
+}
+
+func (c *otherDomainCollector) bucketSize() int64 {
+	if c.bucketSeconds > 0 {
+		return c.bucketSeconds
+	}
+	return 3600
 }
 
 func (m *Manager) OtherDomainEnabled() bool    { return m.otherDomains.current.Load() != nil }
@@ -125,6 +132,8 @@ func (c *otherDomainCollector) update(policy otherDomainPolicy, now int64) {
 		policy.Enabled = false
 	}
 	c.clock.Store(now)
+	seconds := c.bucketSize()
+	bucket := now / seconds * seconds
 	w := c.current.Load()
 	if !policy.Enabled {
 		c.current.Store(nil)
@@ -151,16 +160,16 @@ func (c *otherDomainCollector) update(policy otherDomainPolicy, now int64) {
 		c.activation = now
 		c.limited.Store(false)
 		c.candidates = make(map[string]map[string]int64)
-	} else if w.bucket == now/3600*3600 {
+	} else if w.bucket == bucket {
 		return
 	}
 	c.previous = w
-	if w != nil && w.bucket != now/3600*3600-3600 {
+	if w != nil && w.bucket != bucket-seconds {
 		c.previous = nil
 	}
 	for user, domains := range c.candidates {
 		for domain, seen := range domains {
-			if seen < now/3600*3600-23*3600 {
+			if seen < bucket-23*seconds {
 				delete(domains, domain)
 				c.candidateCount--
 			}
@@ -170,7 +179,7 @@ func (c *otherDomainCollector) update(policy otherDomainPolicy, now int64) {
 		}
 	}
 	c.serial++
-	c.current.Store(&domainWindow{bucket: now / 3600 * 3600, id: c.serial})
+	c.current.Store(&domainWindow{bucket: bucket, id: c.serial})
 }
 
 func (c *otherDomainCollector) get(label, domain string) (*domainPair, bool) {
@@ -308,6 +317,7 @@ func (c *otherDomainCollector) snapshot(pattern string) []featurestats.DetailUsa
 	result := []featurestats.OtherDomainStat{{Name: pattern + "version", Value: 1}}
 	w := c.current.Load()
 	previous, epoch, activation := c.previous, c.epoch, c.activation
+	sampledAt := c.clock.Load()
 	wasLimited := c.limited.Load()
 	c.mu.Unlock()
 	// Formatting/sorting a large snapshot must not lock out cold admission.
@@ -315,6 +325,9 @@ func (c *otherDomainCollector) snapshot(pattern string) []featurestats.DetailUsa
 		return append(result, featurestats.OtherDomainStat{Name: pattern + "enabled", Value: 0})
 	}
 	result = append(result, featurestats.OtherDomainStat{Name: pattern + "enabled", Value: 1}, featurestats.OtherDomainStat{Name: pattern + "epoch:" + epoch, Value: 1}, featurestats.OtherDomainStat{Name: pattern + "activation", Value: activation})
+	if pattern == featurestats.SourceTrafficPattern {
+		result = append(result, featurestats.DetailUsageStat{Name: pattern + "sampled_at", Value: sampledAt})
+	}
 	limited := int64(0)
 	if wasLimited {
 		limited = 1
@@ -344,6 +357,7 @@ func (m *Manager) watchOtherDomains(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case now := <-tick.C:
+			m.sourceTraffic.update(sourceTrafficPolicy(), now.Unix())
 			for i, entry := range m.detailCollectors() {
 				policy, err := readDetailPolicy(entry.environment, i == 1)
 				if err != nil {

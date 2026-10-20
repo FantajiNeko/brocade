@@ -66,7 +66,6 @@ func openDelegatedCounterJournal(path string) (*delegatedMappedJournal, error) {
 		return nil, fmt.Errorf("delegated accounting manifest must be a bounded private regular file")
 	}
 	decoder := json.NewDecoder(io.LimitReader(file, 4097))
-	decoder.DisallowUnknownFields()
 	var manifest delegatedJournalManifest
 	if err := decoder.Decode(&manifest); err != nil {
 		return nil, fmt.Errorf("decode delegated accounting manifest: %w", err)

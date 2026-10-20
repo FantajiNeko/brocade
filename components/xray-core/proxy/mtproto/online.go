@@ -89,12 +89,14 @@ func (t *onlineObservationTracker) observeWithTraffic(
 		lease.touch()
 		t.mu.Unlock()
 		uplink, downlink := sourceTrafficCounters(online, sourceIP)
+		uplink, downlink = featurestats.WithSourceTraffic(manager, email, sourceIP, uplink, downlink)
 		return uplink, downlink, t.releaseOnce(key, lease)
 	}
 	if t.maxRetained <= 0 || len(t.leases) >= t.maxRetained {
 		t.mu.Unlock()
 		add()
 		uplink, downlink := sourceTrafficCounters(online, sourceIP)
+		uplink, downlink = featurestats.WithSourceTraffic(manager, email, sourceIP, uplink, downlink)
 		var once sync.Once
 		return uplink, downlink, func() { once.Do(remove) }
 	}
@@ -108,6 +110,7 @@ func (t *onlineObservationTracker) observeWithTraffic(
 	t.leases[key] = lease
 	t.mu.Unlock()
 	uplink, downlink := sourceTrafficCounters(online, sourceIP)
+	uplink, downlink = featurestats.WithSourceTraffic(manager, email, sourceIP, uplink, downlink)
 	return uplink, downlink, t.releaseOnce(key, lease)
 }
 

@@ -38,6 +38,7 @@ type Manager struct {
 	siteClosing      bool
 	otherDomains     otherDomainCollector
 	failedTargets    otherDomainCollector
+	sourceTraffic    otherDomainCollector
 	otherDomainStop  chan struct{}
 }
 
@@ -72,6 +73,8 @@ func NewManager(ctx context.Context, config *Config) (*Manager, error) {
 		}
 	}
 	m.initOtherDomains()
+	m.sourceTraffic.bucketSeconds = 30
+	m.sourceTraffic.update(sourceTrafficPolicy(), time.Now().Unix())
 	return m, nil
 }
 
@@ -345,6 +348,7 @@ func (m *Manager) Start() error {
 	m.running = true
 	m.otherDomains.closed.Store(false)
 	m.failedTargets.closed.Store(false)
+	m.sourceTraffic.closed.Store(false)
 	if m.otherDomainStop == nil {
 		m.otherDomainStop = make(chan struct{})
 		go m.watchOtherDomains(m.otherDomainStop)
@@ -374,12 +378,14 @@ func (m *Manager) Close() error {
 	m.running = false
 	m.otherDomains.closed.Store(true)
 	m.failedTargets.closed.Store(true)
+	m.sourceTraffic.closed.Store(true)
 	if m.otherDomainStop != nil {
 		close(m.otherDomainStop)
 		m.otherDomainStop = nil
 	}
 	m.otherDomains.update(otherDomainPolicy{}, time.Now().Unix())
 	m.failedTargets.update(otherDomainPolicy{}, time.Now().Unix())
+	m.sourceTraffic.update(otherDomainPolicy{}, time.Now().Unix())
 	if m.siteStop != nil {
 		close(m.siteStop)
 		m.siteStop = nil
