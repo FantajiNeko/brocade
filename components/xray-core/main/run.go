@@ -93,6 +93,7 @@ func executeRun(cmd *base.Command, args []string) {
 		os.Exit(23)
 	}
 	if err := server.Start(); err != nil {
+		tcp.RecordHandoffStartupFailure(err)
 		_ = tcp.CloseHandoff()
 		fmt.Println("Failed to start:", err)
 		os.Exit(-1)

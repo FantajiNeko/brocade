@@ -10,10 +10,13 @@ signalling the old PID remain the Agent's responsibility. The normal startup pat
 `XRAY_TCP_HANDOFF_MANIFEST` is set.
 
 The environment variable points to an absolute, private JSON manifest. The file
-must be an owned, singly linked regular file with mode `0600`; its immediate
-parent and the control socket's parent must be owned directories with mode `0700`.
+must be an owned, singly linked regular file without group or other access; its immediate
+parent and the control socket's parent must be owned, private directories. The normal
+writer uses `0600`/`0700`; reading a `0400` file in a `0500` directory is also valid.
 Symlink path components and unsafe writable ancestors are rejected. Use a fresh
 generation ID and control path; an existing control path is never overwritten.
+Additional JSON fields are ignored; field types, manifest versions, listener identities,
+fencing and the single-value/message-size bounds are still checked.
 
 ```json
 {
@@ -103,8 +106,22 @@ seals it, so grants can be restored before public admission.
 The example identity values and digest placeholder must be replaced with the
 actual exported metadata. Protocol `6` is TCP and `262` is MPTCP. Do not infer the protocol
 from `/proc/net/tcp*` or an omitted `tcpMptcp` setting: Go's default listener can
-be MPTCP. An explicit `tcpMptcp: true` requires MPTCP. Import never silently binds
-a new socket or falls back to a different protocol.
+be MPTCP. `tcpMptcp: true` is also a preference: on a new bind, required
+keepalive takes priority and Go retries incompatible MPTCP sockets as ordinary
+TCP. Failure to apply required options to TCP fails startup. Import accepts an
+already-fallback TCP socket only with its actual exported protocol and matching
+identity/configuration; it never silently binds a new socket or changes protocol.
+On Linux, configured keepalive is read back at startup and import, including
+custom timer/count overrides. A matching digest cannot certify an old listener
+that failed to apply those options. Validation never mutates an inherited socket.
+
+Early MPTCP kernels may reject `IPV6_V6ONLY` and `TCP_KEEP*` reads with
+`EOPNOTSUPP`. For an IPv4 wildcard backed by IPv6, the runtime verifies
+`INET_DIAG_SKV6ONLY` on the TCP listening subflow with the exact held socket
+inode and bind address. Missing or mismatched evidence still rejects startup.
+When `SO_KEEPALIVE` is verified disabled, unsupported MPTCP timers are left
+untouched while restoring that disabled state on accepted connections. Enabled
+keepalive continues to require readable timer values; it is never guessed.
 
 An inherited TCP descriptor must be at least `3`, nonblocking, listening, and match
 the address, inode, cookie and protocol. The runtime consumes that descriptor
@@ -137,6 +154,12 @@ The control socket is Unix `SOCK_SEQPACKET` (`unixpacket` in Go), mode `0600`.
 Only same-UID peers are accepted. Each connection carries one bounded JSON
 request and response. A selected listener starts paused; startup readiness does
 not enable admission.
+
+Generation IDs require 16–128 characters. Fencing intents are nonempty operation
+labels of at most 128 characters, including short labels from small deployment
+IDs. Both allow only ASCII letters, digits, hyphens and underscores. Every mutation
+still requires a positive monotonic epoch; replay at the same epoch must match
+both the exact intent and operation.
 
 ```json
 {
@@ -172,7 +195,7 @@ not enable admission.
   while public TCP connections remain, then pauses private cover admission.
   `retire_ready` becomes true only after cover work also reaches zero.
 
-Every mutation/export requires a positive monotonic epoch and a 16–128-character
+Every mutation/export requires a positive monotonic epoch and a nonempty, at most 128-character
 ASCII alphanumeric/underscore/hyphen intent. Repeating the same epoch, operation
 and intent is idempotent; stale or conflicting intents fail. An error does not
 authorize a caller to guess the current state: query status and reconcile.
@@ -218,3 +241,23 @@ the handoff manifest or create its control socket. They are not listener-import
 validation. A real candidate startup plus explicit readiness/control checks is
 required. See `scripts/tests/xray-manual-handoff/` at the repository root for the
 loopback-only process fixtures and their narrower certification boundaries.
+
+## Startup failure diagnostics
+
+When `Core.Start` fails with a typed TCP/UDP listen errno, Xray records the root
+cause before closing its handoff control socket. The private, generation-specific
+file `<control_path>.startup-error.json` contains version `1`, `generation_id`,
+`pid`, `pid_start_ticks`, `boot_id`, `network` (`tcp` or `udp`), numeric IP/port
+`address`, and Linux `errno`. It contains no free-form error chain, configuration,
+credentials, or command line. Publication is atomic, mode `0600`, and never
+overwrites an existing file or symlink. Diagnostic I/O is best-effort and cannot
+prevent teardown or recovery; there is no work on successful startups or traffic.
+
+The Agent validates the private file (maximum 4 KiB), generation, boot/process
+identity, and declared endpoint. A recognized root errno, such as `EADDRINUSE`,
+`EACCES`, `EADDRNOTAVAIL`, or `EMFILE`, is reported with its Chinese explanation
+and listening endpoint, without opening or attaching the Xray log. A later
+control-socket `ENOENT` is not a startup root cause. Older Xray builds, missing or
+invalid evidence, and unclassified errors retain a non-blocking log fallback that
+reads at most the last 4 KiB. This optional sidecar does not change admission,
+retirement, or the Console/Agent protocol; either binary can be upgraded first.

@@ -226,7 +226,6 @@ func decodeHandoffJSON(data []byte, target any) error {
 		return fmt.Errorf("TCP handoff message is too large")
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
-	d.DisallowUnknownFields()
 	if err := d.Decode(target); err != nil {
 		return fmt.Errorf("invalid TCP handoff JSON: %w", err)
 	}
@@ -237,7 +236,14 @@ func decodeHandoffJSON(data []byte, target any) error {
 }
 
 func validHandoffToken(token string) bool {
-	if len(token) < 16 || len(token) > 128 {
+	return len(token) >= 16 && validHandoffIntent(token)
+}
+
+// Fencing intents are operation identities, not random generation identifiers.
+// Small deployment/claim IDs legitimately produce labels such as config-2-1-seal.
+// Same-UID authentication and exact epoch/intent/operation matching protect RPCs.
+func validHandoffIntent(token string) bool {
+	if len(token) == 0 || len(token) > 128 {
 		return false
 	}
 	for _, ch := range token {
@@ -264,8 +270,8 @@ func checkHandoffParent(path string) error {
 			return fmt.Errorf("TCP handoff ancestor is not a directory")
 		}
 		if dir == parent {
-			if st.Uid != uint32(os.Geteuid()) || st.Mode&07777 != 0700 {
-				return fmt.Errorf("TCP handoff parent must be owned by this uid with mode 0700")
+			if st.Uid != uint32(os.Geteuid()) || st.Mode&0077 != 0 {
+				return fmt.Errorf("TCP handoff parent must be owned by this uid without group or other access")
 			}
 		} else if st.Mode&0022 != 0 && st.Mode&unix.S_ISVTX == 0 {
 			return fmt.Errorf("TCP handoff ancestor %s mode %#o is writable without the sticky bit", dir, st.Mode)
@@ -292,8 +298,8 @@ func readHandoffManifest(path string) (handoffManifest, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return manifest, err
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Mode&07777 != 0600 || st.Uid != uint32(os.Geteuid()) || st.Nlink != 1 {
-		return manifest, fmt.Errorf("TCP handoff manifest must be a singly-linked 0600 regular file owned by this uid")
+	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Mode&0077 != 0 || st.Uid != uint32(os.Geteuid()) || st.Nlink != 1 {
+		return manifest, fmt.Errorf("TCP handoff manifest must be a singly-linked private regular file owned by this uid")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, handoffMaxMessage+1))
 	if err != nil {
@@ -505,12 +511,9 @@ func (c *tcpHandoff) open(address string, unsupported bool, config *internet.Soc
 	if c.closed || c.ready || c.bindings[key] != nil || unsupported {
 		return nil, nil, fmt.Errorf("TCP handoff listener is closed, duplicate or uses unsupported wrapping")
 	}
-	// Xray's false setting leaves Go's listener default in effect (MPTCP on
-	// recent Go versions); it is not an explicit TCP-only request. The manifest
-	// always pins the actual kernel protocol, including when Go chose MPTCP.
-	if config.GetTcpMptcp() && endpoint.Protocol != 0 && endpoint.Protocol != unix.IPPROTO_MPTCP {
-		return nil, nil, fmt.Errorf("TCP handoff protocol does not match configured MPTCP mode")
-	}
+	// MPTCP is a preference, not a requirement: Go can fall back to TCP when
+	// the kernel cannot honor the requested keepalive policy. The manifest
+	// still pins the actual protocol and FD identity, never a guessed protocol.
 	socketConfigSHA256, err := handoffSocketConfigDigest(config)
 	if err != nil {
 		return nil, nil, fmt.Errorf("hash TCP handoff socket configuration: %w", err)
@@ -537,6 +540,10 @@ func (c *tcpHandoff) open(address string, unsupported bool, config *internet.Soc
 	if !ok {
 		listener.Close()
 		return nil, nil, fmt.Errorf("TCP handoff requires an unwrapped TCP listener")
+	}
+	if err := internet.ValidateTCPListenerKeepAlive(tcpListener, config); err != nil {
+		listener.Close()
+		return nil, nil, fmt.Errorf("validate TCP handoff keepalive: %w", err)
 	}
 	identity, err := inspectHandoffListener(tcpListener)
 	if err != nil {
@@ -818,32 +825,35 @@ func handoffKeepAlive(listener *net.TCPListener) (net.KeepAliveConfig, error) {
 	}
 	var failure error
 	err = raw.Control(func(fd uintptr) {
-		enabled, e := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_KEEPALIVE)
-		if e != nil {
-			failure = e
-			return
-		}
-		idle, e := unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPIDLE)
-		if e != nil {
-			failure = e
-			return
-		}
-		interval, e := unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPINTVL)
-		if e != nil {
-			failure = e
-			return
-		}
-		count, e := unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPCNT)
-		if e != nil {
-			failure = e
-			return
-		}
-		config = net.KeepAliveConfig{Enable: enabled != 0, Idle: time.Duration(idle) * time.Second, Interval: time.Duration(interval) * time.Second, Count: count}
+		config, failure = handoffKeepAliveFD(int(fd), unix.GetsockoptInt)
 	})
 	if err != nil {
 		return config, err
 	}
 	return config, failure
+}
+
+func handoffKeepAliveFD(fd int, get func(int, int, int) (int, error)) (net.KeepAliveConfig, error) {
+	var config net.KeepAliveConfig
+	enabled, err := get(fd, unix.SOL_SOCKET, unix.SO_KEEPALIVE)
+	if err != nil {
+		return config, err
+	}
+	var values [3]int
+	for index, option := range []int{unix.TCP_KEEPIDLE, unix.TCP_KEEPINTVL, unix.TCP_KEEPCNT} {
+		values[index], err = get(fd, unix.IPPROTO_TCP, option)
+		if err != nil {
+			protocol, protocolErr := get(fd, unix.SOL_SOCKET, unix.SO_PROTOCOL)
+			if errors.Is(err, unix.EOPNOTSUPP) && protocolErr == nil && protocol == unix.IPPROTO_MPTCP && enabled == 0 {
+				// Early MPTCP kernels implement SO_KEEPALIVE but neither read nor write
+				// TCP_KEEP*. Restore the verified disabled state without asking Go to
+				// write unsupported timers. Enabled keepalive still requires exact values.
+				return net.KeepAliveConfig{Idle: -1, Interval: -1, Count: -1}, nil
+			}
+			return config, err
+		}
+	}
+	return net.KeepAliveConfig{Enable: enabled != 0, Idle: time.Duration(values[0]) * time.Second, Interval: time.Duration(values[1]) * time.Second, Count: values[2]}, nil
 }
 
 func (b *tcpHandoffBinding) close() {
@@ -1215,7 +1225,7 @@ func (c *tcpHandoff) execute(request handoffRequest) (handoffResponse, []int, er
 	case "status":
 	case "seal", "pause", "resume", "export", "drain", "drop_udp", "drop_tcp":
 		c.mu.Lock()
-		valid := !c.closed && request.Epoch > 0 && validHandoffToken(request.Intent) && request.Epoch >= c.epoch
+		valid := !c.closed && request.Epoch > 0 && validHandoffIntent(request.Intent) && request.Epoch >= c.epoch
 		if request.Epoch == c.epoch {
 			valid = valid && request.Intent == c.intent && request.Operation == c.operation
 		}
@@ -1327,9 +1337,22 @@ func handoffListenerMatchesRequestedAddress(listener *net.TCPListener, actualAdd
 		return false
 	}
 	v6Only, optionErr := 1, error(nil)
+	var identity handoffSocketIdentity
 	if err := raw.Control(func(fd uintptr) {
 		v6Only, optionErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY)
-	}); err != nil || optionErr != nil {
+		if errors.Is(optionErr, unix.EOPNOTSUPP) {
+			identity, _ = inspectHandoffFD(int(fd))
+		}
+	}); err != nil {
+		return false
+	}
+	if errors.Is(optionErr, unix.EOPNOTSUPP) && identity.Protocol == unix.IPPROTO_MPTCP && identity.Address == actualAddress {
+		// Linux 5.15 exposes the listening subflow's v6only flag through SOCK_DIAG
+		// even when the MPTCP getsockopt entry point cannot return it. Match the
+		// held socket's inode and address; never infer dual-stack from a wildcard.
+		v6Only, optionErr = handoffMPTCPV6Only(identity)
+	}
+	if optionErr != nil {
 		return false
 	}
 	return v6Only == 0

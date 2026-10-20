@@ -22,7 +22,8 @@ type DefaultListener struct {
 
 func getControlFunc(ctx context.Context, sockopt *SocketConfig, controllers []func(network, address string, c syscall.RawConn) error) func(network, address string, c syscall.RawConn) error {
 	return func(network, address string, c syscall.RawConn) error {
-		return c.Control(func(fd uintptr) {
+		var optionErr error
+		err := c.Control(func(fd uintptr) {
 			for _, controller := range controllers {
 				if err := controller(network, address, c); err != nil {
 					errors.LogInfoInner(ctx, err, "failed to apply external controller")
@@ -32,11 +33,27 @@ func getControlFunc(ctx context.Context, sockopt *SocketConfig, controllers []fu
 			if sockopt != nil {
 				if err := applyInboundSocketOptions(network, fd, sockopt); err != nil {
 					errors.LogInfoInner(ctx, err, "failed to apply socket options to incoming connection")
+					// A configured liveness policy is mandatory. Returning the error
+					// lets Go retry an incompatible MPTCP listener as ordinary TCP,
+					// including when tcpMptcp is explicitly enabled. TCP must also
+					// fail closed if it cannot apply the requested socket options.
+					if isTCPSocket(network) && (sockopt.TcpKeepAliveIdle > 0 || sockopt.TcpKeepAliveInterval > 0) {
+						optionErr = err
+						return
+					}
+				}
+				if err := validateInboundKeepAlive(network, fd, sockopt); err != nil {
+					optionErr = err
+					return
 				}
 			}
 
 			setReusePort(fd)
 		})
+		if err != nil {
+			return err
+		}
+		return optionErr
 	}
 }
 

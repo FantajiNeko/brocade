@@ -127,6 +127,37 @@ func requireHandoffRPC(t *testing.T, c *tcpHandoff, operation string, epoch uint
 	return *response.Status
 }
 
+func TestHandoffSmallDeploymentFencingIntents(t *testing.T) {
+	listener := handoffTestListener(t)
+	c := handoffTestControl(t, handoffTestManifest(t, listener))
+	handoffTestOpen(t, c, listener)
+	if err := c.markReady(); err != nil {
+		t.Fatal(err)
+	}
+	for index, operation := range []string{"seal", "resume", "pause"} {
+		response, fds := handoffTestRPC(t, c, operation, uint64(index+1), "config-2-1-"+operation)
+		if response.Error != "" || response.Status == nil || len(fds) != 0 {
+			t.Fatalf("small deployment %s rejected: %+v fds=%v", operation, response, fds)
+		}
+	}
+	for _, request := range []handoffRequest{
+		{Operation: "resume", GenerationID: c.manifest.GenerationID, Epoch: 2, Intent: "config-2-1-resume"},
+		{Operation: "pause", GenerationID: c.manifest.GenerationID, Epoch: 3, Intent: "config-2-2-pause"},
+		{Operation: "resume", GenerationID: c.manifest.GenerationID, Epoch: 3, Intent: "config-2-1-pause"},
+		{Operation: "resume", GenerationID: c.manifest.GenerationID, Epoch: 4},
+		{Operation: "resume", GenerationID: c.manifest.GenerationID, Epoch: 4, Intent: "bad intent"},
+	} {
+		if _, _, err := c.execute(request); err == nil {
+			t.Fatalf("accepted invalid or conflicting fence: %+v", request)
+		}
+	}
+	manifest := c.manifest
+	manifest.GenerationID = "short"
+	if err := validateHandoffManifest(manifest); err == nil {
+		t.Fatal("short operation intents must not relax generation identity validation")
+	}
+}
+
 func serveHandoffEcho(t *testing.T, listener *net.TCPListener, gate handoffGate, prefix byte) {
 	t.Helper()
 	var handlers sync.WaitGroup
@@ -340,7 +371,7 @@ func TestWholeGenerationIPv4WildcardPreservesLogicalAddressAcrossDualStackImport
 	}
 	logical := (&net.TCPAddr{IP: net.IPv4zero, Port: actualAddress.Port}).String()
 	if !handoffListenerMatchesRequestedAddress(original, actual.Address, logical) {
-		t.Skip("kernel IPv6 wildcard listener is not dual-stack")
+		t.Fatal("default IPv6 wildcard listener did not satisfy the IPv4 wildcard manifest")
 	}
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0700); err != nil {
@@ -609,7 +640,7 @@ func TestHandoffFencingAndScope(t *testing.T) {
 		{Operation: "pause", GenerationID: c.manifest.GenerationID, Epoch: 11, Intent: "different-intent-11"},
 		{Operation: "resume", GenerationID: "wrong-generation-0001", Epoch: 12, Intent: "test-intent-00012"},
 		{Operation: "resume", GenerationID: c.manifest.GenerationID, Epoch: 0, Intent: "test-intent-00012"},
-		{Operation: "resume", GenerationID: c.manifest.GenerationID, Epoch: 12, Intent: "short"},
+		{Operation: "resume", GenerationID: c.manifest.GenerationID, Epoch: 12, Intent: "bad intent"},
 		{Operation: "retire", GenerationID: c.manifest.GenerationID, Epoch: 12, Intent: "test-intent-00012"},
 	} {
 		if _, _, err := c.execute(request); err == nil {
@@ -637,9 +668,6 @@ func TestHandoffIncompleteAndUnsupportedGroupFailClosed(t *testing.T) {
 	bind := func() (net.Listener, error) { bound = true; return l, nil }
 	if _, _, err := c.open(l.Addr().String(), true, nil, bind); err == nil || bound {
 		t.Fatal("wrapped listener must fail before bind")
-	}
-	if _, _, err := c.open(l.Addr().String(), false, &internet.SocketConfig{TcpMptcp: true}, bind); err == nil || bound {
-		t.Fatal("MPTCP mismatch must fail before bind")
 	}
 	handoffTestOpen(t, c, l)
 	if _, _, err := c.open(l.Addr().String(), false, nil, bind); err == nil || bound {
@@ -765,7 +793,7 @@ func TestPreparationAdmissionRejectsNonControlAndNonLoopback(t *testing.T) {
 	}
 }
 
-func TestHandoffManifestPermissionsAndStrictJSON(t *testing.T) {
+func TestHandoffManifestPermissionsAndBoundedJSON(t *testing.T) {
 	l := handoffTestListener(t)
 	manifest := handoffTestManifest(t, l)
 	path := filepath.Join(filepath.Dir(manifest.ControlPath), "manifest.json")
@@ -774,6 +802,20 @@ func TestHandoffManifestPermissionsAndStrictJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := readHandoffManifest(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0400); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(path)
+	defer os.Chmod(parent, 0700)
+	if err := os.Chmod(parent, 0500); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readHandoffManifest(path); err != nil {
+		t.Fatalf("private read-only manifest must remain readable: %v", err)
+	}
+	if err := os.Chmod(parent, 0700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(path, 0640); err != nil {
@@ -802,7 +844,14 @@ func TestHandoffManifestPermissionsAndStrictJSON(t *testing.T) {
 	if err := validateHandoffManifest(manifest); err == nil {
 		t.Fatal("nonprivate control directory accepted")
 	}
-	for _, raw := range []string{`{"unknown":1}`, `{} {}`, strings.Repeat(" ", handoffMaxMessage+1)} {
+	var extended handoffRequest
+	if err := decodeHandoffJSON([]byte(`{"operation":"status","future_field":true}`), &extended); err != nil {
+		t.Fatalf("additional fields rejected: %v", err)
+	}
+	if extended.Operation != "status" {
+		t.Fatal("additional field changed the operation")
+	}
+	for _, raw := range []string{`{"operation":1}`, `{} {}`, strings.Repeat(" ", handoffMaxMessage+1)} {
 		var request handoffRequest
 		if err := decodeHandoffJSON([]byte(raw), &request); err == nil {
 			t.Fatalf("invalid JSON accepted: %.20q", raw)
@@ -988,6 +1037,10 @@ func TestHandoffExplicitKeepAliveMatchesNormalAccept(t *testing.T) {
 		{name: "idle_only", options: &internet.SocketConfig{TcpKeepAliveIdle: 41}},
 		{name: "interval_only", options: &internet.SocketConfig{TcpKeepAliveInterval: 17}},
 		{name: "idle_and_interval", options: &internet.SocketConfig{TcpKeepAliveIdle: 41, TcpKeepAliveInterval: 17}},
+		{name: "brocade_inbound", options: &internet.SocketConfig{
+			TcpKeepAliveIdle: 300, TcpKeepAliveInterval: 90,
+			CustomSockopt: []*internet.CustomSockopt{{System: "linux", Network: "tcp", Level: "6", Opt: "6", Type: "int", Value: "3"}},
+		}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			ordinary, err := internet.ListenSystem(context.Background(), &net.TCPAddr{IP: net.ParseIP("127.0.0.1")}, testCase.options)
@@ -1068,8 +1121,188 @@ func TestHandoffExplicitKeepAliveMatchesNormalAccept(t *testing.T) {
 				if testCase.options.TcpKeepAliveInterval > 0 && (normal[0] != 1 || normal[2] != int(testCase.options.TcpKeepAliveInterval)) {
 					t.Fatalf("ordinary listener did not apply explicit keepalive interval: %v", normal)
 				}
+				if testCase.name == "brocade_inbound" && normal != [4]int{1, 300, 90, 3} {
+					t.Fatalf("Brocade keepalive must not inherit the host probe count: %v", normal)
+				}
 			}
 		})
+	}
+}
+
+func TestHandoffTCPFallbackWithMPTCPPreference(t *testing.T) {
+	t.Setenv("GODEBUG", "multipathtcp=0")
+	config := &internet.SocketConfig{
+		TcpMptcp: true, TcpKeepAliveIdle: 300, TcpKeepAliveInterval: 90,
+		CustomSockopt: []*internet.CustomSockopt{{System: "linux", Network: "tcp", Level: "6", Opt: "6", Type: "int", Value: "3"}},
+	}
+	// Build the exact TCP result of a compatibility fallback independently of
+	// this test host's MPTCP capabilities. Retain the requested MPTCP preference
+	// in the source and candidate configuration digests.
+	bindConfig := proto.Clone(config).(*internet.SocketConfig)
+	bindConfig.TcpMptcp = false
+	bound, err := internet.ListenSystem(context.Background(), &net.TCPAddr{IP: net.ParseIP("127.0.0.1")}, bindConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := bound.(*net.TCPListener)
+	defer listener.Close()
+	identity, err := inspectHandoffListener(listener)
+	if err != nil || identity.Protocol != unix.IPPROTO_TCP {
+		t.Fatalf("expected ordinary TCP: identity=%+v err=%v", identity, err)
+	}
+	manifest := handoffTestManifest(t, listener)
+	source := handoffTestControl(t, manifest)
+	if _, _, err := source.open(identity.Address, false, config, func() (net.Listener, error) { return listener, nil }); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := duplicateHandoffListener(listener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest = handoffTestManifest(t, listener)
+	manifest.Listeners[0] = handoffEndpoint{
+		Address: identity.Address, FD: fd, Protocol: unix.IPPROTO_TCP,
+		SocketInode: identity.SocketInode, SocketCookie: identity.SocketCookie,
+		SocketConfigSHA256: handoffTestDigest(t, config),
+	}
+	candidate := handoffTestControl(t, manifest)
+	imported, gate, err := candidate.open(identity.Address, false, config, func() (net.Listener, error) {
+		t.Fatal("fallback import must preserve its actual TCP socket, not bind another listener")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer imported.Close()
+	client := handoffTestDial(t, identity.Address)
+	defer client.Close()
+	accepted, err := imported.(*net.TCPListener).AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accepted.Close()
+	if err := gate.prepareConnection(accepted); err != nil {
+		t.Fatal(err)
+	}
+	var got [4]int
+	raw, err := accepted.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var optionErr error
+	err = raw.Control(func(fd uintptr) {
+		for i, option := range []struct{ level, option int }{
+			{unix.SOL_SOCKET, unix.SO_KEEPALIVE}, {unix.IPPROTO_TCP, unix.TCP_KEEPIDLE},
+			{unix.IPPROTO_TCP, unix.TCP_KEEPINTVL}, {unix.IPPROTO_TCP, unix.TCP_KEEPCNT},
+		} {
+			got[i], optionErr = unix.GetsockoptInt(int(fd), option.level, option.option)
+			if optionErr != nil {
+				return
+			}
+		}
+	})
+	if err != nil || optionErr != nil || got != [4]int{1, 300, 90, 3} {
+		t.Fatalf("fallback handoff lost keepalive: got=%v raw=%v option=%v", got, err, optionErr)
+	}
+}
+
+func TestHandoffKeepAliveRebindFromMPTCP(t *testing.T) {
+	t.Setenv("GODEBUG", "multipathtcp=1")
+	for _, ip := range []string{"127.0.0.1", "::1"} {
+		t.Run(ip, func(t *testing.T) {
+			bound, err := internet.ListenSystem(context.Background(), &net.TCPAddr{IP: net.ParseIP(ip)}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := bound.(*net.TCPListener)
+			defer old.Close()
+			identity, err := inspectHandoffListener(old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if identity.Protocol != unix.IPPROTO_MPTCP {
+				t.Skip("kernel did not create an MPTCP listener")
+			}
+			manifest := handoffTestManifest(t, old)
+			manifest.Listeners[0].Protocol = identity.Protocol
+			source := handoffTestControl(t, manifest)
+			listener, gate := handoffTestOpen(t, source, old)
+			serveHandoffEcho(t, listener, gate, 'o')
+			if err := source.markReady(); err != nil {
+				t.Fatal(err)
+			}
+			requireHandoffRPC(t, source, "resume", 1)
+			oldClient := handoffTestDial(t, identity.Address)
+			handoffTestExchange(t, oldClient, 'o', '1')
+			requireHandoffRPC(t, source, "pause", 2)
+			// Changed socket options require a fresh bind while the old MPTCP
+			// socket and its accepted connection still exist. Protocol 0 lets
+			// this new endpoint record a compatibility fallback, not inherit
+			// the source's protocol or mutate its shared FD.
+			manifest = handoffTestManifest(t, old)
+			manifest.Listeners[0].Protocol = 0
+			candidate := handoffTestControl(t, manifest)
+			config := &internet.SocketConfig{
+				TcpMptcp: true, TcpKeepAliveIdle: 300, TcpKeepAliveInterval: 90,
+				CustomSockopt: []*internet.CustomSockopt{{System: "linux", Network: "tcp", Level: "6", Opt: "6", Type: "int", Value: "3"}},
+			}
+			fresh, freshGate, err := candidate.open(identity.Address, false, config, func() (net.Listener, error) {
+				return internet.ListenSystem(context.Background(), old.Addr(), config)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			serveHandoffEcho(t, fresh.(*net.TCPListener), freshGate, 'n')
+			if err := candidate.markReady(); err != nil {
+				t.Fatal(err)
+			}
+			requireHandoffRPC(t, candidate, "resume", 1)
+			gate.close()
+			if err := old.Close(); err != nil { // retire admission, not accepted connections
+				t.Fatal(err)
+			}
+			handoffTestExchange(t, oldClient, 'o', '2')
+			newClient := handoffTestDial(t, identity.Address)
+			handoffTestExchange(t, newClient, 'n', '3')
+			keepAlive, err := handoffKeepAlive(fresh.(*net.TCPListener))
+			if err != nil || !keepAlive.Enable || keepAlive.Idle != 300*time.Second || keepAlive.Interval != 90*time.Second || keepAlive.Count != 3 {
+				t.Fatalf("new listener lost keepalive: config=%+v err=%v", keepAlive, err)
+			}
+			t.Logf("source protocol=%d candidate protocol=%d; old and new connections both usable", identity.Protocol, candidate.status().Listeners[0].Protocol)
+		})
+	}
+}
+
+func TestHandoffRejectsUnappliedKeepAlive(t *testing.T) {
+	listener := handoffTestListener(t)
+	config := &internet.SocketConfig{TcpKeepAliveIdle: 300, TcpKeepAliveInterval: 90}
+	before, err := handoffKeepAlive(listener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := inspectHandoffListener(listener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := duplicateHandoffListener(listener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := handoffTestManifest(t, listener)
+	manifest.Listeners[0] = handoffEndpoint{
+		Address: identity.Address, FD: fd, Protocol: identity.Protocol,
+		SocketInode: identity.SocketInode, SocketCookie: identity.SocketCookie,
+		SocketConfigSHA256: handoffTestDigest(t, config),
+	}
+	candidate := handoffTestControl(t, manifest)
+	if _, _, err := candidate.open(identity.Address, false, config, func() (net.Listener, error) {
+		t.Fatal("must not rebind a rejected inherited listener")
+		return nil, nil
+	}); err == nil || !strings.Contains(err.Error(), "keepalive") {
+		t.Fatalf("matching digest must not certify unapplied keepalive: %v", err)
+	}
+	if after, err := handoffKeepAlive(listener); err != nil || before != after {
+		t.Fatalf("rejecting candidate mutated source: before=%+v after=%+v err=%v", before, after, err)
 	}
 }
 

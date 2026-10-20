@@ -21,6 +21,8 @@ func InitHandoff() error {
 func MarkHandoffReady() error { return nil }
 func CloseHandoff() error     { return nil }
 
+func RecordHandoffStartupFailure(error) {}
+
 func openHandoffListener(_ string, _ bool, _ *internet.SocketConfig, bind func() (net.Listener, error)) (net.Listener, handoffGate, error) {
 	l, err := bind()
 	return l, nil, err
