@@ -388,7 +388,7 @@ impl ConsoleServices {
 /// printed into the command an operator runs on a new machine, and a fallback naming a port with
 /// no listener produces an enrolment that fails at the first fetch. A deployment that splits the
 /// faces passes its own value, and `main.rs` derives it from the address the agent face bound.
-pub const DEFAULT_AGENT_ORIGIN: &str = "http://127.0.0.1:8008";
+pub const DEFAULT_AGENT_ORIGIN: &str = "http://127.0.0.1:8080";
 
 impl AppState {
     pub fn new(store: PgStore) -> Self {
@@ -9805,7 +9805,7 @@ mod tests {
 
     #[test]
     fn subscription_origin_accepts_direct_http_ip_in_every_profile() {
-        for origin in ["http://192.0.2.10:8008", "http://[2001:db8::10]:8008"] {
+        for origin in ["http://192.0.2.10:8080", "http://[2001:db8::10]:8080"] {
             assert_eq!(
                 resolve_subscription_origin(None, origin.to_owned()).as_deref(),
                 Some(origin)
@@ -9823,14 +9823,14 @@ mod tests {
     fn stored_agent_origin_overrides_the_startup_origin() {
         assert_eq!(
             resolve_agent_public_url(
-                "http://192.0.2.10:8008".to_owned(),
+                "http://192.0.2.10:8080".to_owned(),
                 Some("http://192.0.2.11:9000/".to_owned())
             ),
             "http://192.0.2.11:9000"
         );
         assert_eq!(
-            resolve_agent_public_url("http://192.0.2.10:8008".to_owned(), None),
-            "http://192.0.2.10:8008"
+            resolve_agent_public_url("http://192.0.2.10:8080".to_owned(), None),
+            "http://192.0.2.10:8080"
         );
     }
 
@@ -10690,7 +10690,7 @@ mod tests {
 
     #[test]
     fn install_command_keeps_the_direct_http_ip_and_port() {
-        let origin = "http://192.0.2.10:8008";
+        let origin = "http://192.0.2.10:8080";
         let dist = AgentDistribution {
             agent_public_url: origin.to_owned(),
             ..AgentDistribution::default()
@@ -10701,8 +10701,8 @@ mod tests {
             "abc",
             InstallCredential::Enrollment("broc_enroll_test"),
         );
-        assert!(command.contains("curl -fsSL 'http://192.0.2.10:8008/enroll/install.sh'"));
-        assert!(command.contains("--server 'http://192.0.2.10:8008'"));
+        assert!(command.contains("curl -fsSL 'http://192.0.2.10:8080/enroll/install.sh'"));
+        assert!(command.contains("--server 'http://192.0.2.10:8080'"));
     }
 
     #[test]

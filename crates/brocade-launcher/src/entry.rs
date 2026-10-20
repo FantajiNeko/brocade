@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn capability_encodes_delimiters_and_accepts_direct_http_origins() {
         let token = format!("{TOKEN}/?#&= +%");
-        let result = entry_url("http://192.0.2.10:8008", Some(&token), true).unwrap();
+        let result = entry_url("http://192.0.2.10:8080", Some(&token), true).unwrap();
         let url = reqwest::Url::parse(&result).unwrap();
         assert_eq!(url.path(), "/");
         assert!(url.query().is_none());

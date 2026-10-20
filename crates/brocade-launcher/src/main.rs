@@ -544,11 +544,11 @@ mod tests {
     #[test]
     fn direct_ip_bootstrap_prints_a_complete_initialization_link() {
         let token = "bootstrap-test-token-with-at-least-32-bytes";
-        let message = initialization_instructions("http://192.0.2.10:8008", token, true).unwrap();
+        let message = initialization_instructions("http://192.0.2.10:8080", token, true).unwrap();
         assert!(message.contains(&format!(
-            "初始化地址：http://192.0.2.10:8008/#/initialize/{token}"
+            "初始化地址：http://192.0.2.10:8080/#/initialize/{token}"
         )));
-        let logged = initialization_instructions("http://192.0.2.10:8008", token, false).unwrap();
+        let logged = initialization_instructions("http://192.0.2.10:8080", token, false).unwrap();
         assert!(!logged.contains(token));
         assert!(logged.contains("sudo brocade url"));
     }
@@ -581,8 +581,8 @@ mod tests {
             panic!("address command")
         };
         let access = args.resolve().unwrap();
-        assert_eq!(access.bind, "0.0.0.0:8008".parse().unwrap());
-        assert_eq!(access.public_url, "http://192.0.2.10:8008");
+        assert_eq!(access.bind, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(access.public_url, "http://192.0.2.10:8080");
         let cli = Cli::try_parse_from([
             "brocade",
             "address",

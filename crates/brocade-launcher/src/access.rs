@@ -3,17 +3,17 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
-pub(crate) const DEFAULT_PORT: u16 = 8008;
+pub(crate) const DEFAULT_PORT: u16 = 8080;
 
 #[derive(Clone, Debug, Default, Args)]
 pub(crate) struct AccessArgs {
     /// 其他机器访问本机的 IP；默认使用默认路由的本机地址
     #[arg(long, value_name = "IP")]
     pub(crate) public_ip: Option<IpAddr>,
-    /// HTTP 监听端口；默认 8008
+    /// HTTP 监听端口；默认 8080
     #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..), conflicts_with = "bind")]
     pub(crate) port: Option<u16>,
-    /// 完整监听地址；默认 0.0.0.0:8008
+    /// 完整监听地址；默认 0.0.0.0:8080
     #[arg(long, value_name = "ADDR")]
     pub(crate) bind: Option<SocketAddr>,
 }
@@ -110,10 +110,10 @@ mod tests {
 
     #[test]
     fn default_port_and_ipv4_ipv6_origins_are_direct_http() {
-        assert_eq!(DEFAULT_PORT, 8008);
+        assert_eq!(DEFAULT_PORT, 8080);
         assert_eq!(
             ip_url("192.0.2.10".parse().unwrap(), DEFAULT_PORT).unwrap(),
-            "http://192.0.2.10:8008"
+            "http://192.0.2.10:8080"
         );
         assert_eq!(
             ip_url("2001:db8::10".parse().unwrap(), 9000).unwrap(),

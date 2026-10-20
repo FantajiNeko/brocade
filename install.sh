@@ -33,7 +33,7 @@ Usage: [sudo] sh install.sh [--public-ip IP] [--port PORT]
                               [--no-start]
 
 Installs the two binaries from this release bundle, the minimal OS prerequisites, and a dedicated
-non-login `brocade` account. Serves HTTP directly on the server IP, port 8008 by default.
+non-login `brocade` account. Serves HTTP directly on the server IP, port 8080 by default.
 An interactive terminal lets you confirm the detected IP, port, and database choice.
 --public-ip overrides automatic local-address detection, including behind NAT.
 
@@ -44,7 +44,8 @@ EOF
 }
 
 public_ip=
-port=8008
+default_port=8080
+port=$default_port
 port_specified=false
 database_type=
 database_url=
@@ -177,7 +178,7 @@ if [ "$database_type" = external ]; then
 fi
 
 say "安装配置："
-say "  公网接入：服务器 IP 直连 HTTP（默认端口 8008）"
+say "  公网接入：服务器 IP 直连 HTTP（默认端口 8080）"
 if [ "$database_type" = managed ]; then
     say "  数据库：Brocade 托管 PostgreSQL"
 else
@@ -363,9 +364,9 @@ if [ -z "$public_ip" ] && [ -t 0 ]; then
 fi
 if [ "$port_specified" = false ] && [ -t 0 ]; then
     while :; do
-        printf 'HTTP 端口 [8008]：'
+        printf 'HTTP 端口 [%s]：' "$default_port"
         IFS= read -r selected_port || die "未读取到 HTTP 端口"
-        port=${selected_port:-8008}
+        port=${selected_port:-$default_port}
         valid_port && break
         say "端口必须是 1 至 65535 之间的整数。"
     done

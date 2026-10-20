@@ -220,7 +220,7 @@ CI 同时生成同名 `.tar.gz.sha256`，用于在解压前校验整个归档。
 sudo sh install.sh
 ```
 
-安装器默认直接提供服务器 IP 的 HTTP 入口，监听 `0.0.0.0:8008`。交互安装先选择托管或外部 PostgreSQL，再确认自动识别的服务器 IP 和端口；重启或升级不会重新分配入口地址。NAT 环境请填写外部机器能访问的 IP，并做好端口映射。非交互安装可指定：
+安装器默认直接提供服务器 IP 的 HTTP 入口，监听 `0.0.0.0:8080`。交互安装先选择托管或外部 PostgreSQL，再确认自动识别的服务器 IP 和端口；端口提示为 `HTTP 端口 [8080]：`，直接回车使用 8080，也可输入 1 至 65535 之间的自定义端口。重启或升级不会重新分配入口地址。NAT 环境请填写外部机器能访问的 IP，并做好端口映射。非交互安装可指定：
 
 ```sh
 sudo sh install.sh --public-ip 192.0.2.10 --managed-db
@@ -228,13 +228,13 @@ sudo sh install.sh --public-ip 192.0.2.10 --port 9000 \
   --database-url postgresql://brocade:password@database.example.net/brocade
 ```
 
-省略 `--public-ip` 时，安装器使用默认路由的本机地址；省略 `--port` 时使用 8008。包含密码的数据库连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器校验发行包与 CPU/libc 后补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建 `brocade` 服务账号并原子安装二进制和配置。有 systemd 时自动启用并启动 `brocade.service`，等待就绪后输出 `http://服务器IP:8008/#/initialize/...` 完整初始化链接；打开后设置管理员用户名和密码即可。无 systemd 时在当前终端前台运行。自动化仅安装文件可加 `--no-start`，随后手动启动：
+省略 `--public-ip` 时，安装器使用默认路由的本机地址；省略 `--port` 时使用 8080。包含密码的数据库连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器校验发行包与 CPU/libc 后补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建 `brocade` 服务账号并原子安装二进制和配置。有 systemd 时自动启用并启动 `brocade.service`，等待就绪后输出 `http://服务器IP:8080/#/initialize/...` 完整初始化链接；打开后设置管理员用户名和密码即可。无 systemd 时在当前终端前台运行。自动化仅安装文件可加 `--no-start`，随后手动启动：
 
 ```sh
 sudo brocade up
 ```
 
-未设置 `DATABASE_URL` 时，launcher 按 CPU 与 libc 下载并校验固定的 PostgreSQL 17.11.0，在持久目录维护数据库；设置了 `DATABASE_URL` 则只连接外部数据库，失败不会回退并新建空库。可用 `--managed-db` 或 `--external-db` 明确选择。系统安装器将访问地址保存到 `/etc/brocade/agent-public-url`，监听地址保存到 `/etc/brocade/listen-address`，以后启动继续使用。直接从发行包执行时可传 `brocade-launcher up --public-ip 192.0.2.10 --port 8008`；仅查看识别结果可执行 `brocade-launcher address`。
+未设置 `DATABASE_URL` 时，launcher 按 CPU 与 libc 下载并校验固定的 PostgreSQL 17.11.0，在持久目录维护数据库；设置了 `DATABASE_URL` 则只连接外部数据库，失败不会回退并新建空库。可用 `--managed-db` 或 `--external-db` 明确选择。系统安装器将访问地址保存到 `/etc/brocade/agent-public-url`，监听地址保存到 `/etc/brocade/listen-address`，以后启动继续使用。直接从发行包执行时可传 `brocade-launcher up --public-ip 192.0.2.10 --port 8080`；仅查看识别结果可执行 `brocade-launcher address`。
 
 首次启动生成一次性初始化凭据。完整链接把凭据放在 `#/initialize/...` fragment 中，网页接收后清除地址栏 fragment，只在内存保留直到提交。完整链接仅向交互终端输出，重定向和 systemd 日志只输出普通地址；再次获取入口运行 `sudo brocade url`。初始化成功后凭据失效，私有文件被删除。初始化只创建系统管理员和根租户；登录后由入门向导纳管首台机器、创建链和首个用户、发布配置并完成真实节点拨测。登录、订阅链接和 Agent 安装命令均支持 HTTP IP 入口。
 
@@ -387,7 +387,7 @@ ssh deploy@console.example.net \
 ```dotenv
 DATABASE_URL=postgres://brocade:CHANGE_ME@127.0.0.1:5432/brocade
 BROCADE_BOOTSTRAP_TOKEN=CHANGE_ME
-BROCADE_ADMIN_BIND=127.0.0.1:8008
+BROCADE_ADMIN_BIND=127.0.0.1:8080
 BROCADE_AGENT_PUBLIC_URL=https://console.example.net
 BROCADE_CACHE_DIR=/var/cache/brocade
 BROCADE_PROBE_RUNTIME_DIR=/run/brocade/probes
@@ -426,7 +426,7 @@ sudo chmod 0600 /opt/brocade/console.env
 Description=Brocade Console listener
 
 [Socket]
-ListenStream=127.0.0.1:8008
+ListenStream=127.0.0.1:8080
 Accept=no
 Backlog=4096
 NoDelay=true
@@ -525,7 +525,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/console.example.net/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8008;
+        proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -624,7 +624,7 @@ SQL 归因范围是请求任务内的查询，不包含后台任务、另行 spa
 或 SSH 转发的本地端口，运行顺序、只读的 HTTP 基线：
 
 ```sh
-BROCADE_BASE_URL=http://127.0.0.1:8008 \
+BROCADE_BASE_URL=http://127.0.0.1:8080 \
   BROCADE_BASELINE_REPEATS=10 node scripts/performance-baseline.mjs > baseline.json
 node --test scripts/performance-baseline.test.mjs
 ```
