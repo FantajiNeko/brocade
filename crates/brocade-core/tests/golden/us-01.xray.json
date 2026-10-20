@@ -301,6 +301,7 @@
         "downlinkOnly": 5,
         "handshake": 60,
         "statsUserDownlink": true,
+        "statsUserOnline": true,
         "statsUserUplink": true,
         "uplinkOnly": 2
       }

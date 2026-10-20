@@ -228,7 +228,7 @@ const EMPTY: Form = {
   connDownlink: '5',
   connBuffer: '',
   connHandshake: '60',
-  statsOnline: 'false',
+  statsOnline: 'true',
   muxConcurrency: String(DEFAULT_HOP_MUX.concurrency),
   muxPrewarmWorkers: String(DEFAULT_HOP_MUX.prewarm_workers),
   muxReuseThreshold: String(DEFAULT_HOP_MUX.reuse_threshold),
@@ -275,7 +275,7 @@ function formOf(s: ModelSettings): Form {
     // null 需转换为空串而非 '0'：该字段的空值表示不写入该键，而 0 表示不缓冲。
     connBuffer: s.connection?.buffer_size_kb == null ? '' : String(s.connection.buffer_size_kb),
     connHandshake: String(s.connection?.handshake_secs ?? 60),
-    statsOnline: String(s.stats_user_online ?? false),
+    statsOnline: String(s.stats_user_online ?? true),
     muxConcurrency: String(s.relay_mux?.concurrency ?? 1),
     muxPrewarmWorkers: String(s.relay_mux?.prewarm_workers ?? 0),
     muxReuseThreshold: String(s.relay_mux?.reuse_threshold ?? 2),

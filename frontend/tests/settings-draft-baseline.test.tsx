@@ -435,6 +435,20 @@ afterEach(() => {
 });
 
 describe('设置页分段保存的基准', () => {
+  it.each([undefined, true, false])('在线来源缺省开启，并保留已保存的 %s 选择', async saved => {
+    const settings: Partial<ReturnType<typeof committedSettings>> = committedSettings();
+    if (saved === undefined) delete settings.stats_user_online;
+    else settings.stats_user_online = saved;
+    ROUTES['/settings'] = () => settings;
+    render(<Harness />);
+    const toggle = within(await screen.findByRole('group', { name: '在线来源统计' }));
+    expect(toggle.getByRole('button', { name: '记录公网 IP' }).getAttribute('aria-pressed')).toBe(
+      String(saved ?? true),
+    );
+    expect(toggle.getByRole('button', { name: '关闭' }).getAttribute('aria-pressed')).toBe(String(!(saved ?? true)));
+    expect(draft.ops()).toEqual([]);
+  });
+
   it.each(pingPresetCases)('%s 填入六个双栈目标，保存后才持久化', async (label, carriers) => {
     const original: PingProbeSettings = {
       targets: [{ name: '原有目标', kind: 'icmp', ipv4: '192.0.2.1', ipv6: null }],

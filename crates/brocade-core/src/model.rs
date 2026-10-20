@@ -103,7 +103,7 @@ pub struct ModelSettings {
     /// This setting only counts. xray does not refuse a connection at any number, so
     /// acting on the count is the control plane's responsibility and outside the scope of
     /// this field.
-    #[serde(default)]
+    #[serde(default = "default_stats_user_online")]
     pub stats_user_online: bool,
 }
 
@@ -121,9 +121,13 @@ impl Default for ModelSettings {
             relay_mux: HopMux::default(),
             reverse_health: ReverseHealth::default(),
             reverse_health_overrides: Vec::new(),
-            stats_user_online: false,
+            stats_user_online: default_stats_user_online(),
         }
     }
+}
+
+fn default_stats_user_online() -> bool {
+    true
 }
 
 /// Bootstrap scheme used before the database installs its random four-stage value.

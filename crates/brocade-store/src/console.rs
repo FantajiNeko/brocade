@@ -314,6 +314,12 @@ pub(crate) async fn bootstrap_root_tenant_tx(
     tenant_id: &str,
 ) -> Result<u64> {
     let previous = lock_control_state(tx).await?;
+    // Seed current product defaults in the initialization revision, preserving both released
+    // migration checksums and explicitly saved settings in already initialized installations.
+    sqlx::query("UPDATE control_state SET stats_user_online = $1 WHERE id = TRUE")
+        .bind(brocade_core::model::ModelSettings::default().stats_user_online)
+        .execute(&mut **tx)
+        .await?;
     let revision_id = insert_revision(tx, actor.operator_id(), "initialize system").await?;
     let changed = create_tenant_tx(
         tx,

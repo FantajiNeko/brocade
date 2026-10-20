@@ -85,6 +85,9 @@ struct TestPg {
 #[path = "cases/node_initialization.rs"]
 mod node_initialization_tests;
 
+#[path = "cases/online_source_defaults.rs"]
+mod online_source_defaults_tests;
+
 #[path = "cases/unattended_deployment.rs"]
 mod unattended_deployment_tests;
 
