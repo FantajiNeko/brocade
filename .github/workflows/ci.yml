@@ -278,12 +278,15 @@ jobs:
       # full Cargo resolution, not only packages reached on the runner's host target.
       - name: Rust dependency vulnerability audit
         run: |
+          python3 -m unittest discover -s scripts/tests -p test_rust_vulnerability_audit.py
+          metadata="${RUNNER_TEMP}/rust-audit-metadata.json"
+          cargo metadata --format-version 1 --locked > "$metadata"
           results=$(
-            cargo metadata --format-version 1 --locked |
+            cat "$metadata" |
               jq -c '{queries: [.resolve.nodes[].id as $id | .packages[] | select(.id == $id and .source != null) | {package: {ecosystem: "crates.io", name: .name}, version: .version}]}' |
               curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 60 \
                 --header 'Content-Type: application/json' --data-binary @- https://api.osv.dev/v1/querybatch |
-              jq -c '[.results[] | .vulns[]? | select((.withdrawn // "") == "")] | unique_by(.id)'
+              jq -c --slurpfile metadata "$metadata" -f scripts/rust-vulnerability-audit.jq
           )
           if [ "$results" != '[]' ]; then
             echo "$results" | jq -r '.[] | [.id, (.summary // "known vulnerability")] | @tsv'
