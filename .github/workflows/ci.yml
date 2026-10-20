@@ -324,7 +324,8 @@ jobs:
 
   build:
     name: brocade dist (${{ matrix.arch }}-${{ matrix.libc }})
-    runs-on: ubuntu-latest
+    # GNU artifacts must load on Ubuntu 22.04 (glibc 2.35), not inherit a moving runner ABI.
+    runs-on: ubuntu-22.04
     strategy:
       # One architecture failing lets the other finish. Seeing both is what distinguishes a problem
       # in the code from a problem in the cross-compilation.
@@ -422,6 +423,18 @@ jobs:
           cargo build --release --locked --target ${{ matrix.triple }} \
             -p brocade-console -p brocade-launcher
 
+      - name: Exercise static launcher and managed PostgreSQL on GNU libc
+        if: matrix.arch == 'x86_64' && matrix.libc == 'musl'
+        env:
+          BROCADE_RUN_LAUNCHER_PG_TESTS: "1"
+          BROCADE_ZIG_TARGET: x86_64-linux-musl
+          CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
+          AR_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-ar
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        run: |
+          cargo test -p brocade-launcher --release --locked \
+            --target x86_64-unknown-linux-musl -- --include-ignored
+
       - name: Preserve embedded Xray build records
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -442,7 +455,13 @@ jobs:
             sha256sum "$bin"
             file -b "$bin"
             if [ "${{ matrix.libc }}" = gnu ]; then
-              echo "highest glibc symbol required: $(readelf -V "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+              glibc_floor=$(readelf -V "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1)
+              [ -n "$glibc_floor" ]
+              echo "highest glibc symbol required: $glibc_floor"
+              if [ "$(printf '%s\n' 2.35 "$glibc_floor" | sort -V | tail -1)" != 2.35 ]; then
+                echo "GNU bundle requires glibc newer than the supported 2.35 baseline: $bin" >&2
+                exit 1
+              fi
               needed=$(readelf -d "$bin" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
               unexpected=$(printf '%s\n' "$needed" | grep -Ev \
                 '^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|liblzma\.so\.5|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$' || true)

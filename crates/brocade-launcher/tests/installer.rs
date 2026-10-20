@@ -44,6 +44,96 @@ fn installer_section(start: &str, end: &str) -> &'static str {
     &INSTALLER[start..end]
 }
 
+#[test]
+fn installer_accepts_static_musl_on_gnu_without_accepting_other_architectures() {
+    let check = installer_section("case $(uname -m) in\n", "\nhas_ca_bundle() {");
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let script = root.path().join("check-platform.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\nscript_dir=$1\n\
+             die() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n{check}\n"
+        ),
+    )
+    .unwrap();
+    for (machine_arch, machine_libc, bundle, accepted) in [
+        ("x86_64", "gnu", "x86_64-musl", true),
+        ("aarch64", "gnu", "aarch64-musl", true),
+        ("x86_64", "gnu", "x86_64-gnu", true),
+        ("x86_64", "musl", "x86_64-musl", true),
+        ("x86_64", "musl", "x86_64-gnu", false),
+        ("x86_64", "gnu", "aarch64-musl", false),
+        ("aarch64", "gnu", "x86_64-gnu", false),
+    ] {
+        executable(
+            &bin.join("uname"),
+            &format!("#!/bin/sh\nprintf '{machine_arch}\\n'\n"),
+        );
+        let ldd = if machine_libc == "gnu" {
+            "#!/bin/sh\nprintf 'ldd (GNU libc) 2.35\\n'\n"
+        } else {
+            "#!/bin/sh\nprintf 'musl libc Version 1.2.5\\n' >&2\nexit 1\n"
+        };
+        executable(&bin.join("ldd"), ldd);
+        fs::write(root.path().join("BROCADE_PLATFORM"), format!("{bundle}\n")).unwrap();
+        let output = Command::new("sh")
+            .arg(&script)
+            .arg(root.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "{machine_arch}-{machine_libc} {bundle}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn launcher_probe_preserves_loader_errors_and_suppresses_success_output() {
+    let check = installer_section("run_launcher --version", "\nresolve_origin() {");
+    let root = tempfile::tempdir().unwrap();
+    let launcher = root.path().join("launcher");
+    let script = root.path().join("probe.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\n\
+             die() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n\
+             run_launcher() {{ \"$BROCADE_TEST_LAUNCHER\" \"$@\"; }}\n{check}\n"
+        ),
+    )
+    .unwrap();
+    for error in ["GLIBC_2.39 not found", "Permission denied"] {
+        executable(
+            &launcher,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{error}' >&2\nexit 127\n"),
+        );
+        let output = Command::new("sh")
+            .arg(&script)
+            .env("BROCADE_TEST_LAUNCHER", &launcher)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(error));
+        assert!(stderr.contains("launcher 无法在当前系统执行"));
+    }
+    executable(&launcher, "#!/bin/sh\nprintf 'brocade 0.3.1\\n'\n");
+    let output = Command::new("sh")
+        .arg(&script)
+        .env("BROCADE_TEST_LAUNCHER", &launcher)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
 fn run_with_terminal_input(command: &mut Command, input: &str) -> Output {
     let (mut master, mut slave) = (-1, -1);
     // SAFETY: Both output pointers are valid and all optional openpty inputs are null.

@@ -741,7 +741,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join("数据库 user's data");
         let cache = root.path().join("cache");
-        let platform = Platform::current().unwrap();
+        let platform = Platform::current().await.unwrap();
         let client = download::client().unwrap();
         let mut original_identity = None;
         let mut socket = None;

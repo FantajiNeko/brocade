@@ -4,10 +4,12 @@
 
 ## 下载
 
-从 [Releases](https://github.com/akiasprin/brocade/releases/latest) 下载与服务器匹配的发行包和同名 `.sha256`，校验后解压。Alpine 等 musl 系统选 `musl`，其余选 `gnu`：
+从 [Releases](https://github.com/akiasprin/brocade/releases/latest) 下载与服务器匹配的发行包和同名 `.sha256`，校验后解压。自 `v0.3.1` 起，GNU 包支持 glibc 2.35 及以上；Alpine 等 musl 系统选 `musl`。静态 musl 包也可安装到同架构 GNU 系统，launcher 会按宿主机的 libc 选择受管 PostgreSQL，不要求额外安装 musl 动态加载器。
+
+`v0.3.0` 的 GNU 包要求 glibc 2.39，且该版本 musl 安装器不支持跨 libc 安装。兼容 Ubuntu 22.04、Debian 12 等较旧 GNU 系统时，请下载 `v0.3.1` 或更新版本：
 
 ```sh
-v=0.3.0 p=linux-x86_64-gnu
+v=0.3.1 p=linux-x86_64-gnu
 url=https://github.com/akiasprin/brocade/releases/download/v$v/brocade-dist-$v-$p.tar.gz
 curl -fLO "$url" && curl -fLO "$url.sha256"
 sha256sum -c brocade-dist-$v-$p.tar.gz.sha256

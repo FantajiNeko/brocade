@@ -216,8 +216,11 @@ case "$ldd_banner" in
 esac
 
 bundle_platform=$(sed -n '1p' "$script_dir/BROCADE_PLATFORM")
-[ "$bundle_platform" = "$machine_arch-$machine_libc" ] ||
-    die "发行包是 $bundle_platform，当前系统是 $machine_arch-$machine_libc"
+# musl bundles are static; their launcher selects PostgreSQL for the host libc at runtime.
+case "$bundle_platform" in
+    "$machine_arch-$machine_libc"|"$machine_arch-musl") ;;
+    *) die "发行包是 $bundle_platform，当前系统是 $machine_arch-$machine_libc" ;;
+esac
 
 has_ca_bundle() {
     for candidate in \
@@ -345,7 +348,7 @@ run_launcher() {
             --init-groups "$launcher_stage" "$@"
     fi
 }
-run_launcher --version >/dev/null 2>&1 || die "launcher 无法在当前系统执行"
+run_launcher --version >/dev/null || die "launcher 无法在当前系统执行；请检查上方的动态加载器或运行库错误"
 resolve_origin() {
     set -- address --port "$port"
     [ -z "$public_ip" ] || set -- "$@" --public-ip "$public_ip"

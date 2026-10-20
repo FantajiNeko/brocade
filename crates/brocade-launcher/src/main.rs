@@ -110,7 +110,6 @@ async fn run(cli: Cli) -> Result<()> {
 
 async fn up(args: UpArgs) -> Result<()> {
     let access = args.access.resolve()?;
-    let platform = Platform::current()?;
     let paths = LauncherPaths::resolve(args.data_dir.clone(), args.cache_dir.clone())?;
     let _instance = paths::InstanceLock::acquire(&paths.runtime)?;
     let client = download::client()?;
@@ -132,6 +131,7 @@ async fn up(args: UpArgs) -> Result<()> {
             url
         }
         DatabaseChoice::Managed => {
+            let platform = Platform::current().await?;
             let root = paths.data.join("postgresql");
             eprintln!(
                 "Database: managed PostgreSQL {}\nData: {}",
