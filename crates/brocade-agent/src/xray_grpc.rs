@@ -23,6 +23,8 @@ use brocade_deployment::protocol::{
     MAX_ONLINE_SOURCE_ENTRIES, MAX_ONLINE_SOURCE_PROTOCOLS, MAX_ONLINE_SOURCE_USERS,
 };
 
+mod transport;
+
 const ADD_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/AddInbound";
 const REMOVE_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/RemoveInbound";
 const LIST_INBOUNDS_PATH: &str = "/xray.app.proxyman.command.HandlerService/ListInbounds";
@@ -31,6 +33,8 @@ const GET_INBOUND_USERS_PATH: &str = "/xray.app.proxyman.command.HandlerService/
 const QUERY_STATS_PATH: &str = "/xray.app.stats.command.StatsService/QueryStats";
 const GET_USERS_STATS_PATH: &str = "/xray.app.stats.command.StatsService/GetUsersStats";
 const MUX_SNAPSHOT_PATH: &str = "/xray.app.stats.command.StatsService/GetMuxSnapshot";
+const REVERSE_HEALTH_SNAPSHOT_PATH: &str =
+    "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot";
 const ADD_USER_OPERATION: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER_OPERATION: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
@@ -196,9 +200,16 @@ pub(crate) fn remove_inbound(api_address: SocketAddr, tag: &str) -> Result<(), S
 }
 
 pub(crate) fn inbound_tags(api_address: SocketAddr) -> Result<Vec<String>, String> {
+    inbound_tags_until(api_address, None)
+}
+
+pub(crate) fn inbound_tags_until(
+    api_address: SocketAddr,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<String>, String> {
     let mut request = Vec::new();
     varint_field(&mut request, 1, 1);
-    let response = grpc_unary(api_address, LIST_INBOUNDS_PATH, &request)?;
+    let response = transport::unary(api_address, LIST_INBOUNDS_PATH, &request, deadline)?;
     decode_inbound_tags(&response)
 }
 
@@ -280,87 +291,9 @@ fn varint(output: &mut Vec<u8>, mut value: u64) {
     output.push(value as u8);
 }
 
-/// One request, one response, one connection. Returns the response protobuf, framing stripped.
+/// Returns the response protobuf, framing stripped. Each attempt owns one connection.
 fn grpc_unary(api_address: SocketAddr, path: &str, request: &[u8]) -> Result<Vec<u8>, String> {
-    let mut message = Vec::with_capacity(request.len() + 5);
-    message.push(0);
-    message.extend_from_slice(
-        &u32::try_from(request.len())
-            .map_err(|_| "xray gRPC request is too large".to_owned())?
-            .to_be_bytes(),
-    );
-    message.extend_from_slice(request);
-    let message = &message[..];
-
-    let address = api_address;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
-        .map_err(|error| format!("connect to xray gRPC api {address}: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("set xray gRPC read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("set xray gRPC write timeout: {error}"))?;
-    let _ = stream.set_nodelay(true);
-
-    stream
-        .write_all(CLIENT_PREFACE)
-        .and_then(|_| write_frame(&mut stream, 4, 0, 0, &settings_payload()))
-        // Connection-level flow control is not covered by SETTINGS and starts at 64 KiB whatever
-        // the stream window says, so it is opened by hand.
-        .and_then(|_| {
-            write_frame(
-                &mut stream,
-                8,
-                0,
-                0,
-                &(WINDOW_SIZE - DEFAULT_WINDOW_SIZE).to_be_bytes(),
-            )
-        })
-        .and_then(|_| {
-            write_frame(
-                &mut stream,
-                1,
-                END_HEADERS,
-                1,
-                &request_headers(api_address, path),
-            )
-        })
-        .and_then(|_| write_frame(&mut stream, 0, END_STREAM, 1, message))
-        .and_then(|_| stream.flush())
-        .map_err(|error| format!("write xray gRPC request: {error}"))?;
-
-    let mut response_data = Vec::new();
-    loop {
-        let frame =
-            read_frame(&mut stream).map_err(|error| format!("read xray gRPC response: {error}"))?;
-        match frame.kind {
-            // DATA
-            0 if frame.stream_id == 1 => {
-                if response_data.len().saturating_add(frame.payload.len()) > WINDOW_SIZE as usize {
-                    return Err("xray gRPC response exceeds snapshot limit".to_owned());
-                }
-                response_data.extend_from_slice(&frame.payload);
-            }
-            // RST_STREAM
-            3 if frame.stream_id == 1 => return Err("xray gRPC reset the stream".to_owned()),
-            // SETTINGS: every non-ACK SETTINGS frame must be acknowledged.
-            4 if frame.flags & ACK == 0 => write_frame(&mut stream, 4, ACK, 0, &[])
-                .map_err(|error| format!("acknowledge xray gRPC settings: {error}"))?,
-            // PING
-            6 if frame.flags & ACK == 0 && frame.payload.len() == 8 => {
-                write_frame(&mut stream, 6, ACK, 0, &frame.payload)
-                    .map_err(|error| format!("acknowledge xray gRPC ping: {error}"))?
-            }
-            // GOAWAY
-            7 => return Err("xray gRPC closed the connection".to_owned()),
-            _ => {}
-        }
-
-        if frame.stream_id == 1 && frame.flags & END_STREAM != 0 {
-            return grpc_response_message(&response_data);
-        }
-    }
+    transport::unary(api_address, path, request, None)
 }
 
 fn settings_payload() -> Vec<u8> {
@@ -414,7 +347,7 @@ fn hpack_integer(output: &mut Vec<u8>, mut value: usize, prefix_bits: u8, first_
 }
 
 fn write_frame(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     kind: u8,
     flags: u8,
     stream_id: u32,
@@ -443,7 +376,7 @@ struct Frame {
     payload: Vec<u8>,
 }
 
-fn read_frame(stream: &mut TcpStream) -> std::io::Result<Frame> {
+fn read_frame(stream: &mut impl Read) -> std::io::Result<Frame> {
     let mut header = [0u8; 9];
     stream.read_exact(&mut header)?;
     let length =
@@ -809,11 +742,7 @@ fn decode_account(message: &[u8]) -> Result<Option<(String, Option<String>)>, St
 pub(crate) fn reverse_health(
     api_address: SocketAddr,
 ) -> Result<brocade_deployment::protocol::ReverseHealthReport, String> {
-    let response = grpc_unary(
-        api_address,
-        "/xray.app.stats.command.StatsService/GetReverseHealthSnapshot",
-        &[],
-    )?;
+    let response = grpc_unary(api_address, REVERSE_HEALTH_SNAPSHOT_PATH, &[])?;
     let mut cursor = 0;
     while let Some((number, field)) = next_field(&response, &mut cursor)? {
         if let (1, Field::Bytes(bytes)) = (number, field) {
@@ -1570,6 +1499,24 @@ mod tests {
                 panic!("xray exited before API became ready: {status}");
             }
             thread::sleep(Duration::from_millis(100));
+        }
+
+        for pattern in ["otherdomain>>>", "sniffingfailed>>>"] {
+            let stats = query_stats(api_address, &format!("{pattern}v2"))
+                .expect("native detail checkpoint snapshot");
+            assert!(stats
+                .iter()
+                .any(|row| row.name == format!("{pattern}version") && row.value == 2));
+            let checkpoints = (1..=256)
+                .map(|id| format!("{id}:0:0"))
+                .collect::<Vec<_>>()
+                .join(",");
+            assert!(query_stats(
+                api_address,
+                &format!("{pattern}ack>>>{}>>>{checkpoints}", "0".repeat(32))
+            )
+            .expect("native empty checkpoint acknowledgement")
+            .is_empty());
         }
 
         add_user(

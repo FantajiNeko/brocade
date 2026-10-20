@@ -268,6 +268,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Initialization belongs to the server: closing the installation page cannot abandon it.
+    let initialization_store = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Err(error) = initialization_store.process_node_initialization().await {
+                eprintln!("node initialization: {error}");
+            }
+        }
+    });
+
     // Permission automation.  The model write and its outbox row are one transaction in store;
     // this loop only turns queued rows into non-disruptive grants deployments. Once any row is
     // due it folds the whole queued batch into its newest revision, including backed-off rows;

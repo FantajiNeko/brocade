@@ -55,8 +55,8 @@ const world: World = {
   system: compileView().system,
 };
 
-const fixedApp = { id: APPS[0].id, label: APPS[0].label };
-const entry: Entry = scene === 'node' ? { node: 'hk-bgp' } : { fixedApp };
+const defaultApp = { id: APPS[0].id, label: APPS[0].label };
+const entry: Entry = scene === 'node' ? { node: 'hk-bgp' } : { defaultApp };
 
 function sceneDraft(key: SceneKey): Draft {
   const base: Draft = {
@@ -238,7 +238,7 @@ createRoot(document.getElementById('root')!).render(
             <ChainWizard
               key={scene}
               node={entry.node ? world.nodes.find(node => node.node_id === entry.node) : undefined}
-              fixedApp={entry.fixedApp}
+              defaultApp={entry.defaultApp}
               onDone={() => undefined}
             />
           ) : (

@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { SessionProvider } from '../src/session';
 
 window.matchMedia = ((query: string) => ({
   matches: false,
@@ -29,6 +30,7 @@ describe('发布预览中的用户订阅变更', () => {
     const after = 'vless://new.example#新入口';
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
+      if (path === '/deployments/plan/artifacts?include=content') return json({ revision: 1144, targets: [] });
       if (path === '/nodes/agent-state') return json({ nodes: [{ node_id: 'n1', name: '台北一号' }] });
       if (path === '/artifacts/index?revision=1144') {
         return json({
@@ -89,15 +91,36 @@ describe('发布预览中的用户订阅变更', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const view = render(
       <QueryClientProvider client={client}>
-        <ArtifactChanges revision={1144} base={1143} targets={[{ node_id: 'n1' }]} />
+        <SessionProvider
+          value={{
+            initial: { node_count: 1, chain_group_count: [] },
+            who: {
+              operator_id: 'reviewer',
+              role: 'system-admin',
+              tenant_scope: null,
+              token_prefix: null,
+              masked_assets: false,
+            },
+          }}
+        >
+          <ArtifactChanges revision={1144} base={1143} targets={[{ node_id: 'n1' }]} />
+        </SessionProvider>
       </QueryClientProvider>,
     );
 
     expect(await view.findByText('用户 alice')).toBeTruthy();
     expect(view.getByText('用户订阅变更 · 1 人')).toBeTruthy();
-    expect(view.getByText('与修订 1143 相比，上方 1 台机器的产物没有变化。')).toBeTruthy();
+    expect(
+      view.getByText('节点已应用产物与本次计划一致，无文件内容变更；重应用等操作以上方执行计划为准。'),
+    ).toBeTruthy();
     await view.findByText((_, element) => element?.tagName === 'TD' && element.textContent === after);
     expect(view.container.querySelector('tr.add')?.textContent).toContain('new.example');
     expect(view.container.querySelector('tr.del')?.textContent).toContain('old.example');
+    expect(view.container.textContent).not.toContain('platform.acme');
+    expect(view.container.querySelector('[title*="platform.acme"]')).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/artifacts/content/user/platform.acme%3Aalice/uri?revision=1144',
+      expect.anything(),
+    );
   });
 });

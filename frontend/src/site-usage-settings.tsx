@@ -6,19 +6,22 @@ import { OtherDomainSettingsSection, SniffingFailedSettingsSection } from './oth
 
 export function SiteUsageSettingsCard({ editable }: { editable: boolean }) {
   return (
-    <section className="panel config-panel" id="set-site-usage" aria-label="全局站点统计">
+    <section className="panel config-panel" id="set-site-usage" aria-label="全局出流量统计">
       <header>
-        <PanelTitle of="usage">站点统计</PanelTitle>
+        <PanelTitle of="usage">出流量统计</PanelTitle>
       </header>
-      <p className="cardsub">按用户采集站点流量，各项独立控制，默认关闭。</p>
-      <div className="site-statistics-sections">
+      <p className="cardsub">
+        按用户和入口节点统计目的端的上下行流量，统计维度包括站点分类、未分类域名和嗅探失败目标，新安装默认全部开启，各项独立配置。
+      </p>
+      <div className="outflow-statistics-sections">
         <SiteClassificationSettings editable={editable} />
         <OtherDomainSettingsSection editable={editable} />
         <SniffingFailedSettingsSection editable={editable} />
       </div>
       <p className="settings-block-note">策略随节点轮询生效，无需发布或重启；统计结果仅管理员可见，不影响计费用量。</p>
       <p className="settings-block-note">
-        域名与目标明细保留 24 小时，不记录 URL 或请求内容。容量耗尽时停止接纳新条目；调整容量会重建采集窗口。
+        域名与目标明细保留 24 小时，不记录 URL
+        或请求内容。容量满时优先淘汰已可靠保存的冷条目；缓冲满时标记受限。调整容量会重建采集窗口。
       </p>
       {!editable && <p className="settings-block-note">仅系统管理员可修改。</p>}
     </section>
@@ -37,19 +40,21 @@ function SiteClassificationSettings({ editable }: { editable: boolean }) {
     },
   });
   return (
-    <section className="site-statistics-section" aria-label="站点分类">
-      <div className="site-statistics-heading">
-        <h5>站点分类</h5>
-        <SegmentedControl
-          ariaLabel="站点分类采集"
-          value={policy.data?.enabled ?? false}
-          options={[
-            { value: false, label: '关闭' },
-            { value: true, label: '开启' },
-          ]}
-          disabled={!editable || !policy.data || policy.isError || save.isPending}
-          onChange={enabled => save.mutate(enabled)}
-        />
+    <section className="setgrp settings-block" aria-label="站点分类">
+      <h5 className="eyebrow">站点分类</h5>
+      <div className="setfld">
+        <div className="v">
+          <SegmentedControl
+            ariaLabel="站点分类统计"
+            value={policy.data?.enabled ?? false}
+            options={[
+              { value: false, label: '关闭' },
+              { value: true, label: '开启' },
+            ]}
+            disabled={!editable || !policy.data || policy.isError || save.isPending}
+            onChange={enabled => save.mutate(enabled)}
+          />
+        </div>
       </div>
       <p className="settings-block-note">按内置站点分类汇总流量；开启后对新连接生效。</p>
       {policy.error && <ErrorBox error={policy.error} />}

@@ -115,6 +115,32 @@ const readingOf = (ledger: HTMLElement, label: string) =>
   within(ledger).getByText(label, { selector: 'dt' }).parentElement?.querySelector('dd')?.textContent;
 
 describe('fleet realtime traffic panel', () => {
+  it.each([true, false])(
+    'hides owner text and tooltips while keeping same-name users separate (details=%s)',
+    async allowDetails => {
+      const payload = snapshot();
+      payload.nodes[0].samples[0].sample.user_traffic!.users!.push({
+        tenant_id: 'hidden-branch',
+        user_id: 'alice',
+        downlink_bytes_per_sec: 3 * MB,
+        uplink_bytes_per_sec: MB,
+      });
+      payload.expected[0].users.push({ tenant_id: 'hidden-branch', user_id: 'alice' });
+      serve(payload);
+      const view = mount(allowDetails);
+      const table = await view.findByRole('table');
+      const identities = [...table.querySelectorAll('tbody tr[data-user]')].map(row => row.getAttribute('data-user'));
+      expect(identities).toContain('platform/alice');
+      expect(identities).toContain('hidden-branch/alice');
+      expect(view.container.textContent).not.toMatch(/platform|hidden-branch/);
+      for (const element of view.container.querySelectorAll('[title], [aria-label]')) {
+        expect(`${element.getAttribute('title')} ${element.getAttribute('aria-label')}`).not.toMatch(
+          /platform|hidden-branch/,
+        );
+      }
+      expect(view.container.querySelector('.flt-utenant')).toBeNull();
+    },
+  );
   it('opens machine usage in place from the column header and matrix cells without a separate picker', async () => {
     const route = await import('../src/forge/route');
     const navigate = vi.spyOn(route, 'navigate').mockReturnValue(true);

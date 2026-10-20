@@ -34,6 +34,7 @@ export interface PreviewProvisionNodeRequest {
   public_ipv4_nat?: boolean;
   public_ipv6_nat?: boolean;
   egress_allowed?: boolean;
+  overlay?: boolean;
   dns?: Dns;
 }
 

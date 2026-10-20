@@ -50,6 +50,11 @@ async function preview(t, query = {}, width = 1280) {
   await page
     .locator(query.view === 'claude' ? '.cw-paper' : query.view === 'current' ? '.pv-chain-fields' : '.cr-paper')
     .waitFor();
+  // Configured scenarios use a manually entered name; the blank scene tests the untouched field.
+  if (!['blank', 'blocked'].includes(query.scene)) {
+    const name = page.getByLabel('链名称', { exact: true });
+    if ((await name.inputValue()) === '') await name.fill('测试链');
+  }
   return page;
 }
 
@@ -63,15 +68,41 @@ test('keeps the familiar two cards above the complete editable path', async t =>
   assert.equal(basic.y, protocols.y);
   assert.ok(protocols.x > basic.x + basic.width);
   assert.ok(path.y > Math.max(basic.y + basic.height, protocols.y + protocols.height));
-  await expect(page.getByLabel('链名称', { exact: true })).toHaveValue('香港 BGP 三网 → 东京 IIJ');
-  await expect(page.getByLabel('当前链路径')).toContainText('东京 IIJ');
+  await expect(page.getByLabel('链名称', { exact: true })).toHaveValue('测试链');
+  await expect(page.getByLabel('当前链路径')).toHaveCount(0);
+  await expect(page.locator('.cr-path .chain-rule-node-head b').filter({ hasText: '东京 IIJ' })).toBeVisible();
   await expect(submit(page)).toBeEnabled();
   await page.getByLabel('在路径末尾添加机器').selectOption('us-gia');
-  await expect(page.getByLabel('当前链路径')).toContainText('洛杉矶 CN2 GIA');
-  await expect(page.getByLabel('链名称', { exact: true })).toHaveValue('香港 BGP 三网 → 洛杉矶 CN2 GIA');
+  await expect(page.locator('.cr-path .chain-rule-node-head b').filter({ hasText: '洛杉矶 CN2 GIA' })).toBeVisible();
+  await expect(page.getByLabel('链名称', { exact: true })).toHaveValue('测试链');
   await page.getByLabel('把 洛杉矶 CN2 GIA 移出本链').click();
-  await expect(page.getByLabel('当前链路径')).not.toContainText('洛杉矶 CN2 GIA');
+  await expect(page.locator('.cr-path .chain-rule-node-head b').filter({ hasText: '洛杉矶 CN2 GIA' })).toHaveCount(0);
   await expect(submit(page)).toBeEnabled();
+});
+
+test('production entry group is a default and switching preserves the full option order', async t => {
+  const page = await preview(t, { view: 'current' });
+  const group = page.getByLabel('分组', { exact: true });
+  const options = await group
+    .locator('option')
+    .evaluateAll(items => items.map(item => ({ value: item.value, label: item.textContent })));
+  const existing = options.filter(option => !option.label?.includes('新建分组'));
+  assert.ok(existing.length > 1, 'sample data includes multiple visible groups');
+  await expect(group).toHaveValue(existing[0].value);
+  await group.selectOption(existing.at(-1).value);
+  await expect(group).toHaveValue(existing.at(-1).value);
+  assert.deepEqual(
+    await group
+      .locator('option')
+      .evaluateAll(items => items.map(item => ({ value: item.value, label: item.textContent }))),
+    options,
+  );
+  await expect(page.getByLabel('链名称', { exact: true })).toHaveValue('测试链');
+  await group.selectOption(options.find(option => option.label?.includes('新建分组')).value);
+  await expect(page.getByLabel('新分组名称', { exact: true })).toBeVisible();
+  await group.selectOption(existing[0].value);
+  await expect(group).toHaveValue(existing[0].value);
+  await expect(page.getByLabel('新分组名称', { exact: true })).toHaveCount(0);
 });
 
 test('authorization uses consistent user avatars without repeating exit facts', async t => {
@@ -88,19 +119,30 @@ test('authorization uses consistent user avatars without repeating exit facts', 
   await expect(alice.locator('.user-generated-avatar')).toHaveAttribute('data-avatar-mark', identity);
   await alice.click();
   await expect(alice.locator('.cr-user-check')).toBeVisible();
-  await expect(page.getByLabel('当前链路径')).toContainText('东京 IIJ');
+  await expect(page.locator('.cr-path .chain-rule-node-head b').filter({ hasText: '东京 IIJ' })).toBeVisible();
   await expect(page.locator('.protocol-choice.cr-ingress-card')).toHaveCount(5);
   assert.equal(await page.locator('.cr-ingress-card > input[type=checkbox]').count(), 5);
 });
 
-test('new path rules start with geosite and prioritize domain keywords next', async t => {
+test('new path rules default to geosite while preserving match menu order', async t => {
   const page = await preview(t);
   const addRule = page.getByRole('button', { name: '＋ 加一条', exact: true }).first();
   await addRule.click();
   const first = page.getByLabel('香港 BGP 三网 第 1 条匹配条件', { exact: true });
   await expect(first).toHaveValue('geosite');
   const options = await first.locator('option').evaluateAll(nodes => nodes.map(node => node.value));
-  assert.deepEqual(options.slice(0, 2), ['geosite', 'domain_keyword']);
+  assert.deepEqual(options, [
+    'any',
+    'sniffing_failed',
+    'geosite',
+    'geoip',
+    'domain_suffix',
+    'domain_keyword',
+    'domain_regex',
+    'ip_cidr',
+    'port',
+    'network',
+  ]);
   await first.selectOption('domain_keyword');
   await page.getByLabel('香港 BGP 三网 第 1 条匹配取值', { exact: true }).fill('google');
   await addRule.click();
@@ -165,7 +207,7 @@ test('ports detect conflicts, reset to automatic and retain explicit values acro
 
 test('protocol details validate local custom settings without replacing the list', async t => {
   const page = await preview(t, {}, 422);
-  await page.getByLabel('VLESS · REALITY 参数', { exact: true }).click();
+  await page.getByLabel('VLESS · TLS/REALITY 参数', { exact: true }).click();
   await page
     .getByRole('group', { name: 'REALITY 伪装目标', exact: true })
     .getByRole('button', { name: '自定义', exact: true })
@@ -192,11 +234,11 @@ test('protocol details validate local custom settings without replacing the list
 test('full descriptions stay readable and visible for every protocol, including disabled options', async t => {
   const page = await preview(t, {}, 422);
   const descriptions = [
-    'TCP / XHTTP 入站；使用 REALITY 保护传输。',
-    'TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。',
-    'TCP 入站；支持 TLS / REALITY、Padding 与连接复用。',
-    'QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。',
-    'Telegram MTProto 代理。',
+    '支持 TCP / XHTTP，以 TLS 加密或 REALITY 伪装保护连接，适用于通用代理接入。',
+    'VLESS 原生加密，适用于无证书加密接入。',
+    '通过分包填充缓解嵌套 TLS 特征，以连接复用降低握手开销，适用于短连接密集场景。',
+    '基于 QUIC / UDP，针对高延迟与丢包链路优化吞吐，适用于弱网场景。',
+    'Telegram 原生支持的专用代理。',
   ];
   await expect(page.locator('.cr-ingress-description')).toHaveText(descriptions);
   for (const description of descriptions) await expect(page.getByText(description, { exact: true })).toBeVisible();
@@ -219,7 +261,7 @@ test('full descriptions stay readable and visible for every protocol, including 
 
 test('complete protocol settings retain custom values across toggles and entry replacement', async t => {
   const page = await preview(t);
-  await page.getByLabel('VLESS · REALITY 参数', { exact: true }).click();
+  await page.getByLabel('VLESS · TLS/REALITY 参数', { exact: true }).click();
   await expect(page.locator('.cr-ingress-certificate')).toContainText('hk-bgp.nodes.example.net');
   await page
     .getByRole('group', { name: 'REALITY 伪装目标', exact: true })
@@ -233,7 +275,7 @@ test('complete protocol settings retain custom values across toggles and entry r
   await page.getByLabel('自定义 REALITY 目标').fill('example.org:443');
   await page.getByLabel('自定义 REALITY SNI').fill('example.org');
   await page.getByLabel('自定义 REALITY 指纹').selectOption('firefox');
-  const vless = page.getByRole('checkbox', { name: 'VLESS · REALITY', exact: true });
+  const vless = page.getByRole('checkbox', { name: 'VLESS · TLS/REALITY', exact: true });
   await vless.focus();
   await vless.press('Space');
   await vless.press('Space');
@@ -242,7 +284,7 @@ test('complete protocol settings retain custom values across toggles and entry r
   await expect(page.getByLabel('自定义 REALITY 目标')).toHaveValue('example.org:443');
   await expect(page.getByLabel('自定义 REALITY 指纹')).toHaveValue('firefox');
   await page.getByLabel('AnyTLS 参数', { exact: true }).click();
-  await expect(page.getByLabel('VLESS · REALITY 参数', { exact: true })).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByLabel('VLESS · TLS/REALITY 参数', { exact: true })).toHaveAttribute('aria-expanded', 'false');
   await page
     .getByRole('group', { name: 'AnyTLS Padding', exact: true })
     .getByRole('button', { name: '自定义', exact: true })
@@ -280,8 +322,12 @@ test('capability errors explain the affected protocol while its checkbox and des
   const mtproxy = page.locator('[data-protocol=mtproto]');
   await expect(mtproxy.getByRole('alert')).toContainText('公网 IPv4 未直接配置在网卡上');
   await expect(mtproxy.getByRole('checkbox')).toBeEnabled();
-  await expect(mtproxy.getByText('Telegram MTProto 代理。', { exact: true })).toBeVisible();
-  for (const name of ['VLESS · REALITY', 'VLESS · Encryption', 'AnyTLS', 'Hysteria 2', 'MTProxy']) {
+  await expect(
+    mtproxy.getByText('Telegram 原生支持的专用代理。', {
+      exact: true,
+    }),
+  ).toBeVisible();
+  for (const name of ['VLESS · TLS/REALITY', 'VLESS · Encryption', 'AnyTLS', 'Hysteria 2', 'MTProxy']) {
     const toggle = page.getByRole('checkbox', { name, exact: true });
     if (await toggle.isChecked()) await toggle.press('Space');
   }
@@ -294,8 +340,10 @@ test('blank start derives route facts and draft submission stays local', async t
   const page = await preview(t, { scene: 'blank' });
   await expect(submit(page)).toBeDisabled();
   await page.getByLabel('选择入口节点').selectOption('hk-hkix');
-  await expect(page.getByLabel('当前链路径')).toContainText('香港 HKIX');
-  await expect(page.getByLabel('链名称', { exact: true })).not.toHaveValue('');
+  await expect(page.locator('.cr-path .chain-rule-node-head b').filter({ hasText: '香港 HKIX' })).toBeVisible();
+  await expect(page.getByLabel('链名称', { exact: true })).toHaveValue('');
+  await expect(submit(page)).toBeDisabled();
+  await page.getByLabel('链名称', { exact: true }).fill('手动命名的链');
   await expect(submit(page)).toBeEnabled();
   await page.getByRole('button', { name: '配置预览', exact: true }).click();
   await expect(page.locator('.cr-preview pre')).toContainText('香港 HKIX');
@@ -314,10 +362,10 @@ test('blank start derives route facts and draft submission stays local', async t
 });
 
 test('all scenes fit desktop, tablet and mobile in both themes', async t => {
-  const page = await preview(t);
   for (const theme of ['light', 'dark']) {
     for (const width of [1180, 620, 390]) {
-      await page.setViewportSize({ width: width + 32, height: 1000 });
+      // Release each viewport's browser context before the next seven full-page captures.
+      const page = await preview(t, { theme, w: String(width) }, width + 32);
       for (const scene of ['blank', 'direct', 'relay', 'branches', 'blocked', 'node', 'crowd']) {
         await page.goto(`${base}?${new URLSearchParams({ scene, theme, w: String(width), nav: '0' })}`);
         await page.locator('.cr-paper').waitFor();
@@ -332,6 +380,7 @@ test('all scenes fit desktop, tablet and mobile in both themes', async t => {
         if (scene === 'crowd') await expect(page.locator('.cr-user')).toHaveCount(41);
         await page.screenshot({ path: `${screenshots}/${scene}-${theme}-${width}.png`, fullPage: true });
       }
+      await page.close();
     }
   }
 });

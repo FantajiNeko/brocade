@@ -205,11 +205,11 @@ describe('用户直达登录', () => {
     const url = directLoginUrl(
       '2d2304da-f114-4574-8d44-625afdb1db5c',
       'broc_login_secret/value',
-      'https://tat.ac/console?from=admin#/users',
+      'https://console.example.net/console?from=admin#/users',
     );
     const parsed = new URL(url);
 
-    expect(`${parsed.origin}${parsed.pathname}${parsed.search}`).toBe('https://tat.ac/console?from=admin');
+    expect(`${parsed.origin}${parsed.pathname}${parsed.search}`).toBe('https://console.example.net/console?from=admin');
     expect(parseDirectLoginHash(parsed.hash)).toEqual({
       uuid: '2d2304da-f114-4574-8d44-625afdb1db5c',
       token: 'broc_login_secret/value',

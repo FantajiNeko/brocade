@@ -500,9 +500,7 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
       <dl className="usage-facts">
         <div>
           <dt>最高用户</dt>
-          <dd title={topUser ? `${topUser.userId} · ${topUser.tenantId}` : undefined}>
-            {topUser ? `${topUser.userId} · ${totalOf(topUser)}` : '—'}
-          </dd>
+          <dd title={topUser?.userId}>{topUser ? `${topUser.userId} · ${totalOf(topUser)}` : '—'}</dd>
         </div>
         <div>
           <dt>最忙机器</dt>
@@ -568,7 +566,6 @@ function FleetBoard({
   hidden,
   expanded,
   onExpand,
-  multiTenant,
   allowDetails,
   onOpenNode,
 }: {
@@ -577,7 +574,6 @@ function FleetBoard({
   hidden: number;
   expanded: boolean;
   onExpand: (value: boolean) => void;
-  multiTenant: boolean;
   allowDetails: boolean;
   onOpenNode: (node: FleetTrafficMatrixNode) => void;
 }) {
@@ -706,20 +702,18 @@ function FleetBoard({
                       <button
                         type="button"
                         className="flt-ubtn"
-                        title={`${user.userId} · ${user.tenantId}`}
+                        title={user.userId}
                         onFocus={() => setFocus({ kind: 'user', user: user.key })}
                         onBlur={() => release({ kind: 'user', user: user.key })}
                         onClick={() => navigate('users', { p: 'user', id: user.userId })}
                       >
                         <GeneratedUserAvatar id={user.userId} variant="mini" />
                         <span className="flt-uname">{user.userId}</span>
-                        {multiTenant && <small className="flt-utenant">{user.tenantId}</small>}
                       </button>
                     ) : (
-                      <span className="flt-ubtn static" title={`${user.userId} · ${user.tenantId}`}>
+                      <span className="flt-ubtn static" title={user.userId}>
                         <GeneratedUserAvatar id={user.userId} variant="mini" />
                         <span className="flt-uname">{user.userId}</span>
-                        {multiTenant && <small className="flt-utenant">{user.tenantId}</small>}
                       </span>
                     )}
                   </th>
@@ -845,13 +839,11 @@ function FleetList({
   matrix,
   rows,
   idle,
-  multiTenant,
   allowDetails,
 }: {
   matrix: FleetTrafficMatrix;
   rows: readonly FleetTrafficMatrixUser[];
   idle: readonly FleetTrafficMatrixUser[];
-  multiTenant: boolean;
   allowDetails: boolean;
 }) {
   const connecting = matrix.nodes.filter(node => node.phase === 'pending');
@@ -874,13 +866,12 @@ function FleetList({
                   <button
                     type="button"
                     className="flt-flow"
-                    title={`${user.userId} · ${user.tenantId}`}
+                    title={user.userId}
                     onClick={() => navigate('users', { p: 'user', id: user.userId })}
                   >
                     <GeneratedUserAvatar id={user.userId} variant="cell" />
                     <span className="flt-flow-who">
                       <b>{user.userId}</b>
-                      {multiTenant && <small>{user.tenantId}</small>}
                     </span>
                     <span className={`flt-flow-total${total > 0 ? '' : ' zero'}`}>
                       {total > 0 ? rateText(total) : '空闲'}
@@ -896,11 +887,10 @@ function FleetList({
                     </span>
                   </button>
                 ) : (
-                  <div className="flt-flow static" title={`${user.userId} · ${user.tenantId}`}>
+                  <div className="flt-flow static" title={user.userId}>
                     <GeneratedUserAvatar id={user.userId} variant="cell" />
                     <span className="flt-flow-who">
                       <b>{user.userId}</b>
-                      {multiTenant && <small>{user.tenantId}</small>}
                     </span>
                     <span className={`flt-flow-total${total > 0 ? '' : ' zero'}`}>
                       {total > 0 ? rateText(total) : '空闲'}
@@ -990,7 +980,6 @@ function FleetCockpit({
   const crowd = matrix.users.length > CROWD_USERS;
   const boardRows = crowd && !expanded ? matrix.users.filter(recent) : matrix.users;
   const listRows = matrix.users.filter(recent);
-  const multiTenant = new Set(matrix.users.map(user => user.tenantId)).size > 1;
 
   return (
     <div
@@ -1009,7 +998,6 @@ function FleetCockpit({
             hidden={matrix.users.length - boardRows.length}
             expanded={expanded}
             onExpand={setExpanded}
-            multiTenant={multiTenant}
             allowDetails={allowMachineDetails}
             onOpenNode={onOpenNode}
           />
@@ -1017,7 +1005,6 @@ function FleetCockpit({
             matrix={matrix}
             rows={listRows}
             idle={matrix.users.filter(user => !recent(user) && user.unknown === 0)}
-            multiTenant={multiTenant}
             allowDetails={allowMachineDetails}
           />
         </>

@@ -3480,6 +3480,7 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
     let service_reentry_ready = operationally_isolated && service_reentry_blockers.is_empty();
 
     Ok(NodeAgentStateItem {
+        initialization: None,
         node_id: row.try_get("node_id")?,
         tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,

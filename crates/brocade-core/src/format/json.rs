@@ -29,6 +29,10 @@ use crate::model::{
 /// ordinary handshake.
 const TCP_FAST_OPEN_BACKLOG: u16 = 256;
 
+const TCP_INBOUND_KEEPALIVE_IDLE_SECS: u16 = 300;
+const TCP_INBOUND_KEEPALIVE_INTERVAL_SECS: u16 = 90;
+const TCP_INBOUND_KEEPALIVE_PROBES: u8 = 3;
+
 pub fn xray(artifact: &XrayArtifact) -> String {
     let value = match artifact {
         XrayArtifact::Disabled { .. } => json!({}),
@@ -318,7 +322,7 @@ fn dns_config(config: &XrayConfig) -> Value {
 }
 
 fn inbound(inbound: &XrayInbound) -> Value {
-    match inbound {
+    let mut value = match inbound {
         XrayInbound::BackboneShadowsocks {
             tag,
             listen,
@@ -621,7 +625,59 @@ fn inbound(inbound: &XrayInbound) -> Value {
             enable_sniffing(&mut value, *sniff);
             value
         }
+    };
+    // API is loopback-only and Hy2 uses QUIC's own liveness. Every other managed inbound
+    // accepts TCP (including the TCP side of Shadowsocks' TCP/UDP listener).
+    match inbound {
+        XrayInbound::Api { .. } | XrayInbound::Hysteria2 { .. } => {}
+        XrayInbound::Vless { .. }
+        | XrayInbound::AnyTls { .. }
+        | XrayInbound::MtProto { .. }
+        | XrayInbound::Backbone { .. }
+        | XrayInbound::BackboneShadowsocks { .. }
+        | XrayInbound::Dokodemo { .. }
+        | XrayInbound::RealityGuard { .. } => {
+            enable_tcp_inbound_keepalive(&mut value["streamSettings"]);
+        }
     }
+    value
+}
+
+/// Keep idle clients reusable while bounding silent disconnects without host-wide sysctl changes.
+///
+/// Xray exposes idle/interval directly but not the probe count. Linux TCP_KEEPCNT is socket
+/// option 6 at IPPROTO_TCP (6); restricting it to Linux TCP covers both IP families without
+/// attempting a TCP option on Shadowsocks' UDP socket. The listener's three values are also
+/// preserved by Brocade's FD handoff path.
+fn enable_tcp_inbound_keepalive(stream_settings: &mut Value) {
+    let socket = stream_settings
+        .as_object_mut()
+        .expect("managed inbound streamSettings must be an object")
+        .entry("sockopt")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .expect("managed inbound sockopt must be an object");
+    socket.insert(
+        "tcpKeepAliveIdle".to_owned(),
+        json!(TCP_INBOUND_KEEPALIVE_IDLE_SECS),
+    );
+    socket.insert(
+        "tcpKeepAliveInterval".to_owned(),
+        json!(TCP_INBOUND_KEEPALIVE_INTERVAL_SECS),
+    );
+    socket
+        .entry("customSockopt")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .expect("managed inbound customSockopt must be an array")
+        .push(json!({
+            "system": "linux",
+            "network": "tcp",
+            "level": "6",
+            "opt": "6",
+            "type": "int",
+            "value": TCP_INBOUND_KEEPALIVE_PROBES.to_string(),
+        }));
 }
 
 fn enable_sniffing(value: &mut Value, enabled: bool) {
@@ -1595,6 +1651,157 @@ fn attach_reverse_health(reverse: Option<&mut Value>, config: &XrayConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_tcp_inbounds_render_explicit_keepalive_without_changing_security_or_tfo() {
+        let cases = vec![
+            XrayInbound::Vless {
+                tag: "vless".to_owned(),
+                listen: "::".to_owned(),
+                port: 443,
+                decryption: None,
+                security: XrayIngressSecurity::None,
+                sniff: true,
+                stream: XrayStream::Tcp,
+            },
+            XrayInbound::Vless {
+                tag: "xhttp".to_owned(),
+                listen: "::".to_owned(),
+                port: 444,
+                decryption: None,
+                security: XrayIngressSecurity::None,
+                sniff: true,
+                stream: XrayStream::Xhttp {
+                    path: "/test".to_owned(),
+                    mode: None,
+                    tuning: None,
+                },
+            },
+            XrayInbound::AnyTls {
+                tag: "anytls".to_owned(),
+                listen: "0.0.0.0".to_owned(),
+                port: 445,
+                security: XrayIngressSecurity::Tls {
+                    certificate_files: vec!["test.pem".to_owned()],
+                    alpn: None,
+                },
+                sniff: true,
+                settings: crate::model::AnyTls::default(),
+            },
+            XrayInbound::MtProto {
+                tag: "mtproto".to_owned(),
+                listen: "::".to_owned(),
+                port: 446,
+            },
+            XrayInbound::Backbone {
+                tag: "backbone".to_owned(),
+                listen: "0.0.0.0".to_owned(),
+                port: 447,
+                security: XrayHopInboundWire::None,
+                clients: vec![],
+                sniff: true,
+            },
+            XrayInbound::BackboneShadowsocks {
+                tag: "shadowsocks".to_owned(),
+                listen: "::".to_owned(),
+                port: 448,
+                method: "2022-blake3-aes-128-gcm",
+                password: "fixture".to_owned(),
+                users: vec![],
+                sniff: true,
+            },
+            XrayInbound::Dokodemo {
+                tag: "front".to_owned(),
+                listen: "0.0.0.0".to_owned(),
+                port: 449,
+                target_port: 450,
+                security: XrayIngressSecurity::None,
+            },
+            XrayInbound::RealityGuard {
+                tag: "guard".to_owned(),
+                listen: "127.0.0.1".to_owned(),
+                port: 451,
+                target_address: "example.test".to_owned(),
+                target_port: 443,
+            },
+        ];
+        for case in cases {
+            let value = inbound(&case);
+            let socket = &value["streamSettings"]["sockopt"];
+            assert_eq!(socket["tcpKeepAliveIdle"], 300, "{case:?}");
+            assert_eq!(socket["tcpKeepAliveInterval"], 90, "{case:?}");
+            assert_eq!(
+                socket["customSockopt"],
+                json!([{
+                    "system": "linux", "network": "tcp", "level": "6", "opt": "6",
+                    "type": "int", "value": "3",
+                }]),
+                "{case:?}"
+            );
+            if matches!(
+                case,
+                XrayInbound::Dokodemo { .. } | XrayInbound::RealityGuard { .. }
+            ) {
+                assert!(socket.get("tcpFastOpen").is_none());
+            } else {
+                assert_eq!(socket["tcpFastOpen"], TCP_FAST_OPEN_BACKLOG);
+            }
+            if matches!(case, XrayInbound::AnyTls { .. }) {
+                assert_eq!(value["streamSettings"]["security"], "tls");
+                assert_eq!(
+                    value["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"],
+                    "test.pem"
+                );
+            }
+            if matches!(case, XrayInbound::BackboneShadowsocks { .. }) {
+                assert_eq!(value["settings"]["network"], "tcp,udp");
+            }
+        }
+    }
+
+    #[test]
+    fn keepalive_does_not_leak_to_quic_api_or_outbound_stream_settings() {
+        for case in [
+            XrayInbound::Api {
+                tag: "api".to_owned(),
+                listen: "127.0.0.1".to_owned(),
+                port: 10085,
+                address: "127.0.0.1".to_owned(),
+            },
+            XrayInbound::Hysteria2 {
+                tag: "hy2".to_owned(),
+                listen: "::".to_owned(),
+                port: 443,
+                security: XrayIngressSecurity::Tls {
+                    certificate_files: vec!["test.pem".to_owned()],
+                    alpn: None,
+                },
+                sniff: true,
+                settings: crate::model::Hysteria2::default(),
+            },
+        ] {
+            assert!(inbound(&case).pointer("/streamSettings/sockopt").is_none());
+        }
+        let mut outbound_stream = stream_settings(&XrayStream::Tcp, &XrayIngressSecurity::None);
+        enable_tcp_fast_open(&mut outbound_stream, json!(true));
+        assert_eq!(outbound_stream["sockopt"], json!({ "tcpFastOpen": true }));
+    }
+
+    #[test]
+    fn keepalive_preserves_existing_socket_options() {
+        let mut stream = json!({"sockopt": {"tcpFastOpen": 256, "mark": 7, "customSockopt": [{"opt": "fixture"}]}});
+        enable_tcp_inbound_keepalive(&mut stream);
+        assert_eq!(stream["sockopt"]["mark"], 7);
+        assert_eq!(stream["sockopt"]["tcpFastOpen"], 256);
+        assert_eq!(
+            stream["sockopt"]["customSockopt"][0],
+            json!({"opt": "fixture"})
+        );
+        assert_eq!(
+            stream["sockopt"]["customSockopt"].as_array().unwrap().len(),
+            2
+        );
+    }
 
     #[test]
     fn mtproxy_inbound_never_enables_content_or_sni_sniffing() {

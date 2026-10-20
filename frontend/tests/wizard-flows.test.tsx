@@ -5,7 +5,8 @@ import { ChainWizard } from '../src/panes/chain-wizard';
 import { draft } from '../src/draft';
 import { ProvisionForm, ProvisionInstall } from '../src/panes/nodes';
 import { SessionProvider } from '../src/session';
-import type { ProvisionNodeResult } from '../src/api';
+import type { ConsoleSnapshot, ProvisionNodeResult } from '../src/api';
+import * as ruleEditor from '../src/panes/rules';
 import * as platform from '../src/ui/platform';
 
 const operator = {
@@ -314,6 +315,7 @@ describe('纳管机器向导', () => {
         public_ipv6_nat: false,
         api_port: null,
         wg_listen_port: 51820,
+        overlay: false,
       },
     });
     expect(go).toHaveBeenCalledWith(expect.objectContaining({ p: 'install', node: 'tw-edge-01' }));
@@ -329,7 +331,8 @@ describe('纳管机器向导', () => {
     );
 
     fireEvent.change(view.getByLabelText('机器 ID'), { target: { value: 'tw-edge-01' } });
-    expect(view.getByText('当前账号没有可用于纳管机器的租户')).toBeTruthy();
+    expect(view.getAllByText('当前账户配置不可用，无法纳管机器。').length).toBeGreaterThan(0);
+    expect(view.queryByText(/租户/)).toBeNull();
     expect(view.getByRole('button', { name: '纳管这台机器' }).hasAttribute('disabled')).toBe(true);
     expect(view.queryByText('准备就绪')).toBeNull();
   });
@@ -449,17 +452,16 @@ describe('新建链向导', () => {
       const view = render(
         <QueryClientProvider client={queryClient()}>
           <SessionProvider value={{ who: operator, initial }}>
-            <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+            <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
           </SessionProvider>
         </QueryClientProvider>,
       );
       fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
       fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '严格限速测试' } });
       fireEvent.click(
-        within(view.getByRole('checkbox', { name: 'VLESS · REALITY' }).closest('.wzp-card') as HTMLElement).getByRole(
-          'button',
-          { name: '参数' },
-        ),
+        within(
+          view.getByRole('checkbox', { name: 'VLESS · TLS/REALITY' }).closest('.wzp-card') as HTMLElement,
+        ).getByRole('button', { name: '参数' }),
       );
       fireEvent.change(view.getByRole('combobox', { name: 'REALITY 目标来源' }), { target: { value: target } });
       if (target === 'custom-site') {
@@ -480,7 +482,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={client}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={() => undefined} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={() => undefined} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -494,11 +496,70 @@ describe('新建链向导', () => {
     return render(
       <QueryClientProvider client={client}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={() => undefined} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={() => undefined} />
         </SessionProvider>
       </QueryClientProvider>,
     );
   }
+
+  it('入口分组仅默认选中，菜单保留完整默认顺序，切换后写入所选分组', async () => {
+    draft.init('wizard-group-default-switch');
+    draft.clear();
+    const client = queryClient();
+    const cached = client.getQueryData<ConsoleSnapshot>(['snapshot'])!;
+    const template = cached.snapshot.apps[0];
+    client.setQueryData(['snapshot'], {
+      ...cached,
+      snapshot: {
+        ...cached.snapshot,
+        apps: [
+          { ...template, id: 'group-last', label: '丙组' },
+          template,
+          { ...template, id: 'group-first', label: '甲组' },
+        ],
+      },
+    });
+    const view = mount(client);
+    const group = view.getByRole('combobox', { name: '分组' }) as HTMLSelectElement;
+    const options = [...group.options].map(option => option.value);
+    expect(group.value).toBe('global');
+    expect(options).toEqual(['group-last', 'global', 'group-first', ' :new-app:']);
+    expect((view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement).value).toBe('');
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '手动命名的链' } });
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    fireEvent.change(group, { target: { value: 'group-first' } });
+    expect(group.value).toBe('group-first');
+    expect([...group.options].map(option => option.value)).toEqual(options);
+    expect(view.getByText('手动命名的链 · 甲组')).toBeTruthy();
+    expect((view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement).value).toBe('手动命名的链');
+    fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
+    await waitFor(() =>
+      expect(draft.ops().find(op => op.op === 'create_ingress')).toMatchObject({ app_id: 'group-first' }),
+    );
+    expect(draft.ops().find(op => op.op === 'create_chain')).toMatchObject({
+      app_id: 'group-first',
+      chain: { name: '手动命名的链' },
+    });
+    expect(draft.ops().some(op => op.op === 'create_app')).toBe(false);
+  });
+
+  it('从分组入口创建链仍可新建分组，并把链加入新分组', async () => {
+    draft.init('wizard-group-default-new');
+    draft.clear();
+    const view = mount();
+    const group = view.getByRole('combobox', { name: '分组' });
+    fireEvent.change(group, { target: { value: ' :new-app:' } });
+    fireEvent.change(view.getByRole('textbox', { name: '新分组名称' }), { target: { value: '自选分组' } });
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '新分组里的链' } });
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    expect(view.getByText('新分组里的链 · 自选分组')).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
+    await waitFor(() => expect(draft.ops().some(op => op.op === 'create_ingress')).toBe(true));
+    const newGroup = draft.ops().find(op => op.op === 'create_app');
+    expect(newGroup).toMatchObject({ app: { label: '自选分组' } });
+    if (newGroup?.op !== 'create_app') throw new Error('expected group creation before chain creation');
+    expect(draft.ops().find(op => op.op === 'create_chain')).toMatchObject({ app_id: newGroup.app.id });
+  });
 
   it('先解释阻塞原因，选择入口后在对应配置卡显示当前值', () => {
     const view = mount();
@@ -509,33 +570,43 @@ describe('新建链向导', () => {
       target: { value: 'hk-edge-01' },
     });
     expect(view.getByText('3 种 · 端口自动避让')).toBeTruthy();
-    expect(view.getByText('香港边缘 直出 · 全球加速')).toBeTruthy();
+    expect(view.getByText('未命名 · 全球加速')).toBeTruthy();
     expect(view.getByRole('textbox', { name: '链名称' }).getAttribute('placeholder')).toBe('给这条链起个名字');
-    expect((view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement).value).toBe('香港边缘 直出');
+    expect((view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement).value).toBe('');
     expect(view.queryByLabelText('新链摘要')).toBeNull();
     expect(view.container.querySelectorAll('.nd-paper')).toHaveLength(1);
     expect(view.container.querySelectorAll('.wz-head, .wz-foot')).toHaveLength(0);
     expect(view.queryByLabelText('出口地区标识')).toBeNull();
     expect(view.queryByText('出口地区标识')).toBeNull();
-    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
+    expect(view.getByText('填写链名称')).toBeTruthy();
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '亚太分流' } });
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
   });
 
-  it('链名称跟随主路径，手动命名或清空后不再覆盖用户输入', () => {
+  it('链名称默认留空，选择入口或修改路径不自动填充，手动命名和清空后保留输入', () => {
     const view = mount();
     const name = view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement;
     expect(name.value).toBe('');
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
-    expect(name.value).toBe('香港边缘 直出');
+    expect(name.value).toBe('');
     fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
       target: { value: 'sg-relay-01' },
     });
-    expect(name.value).toBe('香港边缘 → 新加坡中转');
+    expect(name.value).toBe('');
     fireEvent.click(view.getByRole('button', { name: '把 新加坡中转 移出本链' }));
-    expect(name.value).toBe('香港边缘 直出');
+    expect(name.value).toBe('');
+    fireEvent.click(view.getByRole('button', { name: '换一台当入口' }));
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'sg-relay-01' },
+    });
+    expect(name.value).toBe('');
+    fireEvent.click(view.getByRole('button', { name: '换一台当入口' }));
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
 
     fireEvent.change(name, { target: { value: '手动链名' } });
     fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
@@ -548,18 +619,27 @@ describe('新建链向导', () => {
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
   });
 
-  it('新增规则默认 geosite，关键词紧随其后，并保持终端规则置底', () => {
+  it('新增规则默认 geosite，保留原匹配菜单顺序，并保持终端规则置底', () => {
     const view = mount();
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '规则校验测试' } });
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
     fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
     const match = view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }) as HTMLSelectElement;
     expect(match.value).toBe('geosite');
-    expect([...match.options].slice(0, 2).map(option => option.value)).toEqual(['geosite', 'domain_keyword']);
-    expect([...match.options].map(option => option.value)).toEqual(
-      expect.arrayContaining(['domain_suffix', 'geoip', 'sniffing_failed', 'any']),
-    );
+    expect([...match.options].map(option => option.value)).toEqual([
+      'any',
+      'sniffing_failed',
+      'geosite',
+      'geoip',
+      'domain_suffix',
+      'domain_keyword',
+      'domain_regex',
+      'ip_cidr',
+      'port',
+      'network',
+    ]);
     const values = view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }) as HTMLInputElement;
     expect(values.value).toBe('');
     expect(values.placeholder).toContain('netflix');
@@ -580,6 +660,35 @@ describe('新建链向导', () => {
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
   });
 
+  it('没有 geosite 选项时默认域名关键词，并保留其菜单位置', () => {
+    vi.spyOn(ruleEditor, 'MATCH_KINDS', 'get').mockReturnValue(
+      ruleEditor.MATCH_KINDS.filter(kind => kind.t !== 'geosite'),
+    );
+    const view = mount();
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '关键词校验测试' } });
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
+    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    const match = view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }) as HTMLSelectElement;
+    expect(match.value).toBe('domain_keyword');
+    expect([...match.options].map(option => option.value)).toEqual([
+      'any',
+      'sniffing_failed',
+      'geoip',
+      'domain_suffix',
+      'domain_keyword',
+      'domain_regex',
+      'ip_cidr',
+      'port',
+      'network',
+    ]);
+    const values = view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }) as HTMLInputElement;
+    expect(values.placeholder).toContain('google');
+    fireEvent.change(values, { target: { value: 'google' } });
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
+  });
+
   it('接入协议沿用详情页的逐行选择样式，图标与端口编辑不干扰开关', () => {
     const view = mount();
     const cards = [...view.container.querySelectorAll('.wzp-card')];
@@ -589,11 +698,11 @@ describe('新建链向导', () => {
     expect(cards[0].querySelector('.protocol-choice-icon polygon')).toBeTruthy();
     expect(cards[3].querySelector('.protocol-choice-icon polygon[fill="#ffbc00"]')).toBeTruthy();
     expect(cards.map(card => card.querySelector('.note')?.textContent)).toEqual([
-      'TCP / XHTTP 入站；使用 REALITY 保护传输。',
-      'TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。',
-      'TCP 入站；支持 TLS / REALITY、Padding 与连接复用。',
-      'QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。',
-      'Telegram MTProto 代理。',
+      '支持 TCP / XHTTP，以 TLS 加密或 REALITY 伪装保护连接，适用于通用代理接入。',
+      'VLESS 原生加密，适用于无证书加密接入。',
+      '通过分包填充缓解嵌套 TLS 特征，以连接复用降低握手开销，适用于短连接密集场景。',
+      '基于 QUIC / UDP，针对高延迟与丢包链路优化吞吐，适用于弱网场景。',
+      'Telegram 原生支持的专用代理。',
     ]);
 
     const anyTls = view.getByRole('checkbox', { name: 'AnyTLS' }) as HTMLInputElement;
@@ -620,7 +729,7 @@ describe('新建链向导', () => {
 
   it('所有接入协议都可先选择，切换入口不会重置协议选择', () => {
     const view = mount();
-    const protocols = ['VLESS · REALITY', 'VLESS · Encryption', 'AnyTLS', 'Hysteria 2', 'MTProxy'];
+    const protocols = ['VLESS · TLS/REALITY', 'VLESS · Encryption', 'AnyTLS', 'Hysteria 2', 'MTProxy'];
     const choices = protocols.map(name => view.getByRole('checkbox', { name }) as HTMLInputElement);
     const selected = choices.map(choice => {
       expect(choice.disabled).toBe(false);
@@ -648,7 +757,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={queryClient()}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -695,7 +804,7 @@ describe('新建链向导', () => {
     fireEvent.click(mtproxy);
     expect(mtproxy.checked).toBe(true);
     expect(view.getByRole('alert').textContent).toBe(reason);
-    expect(view.getByText('Telegram MTProto 代理。')).toBeTruthy();
+    expect(view.getByText('Telegram 原生支持的专用代理。')).toBeTruthy();
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
     fireEvent.click(mtproxy);
     expect(view.queryByRole('alert')).toBeNull();
@@ -722,7 +831,7 @@ describe('新建链向导', () => {
     expect(view.getByRole('button', { name: /^alice(?:\s|$)/ }).getAttribute('aria-pressed')).toBe('true');
   });
 
-  it('授权用户按租户分组并使用共享头像，搜索和全选只作用于当前可见用户', () => {
+  it('授权用户平铺且不暴露归属，搜索和全选只作用于当前可见用户', () => {
     const client = queryClient();
     client.setQueryData(['tenants'], {
       tenants: [
@@ -740,7 +849,12 @@ describe('新建链向导', () => {
     const view = mount(client);
     expect(view.getByText('授权用户')).toBeTruthy();
     expect(view.queryByText('谁能用')).toBeNull();
-    expect(view.getByRole('region', { name: '设计团队的用户' })).toBeTruthy();
+    expect(view.queryByRole('region', { name: '设计团队的用户' })).toBeNull();
+    expect(view.queryByText('设计团队')).toBeNull();
+    expect(view.queryByText('platform.design')).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: /^新增用户/ }));
+    expect(view.queryByRole('combobox', { name: /租户/ })).toBeNull();
+    fireEvent.click(view.getByRole('group', { name: '新增用户' }).querySelector('button')!);
     const alice = view.getByRole('button', { name: /^alice(?:\s|$)/ });
     const avatar = alice.querySelector('.user-generated-avatar');
     expect(avatar).toBeTruthy();
@@ -749,7 +863,9 @@ describe('新建链向导', () => {
     fireEvent.click(alice);
     const search = view.getByRole('searchbox', { name: /搜索/ });
     fireEvent.change(search, { target: { value: '设计团队' } });
-    expect(view.getByRole('region', { name: '设计团队的用户' })).toBeTruthy();
+    expect(view.queryByRole('button', { name: /^carol(?:\s|$)/ })).toBeNull();
+    expect(view.getByText('没有匹配的用户')).toBeTruthy();
+    fireEvent.change(search, { target: { value: 'CAROL' } });
     expect(view.getByRole('button', { name: /^carol(?:\s|$)/ })).toBeTruthy();
     expect(view.queryByRole('button', { name: /^alice(?:\s|$)/ })).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '全选' }));
@@ -909,7 +1025,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={client}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={() => undefined} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={() => undefined} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -1032,7 +1148,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={client}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -1070,7 +1186,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={queryClient()}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -1121,12 +1237,12 @@ describe('新建链向导', () => {
     const protocol = (name: string) => view.getByRole('checkbox', { name }).closest('.wzp-card') as HTMLElement;
     const expand = (name: string) => fireEvent.click(within(protocol(name)).getByRole('button', { name: '参数' }));
 
-    expand('VLESS · REALITY');
+    expand('VLESS · TLS/REALITY');
     fireEvent.change(view.getByRole('combobox', { name: 'REALITY 目标来源' }), {
       target: { value: 'global-site' },
     });
-    expect(within(protocol('VLESS · REALITY')).getByText('www.cloudflare.com:443', { exact: true })).toBeTruthy();
-    expect(within(protocol('VLESS · REALITY')).getByText('www.cloudflare.com', { exact: true })).toBeTruthy();
+    expect(within(protocol('VLESS · TLS/REALITY')).getByText('www.cloudflare.com:443', { exact: true })).toBeTruthy();
+    expect(within(protocol('VLESS · TLS/REALITY')).getByText('www.cloudflare.com', { exact: true })).toBeTruthy();
 
     expand('VLESS · Encryption');
     expect(protocol('VLESS · Encryption').textContent).toMatch(/会话票据有效期\s*600s/);
@@ -1213,7 +1329,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={client}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -1326,7 +1442,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={client}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -1362,7 +1478,7 @@ describe('新建链向导', () => {
     const view = render(
       <QueryClientProvider client={queryClient()}>
         <SessionProvider value={{ who: operator, initial }}>
-          <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
         </SessionProvider>
       </QueryClientProvider>,
     );
@@ -1434,5 +1550,65 @@ describe('新建链向导', () => {
       resolution: { address: '1.1.1.1', port: 53 },
     });
     expect(ops.at(-1)).toMatchObject({ grant: { tenant_id: 'platform', user_id: 'alice' } });
+  });
+});
+
+describe('纳管自动初始化', () => {
+  it.each([
+    ['queued', '等待自动初始化', '等待自动初始化…'],
+    ['running', 'Agent 已上线，初始化中', '查看初始化发布单'],
+    ['succeeded', '初始化完成，可创建线路', '查看机器'],
+    ['manual', '需要人工发布', '查看发布计划'],
+    ['failed', '初始化需要处理', '查看失败发布单'],
+  ] as const)('根据服务端 %s 状态展示初始化进度，不自行创建发布单', (state, title, action) => {
+    const client = queryClient();
+    client.setQueryData(['nodes'], {
+      nodes: [
+        {
+          ...agentNodes[0],
+          token_last_used_at: new Date().toISOString(),
+          last_poll_at: new Date().toISOString(),
+          initialization: {
+            state,
+            revision_id: 13,
+            deployment_id: state === 'running' || state === 'failed' ? 21 : null,
+            reason: state === 'manual' ? '已有其他机器的配置待发布' : null,
+          },
+        },
+      ],
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const go = vi.fn();
+    const view = render(
+      <QueryClientProvider client={client}>
+        <SessionProvider value={{ who: operator, initial }}>
+          <ProvisionInstall node="hk-edge-01" result={installResult()} go={go} />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    expect(view.getByText(title)).toBeTruthy();
+    const button = view.getByRole('button', { name: action });
+    expect(button.hasAttribute('disabled')).toBe(state === 'queued');
+    expect(view.queryByRole('button', { name: /去发布 · 计划预览/ })).toBeNull();
+    if (state === 'succeeded') {
+      fireEvent.click(button);
+      expect(go).toHaveBeenCalledWith({ p: 'node', id: 'hk-edge-01' });
+      expect(within(view.getByRole('list', { name: '纳管进度' })).getAllByRole('listitem')[2].className).toBe('done');
+    }
+    if (state === 'manual') expect(view.getByText('已有其他机器的配置待发布')).toBeTruthy();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('WireGuard 初始关闭，允许操作者显式开启', () => {
+    const view = render(
+      <QueryClientProvider client={queryClient()}>
+        <ProvisionForm go={() => undefined} />
+      </QueryClientProvider>,
+    );
+    const toggle = view.getByRole('group', { name: 'WireGuard overlay' });
+    expect(within(toggle).getByRole('button', { name: '关闭' }).getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(within(toggle).getByRole('button', { name: '启用' }));
+    expect(within(toggle).getByRole('button', { name: '启用' }).getAttribute('aria-pressed')).toBe('true');
   });
 });

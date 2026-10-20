@@ -17,6 +17,7 @@ import type {
 } from '../../src/api';
 import { nodeCertificateLabel } from '../../src/certificate';
 import { mtprotoNodeEligibility } from '../../src/mtproto-capability';
+import { INGRESS_PROTOCOL_DESCRIPTIONS } from '../../src/ingress-protocols';
 import { realityFingerprintIsValid, realityServerNameIsValid } from '../../src/reality';
 import {
   reachableWizardTables,
@@ -76,8 +77,8 @@ export interface World {
 }
 
 export interface Entry {
-  /** Entered from a 线路 page: the group is decided. */
-  fixedApp?: { id: string; label: string };
+  /** Entered from a group page: select that group by default. */
+  defaultApp?: { id: string; label: string };
   /** Entered from a machine page: the entry machine is decided. */
   node?: string;
 }
@@ -113,7 +114,7 @@ export interface Proto {
 }
 
 export interface Draft {
-  /** null follows the route until the operator types a name. */
+  /** null leaves the name blank until the operator types one. */
   name: string | null;
   app: string;
   newAppLabel: string;
@@ -297,10 +298,8 @@ export function derive(world: World, entry: Entry, draft: Draft) {
   const granted = userRows.filter(user => picked.has(user.key) && !user.blocked);
 
   /* ── Group and name ── */
-  const fixed = entry.fixedApp;
-  const appMode = fixed ? 'existing' : draft.app === NEW_APP ? 'new' : 'existing';
-  const autoName = !head ? '' : spine.length === 1 ? `${head.name} 直出` : `${head.name} → ${nameOf(tail ?? '')}`;
-  const name = draft.name ?? autoName;
+  const appMode = draft.app === NEW_APP ? 'new' : 'existing';
+  const name = draft.name ?? '';
 
   /* ── Blocking issues, each pointing at the row that fixes it ── */
   const issues: Issue[] = [];
@@ -395,7 +394,6 @@ export function derive(world: World, entry: Entry, draft: Draft) {
     picked,
     granted,
     appMode,
-    autoName,
     name,
     issues,
     ingressIssues,
@@ -583,7 +581,10 @@ type Actions = ReturnType<typeof actionsFor>;
 /* ══ Page ══ */
 
 export function ChainWizardMockup({ world, entry, initial }: { world: World; entry: Entry; initial: Draft }) {
-  const [draft, setDraft] = useState(initial);
+  const [draft, setDraft] = useState(() => ({
+    ...initial,
+    app: world.apps.find(app => app.id === entry.defaultApp?.id)?.id ?? initial.app,
+  }));
   const d = derive(world, entry, draft);
   const act = actionsFor(d, setDraft);
   const paper = useRef<HTMLFormElement>(null);
@@ -645,7 +646,6 @@ export function ChainWizardMockup({ world, entry, initial }: { world: World; ent
 /* ══ Header: the chain's identity as the detail page will show it ══ */
 
 function Header({ d, act }: { d: Derived; act: Actions }) {
-  const fixed = d.entry.fixedApp;
   return (
     <header className="nd-page-head cw-head">
       <div className="nd-page-identity cw-identity">
@@ -673,21 +673,15 @@ function Header({ d, act }: { d: Derived; act: Actions }) {
           <select
             id="cw-group"
             className="cw-bare-select"
-            value={fixed ? fixed.id : d.draft.app}
+            value={d.draft.app}
             onChange={event => act.setApp(event.target.value)}
           >
-            {fixed ? (
-              <option value={fixed.id}>{fixed.label}</option>
-            ) : (
-              <>
-                {d.world.apps.map(app => (
-                  <option key={app.id} value={app.id}>
-                    {app.label || app.id}
-                  </option>
-                ))}
-                <option value={NEW_APP}>＋ 新建分组…</option>
-              </>
-            )}
+            {d.world.apps.map(app => (
+              <option key={app.id} value={app.id}>
+                {app.label || app.id}
+              </option>
+            ))}
+            <option value={NEW_APP}>＋ 新建分组…</option>
           </select>
           {d.appMode === 'new' && (
             <input
@@ -990,15 +984,8 @@ function UsersPanel({ d, act }: { d: Derived; act: Actions }) {
   const [query, setQuery] = useState('');
   const [creating, setCreating] = useState(false);
   const q = query.trim().toLowerCase();
-  const visible = d.userRows.filter(user => !q || `${user.id} ${user.tenant_id}`.toLowerCase().includes(q));
+  const visible = d.userRows.filter(user => !q || user.id.toLowerCase().includes(q));
   const selectable = d.userRows.filter(user => !user.blocked);
-  const tenantName = (id: string) => d.world.tenants.find(tenant => tenant.id === id)?.name ?? id;
-  const groups = [...new Set(visible.map(user => user.tenant_id))]
-    .map(tenant => {
-      const rows = visible.filter(user => user.tenant_id === tenant);
-      return { tenant, rows, out: rows.every(user => user.blocked === '不可授权') };
-    })
-    .sort((a, b) => Number(a.out) - Number(b.out));
   return (
     <div className="cw-panel">
       <PanelHead
@@ -1042,53 +1029,34 @@ function UsersPanel({ d, act }: { d: Derived; act: Actions }) {
       {creating && (
         <div className="cw-new-user" role="group" aria-label="新增用户">
           <input className="f mono" autoFocus placeholder="用户 ID" aria-label="新用户 ID" />
-          {d.world.tenants.length > 1 && (
-            <select className="f" aria-label="新用户所属租户" defaultValue={d.tenant || 'platform'}>
-              {d.world.tenants.map(tenant => (
-                <option key={tenant.id} value={tenant.id}>
-                  {tenant.name}
-                </option>
-              ))}
-            </select>
-          )}
           <button type="button" className="btn sm primary">
             新增并选中
           </button>
         </div>
       )}
-      <div className="cw-user-groups">
-        {groups.map(group => (
-          <section className={`cw-user-group${group.out ? ' out' : ''}`} key={group.tenant}>
-            {(groups.length > 1 || group.out) && (
-              <h4>
-                {tenantName(group.tenant)}
-                {group.out && <small>不可授权</small>}
-              </h4>
-            )}
-            <div className="cw-user-chips" role="group" aria-label={`${tenantName(group.tenant)}的用户`}>
-              {group.rows.map(user => {
-                const on = d.picked.has(user.key);
-                return (
-                  <button
-                    type="button"
-                    key={user.key}
-                    className={`cw-user${on ? ' on' : ''}${user.blocked ? ' blocked' : ''}`}
-                    aria-pressed={on}
-                    disabled={Boolean(user.blocked) && !on}
-                    title={user.blocked ?? undefined}
-                    onClick={() => act.toggleUser(user.key)}
-                  >
-                    <span className="cw-user-mark" aria-hidden="true">
-                      {on && <Icon of="check" size={10} />}
-                    </span>
-                    {user.id}
-                    {user.status !== 'active' && <small>停用</small>}
-                  </button>
-                );
-              })}
-            </div>
-          </section>
-        ))}
+      <div className="cw-user-list">
+        <div className="cw-user-chips" role="group" aria-label="选择可用用户">
+          {visible.map(user => {
+            const on = d.picked.has(user.key);
+            return (
+              <button
+                type="button"
+                key={user.key}
+                className={`cw-user${on ? ' on' : ''}${user.blocked ? ' blocked' : ''}`}
+                aria-pressed={on}
+                disabled={Boolean(user.blocked) && !on}
+                title={user.blocked ?? undefined}
+                onClick={() => act.toggleUser(user.key)}
+              >
+                <span className="cw-user-mark" aria-hidden="true">
+                  {on && <Icon of="check" size={10} />}
+                </span>
+                {user.id}
+                {user.status !== 'active' && <small>停用</small>}
+              </button>
+            );
+          })}
+        </div>
         {visible.length === 0 && <p className="cw-empty">没有匹配的用户</p>}
       </div>
     </div>
@@ -1201,9 +1169,9 @@ export function IngressPanel({ d, act }: { d: Derived; act: Actions }) {
       <PanelHead title="接入协议" aside={d.head && <span className="cw-count">{d.head.name}</span>} />
       <ul className="cw-protos">
         <ProtocolRow
-          name="VLESS · REALITY"
+          name="VLESS · TLS/REALITY"
           icon="xray"
-          note="TCP · XHTTP"
+          note={INGRESS_PROTOCOL_DESCRIPTIONS.vless}
           enabled={p.vless}
           onToggle={vless => act.setProto({ vless })}
           issue={p.vless ? (d.portIssue.vless ?? (!d.realityReady ? '补全伪装目标' : null)) : null}
@@ -1253,7 +1221,7 @@ export function IngressPanel({ d, act }: { d: Derived; act: Actions }) {
         <ProtocolRow
           name="AnyTLS"
           icon="bolt"
-          note="TCP · TLS"
+          note={INGRESS_PROTOCOL_DESCRIPTIONS.anytls}
           enabled={p.anytls}
           onToggle={anytls => act.setProto({ anytls })}
           issue={p.anytls ? (d.portIssue.anytls ?? certIssue) : null}
@@ -1292,7 +1260,7 @@ export function IngressPanel({ d, act }: { d: Derived; act: Actions }) {
         <ProtocolRow
           name="Hysteria 2"
           icon="hysteria"
-          note="UDP · QUIC"
+          note={INGRESS_PROTOCOL_DESCRIPTIONS.hy2}
           enabled={p.hy2}
           onToggle={hy2 => act.setProto({ hy2 })}
           issue={p.hy2 ? (d.portIssue.hy2 ?? certIssue) : null}
@@ -1340,7 +1308,7 @@ export function IngressPanel({ d, act }: { d: Derived; act: Actions }) {
         <ProtocolRow
           name="VLESS · Encryption"
           icon="xray"
-          note="TCP · 原生加密"
+          note={INGRESS_PROTOCOL_DESCRIPTIONS.encryption}
           enabled={p.encryption}
           onToggle={encryption => act.setProto({ encryption })}
           issue={p.encryption ? d.portIssue.encryption : null}
@@ -1371,7 +1339,7 @@ export function IngressPanel({ d, act }: { d: Derived; act: Actions }) {
         <ProtocolRow
           name="MTProxy"
           icon="telegram"
-          note="Telegram"
+          note={INGRESS_PROTOCOL_DESCRIPTIONS.mtproto}
           enabled={p.mtproto}
           onToggle={mtproto => act.setProto({ mtproto })}
           issue={d.mtprotoUnavailable ? '需要非 NAT 的公网 IPv4' : p.mtproto ? d.portIssue.mtproto : null}

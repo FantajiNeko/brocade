@@ -42,16 +42,21 @@ import {
 import { ErrorBox, Loading } from '../ui/bits';
 import { freePortAcross, freeSpanAcross, hopListener, isValidSlug, occupiedPorts, portClash, spanClash } from './ports';
 import { appId as randomAppId, modelIdPair } from '../model-id';
-import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
+import {
+  DEFAULT_TLS_FINGERPRINT,
+  REALITY_FINGERPRINT_OPTIONS,
+  realityFingerprintIsValid,
+  realityServerNameIsValid,
+} from '../reality';
 import { DEFAULT_VLESS_ENCRYPTION } from '../vless-encryption';
 import { newRealityFallbackLimits } from '../reality-fallback';
 import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader } from '../ui/wizard-paper';
 import { Icon, type IconName } from '../ui/icons';
-import { RegionFlag } from '../ui/region-flag';
 import { GeneratedUserAvatar } from '../ui/user-avatar';
 import { useInitialReady } from '../ui/use-initial-ready';
 import { vpngateNodeEligibility } from '../vpngate-capability';
-import { MTPROTO_DESCRIPTION, mtprotoNodeEligibility } from '../mtproto-capability';
+import { mtprotoNodeEligibility } from '../mtproto-capability';
+import { INGRESS_PROTOCOL_DESCRIPTIONS } from '../ingress-protocols';
 import { useUnsavedChanges } from '../ui/navigation-guard';
 import {
   wizardDefaultListenerWire,
@@ -280,7 +285,6 @@ function WizardProtocolTile({
   onExpand,
   portRange = false,
   issues = [],
-  requirement,
 }: {
   name: string;
   note: string;
@@ -293,7 +297,6 @@ function WizardProtocolTile({
   onExpand?: () => void;
   portRange?: boolean;
   issues?: string[];
-  requirement?: string;
 }) {
   const checkboxId = useId();
   return (
@@ -311,7 +314,6 @@ function WizardProtocolTile({
           {name}
         </b>
         <span className="note">{note}</span>
-        {requirement && <span className="note">{requirement}</span>}
       </label>
       <span className="wzp-port">{port}</span>
       {params && (
@@ -331,16 +333,15 @@ function WizardProtocolTile({
 
 export function ChainWizard({
   node,
-  fixedApp,
+  defaultApp,
   onDone,
 }: {
   // 预填的链头。机器页传入（入口即该机器），线路页不传入——由路径的第一行选择。
   // 不传入不表示使用另一套界面：该行本身存在，只是从固定文本变为
   // 用于选择入口机器的下拉框。
   node?: NodeAgentStateItem;
-  // 从线路页进入时线路已确定：该项已在进入前指定，此处再次询问
-  // （且提供新建选项）会造成对当前位置的误判。
-  fixedApp?: { id: string; label: string };
+  // 从分组等入口进入时默认选中该分组，仍可切换到其他分组或新建。
+  defaultApp?: { id: string; label: string };
   onDone: (created?: { appId: string; chainId: string; ingressId: string }) => void;
 }) {
   const { who } = useSession();
@@ -361,7 +362,8 @@ export function ChainWizard({
 
   const apps = snapshot.data?.snapshot.apps ?? [];
 
-  // 线路的选择：默认为第一个已有线路，没有任何线路时才使用新建。与 id、端口遵循同一规则——
+  // 分组的选择：优先默认分组，否则使用第一个已有分组，没有任何分组时才使用新建。
+  // 默认选择不改变菜单顺序。与 id、端口遵循同一规则——
   // state 存储的是是否手动选择过（null 表示未选择），显示值实时计算。不能使用 useState 的
   // 初始值：快照尚未返回时 `apps` 为空，此时计算的默认值始终是新建，且不会再更新。
   // 创建分组需要 system-admin 而创建链只需 editor，两种权限都不具备时该项无法给出取值：
@@ -369,9 +371,9 @@ export function ChainWizard({
   const [appModeRaw, setAppMode] = useState<'new' | 'existing' | null>(null);
   const [appLabelRaw, setAppLabel] = useState<string | null>(null);
   const [pickedAppRaw, setPickedApp] = useState<string | null>(null);
-  const appMode: 'new' | 'existing' = fixedApp ? 'existing' : (appModeRaw ?? (apps.length > 0 ? 'existing' : 'new'));
-  const pickedApp = fixedApp?.id ?? pickedAppRaw ?? apps[0]?.id ?? '';
-  const [chainNameRaw, setChainName] = useState<string | null>(null);
+  const appMode: 'new' | 'existing' = appModeRaw ?? (apps.length > 0 ? 'existing' : 'new');
+  const pickedApp = pickedAppRaw ?? apps.find(app => app.id === defaultApp?.id)?.id ?? apps[0]?.id ?? '';
+  const [chainName, setChainName] = useState('');
   // 与链详情共用 Rule 的语义：主干和支路均从显式转发规则推导，不保存第二份路径顺序。
   const [headId, setHeadId] = useState<string | null>(node?.node_id ?? null);
   const [pathRules, setPathRules] = useState<WizardRuleTables>(node ? { [node.node_id]: [wizardEgressRule()] } : {});
@@ -407,7 +409,7 @@ export function ChainWizard({
   const [mtprotoEnabled, setMtProtoEnabled] = useState<boolean>(NEW_CHAIN_PROTOCOL_DEFAULTS.mtproto);
   const [customRealityDest, setCustomRealityDest] = useState('');
   const [customRealityNames, setCustomRealityNames] = useState('');
-  const [customRealityFingerprint, setCustomRealityFingerprint] = useState('chrome');
+  const [customRealityFingerprint, setCustomRealityFingerprint] = useState<string>(DEFAULT_TLS_FINGERPRINT);
   const [error, setError] = useState<unknown>(null);
   const [attempted, setAttempted] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -443,9 +445,6 @@ export function ChainWizard({
       realityFingerprintIsValid(customRealityFingerprint));
   const [appId] = useState(() => randomAppId());
   const appLabel = appLabelRaw ?? headLabel;
-  const chainName =
-    chainNameRaw ??
-    (!head ? '' : spine.length === 1 ? `${headLabel} 直出` : `${headLabel} → ${nameOf(spine.at(-1) ?? '')}`);
   /* 选择连接方式需要读取对端的公网地址，因此此处需要完整的节点数据而非只有名称。 */
   const nodeOf = (id: string) => (nodes.data?.nodes ?? []).find(n => n.node_id === id) ?? null;
   // 订阅地区只描述主链最终从哪里出网，因此跟随 Any 转发主干的末尾节点；例外支路不改变
@@ -584,7 +583,7 @@ export function ChainWizard({
     hy2Down,
   });
   const entryTcpListeners: TcpListenerChoice[] = [];
-  if (vlessEnabled) entryTcpListeners.push({ label: 'VLESS · REALITY', port });
+  if (vlessEnabled) entryTcpListeners.push({ label: 'VLESS · TLS/REALITY', port });
   if (encryptionEnabled) entryTcpListeners.push({ label: 'VLESS · Encryption', port: encryptionPort });
   if (anyTlsEnabled) entryTcpListeners.push({ label: 'AnyTLS', port: anyTlsPort });
   if (mtprotoEnabled) entryTcpListeners.push({ label: 'MTProxy', port: mtprotoPort });
@@ -624,7 +623,7 @@ export function ChainWizard({
   const certificateIssue = head && !headCertificate ? `入口尚未分配${headCertificateLabel}` : null;
   const protocolIssues = {
     vless: vlessEnabled
-      ? [...tcpIssuesFor('VLESS · REALITY'), ...(!realityTargetReady ? ['补全 REALITY 伪装目标'] : [])]
+      ? [...tcpIssuesFor('VLESS · TLS/REALITY'), ...(!realityTargetReady ? ['补全 REALITY 伪装目标'] : [])]
       : [],
     encryption: encryptionEnabled ? tcpIssuesFor('VLESS · Encryption') : [],
     anytls: anyTlsEnabled
@@ -800,15 +799,15 @@ export function ChainWizard({
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
   /* 键使用 `租户/用户`：用户 id 只在租户内唯一（user.dup 只在单个租户内查重）。 */
   const [pickedUsers, setPickedUsers] = useState<Set<string>>(new Set());
-  const [newUser, setNewUser] = useState<{ id: string; tenant: string } | null>(null);
+  const [newUser, setNewUser] = useState<{ id: string } | null>(null);
   const [userQuery, setUserQuery] = useState('');
-  const guardScope = node ? `chain-wizard:node:${node.node_id}` : `chain-wizard:app:${fixedApp?.id ?? 'new'}`;
+  const guardScope = node ? `chain-wizard:node:${node.node_id}` : `chain-wizard:app:${defaultApp?.id ?? 'new'}`;
   const initialPathRules: WizardRuleTables = node ? { [node.node_id]: [wizardEgressRule()] } : {};
   const dirty =
     appModeRaw !== null ||
     appLabelRaw !== null ||
     pickedAppRaw !== null ||
-    chainNameRaw !== null ||
+    chainName !== '' ||
     headId !== (node?.node_id ?? null) ||
     JSON.stringify(pathRules) !== JSON.stringify(initialPathRules) ||
     activeDnsChanges.length > 0 ||
@@ -826,7 +825,7 @@ export function ChainWizard({
     mtprotoEnabled !== NEW_CHAIN_PROTOCOL_DEFAULTS.mtproto ||
     customRealityDest !== '' ||
     customRealityNames !== '' ||
-    customRealityFingerprint !== 'chrome' ||
+    customRealityFingerprint !== DEFAULT_TLS_FINGERPRINT ||
     portRaw !== null ||
     encryptionPortRaw !== null ||
     anyTlsPortRaw !== null ||
@@ -841,7 +840,7 @@ export function ChainWizard({
   // （validate.rs 的 tenant.scope：`under(grant.tenant, ingress.tenant)`）。
   const ingressTenant = head?.tenant_id ?? '';
   const userRows = [...(users.data?.users ?? [])]
-    .sort((a, b) => a.tenant_id.localeCompare(b.tenant_id) || a.id.localeCompare(b.id))
+    .sort((a, b) => a.id.localeCompare(b.id) || a.tenant_id.localeCompare(b.tenant_id))
     .map(u => ({
       ...u,
       key: `${u.tenant_id}/${u.id}`,
@@ -871,19 +870,15 @@ export function ChainWizard({
       return next;
     });
   const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
-  const tenantName = (id: string) => tenantOptions.find(tenant => tenant.id === id)?.name || id;
   const normalizedUserQuery = userQuery.trim().toLowerCase();
   const visibleUsers = userRows.filter(
-    user =>
-      !normalizedUserQuery ||
-      `${user.id} ${user.tenant_id} ${tenantName(user.tenant_id)}`.toLowerCase().includes(normalizedUserQuery),
+    user => !normalizedUserQuery || user.id.toLowerCase().includes(normalizedUserQuery),
   );
   const visibleSelectableUsers = visibleUsers.filter(user => !user.blocked);
-  const userGroups = [...new Set(visibleUsers.map(user => user.tenant_id))];
   const defaultNewUserTenant =
     (head && tenantOptions.some(tenant => tenant.id === head.tenant_id) ? head.tenant_id : '') ||
     (tenantOptions.length === 1 ? tenantOptions[0].id : '');
-  const newUserTenant = newUser?.tenant || defaultNewUserTenant;
+  const newUserTenant = defaultNewUserTenant;
   const newUserId = newUser?.id.trim() ?? '';
   const newUserBadSlug = newUserId && !isValidSlug(newUserId) ? 'ID 只能用 a-z 0-9 . _ -，最长 32' : null;
   const newUserDuplicate = userRows.some(user => user.tenant_id === newUserTenant && user.id === newUserId)
@@ -936,10 +931,10 @@ export function ChainWizard({
     if (appMode === 'new') list.push({ op: 'upsert_app', arg: `${targetApp}「${appLabel.trim() || targetApp}」` });
     list.push({
       op: 'upsert_chain',
-      arg: `${chainId.trim()}「${chainName.trim() || chainId.trim()}」`,
+      arg: `${chainId.trim()}「${chainName.trim() || '未命名'}」`,
     });
     const protocolNames = [
-      vlessEnabled && 'VLESS · REALITY',
+      vlessEnabled && 'VLESS · TLS/REALITY',
       encryptionEnabled && 'VLESS · Encryption',
       anyTlsEnabled && 'AnyTLS',
       hy2Enabled && 'Hysteria 2',
@@ -1004,7 +999,7 @@ export function ChainWizard({
       await createChain(app, {
         id: chainId.trim(),
         tenant_id: head?.tenant_id ?? '',
-        name: chainName.trim() || chainId.trim(),
+        name: chainName.trim(),
         subscription_country: exitCountry,
       });
       await createIngress(app, {
@@ -1126,7 +1121,7 @@ export function ChainWizard({
     entryPortCollision,
     entryPortIssues[0] ?? null,
     anyTlsEnabled || hy2Enabled ? (!headCertificate ? `先为入口节点分配${headCertificateLabel}` : null) : null,
-    !realityTargetReady ? '补全 VLESS · REALITY 伪装目标' : null,
+    !realityTargetReady ? '补全 VLESS · TLS/REALITY 伪装目标' : null,
     wizardRuleIssue(headId, stagedRules),
     activeDnsChanges.find(
       change =>
@@ -1166,7 +1161,7 @@ export function ChainWizard({
         icon="chains"
         meta={[
           chainName.trim() || '未命名',
-          fixedApp?.label || apps.find(app => app.id === pickedApp)?.label || appLabel.trim(),
+          appMode === 'new' ? appLabel.trim() : existingApp?.label || existingApp?.id,
         ]
           .filter(Boolean)
           .join(' · ')}
@@ -1196,23 +1191,17 @@ export function ChainWizard({
                         }
                       }}
                     >
-                      {fixedApp ? (
-                        <option value={fixedApp.id}>{fixedApp.label || fixedApp.id}</option>
-                      ) : (
-                        <>
-                          {apps.map(app => (
-                            <option key={app.id} value={app.id}>
-                              {app.label || app.id}
-                            </option>
-                          ))}
-                          <option value={NEW_APP} disabled={!system}>
-                            ＋ 新建分组…
-                          </option>
-                        </>
-                      )}
+                      {apps.map(app => (
+                        <option key={app.id} value={app.id}>
+                          {app.label || app.id}
+                        </option>
+                      ))}
+                      <option value={NEW_APP} disabled={!system}>
+                        ＋ 新建分组…
+                      </option>
                     </select>
                   </WizardField>
-                  {appMode === 'new' && !fixedApp && (
+                  {appMode === 'new' && (
                     <WizardField label="分组名称" htmlFor="chain-wizard-app-name">
                       <input
                         id="chain-wizard-app-name"
@@ -1286,7 +1275,7 @@ export function ChainWizard({
                     disabled={addUser.isPending}
                     onClick={() => {
                       addUser.reset();
-                      setNewUser(current => (current ? null : { id: '', tenant: defaultNewUserTenant }));
+                      setNewUser(current => (current ? null : { id: '' }));
                     }}
                   >
                     ＋ 新增用户
@@ -1336,28 +1325,9 @@ export function ChainWizard({
                         onChange={event => setNewUser({ ...newUser, id: event.target.value })}
                       />
                     </label>
-                    {tenantOptions.length > 1 && (
-                      <label className="user-new-field">
-                        <span>所属租户</span>
-                        <select
-                          className="f"
-                          aria-label="新用户所属租户"
-                          value={newUserTenant}
-                          disabled={addUser.isPending}
-                          onChange={event => setNewUser({ ...newUser, tenant: event.target.value })}
-                        >
-                          <option value="">— 选择租户 —</option>
-                          {tenantOptions.map(tenant => (
-                            <option key={tenant.id} value={tenant.id}>
-                              {tenant.name || tenant.id}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    )}
-                    {(newUserBadSlug || newUserDuplicate || !tenantOptions.length) && (
+                    {(newUserBadSlug || newUserDuplicate || !newUserTenant) && (
                       <p className="user-new-error" role="alert">
-                        {newUserBadSlug || newUserDuplicate || '没有可用租户'}
+                        {newUserBadSlug || newUserDuplicate || '当前配置下无法新增用户，请先选择入口机器。'}
                       </p>
                     )}
                     {addUser.error && <ErrorBox error={addUser.error} />}
@@ -1385,46 +1355,33 @@ export function ChainWizard({
                   </div>
                 )}
                 <div className="cc-user-list" role="group" aria-label="选择可用用户">
-                  {userGroups.map(tenant => {
-                    const tenantUsers = visibleUsers.filter(user => user.tenant_id === tenant);
-                    return (
-                      <section key={tenant} aria-label={`${tenantName(tenant)}的用户`}>
-                        {userGroups.length > 1 && (
-                          <h4 className="sec">
-                            {tenantName(tenant)}
-                            <span className="wz-sec-note">{tenantUsers.length}</span>
-                          </h4>
-                        )}
-                        <div className="cc-user-grid">
-                          {tenantUsers.map(user => {
-                            const selected = pickedUsers.has(user.key);
-                            return (
-                              <button
-                                type="button"
-                                key={user.key}
-                                className="grant-card cc-user"
-                                aria-pressed={selected}
-                                disabled={Boolean(user.blocked) && !selected}
-                                title={`${user.id}${user.blocked ? ` · ${user.blocked}` : ''}`}
-                                onClick={() => toggleUser(user.key)}
-                              >
-                                <GeneratedUserAvatar id={user.id} variant="cell" />
-                                <span className="cc-user-copy">
-                                  <span className="gc-app">{user.id}</span>
-                                  {user.blocked && (
-                                    <span className="gc-at">{user.status !== 'active' ? '已停用' : '不可授权'}</span>
-                                  )}
-                                </span>
-                                <span className="gc-mark" aria-hidden="true">
-                                  {selected ? '✓' : ''}
-                                </span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </section>
-                    );
-                  })}
+                  <div className="cc-user-grid">
+                    {visibleUsers.map(user => {
+                      const selected = pickedUsers.has(user.key);
+                      return (
+                        <button
+                          type="button"
+                          key={user.key}
+                          className="grant-card cc-user"
+                          aria-pressed={selected}
+                          disabled={Boolean(user.blocked) && !selected}
+                          title={`${user.id}${user.blocked ? ` · ${user.blocked}` : ''}`}
+                          onClick={() => toggleUser(user.key)}
+                        >
+                          <GeneratedUserAvatar id={user.id} variant="cell" />
+                          <span className="cc-user-copy">
+                            <span className="gc-app">{user.id}</span>
+                            {user.blocked && (
+                              <span className="gc-at">{user.status !== 'active' ? '已停用' : '不可授权'}</span>
+                            )}
+                          </span>
+                          <span className="gc-mark" aria-hidden="true">
+                            {selected ? '✓' : ''}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                   {!visibleUsers.length && (
                     <p className="note">{normalizedUserQuery ? '没有匹配的用户' : '还没有用户，可以在这里新增。'}</p>
                   )}
@@ -1440,9 +1397,9 @@ export function ChainWizard({
               <WizardCard title="接入协议" icon="ingress" hint={`${enabledProtocolCount} 种 · 端口自动避让`}>
                 <div className="wzp" aria-label="接入协议">
                   <WizardProtocolTile
-                    name="VLESS · REALITY"
+                    name="VLESS · TLS/REALITY"
                     issues={protocolIssues.vless}
-                    note="TCP / XHTTP 入站；使用 REALITY 保护传输。"
+                    note={INGRESS_PROTOCOL_DESCRIPTIONS.vless}
                     icon="xray"
                     enabled={vlessEnabled}
                     onToggle={setVlessEnabled}
@@ -1453,7 +1410,7 @@ export function ChainWizard({
                           label="VLESS 监听端口"
                           value={portText}
                           disabled={!vlessEnabled}
-                          invalid={tcpIssuesFor('VLESS · REALITY').length > 0}
+                          invalid={tcpIssuesFor('VLESS · TLS/REALITY').length > 0}
                           onChange={setPort}
                         />
                         {vlessEnabled && portRaw !== null && (
@@ -1541,7 +1498,7 @@ export function ChainWizard({
                   <WizardProtocolTile
                     name="VLESS · Encryption"
                     issues={protocolIssues.encryption}
-                    note="TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。"
+                    note={INGRESS_PROTOCOL_DESCRIPTIONS.encryption}
                     icon="xray"
                     enabled={encryptionEnabled}
                     onToggle={setEncryptionEnabled}
@@ -1584,7 +1541,7 @@ export function ChainWizard({
                   <WizardProtocolTile
                     name="AnyTLS"
                     issues={protocolIssues.anytls}
-                    note="TCP 入站；支持 TLS / REALITY、Padding 与连接复用。"
+                    note={INGRESS_PROTOCOL_DESCRIPTIONS.anytls}
                     icon="bolt"
                     enabled={anyTlsEnabled}
                     onToggle={setAnyTlsEnabled}
@@ -1635,7 +1592,7 @@ export function ChainWizard({
                     name="Hysteria 2"
                     issues={protocolIssues.hy2}
                     portRange
-                    note="QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。"
+                    note={INGRESS_PROTOCOL_DESCRIPTIONS.hy2}
                     icon="hysteria"
                     enabled={hy2Enabled}
                     onToggle={setHy2Enabled}
@@ -1701,9 +1658,8 @@ export function ChainWizard({
                   />
                   <WizardProtocolTile
                     name="MTProxy"
-                    requirement="入口需有直接配置在网卡上的公网 IPv4。"
                     issues={protocolIssues.mtproto}
-                    note={MTPROTO_DESCRIPTION}
+                    note={INGRESS_PROTOCOL_DESCRIPTIONS.mtproto}
                     icon="telegram"
                     enabled={mtprotoEnabled}
                     onToggle={setMtProtoEnabled}
@@ -1729,7 +1685,6 @@ export function ChainWizard({
                     至少开启一个接入协议。
                   </p>
                 )}
-                <p className="note">其余参数使用默认值，建成后可在线路详情调整。</p>
               </WizardCard>
             </div>
           </div>
@@ -1744,23 +1699,6 @@ export function ChainWizard({
                   }`
             }
           >
-            {spine.length > 0 && (
-              <div className="chain-path cc-route" role="group" aria-label="当前链路径">
-                {spine.map((id, index) => (
-                  <span key={id} className="cp-seg">
-                    {index > 0 && <i className="cp-wire" aria-hidden="true" />}
-                    <span
-                      className="cp-hop"
-                      data-role={index === 0 ? 'entry' : index === spine.length - 1 ? 'exit' : 'relay'}
-                      title={id}
-                    >
-                      <RegionFlag code={nodeOf(id)?.public_ipv4_country} />
-                      {nameOf(id)}
-                    </span>
-                  </span>
-                ))}
-              </div>
-            )}
             <WizardPathEditor
               root={headId}
               tables={pathRules}

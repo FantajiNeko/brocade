@@ -70,7 +70,19 @@
         },
         "security": "reality",
         "sockopt": {
-          "tcpFastOpen": 256
+          "customSockopt": [
+            {
+              "level": "6",
+              "network": "tcp",
+              "opt": "6",
+              "system": "linux",
+              "type": "int",
+              "value": "3"
+            }
+          ],
+          "tcpFastOpen": 256,
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 90
         }
       },
       "tag": "in:frt/i-frt-us"
@@ -93,7 +105,21 @@
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "none"
+        "security": "none",
+        "sockopt": {
+          "customSockopt": [
+            {
+              "level": "6",
+              "network": "tcp",
+              "opt": "6",
+              "system": "linux",
+              "type": "int",
+              "value": "3"
+            }
+          ],
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 90
+        }
       },
       "tag": "in:frt/i-frt-us:guard"
     },
@@ -115,7 +141,19 @@
         "network": "tcp",
         "security": "none",
         "sockopt": {
-          "tcpFastOpen": 256
+          "customSockopt": [
+            {
+              "level": "6",
+              "network": "tcp",
+              "opt": "6",
+              "system": "linux",
+              "type": "int",
+              "value": "3"
+            }
+          ],
+          "tcpFastOpen": 256,
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 90
         }
       },
       "tag": "in:hop:brc/c-brc-jp"
@@ -138,7 +176,19 @@
         "network": "tcp",
         "security": "none",
         "sockopt": {
-          "tcpFastOpen": 256
+          "customSockopt": [
+            {
+              "level": "6",
+              "network": "tcp",
+              "opt": "6",
+              "system": "linux",
+              "type": "int",
+              "value": "3"
+            }
+          ],
+          "tcpFastOpen": 256,
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 90
         }
       },
       "tag": "in:hop:brc/c-brc-smart"
@@ -161,7 +211,19 @@
         "network": "tcp",
         "security": "none",
         "sockopt": {
-          "tcpFastOpen": 256
+          "customSockopt": [
+            {
+              "level": "6",
+              "network": "tcp",
+              "opt": "6",
+              "system": "linux",
+              "type": "int",
+              "value": "3"
+            }
+          ],
+          "tcpFastOpen": 256,
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 90
         }
       },
       "tag": "in:hop:lin/c-lin-jp"
@@ -184,7 +246,19 @@
         "network": "tcp",
         "security": "none",
         "sockopt": {
-          "tcpFastOpen": 256
+          "customSockopt": [
+            {
+              "level": "6",
+              "network": "tcp",
+              "opt": "6",
+              "system": "linux",
+              "type": "int",
+              "value": "3"
+            }
+          ],
+          "tcpFastOpen": 256,
+          "tcpKeepAliveIdle": 300,
+          "tcpKeepAliveInterval": 90
         }
       },
       "tag": "in:hop:lin/c-lin-us"

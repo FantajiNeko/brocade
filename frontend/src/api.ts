@@ -336,7 +336,7 @@ export const fetchWhoami = (token = '') => api<Whoami>('/whoami', token);
 
 export interface AuthState {
   initialized: boolean;
-  /** 存在 `public` 操作者且未设置密码：任何访问该页面的人都可直接进入。见 `PUBLIC_ID`。 */
+  /** 开启时，无登录凭据的请求可直接读取经过脱敏的访客页面，不创建登录会话。 */
   public_open: boolean;
 }
 
@@ -466,7 +466,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 36;
+export const AGENT_PROTOCOL_VERSION = 38;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
 export const XRAY_HANDOFF_PROTOCOL_VERSION = 30;
@@ -540,7 +540,15 @@ export interface GeodataObservation {
   asset_dir: string;
 }
 
+export interface NodeInitialization {
+  state: 'waiting-agent' | 'queued' | 'running' | 'succeeded' | 'manual' | 'failed';
+  revision_id: number;
+  deployment_id: number | null;
+  reason: string | null;
+}
+
 export interface NodeAgentStateItem {
+  initialization?: NodeInitialization | null;
   node_id: string;
   tenant_id: string;
   name: string;
@@ -851,15 +859,6 @@ export interface TenantListItem {
 
 export const fetchTenants = (token = '') => api<{ tenants: TenantListItem[] }>('/tenants', token);
 
-/* 首次安装的流程需要立即写库：该阶段还没有控制台界面，因此不存在提交操作。 */
-export const createTenantNow = (body: { id: string; name: string }, token = '') =>
-  post<unknown>('/tenants', body, token);
-
-export const createTenant = async (body: { id: string; name: string }) => {
-  draft.push({ op: 'create_tenant', tenant: body });
-  return {} as unknown;
-};
-
 /* ── 发布 ── */
 
 /* 服务端使用 PlannedAction 的 kebab-case 形式：ApplyWireGuard → apply-wire-guard（WireGuard 被拆为两段） */
@@ -986,6 +985,14 @@ export interface DeploymentCommandResult {
 
 export const planDeployment = (revision_id: number, token = '') =>
   post<DeploymentPlan>('/deployments/plan', { revision_id }, token);
+
+/** Actual acknowledged artifacts → planned bytes; historical revisions are not recompiled as the baseline. */
+export const fetchPlanArtifacts = (revision_id: number, includeContent = false, token = '') =>
+  post<{ revision: number; targets: DeploymentTargetDetail[] }>(
+    `/deployments/plan/artifacts${includeContent ? '?include=content' : ''}`,
+    { revision_id },
+    token,
+  );
 
 // 不传 kind 表示两类都返回。筛选在服务端执行：在前端筛选时 limit 会先被高频的权限单
 // （人工权限操作和配额执行都会产生）占满，导致配置单无法返回。
@@ -1217,6 +1224,9 @@ export const fetchMyUser = () => api<UserListItem>('/me/user');
 
 export type ForwardingProtocol = 'tcp' | 'udp' | 'tcp_udp';
 
+/** Readonly and public responses replace dialable ports with this mask on the server. */
+export type ForwardingPort = number | '***';
+
 export interface ForwardingEntitlement {
   node_id: string;
   node_name: string;
@@ -1225,8 +1235,8 @@ export interface ForwardingEntitlement {
   enabled: boolean;
   tcp_allowed: boolean;
   udp_allowed: boolean;
-  listen_port_start: number;
-  listen_port_end: number;
+  listen_port_start: ForwardingPort;
+  listen_port_end: ForwardingPort;
   max_rules: number;
   allow_private_targets: boolean;
   rule_count: number;
@@ -1277,9 +1287,9 @@ export interface ForwardingRule {
   node_id: string;
   name: string;
   protocol: ForwardingProtocol;
-  listen_port: number;
+  listen_port: ForwardingPort;
   target_host: string;
-  target_port: number;
+  target_port: ForwardingPort;
   enabled: boolean;
   runtime_status: 'active' | 'pending' | 'error' | 'disabled' | 'quota-paused';
   uplink_bytes: number;
@@ -1703,7 +1713,7 @@ export const setQuota = (body: { tenant_id: string; user_id: string; app_id: str
 // 机器是否运行 xray 由计算得出（physical/node.rs 的 xray_plan：inbounds 来自该机器上的
 // 接入面，outbounds 来自链的转发边），因此使节点运行 xray 的方式是为其创建链和接入面，
 // 而不是在节点上增加开关。创建项目需要 system-admin，链和接入面需要 editor。
-// 三个请求体都设置了 deny_unknown_fields，只能发送下列字段。
+// 请求体只声明当前支持的字段；服务端忽略新增字段以兼容滚动升级。
 export interface ModelWriteResult {
   revision_id: number;
 }
@@ -3472,14 +3482,14 @@ export interface UserTrafficHistory {
   }[];
 }
 
-export const fetchNodeUserTrafficHistory = (nodeId: string) =>
-  api<UserTrafficHistory>(`/realtime/nodes/${encodeURIComponent(nodeId)}/user-history`);
 export const fetchUserTrafficHistory = (tenantId: string, userId: string) =>
   api<UserTrafficHistory>(`/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}/realtime/history`);
 
 /** 站点流量的统计范围：UTC+8 自然日、周一起的自然周、自然月（与额度的自然月相同）。 */
 export type SiteUsagePeriod = 'day' | 'week' | 'month';
 
+/** 代理入口的站点分类及独立 forwarding 类型；转发总量来自账本，小时图仅含保留的窗口明细。
+ * 采集开关、覆盖与观测起点只描述代理入口，不限制转发账本。 */
 export interface UserSiteUsage {
   collection_enabled: boolean;
   catalog_version: number;
@@ -3551,7 +3561,28 @@ export interface NodeInflowUsage {
   latest_report_unix_secs: number | null;
   rows: NodeInflowRow[];
   idle_users: { tenant_id: string; user_id: string }[];
+  range_limited?: boolean;
 }
+export interface TrafficTimeRange {
+  start_unix_secs: number;
+  end_unix_secs: number;
+}
+export interface NodeInflowDetailRow extends NodeInflowRow {
+  source_ip: string | null;
+}
+export interface NodeInflowDetails {
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
+  observed_since_unix_secs: number | null;
+  latest_report_unix_secs: number | null;
+  limited: boolean;
+  accounting_mismatch: boolean;
+  accounting_uplink_bytes: number;
+  accounting_downlink_bytes: number;
+  rows: NodeInflowDetailRow[];
+}
+/** 机器流出：站点分类及独立 forwarding 类型。转发总量来自日账本，小时图仅含保留的窗口明细；
+ * 站点采集开关、覆盖与观测起点只描述认证代理入口，不限制转发账本。 */
 export interface NodeSiteUsage extends UserSiteUsage {
   top_users: {
     site_id: string;
@@ -3561,16 +3592,46 @@ export interface NodeSiteUsage extends UserSiteUsage {
     other_downlink_bytes: number;
   }[];
 }
-const nodeUsagePath = (nodeId: string, kind: string, period: SiteUsagePeriod) =>
-  `/nodes/${encodeURIComponent(nodeId)}/${kind}?period=${period}`;
-export const fetchNodeInflowUsage = (nodeId: string, period: SiteUsagePeriod) =>
-  api<NodeInflowUsage>(nodeUsagePath(nodeId, 'inflow-usage', period));
-export const fetchNodeSiteUsage = (nodeId: string, period: SiteUsagePeriod) =>
-  api<NodeSiteUsage>(nodeUsagePath(nodeId, 'site-usage', period));
-export const fetchNodeOtherDomains = (nodeId: string, period: SiteUsagePeriod) =>
-  api<UserOtherDomains>(nodeUsagePath(nodeId, 'other-domains', period));
-export const fetchNodeSniffingFailedTargets = (nodeId: string, period: SiteUsagePeriod) =>
-  api<UserSniffingFailedTargets>(nodeUsagePath(nodeId, 'sniffing-failed-targets', period));
+const nodeUsagePath = (nodeId: string, kind: string, period: SiteUsagePeriod, range?: TrafficTimeRange) =>
+  `/nodes/${encodeURIComponent(nodeId)}/${kind}?period=${period}${range ? `&start_unix_secs=${range.start_unix_secs}&end_unix_secs=${range.end_unix_secs}` : ''}`;
+export interface NodeTrafficHistory {
+  range_start_unix_secs: number;
+  range_end_unix_secs: number;
+  bucket_secs: number;
+  /** 窗口结束时间、上行 B/s、下行 B/s；null 表示没有完整的来源观测。 */
+  points: [number, number | null, number | null][];
+  recorded_bytes: number;
+  has_gap: boolean;
+  has_unplaced: boolean;
+}
+export const fetchNodeTrafficHistory = (nodeId: string, period: SiteUsagePeriod, range?: TrafficTimeRange) =>
+  api<NodeTrafficHistory>(nodeUsagePath(nodeId, 'traffic-history', period, range));
+export const fetchNodeInflowUsage = (nodeId: string, period: SiteUsagePeriod, range?: TrafficTimeRange) =>
+  api<NodeInflowUsage>(nodeUsagePath(nodeId, 'inflow-usage', period, range)).then(data => {
+    if (
+      range &&
+      (data.range_start_unix_secs !== range.start_unix_secs || data.range_end_unix_secs !== range.end_unix_secs)
+    ) {
+      throw new Error('当前 Console 未应用自选时间段，请更新 Console 后重试。');
+    }
+    return data;
+  });
+export const fetchNodeSiteUsage = (nodeId: string, period: SiteUsagePeriod, range?: TrafficTimeRange) =>
+  api<NodeSiteUsage>(nodeUsagePath(nodeId, 'site-usage', period, range));
+export const fetchNodeOtherDomains = (nodeId: string, period: SiteUsagePeriod, range?: TrafficTimeRange) =>
+  api<UserOtherDomains>(nodeUsagePath(nodeId, 'other-domains', period, range));
+export const fetchNodeSniffingFailedTargets = (nodeId: string, period: SiteUsagePeriod, range?: TrafficTimeRange) =>
+  api<UserSniffingFailedTargets>(nodeUsagePath(nodeId, 'sniffing-failed-targets', period, range));
+export const fetchNodeInflowDetails = (
+  nodeId: string,
+  tenant: string,
+  user: string,
+  period: SiteUsagePeriod,
+  range?: TrafficTimeRange,
+) =>
+  api<NodeInflowDetails>(
+    `${nodeUsagePath(nodeId, 'inflow-details', period, range)}&tenant_id=${encodeURIComponent(tenant)}&user_id=${encodeURIComponent(user)}`,
+  );
 
 export const fetchSiteUsagePolicy = () => api<{ enabled: boolean }>('/site-usage/settings');
 export const saveSiteUsagePolicy = (enabled: boolean) =>
@@ -3752,6 +3813,14 @@ export interface NodeConnection {
 }
 
 export const fetchSettings = () => currentDraftRead(() => api<ModelSettings>('/settings'));
+
+export interface DeploymentSettings {
+  unattended: boolean;
+  xray_handoff_beta: boolean;
+}
+export const fetchDeploymentSettings = () => api<DeploymentSettings>('/deployment-settings');
+export const saveDeploymentSettings = (body: Partial<DeploymentSettings>) =>
+  api<DeploymentSettings>('/deployment-settings', '', { method: 'PUT', body: JSON.stringify(body) });
 export const saveSettings = async (body: ModelSettings) => {
   draft.push({ op: 'update_settings', settings: body });
   return { revision_id: 0 };
@@ -3776,8 +3845,8 @@ export const saveProbeSettings = (probe: ModelSettings['probe']) =>
  *
  * 与上面一组分开，因为两者性质不同：模型设置进入修订，只有实际改变机器产物时才需要发布；
  * 地址不进入模型或任何产物，只决定安装命令中的地址和 /enroll/dist 清单，在安装时被读取，因此
- * 不进入草稿而是直接 PUT。xray_version 在响应结构中承载控制台内置版本，存储值不会覆盖
- * 随构建提供的二进制。
+ * 不进入草稿而是直接 PUT。xray_version 保留安装兼容版本，界面显示独立的源码提交
+ * xray_source_revision；存储值不会覆盖随构建提供的二进制。
  *
  * `stored` 是在此处填写的值，`effective` 是实际生效的值（已填写时即为该值，未填写时
  * 回退到进程启动时的环境变量，再回退到内置默认值）。两者都需要：仍使用环境变量的部署中
@@ -3790,6 +3859,8 @@ export interface DistributionSettings {
 export interface DistributionView {
   stored: DistributionSettings;
   effective: DistributionSettings;
+  /** 缺失表示旧 Console 没有提供源码提交，不能从兼容版本推断。 */
+  xray_source_revision?: string | null;
 }
 
 export const fetchDistribution = () => api<DistributionView>('/distribution');

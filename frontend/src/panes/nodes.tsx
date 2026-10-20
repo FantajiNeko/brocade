@@ -1,5 +1,6 @@
 import { useMetricQuery } from '../ui/metric-cadence';
 import { draft } from '../draft';
+import { NODE_DRAFT_PANELS, nodeDraftPanelKey, useNodeDraftFocus } from '../forge/draft-node-location';
 import {
   Fragment,
   lazy,
@@ -92,6 +93,7 @@ import { FieldLoading, PanelLoading } from '../ui/loading';
 import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { CopyButton } from '../ui/copy-button';
+import { nodeInitializationView } from '../node-initialization';
 import { firstProvisionError, provisionFormErrors } from '../provision-form';
 import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader } from '../ui/wizard-paper';
 import { useNarrow } from '../ui/viewport';
@@ -226,7 +228,7 @@ function useNodeObservationModules(): NodeObservationModuleState {
 export type Drill =
   | { p: 'list' }
   // range / from / to 是地址栏里的观测时间范围（ui/observe-range.ts 的 LoadRangeQuery）。
-  | ({ p: 'node'; id: string; tab?: 'config' } & LoadRangeQuery)
+  | ({ p: 'node'; id: string; tab?: NodeTab } & LoadRangeQuery)
   | { p: 'provision'; step: number }
   | { p: 'install'; node: string; step: number; result?: ProvisionNodeResult }
   | { p: 'chain'; id: string };
@@ -243,7 +245,7 @@ const PROVISION_FORM_DEFAULTS = {
   public_ipv6_nat: false,
   wg_listen_port: '51820',
   api_port: '10085',
-  overlay: true,
+  overlay: false,
   egress_allowed: true,
   dns: 'system',
   domain_strategy: 'use_ip' as DomainStrategy,
@@ -2858,7 +2860,7 @@ export function CertGroupCard({ node, canEdit }: { node: NodeAgentStateItem; can
   if (certs.error) return <ErrorBox error={certs.error} />;
 
   return (
-    <div className="panel config-panel">
+    <div className="panel config-panel" data-draft-panel={nodeDraftPanelKey(node.node_id, 'certificates')}>
       <header>
         <PanelTitle of="certificate">证书组</PanelTitle>
       </header>
@@ -3011,7 +3013,7 @@ export function DnsCard({
   });
 
   return (
-    <div className="panel config-panel">
+    <div className="panel config-panel" data-draft-panel={nodeDraftPanelKey(node.node_id, 'dns')}>
       <header>
         <PanelTitle of="dns">DNS</PanelTitle>
       </header>
@@ -3213,6 +3215,7 @@ function ConnectionCard({
   return (
     <details
       className="panel config-panel config-disclosure conn-card"
+      data-draft-panel={nodeDraftPanelKey(node.node_id, 'connection')}
       open={expanded}
       onToggle={event => setExpanded(event.currentTarget.open)}
     >
@@ -3841,7 +3844,7 @@ export function WgCard({
   onSaved: () => void;
 }) {
   return (
-    <div className="panel config-panel">
+    <div className="panel config-panel" data-draft-panel={nodeDraftPanelKey(node.node_id, 'wireguard')}>
       <header>
         <PanelTitle of="tunnels">WIREGUARD</PanelTitle>
       </header>
@@ -3942,7 +3945,7 @@ function WgDisabledLinksRow({
           onChange={event => setSelected(event.target.value)}
         >
           <option value="">选择 Peer…</option>
-          {/* 有名字时不再把 id 附在括号里重复一遍：`香港 DMIT AS3 Pro (dmit-hkg-as3-pro-lokmachau)`
+          {/* 有名字时不再把 id 附在括号里重复一遍：`香港示例入口 (example-hk-edge-01)`
               里 id 占了一半宽度，而上面的已禁用列表本来就是「名字 + 小字 id」两行式，
               加进去之后那一行仍然会写明是哪台。没有名字的机器仍然显示 id。 */}
           {candidates.map(peer => (
@@ -5060,7 +5063,7 @@ function RuntimeCard({
   children?: ReactNode;
 }) {
   return (
-    <div className="panel nd-runtime">
+    <div className="panel nd-runtime" data-draft-panel={nodeDraftPanelKey(node.node_id, 'observed')}>
       <header>
         <PanelTitle of="observe">运行状态</PanelTitle>
       </header>
@@ -5579,6 +5582,12 @@ function NodeDetail({
     id,
     tab: initialTab,
   });
+  const draftFocus = useNodeDraftFocus(id);
+  const [lastDraftFocus, setLastDraftFocus] = useState(0);
+  if (draftFocus && lastDraftFocus !== draftFocus.token) {
+    setLastDraftFocus(draftFocus.token);
+    setTabState({ id, tab: NODE_DRAFT_PANELS[draftFocus.panel].tab });
+  }
   const tabIdBase = useId();
   const activeTab: NodeTab = tabState.id !== id ? initialTab : tabState.tab;
   const setTab = (next: NodeTab) => {
@@ -6254,13 +6263,14 @@ function NodeDetail({
       {tab === 'config' && snapshot.data && (
         <section
           id={panelId('config')}
+          data-draft-panel={nodeDraftPanelKey(id, 'config')}
           className="nd-tab-config nd-tab-panel"
           role="tabpanel"
           aria-labelledby={tabId('config')}
           tabIndex={0}
         >
           <div>
-            <div className="panel config-panel">
+            <div className="panel config-panel" data-draft-panel={nodeDraftPanelKey(id, 'identity')}>
               <header>
                 <PanelTitle of="identity">身份</PanelTitle>
               </header>
@@ -6367,7 +6377,10 @@ function NodeDetail({
           aria-labelledby={tabId('chains')}
           tabIndex={0}
         >
-          <div className="panel config-panel rule-sheet-card node-egress-rule-sheet">
+          <div
+            className="panel config-panel rule-sheet-card node-egress-rule-sheet"
+            data-draft-panel={snapshot.data ? nodeDraftPanelKey(id, 'egress-dns') : undefined}
+          >
             <MachineEgressDnsRules
               key={id}
               nodeId={id}
@@ -6378,7 +6391,10 @@ function NodeDetail({
               snapshotError={snapshot.error}
             />
           </div>
-          <div className="panel config-panel rule-sheet-card node-chain-sheet">
+          <div
+            className="panel config-panel rule-sheet-card node-chain-sheet"
+            data-draft-panel={snapshot.data ? nodeDraftPanelKey(id, 'chains') : undefined}
+          >
             <NodeChainsSection
               id={id}
               inChains={inChains}
@@ -6471,12 +6487,7 @@ export function ProvisionForm({ go }: { go: (d: Drill) => void }) {
   // 单租户阶段不显示归属选择，并且只按数量判断：恰好一条才可纳管，不识别任何特殊名称。
   const defaultTenant = options.length === 1 ? options[0].id : '';
   const tenantId = defaultTenant;
-  const tenantError =
-    options.length === 0
-      ? '当前账号没有可用于纳管机器的租户'
-      : options.length > 1
-        ? '当前流程要求恰好一个可见租户，请先收窄账号范围'
-        : null;
+  const tenantError = options.length === 1 ? null : '当前账户配置不可用，无法纳管机器。';
 
   const guardScope = 'node-provision';
   const dirty = JSON.stringify(form) !== JSON.stringify(PROVISION_FORM_DEFAULTS);
@@ -6548,7 +6559,7 @@ export function ProvisionForm({ go }: { go: (d: Drill) => void }) {
         stages={[
           { label: '登记配置', state: 'current' },
           { label: '安装 Agent', state: 'next' },
-          { label: '上线发布', state: 'next' },
+          { label: '初始化', state: 'next' },
         ]}
         aside={<span className="st st-gold">立即写库</span>}
       />
@@ -6801,11 +6812,7 @@ export function ProvisionForm({ go }: { go: (d: Drill) => void }) {
             </div>
           </div>
         </fieldset>
-        {tenants.data && tenants.data.tenants.length !== 1 && (
-          <div className="callout warn">
-            系统归属配置异常：当前必须恰好有一条，实际为 {tenants.data.tenants.length} 条。
-          </div>
-        )}
+        {tenantError && <div className="callout warn">{tenantError}</div>}
         {provision.error && <ErrorBox error={provision.error} />}
       </div>
       <WizardFooter
@@ -6884,6 +6891,8 @@ export function ProvisionInstall({
 
   const probe = useAgentLiveness(nodeRow);
   const online = probe?.state === 'online';
+  const initialization = nodeRow?.initialization;
+  const initializationView = nodeInitializationView(initialization);
   const redeemed = probe?.state === 'polling' || online;
   const now = useNow();
   const tokenUsedAt = nodeRow?.token_last_used_at
@@ -6958,7 +6967,7 @@ export function ProvisionInstall({
         stages={[
           { label: '登记配置', state: 'done' },
           { label: '安装 Agent', state: redeemed ? 'done' : 'current' },
-          { label: '上线发布', state: redeemed ? 'current' : 'next' },
+          { label: '初始化', state: initialization?.state === 'succeeded' ? 'done' : redeemed ? 'current' : 'next' },
         ]}
         aside={
           <span className={online ? 'st st-succeeded' : 'st'}>
@@ -7196,10 +7205,18 @@ export function ProvisionInstall({
         {issue.error && <ErrorBox error={issue.error} />}
       </div>
       <WizardFooter
-        tone={online ? 'ok' : enrollmentExpired || enrollmentStalled ? 'warn' : redeemed ? 'busy' : 'idle'}
+        tone={
+          online
+            ? initializationView.tone
+            : enrollmentExpired || enrollmentStalled
+              ? 'warn'
+              : redeemed
+                ? 'busy'
+                : 'idle'
+        }
         title={
           online
-            ? '机器已就绪'
+            ? initializationView.title
             : enrollmentExpired
               ? '安装命令已过期'
               : enrollmentStalled || (probe?.state === 'polling' && probe.onceOnline)
@@ -7210,7 +7227,7 @@ export function ProvisionInstall({
         }
         description={
           online
-            ? '进入发布计划前仍可先查看机器详情；未发布的配置不会下发。'
+            ? initializationView.description
             : enrollmentExpired
               ? '请重新生成一条安装命令，再到目标机器执行。'
               : redeemed
@@ -7229,11 +7246,15 @@ export function ProvisionInstall({
         <button
           type="button"
           className="btn primary"
-          disabled={target == null || !online}
-          title={online ? '' : '等 agent 上线后再发布'}
-          onClick={() => navigate('deploy', { p: 'plan', revision: target })}
+          disabled={!online || initializationView.action === 'waiting'}
+          onClick={() => {
+            if (initializationView.action === 'details') go({ p: 'node', id: node });
+            else if (initializationView.action === 'deployment' && initialization?.deployment_id != null)
+              navigate('deploy', { p: 'detail', id: initialization.deployment_id });
+            else if (initializationView.action === 'plan') navigate('deploy', { p: 'plan', revision: current });
+          }}
         >
-          {online ? '去发布 · 计划预览（修订 ' + (target ?? '…') + '）' : '等 agent 上线…'}
+          {online ? initializationView.actionLabel : '等 Agent 上线…'}
         </button>
       </WizardFooter>
       {confirmIssue && (

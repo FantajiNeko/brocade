@@ -17,10 +17,6 @@ use sqlx::{PgPool, Row};
 
 use crate::{AdminContext, Result, StoreError};
 
-/// Longest accepted value. Both fields end up in a shell command people paste, so the cap is
-/// about keeping that command readable rather than about storage.
-const MAX_LEN: usize = 255;
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DistributionSettings {
     /// The address nodes fetch the agent and `install.sh` from. Must be reachable *from a node*,
@@ -93,11 +89,6 @@ fn normalize(settings: DistributionSettings) -> DistributionSettings {
 
 fn validate(settings: &DistributionSettings) -> Result<()> {
     if let Some(url) = &settings.agent_public_url {
-        if url.len() > MAX_LEN {
-            return Err(StoreError::InvalidData(format!(
-                "Agent 请求地址最长 {MAX_LEN} 个字符"
-            )));
-        }
         // Scheme required rather than guessed. Defaulting to https would silently rewrite what
         // the operator typed, and defaulting to http would hand every node a plaintext download
         // of a binary it is about to run as root.
@@ -106,27 +97,22 @@ fn validate(settings: &DistributionSettings) -> Result<()> {
                 "Agent 请求地址要带 http:// 或 https://".to_owned(),
             ));
         }
-        // The value is pasted into a shell command, so anything that could end the argument has
-        // to be refused here rather than escaped later.
-        if url.contains(char::is_whitespace) || url.contains(['\'', '"', '`', '$', '\\']) {
+        // install_command shell-quotes arguments. Reject invalid URL whitespace/control bytes,
+        // rather than shell metacharacters which may legitimately occur in a URL path.
+        if url.contains(|c: char| c.is_whitespace() || c.is_control()) {
             return Err(StoreError::InvalidData(
-                "Agent 请求地址里不能有空白或引号".to_owned(),
+                "Agent 请求地址里不能有空白或控制字符".to_owned(),
             ));
         }
     }
     if let Some(version) = &settings.xray_version {
-        if version.len() > MAX_LEN {
-            return Err(StoreError::InvalidData(format!(
-                "xray 版本最长 {MAX_LEN} 个字符"
-            )));
-        }
-        // Same reason as above: this one reaches the shell too, as `--xray-version <tag>`.
+        // Accept release tags including SemVer build metadata.
         if !version
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | 'v'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
         {
             return Err(StoreError::InvalidData(
-                "xray 版本只能用字母、数字和 . - _".to_owned(),
+                "xray 版本只能用字母、数字和 . - _ +".to_owned(),
             ));
         }
     }
@@ -169,9 +155,8 @@ mod tests {
         assert!(validate(&settings).is_err());
     }
 
-    /// Both values are pasted into a shell command, so a quote is refused at the door.
     #[test]
-    fn shell_metacharacters_are_refused() {
+    fn invalid_url_whitespace_and_non_tag_versions_are_refused() {
         for url in [
             "https://a.example.net'; rm -rf /",
             "https://a.example.net $(id)",
@@ -188,6 +173,18 @@ mod tests {
             xray_version: Some("v26.4.25; id".to_owned()),
         };
         assert!(validate(&settings).is_err());
+    }
+
+    #[test]
+    fn long_urls_and_quoted_arguments_do_not_need_a_readability_limit() {
+        let settings = DistributionSettings {
+            agent_public_url: Some(format!(
+                "https://a.example.net/a'$`/{}",
+                "segment/".repeat(100)
+            )),
+            xray_version: Some("v26.4.25+brocade.1".to_owned()),
+        };
+        assert!(validate(&settings).is_ok());
     }
 
     #[test]

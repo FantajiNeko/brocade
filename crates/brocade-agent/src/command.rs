@@ -61,8 +61,7 @@ pub(crate) fn run_command_with_timeout(
 }
 
 /// The lower-level form used when non-zero is expected and its output still has
-/// meaning, as with probing a candidate agent using an intentionally unknown
-/// subcommand.
+/// meaning, as with the compatibility probe for older candidate Agents.
 pub(crate) fn capture_command_with_timeout(
     program: &str,
     args: &[&str],

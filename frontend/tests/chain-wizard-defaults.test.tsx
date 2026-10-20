@@ -92,13 +92,13 @@ describe('建链向导提交前校验', () => {
   it('拒绝同一入口上共用 TCP 端口的接入协议', () => {
     expect(
       entryTcpPortCollision([
-        { label: 'VLESS · REALITY', port: 14443 },
+        { label: 'VLESS · TLS/REALITY', port: 14443 },
         { label: 'AnyTLS', port: 14443 },
       ]),
-    ).toBe('VLESS · REALITY 与 AnyTLS 不能共用 TCP 14443');
+    ).toBe('VLESS · TLS/REALITY 与 AnyTLS 不能共用 TCP 14443');
     expect(
       entryTcpPortCollision([
-        { label: 'VLESS · REALITY', port: 13443 },
+        { label: 'VLESS · TLS/REALITY', port: 13443 },
         { label: 'AnyTLS', port: 14443 },
       ]),
     ).toBeNull();

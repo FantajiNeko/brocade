@@ -101,7 +101,7 @@ export function WarpRegistrationAction({
               ? context === 'rule'
                 ? '当前规则发布前必须补齐；可以留在本页直接申请。'
                 : '每台实际使用 WARP 的机器都需要独立身份。'
-              : '先纳管一台属于该租户的机器。'}
+              : '请先纳管一台可用机器。'}
           </small>
         </span>
       </div>

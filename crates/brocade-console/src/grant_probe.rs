@@ -786,7 +786,21 @@ fn validate_selection<'a>(
 }
 
 fn inspect_xray(path: &Path, expected: Option<&str>) -> ProbeCapability {
-    let output = match std::process::Command::new(path).arg("version").output() {
+    let mut attempts_left = 2;
+    let output = loop {
+        let result = std::process::Command::new(path).arg("version").output();
+        if attempts_left > 0
+            && result
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::ETXTBSY))
+        {
+            attempts_left -= 1;
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        break result;
+    };
+    let output = match output {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             return ProbeCapability {
@@ -809,44 +823,29 @@ fn inspect_xray(path: &Path, expected: Option<&str>) -> ProbeCapability {
             };
         }
     };
-    let first = String::from_utf8_lossy(&output.stdout)
+    let actual = String::from_utf8_lossy(&output.stdout)
         .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    let mut fields = first.split_whitespace();
-    let actual = if fields.next() == Some("Xray") {
-        fields
-            .next()
-            .filter(|version| {
-                version
-                    .trim_start_matches('v')
-                    .split('.')
-                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-            })
-            .map(str::to_owned)
-    } else {
-        None
-    };
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("Xray"))
+                .then(|| fields.next().map(str::to_owned))
+                .flatten()
+        });
     if actual.is_none() {
         return ProbeCapability {
             available: false,
             version: None,
-            reason: Some("Console 无法识别拨测 Xray 的版本".to_owned()),
+            reason: Some("Console 无法识别拨测 Xray 的程序标识".to_owned()),
             concurrency: GLOBAL_CONCURRENCY,
         };
     }
     if let (Some(expected), Some(actual)) = (expected, actual.as_deref()) {
         if expected.trim_start_matches('v') != actual.trim_start_matches('v') {
-            return ProbeCapability {
-                available: false,
-                version: Some(actual.to_owned()),
-                reason: Some(format!(
-                    "Console 拨测 Xray 版本为 {actual}，要求 {expected}"
-                )),
-                concurrency: GLOBAL_CONCURRENCY,
-            };
+            // An explicit override can be a compatible fork or a different patch release.
+            // Its actual config/startup/probe result decides compatibility, not banner equality.
+            eprintln!(
+                "Console 拨测 Xray 版本为 {actual}，参考版本 {expected}；以实际拨测结果判断兼容性"
+            );
         }
     }
     ProbeCapability {
@@ -945,7 +944,8 @@ mod tests {
         assert!(!configured().capability().available);
         for (banner, available) in [
             ("Xray 26.4.25", true),
-            ("Xray 1.2.3", false),
+            ("Xray 1.2.3", true),
+            ("Wrapper info\nXray custom-build+test", true),
             ("unknown", false),
         ] {
             std::fs::write(&path, format!("#!/bin/sh\nprintf '{banner}\\n'\n")).unwrap();

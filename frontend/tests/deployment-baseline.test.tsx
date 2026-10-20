@@ -18,6 +18,11 @@ const item = (id: number, revision: number, status: string) =>
   ({ id, revision_id: revision, status }) as DeploymentListItem;
 
 describe('发布计划基线', () => {
+  it('单机自动初始化成功不推进业务发布基线', () => {
+    const initialization = { ...item(20, 120, 'succeeded'), actor: 'system:node-initialization' };
+    expect(latestSuccessfulRevision([initialization, item(19, 110, 'succeeded')])).toBe(110);
+    expect(latestSuccessfulRevision([initialization])).toBeNull();
+  });
   it('按发布发生顺序选最近一次成功，不依赖接口数组顺序或修订号大小', () => {
     expect(
       latestSuccessfulRevision([

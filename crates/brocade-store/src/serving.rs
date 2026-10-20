@@ -127,6 +127,19 @@ pub(crate) async fn activate_deployment_tx(
     tx: &mut Transaction<'_, Postgres>,
     deployment_id: i64,
 ) -> Result<()> {
+    // A bootstrap release is operational initialization, not approval of business topology.
+    let initialization: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM jobs j JOIN deployments d
+             ON d.id::text=j.payload->>'deployment_id'
+           WHERE j.kind = 'node-initialization' AND d.id=$1
+             AND d.idempotency_key='node-initialization:' || j.id::text)",
+    )
+    .bind(deployment_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if initialization {
+        return Ok(());
+    }
     let deployment = sqlx::query(
         "SELECT kind, revision_id, activation_status
            FROM deployments

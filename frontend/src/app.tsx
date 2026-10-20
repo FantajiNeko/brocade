@@ -8,14 +8,13 @@ import {
   fetchSnapshot,
   initialBranding,
   logoutAdmin,
-  type AuthState,
   type BrandingSettings,
 } from './api';
 import { DirectLogin, Login, parseDirectLoginHash, parseInitializationHash } from './ui/login';
 import {
   announceSessionChange,
   autoPublicSuppressed,
-  enterPublic,
+  isPublic,
   isVisitor,
   suppressAutoPublic,
   SessionProvider,
@@ -66,25 +65,6 @@ function prefetchInitialRouteData(queryClient: QueryClient, hash: string, sessio
 
 export type { Session } from './session';
 
-/**
- * cookie 中没有会话时的备用路径：控制面启用了 public 免密账户时，自动以访客身份登录。
- *
- * 登录操作放在前端而非由服务端将无 cookie 的请求视为 public，是为了使访客和已登录用户
- * 走同一流程：都对应 admin_operators 中的一个身份、一个会话 cookie、一份 whoami。
- * 服务端因此不存在无身份请求这种状态，鉴权只有一处实现。
- *
- * 任一步骤失败时返回 null 并进入登录页——public 不存在、已设置密码、网络异常都是如此。
- */
-async function restorePublic(auth: AuthState) {
-  if (autoPublicSuppressed()) return null;
-  try {
-    if (!auth.public_open) return null;
-    return await enterPublic();
-  } catch {
-    return null;
-  }
-}
-
 export function App() {
   const queryClient = useQueryClient();
   const brandingQuery = useQuery({
@@ -101,7 +81,7 @@ export function App() {
   // startup choice even if the user later falls back to the password form; do not restore the old
   // identity after explicitly leaving a failed direct login.
   const [restoreExistingSession] = useState(directCredentials === null);
-  /* 浏览器会话依赖 HttpOnly cookie；内存中保存身份及首帧骨架所需的轻量统计。 */
+  /* 登录账号使用 HttpOnly cookie，访客由服务端按当前开关解析；内存保存界面身份。 */
   const [session, setSession] = useState<Session | null>(null);
   useEffect(() => {
     if (session && parseInitializationHash(window.location.hash)) {
@@ -134,30 +114,21 @@ export function App() {
       forgeShellModule = undefined;
     });
     void preloadPaneForHash(window.location.hash).catch(() => undefined);
-    // Start both reads together. A valid cookie may enter immediately when /bootstrap wins; a missing
-    // cookie can reuse the already-running auth-state request instead of paying a second RTT.
-    // fetchQuery also seeds Login's query, so falling through to the form does not fetch it again.
-    const authState = queryClient
+    // Bootstrap resolves both signed-in accounts and stateless visitors. Seed Login's auth-state
+    // query in parallel so a closed visitor switch or explicit sign-out can show the form promptly.
+    void queryClient
       .fetchQuery({ queryKey: ['auth-state'], queryFn: fetchAuthState, staleTime: 5_000, retry: false })
-      .then(
-        value => value,
-        () => null,
-      );
+      .catch(() => undefined);
     const restore = async () => {
       try {
         const bootstrap = await fetchConsoleBootstrap();
+        if (isPublic(bootstrap.who) && autoPublicSuppressed()) return;
         if (active) {
           prefetchInitialRouteData(queryClient, window.location.hash, bootstrap);
           setSession(bootstrap);
         }
       } catch {
-        const auth = await authState;
-        if (!active || !auth) return;
-        const bootstrap = await restorePublic(auth);
-        if (active && bootstrap) {
-          prefetchInitialRouteData(queryClient, window.location.hash, bootstrap);
-          setSession(bootstrap);
-        }
+        // Missing, expired or invalid credentials return to Login; visitors need no login retry.
       } finally {
         if (active) setRestoring(false);
       }
@@ -204,7 +175,7 @@ export function App() {
     );
 
   const onLogout = async () => {
-    // 退出后的下一帧即登录页，不能再被自动登录切回 public——否则在开放访问的控制面上
+    // 退出后的下一帧即登录页，不能再自动切回访客——否则在开放访问的控制面上
     // 退出不产生任何效果，无法显示登录表单。返回访客视角的路径是登录页的
     // 「访客模式」按钮（见 session.tsx 的 enterPublic）。
     suppressAutoPublic();

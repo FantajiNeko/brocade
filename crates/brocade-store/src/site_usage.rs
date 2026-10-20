@@ -1,4 +1,4 @@
-//! Non-billable, fixed-category observations. Written inside the usage receipt transaction.
+//! Fixed-category observations and the independent forwarding ledger in user/machine reports.
 use crate::{AdminContext, Result, StoreError};
 use brocade_deployment::site_usage::{
     catalog, SiteUsagePeriod, SiteUsageReport, UserSiteUsage, UserSiteUsageRow,
@@ -209,9 +209,27 @@ fn hourly_parts(start: i64, end: i64, up: i64, down: i64) -> Vec<(i64, i64, i64)
 
 /// Start, end and query time of a calendar period, all read from the database clock.
 pub(crate) struct PeriodBounds {
+    pub(crate) clock: i64,
     pub(crate) now: i64,
     pub(crate) start: i64,
     pub(crate) end: i64,
+}
+
+pub(crate) async fn range_bounds(
+    pool: &PgPool,
+    period: SiteUsagePeriod,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+) -> Result<PeriodBounds> {
+    let mut bounds = period_bounds(pool, period).await?;
+    if let Some(range) = range {
+        let range = range
+            .validate(bounds.now)
+            .map_err(|e| StoreError::InvalidData(e.into()))?;
+        bounds.start = range.start_unix_secs;
+        bounds.now = range.end_unix_secs;
+        bounds.end = range.end_unix_secs;
+    }
+    Ok(bounds)
 }
 
 /// Calendar boundaries follow monthly usage and quotas: `date_trunc` at Asia/Hong_Kong (+08, no
@@ -228,10 +246,26 @@ pub(crate) async fn period_bounds(pool: &PgPool, period: SiteUsagePeriod) -> Res
     .fetch_one(pool)
     .await?;
     Ok(PeriodBounds {
+        clock: row.try_get("now")?,
         now: row.try_get("now")?,
         start: row.try_get("start_at")?,
         end: row.try_get("end_at")?,
     })
+}
+
+/// Destination observations are persisted hourly; do not prorate an hour into minute estimates.
+pub(crate) async fn destination_bounds(
+    pool: &PgPool,
+    period: SiteUsagePeriod,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+) -> Result<PeriodBounds> {
+    let mut bounds = range_bounds(pool, period, range).await?;
+    if range.is_some() {
+        bounds.start = bounds.start / 3600 * 3600;
+        bounds.end = (bounds.now + 3599) / 3600 * 3600;
+        bounds.now = bounds.end.min(bounds.clock);
+    }
+    Ok(bounds)
 }
 
 fn site_name(id: &str) -> Result<String> {
@@ -259,6 +293,10 @@ pub(crate) async fn query(
         .map(|target| target.node_id)
         .collect();
     let bounds = period_bounds(pool, period).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     // Stored hours regrouped into chart buckets that start at the period start: whole hours for a
     // day or a week, +08 calendar days for a month. Window totals share the same SQL snapshot so
     // concurrent usage reports cannot make the ranking disagree with the chart.
@@ -267,8 +305,135 @@ pub(crate) async fn query(
         sum(sum(downlink_bytes)) OVER (PARTITION BY site_id)::bigint AS total_down
         FROM user_site_usage_hourly WHERE tenant_id=$1 AND user_id=$2 AND bucket >= $3 AND bucket <= $4
         GROUP BY site_id, slot ORDER BY site_id, slot")
-        .bind(tenant_id).bind(user_id).bind(bounds.start).bind(bounds.now).bind(i64::from(period.bucket_secs())).fetch_all(pool).await?;
-    assemble(pool, &nodes, &bounds, period, points).await
+        .bind(tenant_id).bind(user_id).bind(bounds.start).bind(bounds.now).bind(i64::from(period.bucket_secs())).fetch_all(&mut *tx).await?;
+    // Historical ownership survives rule deletion, revocation and moves between machines.
+    let (forwarding_up, forwarding_down): (i64, i64) = sqlx::query_as(
+        "SELECT coalesce(sum(uplink_bytes),0)::bigint,coalesce(sum(downlink_bytes),0)::bigint
+           FROM forwarding_usage_rollups WHERE tenant_id=$1 AND user_id=$2
+            AND period_start>=to_timestamp($3::bigint) AND period_start<to_timestamp($4::bigint)",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(bounds.start)
+    .bind(bounds.now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let forwarding_points = forwarding_series_tx(
+        &mut tx,
+        ForwardingScope::User { tenant_id, user_id },
+        &bounds,
+        period,
+    )
+    .await?;
+    tx.commit().await?;
+    let mut usage = assemble(pool, &nodes, &bounds, period, points).await?;
+    prepend_forwarding(
+        &mut usage,
+        forwarding_up as u64,
+        forwarding_down as u64,
+        forwarding_points,
+    );
+    Ok(usage)
+}
+
+enum ForwardingScope<'a> {
+    User {
+        tenant_id: &'a str,
+        user_id: &'a str,
+    },
+    Node {
+        node_id: &'a str,
+        actor: &'a AdminContext,
+    },
+}
+
+/// Retained daily totals must never be spread into invented hourly measurements.
+async fn forwarding_series_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: ForwardingScope<'_>,
+    bounds: &PeriodBounds,
+    period: SiteUsagePeriod,
+) -> Result<Vec<(i64, u64, u64)>> {
+    // All identifiers/expressions are private constants; scope and time values remain binds.
+    let (table, time, slot) = if period == SiteUsagePeriod::Month {
+        (
+            "forwarding_usage_rollups",
+            "period_start",
+            "extract(epoch FROM period_start)::bigint",
+        )
+    } else {
+        (
+            "forwarding_usage_samples",
+            "coalesce(window_start,read_at)",
+            "(floor(extract(epoch FROM coalesce(window_start,read_at))/3600)*3600)::bigint",
+        )
+    };
+    // Keep node and user keys as direct predicates so their accounting indexes remain usable.
+    let filter = match &scope {
+        ForwardingScope::User { .. } => "tenant_id=$1 AND user_id=$2",
+        ForwardingScope::Node { .. } => {
+            "node_id=$1 AND ($2::text IS NULL OR tenant_id=$2 OR tenant_id LIKE $5 ESCAPE '\\')"
+        }
+    };
+    let sql = format!(
+        "SELECT {slot} AS slot,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down
+           FROM {table} WHERE {filter}
+            AND {time}>=to_timestamp($3::bigint) AND {time}<to_timestamp($4::bigint)
+          GROUP BY slot ORDER BY slot"
+    );
+    let query = sqlx::query(&sql);
+    let rows = match scope {
+        ForwardingScope::User { tenant_id, user_id } => {
+            query
+                .bind(tenant_id)
+                .bind(user_id)
+                .bind(bounds.start)
+                .bind(bounds.now)
+                .fetch_all(&mut **tx)
+                .await?
+        }
+        ForwardingScope::Node { node_id, actor } => {
+            query
+                .bind(node_id)
+                .bind(actor.tenant_scope())
+                .bind(bounds.start)
+                .bind(bounds.now)
+                .bind(actor.tenant_scope_like_pattern())
+                .fetch_all(&mut **tx)
+                .await?
+        }
+    };
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("slot")?,
+                row.try_get::<i64, _>("up")? as u64,
+                row.try_get::<i64, _>("down")? as u64,
+            ))
+        })
+        .collect()
+}
+
+fn prepend_forwarding(usage: &mut UserSiteUsage, up: u64, down: u64, points: Vec<(i64, u64, u64)>) {
+    if up == 0 && down == 0 {
+        return;
+    }
+    usage.rows.insert(
+        0,
+        UserSiteUsageRow {
+            site_id: "forwarding".into(),
+            name: "端口转发".into(),
+            uplink_bytes: up,
+            downlink_bytes: down,
+        },
+    );
+    usage.series.insert(
+        0,
+        UserSiteUsageSeries {
+            site_id: "forwarding".into(),
+            points,
+        },
+    );
 }
 
 /// Per-site users on one machine, most traffic first; the remainder is folded into totals.
@@ -290,7 +455,7 @@ pub struct NodeSiteUser {
 }
 
 /// A machine's outflow by destination category: every user in the actor's scope on one ingress
-/// machine, plus who carries each category. Port forwarding is never classified.
+/// machine, plus who carries each category. Port forwarding is a separate ledger-backed category.
 #[derive(Debug, Serialize)]
 pub struct NodeSiteUsage {
     #[serde(flatten)]
@@ -332,8 +497,23 @@ pub(crate) async fn query_node(
     node_id: &str,
     period: SiteUsagePeriod,
 ) -> Result<NodeSiteUsage> {
+    query_node_range(pool, actor, node_id, period, None).await
+}
+
+pub(crate) async fn query_node_range(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    period: SiteUsagePeriod,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+) -> Result<NodeSiteUsage> {
+    let period = if range.is_some() {
+        SiteUsagePeriod::Day
+    } else {
+        period
+    };
     let nodes = classified_node(pool, actor, node_id).await?;
-    let bounds = period_bounds(pool, period).await?;
+    let bounds = destination_bounds(pool, period, range).await?;
     let scope = actor.tenant_scope();
     let pattern = actor.tenant_scope_like_pattern();
     let mut tx = pool.begin().await?;
@@ -344,17 +524,34 @@ pub(crate) async fn query_node(
     let points = sqlx::query("SELECT site_id, $2 + (bucket - $2) / $4 * $4 AS slot, sum(uplink_bytes)::bigint AS up, sum(downlink_bytes)::bigint AS down,
         sum(sum(uplink_bytes)) OVER (PARTITION BY site_id)::bigint AS total_up,
         sum(sum(downlink_bytes)) OVER (PARTITION BY site_id)::bigint AS total_down
-        FROM user_site_usage_hourly WHERE node_id=$1 AND bucket >= $2 AND bucket <= $3
+        FROM user_site_usage_hourly WHERE node_id=$1 AND bucket >= $2 AND bucket < $3
         AND ($5::text IS NULL OR tenant_id=$5 OR tenant_id LIKE $6 ESCAPE '\\')
         GROUP BY site_id, slot ORDER BY site_id, slot")
         .bind(node_id).bind(bounds.start).bind(bounds.now).bind(i64::from(period.bucket_secs()))
         .bind(scope).bind(pattern.as_deref()).fetch_all(&mut *tx).await?;
-    let carriers = sqlx::query("SELECT site_id, tenant_id, user_id, sum(uplink_bytes)::bigint AS up, sum(downlink_bytes)::bigint AS down
-        FROM user_site_usage_hourly WHERE node_id=$1 AND bucket >= $2 AND bucket <= $3
+    // These identifiers are private constants. Every scope/time value remains a SQL bind.
+    let (forwarding_table, forwarding_time) = if range.is_some() {
+        ("forwarding_usage_samples", "coalesce(window_start,read_at)")
+    } else {
+        ("forwarding_usage_rollups", "period_start")
+    };
+    let carriers = sqlx::query(&format!("SELECT site_id, tenant_id, user_id, sum(uplink_bytes)::bigint AS up, sum(downlink_bytes)::bigint AS down
+        FROM user_site_usage_hourly WHERE node_id=$1 AND bucket >= $2 AND bucket < $3
         AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\')
-        GROUP BY site_id, tenant_id, user_id")
+        GROUP BY site_id, tenant_id, user_id
+        UNION ALL SELECT 'forwarding', tenant_id, user_id, sum(uplink_bytes)::bigint, sum(downlink_bytes)::bigint
+        FROM {forwarding_table} WHERE node_id=$1 AND {forwarding_time}>=to_timestamp($2::bigint) AND {forwarding_time}<to_timestamp($3::bigint)
+        AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\')
+        GROUP BY tenant_id, user_id HAVING sum(uplink_bytes)>0 OR sum(downlink_bytes)>0"))
         .bind(node_id).bind(bounds.start).bind(bounds.now)
         .bind(scope).bind(pattern.as_deref()).fetch_all(&mut *tx).await?;
+    let forwarding_points = forwarding_series_tx(
+        &mut tx,
+        ForwardingScope::Node { node_id, actor },
+        &bounds,
+        period,
+    )
+    .await?;
     tx.commit().await?;
     let mut by_site = BTreeMap::<String, Vec<NodeSiteUser>>::new();
     for row in carriers {
@@ -367,6 +564,15 @@ pub(crate) async fn query_node(
                 uplink_bytes: row.try_get::<i64, _>("up")? as u64,
                 downlink_bytes: row.try_get::<i64, _>("down")? as u64,
             });
+    }
+    let mut usage = assemble(pool, &nodes, &bounds, period, points).await?;
+    if let Some(users) = by_site.get("forwarding") {
+        prepend_forwarding(
+            &mut usage,
+            users.iter().map(|user| user.uplink_bytes).sum(),
+            users.iter().map(|user| user.downlink_bytes).sum(),
+            forwarding_points,
+        );
     }
     let top_users = by_site
         .into_iter()
@@ -386,10 +592,7 @@ pub(crate) async fn query_node(
             }
         })
         .collect();
-    Ok(NodeSiteUsage {
-        usage: assemble(pool, &nodes, &bounds, period, points).await?,
-        top_users,
-    })
+    Ok(NodeSiteUsage { usage, top_users })
 }
 
 /// Rows and per-category series from regrouped points, plus the reporting state of `nodes`.
@@ -402,7 +605,7 @@ async fn assemble(
 ) -> Result<UserSiteUsage> {
     let state = sqlx::query("SELECT (count(*) FILTER (WHERE read_at >= $2))::bigint AS reporting, bool_or(limited) AS limited, max(read_at) AS latest, max(baseline_at) AS baseline
         FROM node_site_usage_state WHERE node_id=ANY($1)")
-        .bind(nodes).bind(bounds.now-300).fetch_one(pool).await?;
+        .bind(nodes).bind(bounds.clock-300).fetch_one(pool).await?;
     let mut result = Vec::new();
     let mut series: Vec<UserSiteUsageSeries> = Vec::new();
     for row in points {

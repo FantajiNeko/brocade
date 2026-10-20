@@ -658,9 +658,13 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    // health and repair do not contact the control plane and therefore need no
-    // --server / token, so they branch off before the full parse
+    // Local commands do not contact the control plane and need no server/token,
+    // so they branch off before parsing the daemon configuration.
     match args.first().map(String::as_str) {
+        Some("self-test") => {
+            println!("{}", brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE);
+            return Ok(());
+        }
         Some("health") => return health(&health_state_dir(&args)),
         Some("repair") => return reconcile_local(&health_state_dir(&args), Drift::Always),
         // Internal stdin consumer used by the Xray/Phantun launch pipelines. It must not require
@@ -2523,6 +2527,12 @@ fn apply_once_inner(
     ) {
         warn(format!("站点采集开关未能落地：{error}"));
     }
+    if let Err(error) = other_domain::apply_source_capability(
+        &options.state_dir,
+        response.header(brocade_deployment::source_traffic::SOURCE_TRAFFIC_HEADER),
+    ) {
+        eprintln!("source observation capability: {error}");
+    }
     if let Err(error) = other_domain::apply_failed_policy(
         &options.state_dir,
         response.header(brocade_deployment::sniffing_failed::SNIFFING_FAILED_POLICY_HEADER),
@@ -3256,7 +3266,9 @@ fn converge_linux(
         &desired.desired.xray,
         false,
         Some((desired.deployment_id, desired.claim_generation)),
-        desired.actions.contains(&PlannedAction::ApplyXray),
+        desired
+            .xray_config_update_policy
+            .unwrap_or(brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff),
         match &desired.desired.grants {
             DesiredGrants::Present { inbounds } => Some(inbounds),
             _ => None,
@@ -3345,9 +3357,10 @@ fn converge_linux_xray(
     desired: &DesiredArtifact,
     force_restart: bool,
     deployment: Option<(i64, u64)>,
-    forbid_restart: bool,
+    policy: brocade_deployment::protocol::XrayConfigUpdatePolicy,
     desired_grants: Option<&[GrantInbound]>,
 ) -> Result<(), String> {
+    let forbid_restart = policy == brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff;
     match desired {
         DesiredArtifact::Present { content, .. } => {
             let path = state_dir.join("xray.json");
@@ -3387,7 +3400,7 @@ fn converge_linux_xray(
                             if forbid_restart {
                                 eprintln!("热切换失败，继续尝试 Xray 代际交接：{error}");
                             } else {
-                                eprintln!("热切换失败，回退到代际交接或重启 xray：{error}");
+                                eprintln!("热更新失败，按发布策略重启 Xray：{error}");
                             }
                         }
                     }
@@ -3399,7 +3412,7 @@ fn converge_linux_xray(
             let candidate = state_dir.join("xray.next.json");
             write_private(&candidate, content)?;
             let serving = serving_xray_process_in(state_dir).is_some();
-            let handoff_ready = xrayupdate::config_handoff_ready(state_dir);
+            let handoff_ready = forbid_restart && xrayupdate::config_handoff_ready(state_dir);
             let handoff_eligible = previous
                 .as_deref()
                 .is_some_and(|previous| previous != content);
@@ -3418,7 +3431,7 @@ fn converge_linux_xray(
                     ));
                 }
             }
-            if !force_restart && serving && handoff_ready && handoff_eligible {
+            if forbid_restart && !force_restart && serving && handoff_ready && handoff_eligible {
                 let (deployment_id, claim_generation) = deployment.ok_or_else(|| {
                     "配置满足 Xray 交接条件，但当前收敛没有可审计的发布身份".to_owned()
                 })?;
@@ -3796,13 +3809,23 @@ fn apply_xray_with_grants(
     .trim()
     .parse::<libc::pid_t>()
     .map_err(|error| format!("读取 Xray 启动器 PID 失败：{error}"))?;
-    let launcher = process_ref(launcher)
-        .ok_or_else(|| xray_startup_failure(&log_path, "Xray 启动器在返回 PID 前已经退出"))?;
+    let startup_manifest = bootstrap
+        .as_ref()
+        .map(|bootstrap| bootstrap.manifest_path());
+    let launcher = process_ref(launcher).ok_or_else(|| {
+        xrayupdate::xray_startup_failure(
+            &log_path,
+            "Xray 启动器在返回 PID 前已经退出",
+            startup_manifest,
+            None,
+        )
+    })?;
     let process = wait_for_managed_xray_listener(
         state_dir,
         api_address,
         launcher,
         &log_path,
+        startup_manifest,
         XRAY_API_START_TIMEOUT,
     )?;
     let started = (|| -> Result<XrayRuntimeRecovery, String> {
@@ -3810,7 +3833,12 @@ fn apply_xray_with_grants(
         if serving_xray_process_in(state_dir) != Some(process) {
             return Err("Xray API 就绪后受管进程身份发生变化".to_owned());
         }
-        wait_for_xray_grpc(api_address, &log_path, XRAY_API_START_TIMEOUT)?;
+        wait_for_xray_grpc(
+            api_address,
+            &log_path,
+            startup_manifest,
+            XRAY_API_START_TIMEOUT,
+        )?;
         fs::write(state_dir.join(XRAY_BOUNDED_LOG_MARKER), b"dynamic\n")
             .map_err(|error| format!("failed to record bounded xray logging: {error}"))?;
         fs::write(
@@ -3850,18 +3878,21 @@ fn apply_xray_with_grants(
 fn wait_for_xray_grpc(
     api_address: SocketAddr,
     log_path: &Path,
+    startup_manifest: Option<&Path>,
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        match xray_grpc::inbound_tags(api_address) {
+        match xray_grpc::inbound_tags_until(api_address, Some(deadline)) {
             Ok(_) => return Ok(()),
             Err(error) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(xray_startup_failure(
+                    return Err(xrayupdate::xray_startup_failure(
                         log_path,
                         &format!("Xray API 端口已监听但 gRPC 尚不可用：{error}"),
+                        startup_manifest,
+                        None,
                     ));
                 }
                 thread::sleep(XRAY_API_START_INTERVAL.min(remaining));
@@ -3875,6 +3906,7 @@ fn wait_for_managed_xray_listener(
     api_address: SocketAddr,
     launcher: ProcessRef,
     log_path: &Path,
+    startup_manifest: Option<&Path>,
     timeout: Duration,
 ) -> Result<ProcessRef, String> {
     let deadline = Instant::now() + timeout;
@@ -3885,9 +3917,11 @@ fn wait_for_managed_xray_listener(
                 Ok(false) => {}
                 Err(error) if process_is_live(process) => {
                     if Instant::now() >= deadline {
-                        return Err(xray_startup_failure(
+                        return Err(xrayupdate::xray_startup_failure(
                             log_path,
                             &format!("检查 Xray PID {} 的 API 监听失败：{error}", process.pid),
+                            startup_manifest,
+                            Some(process),
                         ));
                     }
                 }
@@ -3895,37 +3929,26 @@ fn wait_for_managed_xray_listener(
             }
         }
         if !process_is_live(launcher) {
-            return Err(xray_startup_failure(
+            return Err(xrayupdate::xray_startup_failure(
                 log_path,
                 "Xray 在 API 监听就绪前已经退出",
+                startup_manifest,
+                None,
             ));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(xray_startup_failure(
+            return Err(xrayupdate::xray_startup_failure(
                 log_path,
                 &format!(
                     "Xray API 地址 {api_address} 在 {} 毫秒内没有就绪",
                     timeout.as_millis()
                 ),
+                startup_manifest,
+                None,
             ));
         }
         thread::sleep(XRAY_API_START_INTERVAL.min(remaining));
-    }
-}
-
-fn xray_startup_failure(log_path: &Path, reason: &str) -> String {
-    const MAX_LOG_TAIL: usize = 16 * 1024;
-    let Ok(log) = fs::read(log_path) else {
-        return reason.to_owned();
-    };
-    let start = log.len().saturating_sub(MAX_LOG_TAIL);
-    let detail = String::from_utf8_lossy(&log[start..]);
-    let detail = detail.trim();
-    if detail.is_empty() {
-        reason.to_owned()
-    } else {
-        format!("{reason}；Xray 日志末尾：{detail}")
     }
 }
 
@@ -5732,8 +5755,14 @@ mod tests {
                 sha256: super::sha256_hex(encoded.as_bytes()),
                 content: encoded.clone(),
             };
-            // This is the same forbid-restart flag used by every ApplyXray work order.
-            super::converge_linux_xray(&root, &desired, false, Some((615, 0)), true, None).unwrap();
+            // Both policies must keep the in-process path available.
+            for policy in [
+                brocade_deployment::protocol::XrayConfigUpdatePolicy::Restart,
+                brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff,
+            ] {
+                super::converge_linux_xray(&root, &desired, false, Some((615, 0)), policy, None)
+                    .unwrap();
+            }
             assert_eq!(super::serving_xray_process_in(&root), Some(process));
             assert_eq!(super::serving_xray_processes_in(&root).len(), 1);
             assert!(super::xrayupdate::read_upgrade_runtime(&root)
@@ -5763,6 +5792,31 @@ mod tests {
         apply(&content);
         exchange(&mut old, b'A');
         exchange(&mut connect(), b'A');
+
+        // A startup-only change with Beta off must really replace the PID, even though the
+        // running binary supports handoff. It must not leave a second draining generation.
+        content["policy"] = serde_json::json!({"levels":{"0":{"connIdle":301}}});
+        let desired = brocade_deployment::plan::DesiredArtifact::Present {
+            content: content.to_string(),
+            sha256: "test-only".to_owned(),
+        };
+        super::converge_linux_xray(
+            &root,
+            &desired,
+            false,
+            Some((616, 0)),
+            brocade_deployment::protocol::XrayConfigUpdatePolicy::Restart,
+            None,
+        )
+        .unwrap();
+        assert_ne!(super::serving_xray_process_in(&root), Some(process));
+        assert_eq!(super::serving_xray_processes_in(&root).len(), 1);
+        assert!(super::xrayupdate::read_upgrade_runtime(&root)
+            .unwrap()
+            .is_none());
+        exchange(&mut connect(), b'A');
+        let mut response = [0; 1];
+        assert!(!matches!(old.read(&mut response), Ok(n) if n > 0));
     }
 
     #[test]
@@ -7475,6 +7529,7 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
                 claim_generation: 0,
                 wave: 1,
                 actions: vec![brocade_deployment::plan::PlannedAction::ApplyXray],
+                xray_config_update_policy: None,
                 usage_generation_id: None,
                 desired: brocade_deployment::plan::NodeDesiredState {
                     phantun: disabled("test"),

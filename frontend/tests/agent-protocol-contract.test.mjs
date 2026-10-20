@@ -1,10 +1,22 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { DEFAULT_TLS_FINGERPRINT } from '../src/reality.ts';
 
 const rust = readFileSync(new URL('../../crates/brocade-deployment/src/protocol.rs', import.meta.url), 'utf8');
 const core = readFileSync(new URL('../../crates/brocade-core/src/model.rs', import.meta.url), 'utf8');
 const api = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
+
+test('compiler, database and frontend agree on the new TLS fingerprint default', () => {
+  const rustDefault = core.match(/pub const DEFAULT_TLS_FINGERPRINT: &str = "([^"]+)";/)?.[1];
+  const schema = readFileSync(new URL('../../crates/brocade-store/migrations/0001_init.sql', import.meta.url), 'utf8');
+  const databaseDefault = schema.match(/reality_fingerprint TEXT DEFAULT '([^']+)'/)?.[1];
+  assert.ok(rustDefault, 'compiler TLS fingerprint default is missing');
+  assert.ok(databaseDefault, 'database TLS fingerprint default is missing');
+  assert.equal(rustDefault, 'safari');
+  assert.equal(DEFAULT_TLS_FINGERPRINT, rustDefault);
+  assert.equal(databaseDefault, rustDefault);
+});
 
 test('frontend and control plane expose the same Agent protocol version', () => {
   const rustVersion = rust.match(/pub const AGENT_PROTOCOL_VERSION: u32 = (\d+);/)?.[1];

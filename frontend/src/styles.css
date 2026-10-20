@@ -5894,6 +5894,16 @@ textarea.f::placeholder {
   visibility: hidden;
   pointer-events: none;
 }
+/* A routed surface is already mounted while its nested requests register with the boundary. Pause
+ * its entrance at the first frame instead of spending the animation behind `visibility: hidden`;
+ * removing the guard then resumes the same animation without remounting page state. */
+.loading-boundary-guard
+  ~ :is(.fg-sheet, .panel, .chart-card, .ncard, .chain-card, .tunnel-row):has(~ .loading-boundary-end),
+.loading-boundary-guard
+  ~ *:has(~ .loading-boundary-end)
+  :is(.fg-sheet, .panel, .chart-card, .ncard, .chain-card, .tunnel-row) {
+  animation-play-state: paused;
+}
 
 /* ── VPN Gate：常驻地区栏、地区工作区与全局目录采集 ─────────────────── */
 .vpngate-page {
@@ -9495,7 +9505,7 @@ table.t tbody tr:last-child td {
 }
 /* 设置页按子系统分区：一个子系统一段，标题行沿用 .wavehead 的形式（名称 + 一条延伸到
    末端的线）。分区之下再分小组，小组用 .eyebrow 作为标签。 */
-/* 段标题：租户页和操作者页共用。名称 + 一句说明（该段的内容和修改后的影响）+ 右侧操作。
+/* 操作者段标题。名称 + 一句说明（该段的内容和修改后的影响）+ 右侧操作。
    设置页现在直接使用 `.panel.config-panel`，标题由公共表头条渲染。 */
 .sh {
   display: flex;
@@ -9810,10 +9820,7 @@ details.more b {
   color: var(--ink-2);
 }
 
-/* ═══ 租户 / 操作者：两页共用同一结构——先说明规则，再列出数据 ═══
-   两页原本都是「一条创建工具栏 + 一张表 + 页尾一句关键说明」，而那句说明
-   （「租户树即权限树」「知道 id 即可登录」）是理解整页的前提。
-   因此将其前置：规则块位于表格之上，表格只负责列出数据。 */
+/* 操作者：先说明权限层级，再列出账号与凭据。 */
 .rulebox {
   border: 1px solid var(--line);
   border-radius: var(--r-card);
@@ -9889,73 +9896,6 @@ details.more b {
   margin-top: 2px;
 }
 
-/* 租户路径示意：一棵三层的树 + 两行 scope 覆盖范围说明。
-   规则本身是 admin.rs 的 tenant_in_scope：路径相等，或 scope 之后紧跟一个点。
-   段边界对齐这一条需要反例才能说明，因此示意中包含 platformx。 */
-.pathdemo {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 3px 14px;
-  align-items: baseline;
-  font-size: 12px;
-}
-/* 路径不换行：platform.acme 断成两行后无法识别为一条路径 */
-.pathdemo .p {
-  font: 12px var(--mono);
-  color: var(--ink-2);
-  white-space: nowrap;
-}
-/* 高亮片段使用 .hl，不使用 .seg：.seg 是分段控件（带边框的 flex 容器），
-   在此会给每条路径添加圆角边框，并将其变为块级元素。 */
-.pathdemo .p .hl {
-  color: var(--ink);
-}
-.pathdemo .d {
-  color: var(--ink-4);
-  font-size: 11.5px;
-}
-.pathdemo .p.out {
-  color: var(--ink-4);
-  text-decoration: line-through;
-}
-
-/* 租户表：计数是可点击的入口而非静态数字，整行可展开 */
-.tnt-row {
-  cursor: pointer;
-}
-.tnt-row:hover td {
-  background: var(--hover);
-}
-.tnt-row td .cnt {
-  color: var(--ink);
-  border-bottom: 1px dotted var(--ink-4);
-}
-.tnt-row.on td {
-  background: var(--action-wash);
-}
-.tnt-open > td {
-  padding: 0 0 12px;
-}
-.tnt-open .in {
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 10px 13px 11px;
-}
-.tnt-blk + .tnt-blk {
-  margin-top: 12px;
-}
-.tnt-blk > .bh {
-  font: 10px var(--mono);
-  letter-spacing: 0.12em;
-  color: var(--ink-4);
-  margin: 0 0 6px;
-  text-transform: uppercase;
-}
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
 .chip {
   border: 1px solid var(--line);
   border-radius: 5px;
@@ -9963,19 +9903,6 @@ details.more b {
   font: 11.5px var(--mono);
   color: var(--ink-2);
   background: var(--sheet);
-}
-.chip .r {
-  color: var(--ink-4);
-  font-size: 10.5px;
-  margin-left: 6px;
-  font-family: var(--sans);
-}
-.chip.act {
-  cursor: pointer;
-}
-.chip.act:hover {
-  border-color: var(--action);
-  color: var(--ink);
 }
 
 /* 操作者按角色分档。版面自上而下即权限由高到低——本页需要表达的是各操作者的权限大小，
@@ -10048,11 +9975,6 @@ details.more b {
   font: 600 13px var(--mono);
   overflow-wrap: anywhere;
 }
-.op-card .op-who .sc {
-  font-size: 11px;
-  color: var(--ink-3);
-  margin-top: 1px;
-}
 .op-card .cred {
   min-width: 0;
 }
@@ -10089,7 +10011,7 @@ details.more b {
 }
 
 /* 创建表单：由常驻工具栏改为一个按钮加就地展开。
-   创建租户和创建操作者都是低频操作，不应长期占用首屏最显著的位置。
+   创建操作者是低频操作，不应长期占用首屏最显著的位置。
    使用就地展开而非弹窗：本界面其他位置均未使用弹窗。 */
 .newform {
   border: 1px solid var(--line);
@@ -10240,12 +10162,6 @@ details.more b {
      overflow 不会生效。 */
   min-height: 0;
   overscroll-behavior: contain;
-}
-.confirm-word {
-  width: 100%;
-  box-sizing: border-box;
-  margin-bottom: 12px;
-  flex: none;
 }
 .confirm-actions {
   display: flex;
@@ -15774,11 +15690,19 @@ body.has-artpanel .topo-deck {
 
 /* ── 草稿条 ──
    未提交的编辑显示在面包屑下方。使用 gold 而非 err：它表示存在未完成的操作，
-   不是错误；红色会被理解为出现故障。 */
+   不是错误；红色会被理解为出现故障。独立提示层使用悬浮材质隔开背后的网格和正文，
+   不支持模糊时保留实色底，不能退回近乎透明的金色洗色。 */
 .fg-draft {
   flex: 0 0 auto;
   border-bottom: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--gold) 9%, transparent);
+  background: color-mix(in srgb, var(--gold) 8%, var(--sheet));
+  -webkit-backdrop-filter: var(--float-filter);
+  backdrop-filter: var(--float-filter);
+}
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .fg-draft {
+    background: color-mix(in srgb, var(--gold) 8%, var(--float-sheet));
+  }
 }
 .fg-draft-head {
   display: flex;
@@ -15797,7 +15721,7 @@ body.has-artpanel .topo-deck {
 .fg-draft-head .note {
   margin: 0;
   line-height: inherit;
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
 .fg-draft-count {
   background: none;
@@ -15828,9 +15752,40 @@ body.has-artpanel .topo-deck {
   gap: 10px;
   font-size: 12px;
 }
-.fg-draft-list li .mono {
+.fg-draft-entry {
+  display: flex;
   flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
   color: var(--ink-2);
+}
+.fg-draft-name {
+  overflow-wrap: anywhere;
+}
+.fg-draft-location {
+  min-height: var(--ctl-h);
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--action);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.fg-draft-location:hover {
+  text-decoration: underline;
+}
+.fg-draft-location:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: var(--r-ctl);
+}
+[data-draft-highlight='true'] {
+  outline: 2px solid var(--gold);
+  outline-offset: 3px;
+  scroll-margin-block: 96px;
 }
 
 /* ── 台面 + 纸 ── */
@@ -16408,7 +16363,6 @@ body.fg-dragging * {
     padding-bottom: env(safe-area-inset-bottom, 0px);
     padding-left: var(--safe-left);
     padding-right: var(--safe-right);
-    background: color-mix(in srgb, var(--gold) 12%, var(--sheet));
     box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.22);
   }
   /* 台面滚动到底部时最后一行不应被草稿条遮挡。使用 `:has()` 而非无条件留白：
@@ -17579,7 +17533,7 @@ body.fg-dragging * {
   grid-column: 2 / -1;
   margin: 0;
 }
-/* 基本信息只有分组和链名称两项，值列占满卡片：自动生成的「入口 → 出口」名称不被截断。 */
+/* 基本信息只有分组和链名称两项，值列占满卡片，长名称不被截断。 */
 .pv-chain-fields .cc-basic .fgrid .v > :is(input.f, select.f) {
   width: 100%;
   max-width: none;
@@ -17633,15 +17587,6 @@ body.fg-dragging * {
   flex: 1;
   min-width: 0;
   gap: 1px;
-}
-/* 路径摘要沿用线路列表的主干图（.chain-path）；名称前加地区旗，出口地区从这里读。 */
-.pv-chain-fields .cc-route {
-  margin-bottom: 12px;
-}
-.pv-chain-fields .cc-route .cp-hop {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
 }
 /* 协议卡落在半幅面板里时内容宽约 508px：端口与参数仍排得下，标题行保持一行；
    再窄才把端口和参数移到说明下方。 */
@@ -26912,10 +26857,10 @@ body.observe-brushing .observe-chart-tip {
 .settings-field-grid-three {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
-.settings-block .host-network-tuning-grid .setfld > .v {
+.settings-block :is(.host-network-tuning-grid, .outflow-statistics-grid) .setfld > .v {
   flex-wrap: nowrap;
 }
-.settings-block .host-network-tuning-grid .f {
+.settings-block :is(.host-network-tuning-grid, .outflow-statistics-grid) .f {
   width: 100%;
   max-width: 112px;
   font-family: var(--mono);
@@ -28609,6 +28554,11 @@ body.observe-brushing .observe-chart-tip {
 }
 .usage-tab-body {
   padding: 0;
+}
+.usage-month-loading {
+  display: grid;
+  min-height: 300px;
+  place-items: center;
 }
 .usage-refreshing {
   color: var(--ink-4);
@@ -33344,12 +33294,10 @@ body.fg-dragging .fg-rail {
   color: var(--action);
 }
 
-/* 组成条与组成行的状态配色：已是新版用数据色（与进度同义），待升级 / 升级中是同一色相的浅色（正在走向
-   已是新版），可升级金、失败红、其余淡灰。进行中不用主题色：各配色的 --data 都取自主题色的色相，
-   两者并排时分不出来。 */
+/* 组成条与组成行表达执行状态：成功绿、待升级 / 升级中用浅数据色、可升级金、失败红、其余淡灰。 */
 .usage-split > i.cgc-seg-ok,
 .usage-io .cgc-io-ok dt i {
-  background: var(--data);
+  background: var(--ok);
 }
 .usage-split > i.cgc-seg-warn,
 .usage-io .cgc-io-warn dt i {
@@ -33366,6 +33314,9 @@ body.fg-dragging .fg-rail {
 .usage-split > i.cgc-seg-none,
 .usage-io .cgc-io-none dt i {
   background: color-mix(in srgb, var(--ink) 16%, transparent);
+}
+.usage-io .cgc-io-ok :is(dt, dd:not(.usage-share)) {
+  color: var(--ok);
 }
 .usage-io .cgc-io-warn dd:not(.usage-share) {
   color: var(--gold);
@@ -33506,6 +33457,9 @@ body.fg-dragging .fg-rail {
   color: var(--ink-3);
   font-size: 12px;
   white-space: nowrap;
+}
+.cgc-tr.ok .cgc-st {
+  color: var(--ok);
 }
 .cgc-tr.warn .cgc-st {
   color: var(--gold);
@@ -36361,49 +36315,20 @@ details.cg-menu-wrap > summary::-webkit-details-marker {
 .site-usage > header .rut-status.warn b {
   color: inherit;
 }
-.site-statistics-sections {
+.outflow-statistics-sections {
+  display: grid;
+  gap: 10px;
   margin: 0 0 12px;
 }
-.site-statistics-section {
-  min-width: 0;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--line-soft);
-}
-.site-statistics-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px 12px;
-}
-.site-statistics-heading h5 {
-  margin: 0;
-  color: var(--ink-2);
-  font: 600 12px/1.5 var(--sans);
-}
-.site-statistics-actions {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 8px;
-}
-.other-domain-settings {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+.outflow-statistics-grid {
+  min-inline-size: 0;
   padding: 0;
-  margin: 12px 0 8px;
+  margin: 0;
   border: 0;
 }
-.other-domain-settings label {
-  display: grid;
-  min-width: 0;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--ink-2);
-}
-.other-domain-settings input {
-  min-width: 0;
-  width: 100%;
+.outflow-statistics-settings .settings-savebar {
+  margin: 8px -11px -11px;
+  padding-inline: 11px;
 }
 /* 切换周期时保留上一周期的读数，读取中略微降低对比 */
 .site-usage-body[aria-busy='true'] .site-usage-main {
@@ -37111,14 +37036,6 @@ button.site-usage-row:focus-visible {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.flt-utenant {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink-4);
-  font-size: 10.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 @media (hover: hover) {
   button.flt-ubtn:hover .flt-uname {
     color: var(--action);
@@ -37464,15 +37381,12 @@ button.site-usage-row:focus-visible {
     grid-row: span 2;
   }
 }
-/* 较窄的板面（以 .flt-board 为容器）：收窄用户列与合计列、组间缝，租户名只留在提示里。 */
+/* 较窄的板面（以 .flt-board 为容器）：收窄用户列与合计列、组间缝。 */
 @container (max-width: 860px) {
   .flt-grid {
     --flt-user-w: 116px;
     --flt-sum-w: 76px;
     --flt-gap: 6px;
-  }
-  .flt-utenant {
-    display: none;
   }
 }
 @container (max-width: 680px) {

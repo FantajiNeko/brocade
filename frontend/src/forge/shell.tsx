@@ -53,6 +53,7 @@ import { confirmDiscardChanges } from '../ui/navigation-guard';
 import { FleetTrafficMeter } from '../ui/fleet-traffic';
 import { MachineNotifications } from '../ui/machine-notifications';
 import { routeForViewer } from './access';
+import { ROLE_LABEL } from '../ui/role-label';
 
 const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
 const OnboardingGuide = lazy(() => import('../panes/onboarding').then(module => ({ default: module.OnboardingGuide })));
@@ -103,15 +104,6 @@ const OFF_NAV: Face[] = [{ key: 'password', label: '修改密码' }];
 const LABEL: Record<NavKey, string> = Object.fromEntries(
   [...NAV, ...MORE, ...OFF_NAV].map(f => [f.key, f.label]),
 ) as Record<NavKey, string>;
-
-const ROLE_LABEL: Record<AdminRole, string> = {
-  user: '用户',
-  readonly: '只读',
-  editor: '编辑',
-  publisher: '发布',
-  'tenant-admin': '租户管理员',
-  'system-admin': '系统管理员',
-};
 
 /** 顶栏账户牌与菜单头显示的身份。公开访客没有账户名；单租户阶段不显示租户范围。 */
 function accountOf(who: Whoami) {
@@ -218,7 +210,7 @@ export function ForgeShell({
     refetchInterval: query => (query.state.data?.deployments.some(deployment => deployment.active) ? 5_000 : 30_000),
   });
   const activeDeploy = (deployments.data?.deployments ?? []).find(d => d.active);
-  // 等待确认与执行中需要区分：含破坏性动作的波需要人工确认后才继续下发，而顶栏两种情况
+  // 等待确认与执行中需要区分：关闭无人值守时，破坏性波需人工确认后才继续下发，而顶栏两种情况
   // 都只显示一个红色角标，会导致持续等待一个不会自动继续的操作。
   const awaitingDeploy = (deployments.data?.deployments ?? []).find(d => d.awaiting_confirmation);
   // 权限任务在生成 deployment 之前就可能失败，因此不能从发布列表推断这层状态。

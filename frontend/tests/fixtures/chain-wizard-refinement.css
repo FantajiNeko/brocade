@@ -270,17 +270,6 @@
   scrollbar-width: thin;
   padding: 0 3px 5px;
 }
-.cr-tenant-group h3 {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin: 0 0 5px;
-  color: var(--ink-4);
-  font: 500 10.5px/16px var(--sans);
-}
-.cr-tenant-group h3 small {
-  font: 10px var(--mono);
-}
 .cr-user-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
@@ -358,7 +347,7 @@
 }
 .cr-new-user {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 88px auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 6px;
   margin: 6px 3px 10px;
 }
@@ -472,17 +461,6 @@
 }
 .cr-ingress-card .cr-ingress-description {
   font: 12px/1.7 var(--sans);
-}
-.cr-ingress-requirement {
-  grid-column: 2 / -1;
-  margin: 0;
-  color: var(--ink-3);
-  font: 12px/1.65 var(--sans);
-  overflow-wrap: anywhere;
-}
-.cr-ingress-requirement {
-  color: var(--ink-4);
-  font-size: 11px;
 }
 .cr-ingress-errors {
   display: grid;
@@ -612,45 +590,15 @@
 .cr-ingress-range > .cr-text-btn {
   margin-left: auto;
 }
-.cr-ingress-hint,
-.cr-ingress-defaults {
+.cr-ingress-hint {
   margin: 0;
   color: var(--ink-3);
   font: 11px/1.65 var(--sans);
-}
-.cr-ingress-defaults {
-  padding-top: 11px;
-  border-top: 1px solid var(--line-soft);
 }
 
 /* Keep the existing path tree and its actual target menus; soften nested surfaces. */
 .cr-path-body {
   padding: 5px 2px 1px;
-}
-.cr-path-summary {
-  display: flex;
-  min-width: 0;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin: 3px 0 13px;
-  padding-bottom: 13px;
-  border-bottom: 1px solid var(--line-soft);
-}
-.cr-path-summary > span {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-}
-.cr-path-summary b {
-  color: var(--ink-2);
-  font: 500 12px var(--sans);
-}
-.cr-path-summary small,
-.cr-path-summary > .ui-icon {
-  color: var(--ink-4);
-  font: 10.5px var(--sans);
 }
 .cr-path .wzr-root {
   flex-wrap: wrap;
@@ -811,7 +759,7 @@
     padding-inline: 6px;
   }
   .cr-new-user {
-    grid-template-columns: minmax(0, 1fr) 86px;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
   .cr-new-user .btn {
     grid-column: 1 / -1;
@@ -841,7 +789,6 @@
     margin-left: auto;
     font-size: 12px;
   }
-  .cr-ingress-requirement,
   .cr-ingress-errors,
   .cr-ingress-params {
     grid-column: 1 / -1;
@@ -882,12 +829,6 @@
   }
   .cr-ingress-range > .cr-text-btn {
     min-height: 44px;
-  }
-  .cr-path-summary {
-    gap: 7px 8px;
-  }
-  .cr-path-summary b {
-    font-size: 11px;
   }
   .cr-path .chain-rule-node-head .m-hop {
     white-space: normal;

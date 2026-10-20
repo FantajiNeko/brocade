@@ -368,6 +368,10 @@ export const ARTIFACT_META: Record<string, { file: string; fmt: string }> = {
 export const artifactFile = (kind: string) => ARTIFACT_META[kind]?.file ?? kind;
 export const artifactFmt = (kind: string) => ARTIFACT_META[kind]?.fmt ?? '';
 
+/** Keep the wire identity intact; subscription ownership is not part of its visible label. */
+export const artifactTargetLabel = (kind: string, target: string) =>
+  kind === 'user' ? target.slice(target.indexOf(':') + 1) : target;
+
 export function fmtBytes(n: number | null): string {
   return fileBytes(n);
 }

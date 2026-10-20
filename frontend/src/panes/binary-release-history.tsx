@@ -163,7 +163,8 @@ function TargetAttempts({
         onClick={() => setExpanded(value => !value)}
       >
         <span>
-          {names(target.node_id)} · {targetStatusText(target)}
+          {names(target.node_id)} ·{' '}
+          <span className={target.status === 'succeeded' ? 'st st-ok' : undefined}>{targetStatusText(target)}</span>
         </span>
         <span className="mono">
           {target.before_sha256.slice(0, 8)} → {target.desired_sha256?.slice(0, 8) ?? '未领取'}
@@ -183,7 +184,12 @@ function TargetAttempts({
             {attempts.data.map(attempt => (
               <li key={attempt.attempt}>
                 <span>
-                  第 {attempt.attempt} 次 · {BINARY_TARGET_STATUS[attempt.status].text}
+                  第 {attempt.attempt} 次 ·{' '}
+                  {attempt.status === 'succeeded' ? (
+                    <span className="st st-ok">{BINARY_TARGET_STATUS[attempt.status].text}</span>
+                  ) : (
+                    BINARY_TARGET_STATUS[attempt.status].text
+                  )}
                 </span>
                 <small>
                   {attempt.verification ? BINARY_VERIFICATION[attempt.verification] : '尚无验证结果'} ·{' '}
@@ -200,8 +206,12 @@ function TargetAttempts({
 }
 
 function targetStatusText(target: BinaryReleaseTarget) {
-  if (target.status === 'succeeded' && target.reported_forced_retirement === true) return '强制退役完成';
-  if (target.status === 'succeeded' && target.recovered_after_dirty === true) return '自动恢复完成';
+  if (
+    target.status === 'succeeded' &&
+    target.recovered_after_dirty === true &&
+    target.reported_forced_retirement !== true
+  )
+    return '自动恢复完成';
   return BINARY_TARGET_STATUS[target.status].text;
 }
 

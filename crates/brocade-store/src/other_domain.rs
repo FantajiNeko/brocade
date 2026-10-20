@@ -2,7 +2,7 @@
 use crate::{AdminContext, Result, StoreError};
 use brocade_deployment::other_domain::{
     valid_domain, OtherDomainPolicy, OtherDomainReport, UserOtherDomainRow, UserOtherDomains,
-    OTHER_DOMAIN_MAX_ROWS, OTHER_DOMAIN_VERSION,
+    DETAIL_CHECKPOINT_VERSION, OTHER_DOMAIN_MAX_ROWS, OTHER_DOMAIN_VERSION,
 };
 use brocade_deployment::site_usage::SiteUsagePeriod;
 use brocade_deployment::sniffing_failed::{
@@ -14,6 +14,18 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
 };
+
+const DETAIL_HISTORY_MAX_ROWS: usize = 65_536;
+
+// The existing namespace column identifies a cumulative counter lifetime. A segment suffix
+// separates readmissions without a schema change or altering legacy v1 counter identities.
+fn counter_epoch(epoch: &str, counter_id: u64) -> Cow<'_, str> {
+    if counter_id == 0 {
+        Cow::Borrowed(epoch)
+    } else {
+        Cow::Owned(format!("{epoch}:{counter_id}"))
+    }
+}
 
 #[derive(Clone, Copy)]
 enum DetailKind {
@@ -112,12 +124,16 @@ fn validate(report: &OtherDomainReport, now: i64) -> Result<()> {
 }
 fn validate_for(report: &OtherDomainReport, now: i64, kind: DetailKind) -> Result<()> {
     let mut seen = BTreeSet::new();
-    if report.version != OTHER_DOMAIN_VERSION
-        || report.epoch.len() != 32
+    let mut segments = BTreeSet::new();
+    let checkpointed = report.version == DETAIL_CHECKPOINT_VERSION;
+    if !matches!(
+        report.version,
+        OTHER_DOMAIN_VERSION | DETAIL_CHECKPOINT_VERSION
+    ) || report.epoch.len() != 32
         || !report.epoch.bytes().all(|c| c.is_ascii_hexdigit())
         || report.counters.len() > OTHER_DOMAIN_MAX_ROWS
         || report.read_at_unix_secs > now + 60
-        || report.read_at_unix_secs < now - 600
+        || (!checkpointed && report.read_at_unix_secs < now - 600)
         || report.activation_unix_secs <= 0
         || report.activation_unix_secs > report.read_at_unix_secs
         || report.usage_generation_id <= 0
@@ -134,7 +150,10 @@ fn validate_for(report: &OtherDomainReport, now: i64, kind: DetailKind) -> Resul
             || ![hour, hour - 3600].contains(&row.bucket)
             || row.uplink_bytes > i64::MAX as u64
             || row.downlink_bytes > i64::MAX as u64
-            || !seen.insert((row.bucket, &row.label, &row.domain))
+            || (checkpointed && (row.counter_id == 0 || row.counter_id > i64::MAX as u64))
+            || (checkpointed && !segments.insert(row.counter_id))
+            || (!checkpointed && row.counter_id != 0)
+            || !seen.insert((row.bucket, &row.label, &row.domain, row.counter_id))
         {
             return Err(StoreError::InvalidData(
                 "invalid or duplicate domain observation row".into(),
@@ -172,6 +191,21 @@ async fn record_for(
         .fetch_one(&mut *tx)
         .await?;
     validate_for(&report, now, kind)?;
+    let checkpointed = report.version == DETAIL_CHECKPOINT_VERSION;
+    let retention_floor = (now / 3600 - 23) * 3600;
+    if checkpointed && report.read_at_unix_secs / 3600 * 3600 < retention_floor {
+        // Already outside the product's history window. Acknowledge an expired durable
+        // checkpoint so it cannot permanently pin the Agent's bounded FIFO.
+        tx.commit().await?;
+        return Ok(());
+    }
+    if !checkpointed {
+        let checkpointed_epoch: bool = sqlx::query_scalar(&kind.sql("SELECT EXISTS (SELECT 1 FROM other_domain_counter_heads WHERE node_id=$1 AND epoch LIKE $2)"))
+            .bind(node).bind(format!("{}:%", report.epoch)).fetch_one(&mut *tx).await?;
+        if checkpointed_epoch {
+            return Err(StoreError::InvalidData("checkpointed epoch requires v2 reports; restart Xray before legacy observation rollback".into()));
+        }
+    }
     let policy: serde_json::Value = sqlx::query_scalar(
         &kind.sql("SELECT other_domain_policy FROM control_state WHERE id=TRUE"),
     )
@@ -181,7 +215,7 @@ async fn record_for(
     policy
         .validate()
         .map_err(|e| StoreError::InvalidData(e.into()))?;
-    if !policy.enabled {
+    if !policy.enabled && !checkpointed {
         return Err(StoreError::Forbidden(
             "domain observations are disabled".into(),
         ));
@@ -192,26 +226,51 @@ async fn record_for(
     .bind(node)
     .fetch_optional(&mut *tx)
     .await?;
-    if previous
-        .as_ref()
-        .is_some_and(|p| p.get::<i64, _>("read_at") >= report.read_at_unix_secs)
+    if !checkpointed
+        && previous
+            .as_ref()
+            .is_some_and(|p| p.get::<i64, _>("read_at") >= report.read_at_unix_secs)
     {
         tx.commit().await?;
         return Ok(());
     }
-    if previous.as_ref().is_some_and(|p| {
-        p.get::<String, _>("epoch") != report.epoch
-            && p.get::<i64, _>("observed_since") > report.activation_unix_secs
-    }) {
+    if !checkpointed
+        && previous.as_ref().is_some_and(|p| {
+            p.get::<String, _>("epoch") != report.epoch
+                && p.get::<i64, _>("observed_since") > report.activation_unix_secs
+        })
+    {
         return Err(StoreError::InvalidData(
             "stale domain observation epoch".into(),
         ));
     }
     let owners =
         crate::usage::other_domain_owners(&mut tx, node, report.usage_generation_id).await?;
-    let old=sqlx::query(&kind.sql("SELECT bucket,label,domain,uplink_bytes,downlink_bytes FROM other_domain_counter_heads WHERE node_id=$1 AND epoch=$2 AND bucket >= $3"))
-        .bind(node).bind(&report.epoch).bind(report.read_at_unix_secs/3600*3600-3600).fetch_all(&mut *tx).await?
-        .into_iter().map(|r| ((r.get::<i64,_>("bucket"),r.get::<String,_>("label"),r.get::<String, _>(kind.key_column())),(r.get::<i64,_>("uplink_bytes"),r.get::<i64,_>("downlink_bytes")))).collect::<BTreeMap<_,_>>();
+    let mut first_segments = BTreeMap::<(i64, &str, &str), u64>::new();
+    for row in &report.counters {
+        first_segments
+            .entry((row.bucket, row.label.as_str(), row.domain.as_str()))
+            .and_modify(|id| *id = (*id).min(row.counter_id))
+            .or_insert(row.counter_id);
+    }
+    let report_buckets = report
+        .counters
+        .iter()
+        .map(|r| r.bucket)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut counter_epochs = report
+        .counters
+        .iter()
+        .map(|r| counter_epoch(&report.epoch, r.counter_id).into_owned())
+        .collect::<Vec<_>>();
+    if checkpointed {
+        counter_epochs.push(report.epoch.clone());
+    }
+    let old=sqlx::query(&kind.sql("SELECT bucket,label,domain,epoch,uplink_bytes,downlink_bytes FROM other_domain_counter_heads WHERE node_id=$1 AND epoch=ANY($2) AND bucket >= $3 AND bucket=ANY($4)"))
+        .bind(node).bind(&counter_epochs).bind(retention_floor).bind(&report_buckets).fetch_all(&mut *tx).await?
+        .into_iter().map(|r| ((r.get::<i64,_>("bucket"),r.get::<String,_>("label"),r.get::<String, _>(kind.key_column()),r.get::<String,_>("epoch")),(r.get::<i64,_>("uplink_bytes"),r.get::<i64,_>("downlink_bytes")))).collect::<BTreeMap<_,_>>();
     let mut limited = report.limited;
     let same_epoch = previous
         .as_ref()
@@ -230,13 +289,24 @@ async fn record_for(
                 || report.read_at_unix_secs - p.get::<i64, _>("read_at") > 3600);
     }
     // Arrays are bounded by the protocol and one batch avoids thousands of SQL round trips.
-    let (mut buckets, mut labels, mut domains, mut ups, mut downs) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut buckets, mut labels, mut domains, mut epochs, mut ups, mut downs) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
     let mut totals = BTreeMap::<(i64, String, String, String), (i64, i64)>::new();
     // A restarted/misbehaving node cannot evade the per-hour storage budget by
     // rotating its volatile epoch or splitting a snapshot into many requests.
-    let persisted=sqlx::query(&kind.sql("SELECT bucket,tenant_id,user_id,domain FROM user_other_domain_hourly WHERE node_id=$1 AND bucket >= $2"))
-        .bind(node).bind(report.read_at_unix_secs/3600*3600-3600).fetch_all(&mut *tx).await?;
+    let report_domains = report
+        .counters
+        .iter()
+        .map(|r| r.domain.as_str())
+        .collect::<Vec<_>>();
+    let persisted=sqlx::query(&kind.sql("SELECT bucket,tenant_id,user_id,domain FROM user_other_domain_hourly WHERE node_id=$1 AND bucket=ANY($2) AND domain=ANY($3)"))
+        .bind(node).bind(&report_buckets).bind(&report_domains).fetch_all(&mut *tx).await?;
     let mut persisted_keys: BTreeSet<_> = persisted
         .into_iter()
         .map(|r| {
@@ -248,36 +318,82 @@ async fn record_for(
             )
         })
         .collect();
-    let mut bucket_counts = BTreeMap::<i64, usize>::new();
-    for (bucket, _, _, _) in &persisted_keys {
-        *bucket_counts.entry(*bucket).or_default() += 1;
-    }
+    let mut bucket_counts = sqlx::query(&kind.sql("SELECT bucket,count(*)::bigint AS n FROM user_other_domain_hourly WHERE node_id=$1 AND bucket=ANY($2) GROUP BY bucket"))
+        .bind(node).bind(&report_buckets).fetch_all(&mut *tx).await?.into_iter()
+        .map(|r| (r.get::<i64,_>("bucket"), r.get::<i64,_>("n") as usize)).collect::<BTreeMap<_,_>>();
+    let mut head_counts = sqlx::query(&kind.sql("SELECT bucket,count(*)::bigint AS n FROM other_domain_counter_heads WHERE node_id=$1 AND bucket=ANY($2) GROUP BY bucket"))
+        .bind(node).bind(&report_buckets).fetch_all(&mut *tx).await?.into_iter()
+        .map(|r| (r.get::<i64,_>("bucket"), r.get::<i64,_>("n") as usize)).collect::<BTreeMap<_,_>>();
     for r in &report.counters {
+        if checkpointed && r.bucket < retention_floor {
+            continue;
+        }
         let Some((tenant, user)) = owners.get(&r.label) else {
             limited = true;
             continue;
         };
-        let (old_up, old_down) = old
-            .get(&(r.bucket, r.label.clone(), r.domain.clone()))
-            .copied()
-            .unwrap_or_default();
-        let (up, down) = (r.uplink_bytes as i64, r.downlink_bytes as i64);
-        if up < old_up || down < old_down {
+        let head_key = (
+            r.bucket,
+            r.label.clone(),
+            r.domain.clone(),
+            counter_epoch(&report.epoch, r.counter_id).into_owned(),
+        );
+        let previous_head = old.get(&head_key);
+        let legacy_key = (
+            r.bucket,
+            r.label.clone(),
+            r.domain.clone(),
+            report.epoch.clone(),
+        );
+        let first_segment = first_segments.get(&(r.bucket, r.label.as_str(), r.domain.as_str()))
+            == Some(&r.counter_id);
+        let legacy_head = if checkpointed && previous_head.is_none() && first_segment {
+            old.get(&legacy_key)
+        } else {
+            None
+        };
+        let migrating = legacy_head.is_some();
+        let (old_up, old_down) = previous_head.or(legacy_head).copied().unwrap_or_default();
+        let (mut up, mut down) = (r.uplink_bytes as i64, r.downlink_bytes as i64);
+        if checkpointed {
+            // Spool retries and coalescing can deliver older directional snapshots. A
+            // segment never resets: retain each direction's greatest committed value.
+            up = up.max(old_up);
+            down = down.max(old_down);
+        } else if up < old_up || down < old_down {
             limited = true;
             continue;
         }
-        if up == old_up && down == old_down {
+        if up == old_up && down == old_down && !migrating {
+            continue;
+        }
+        let new_head = checkpointed && previous_head.is_none();
+        if new_head
+            && !migrating
+            && head_counts.get(&r.bucket).copied().unwrap_or(0) >= DETAIL_HISTORY_MAX_ROWS
+        {
+            limited = true;
             continue;
         }
         let key = (r.bucket, tenant.clone(), user.clone(), r.domain.clone());
         if !persisted_keys.contains(&key) {
             let count = bucket_counts.entry(r.bucket).or_default();
-            if *count >= policy.node_capacity as usize {
+            // Resident capacity is unrelated to the number of distinct names seen over an
+            // hour. Keep a separate defensive history budget for high-cardinality input.
+            let history_capacity = if checkpointed {
+                DETAIL_HISTORY_MAX_ROWS
+            } else {
+                policy.node_capacity as usize
+            };
+            if *count >= history_capacity {
                 limited = true;
                 continue;
             }
             *count += 1;
             persisted_keys.insert(key.clone());
+        }
+        if new_head && !migrating {
+            *head_counts.entry(r.bucket).or_default() += 1;
         }
         let t = totals.entry(key).or_default();
         t.0 =
@@ -289,12 +405,19 @@ async fn record_for(
         buckets.push(r.bucket);
         labels.push(r.label.as_str());
         domains.push(r.domain.as_str());
+        epochs.push(head_key.3);
         ups.push(up);
         downs.push(down);
     }
     if !buckets.is_empty() {
-        sqlx::query(&kind.sql("INSERT INTO other_domain_counter_heads (node_id,epoch,bucket,label,domain,uplink_bytes,downlink_bytes) SELECT $1,$2,x.* FROM unnest($3::bigint[],$4::text[],$5::text[],$6::bigint[],$7::bigint[]) x(bucket,label,domain,up,down) ON CONFLICT (node_id,epoch,bucket,label,domain) DO UPDATE SET uplink_bytes=EXCLUDED.uplink_bytes,downlink_bytes=EXCLUDED.downlink_bytes"))
-            .bind(node).bind(&report.epoch).bind(&buckets).bind(&labels).bind(&domains).bind(&ups).bind(&downs).execute(&mut *tx).await?;
+        sqlx::query(&kind.sql("INSERT INTO other_domain_counter_heads (node_id,epoch,bucket,label,domain,uplink_bytes,downlink_bytes) SELECT $1,x.* FROM unnest($2::text[],$3::bigint[],$4::text[],$5::text[],$6::bigint[],$7::bigint[]) x(epoch,bucket,label,domain,up,down) ON CONFLICT (node_id,epoch,bucket,label,domain) DO UPDATE SET uplink_bytes=EXCLUDED.uplink_bytes,downlink_bytes=EXCLUDED.downlink_bytes"))
+            .bind(node).bind(&epochs).bind(&buckets).bind(&labels).bind(&domains).bind(&ups).bind(&downs).execute(&mut *tx).await?;
+        if checkpointed {
+            // Transfer each legacy baseline once. New admissions of the same target must
+            // start at zero, while an Agent upgrade must not count the old bytes again.
+            sqlx::query(&kind.sql("DELETE FROM other_domain_counter_heads h USING unnest($3::bigint[],$4::text[],$5::text[]) x(bucket,label,domain) WHERE h.node_id=$1 AND h.epoch=$2 AND h.bucket=x.bucket AND h.label=x.label AND h.domain=x.domain"))
+                .bind(node).bind(&report.epoch).bind(&buckets).bind(&labels).bind(&domains).execute(&mut *tx).await?;
+        }
     }
     if !totals.is_empty() {
         let (mut bs, mut ts, mut us, mut ds, mut up, mut down) = (
@@ -316,15 +439,14 @@ async fn record_for(
         sqlx::query(&kind.sql("INSERT INTO user_other_domain_hourly (bucket,node_id,tenant_id,user_id,domain,uplink_bytes,downlink_bytes) SELECT x.bucket,$1,x.tenant,x.user_id,x.domain,x.up,x.down FROM unnest($2::bigint[],$3::text[],$4::text[],$5::text[],$6::bigint[],$7::bigint[]) x(bucket,tenant,user_id,domain,up,down) ON CONFLICT (bucket,node_id,tenant_id,user_id,domain) DO UPDATE SET uplink_bytes=user_other_domain_hourly.uplink_bytes+EXCLUDED.uplink_bytes,downlink_bytes=user_other_domain_hourly.downlink_bytes+EXCLUDED.downlink_bytes"))
             .bind(node).bind(&bs).bind(&ts).bind(&us).bind(&ds).bind(&up).bind(&down).execute(&mut *tx).await?;
     }
-    sqlx::query(&kind.sql("INSERT INTO node_other_domain_state (node_id,epoch,read_at,observed_since,limited) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (node_id) DO UPDATE SET epoch=EXCLUDED.epoch,read_at=EXCLUDED.read_at,observed_since=EXCLUDED.observed_since,limited=EXCLUDED.limited"))
+    sqlx::query(&kind.sql("INSERT INTO node_other_domain_state (node_id,epoch,read_at,observed_since,limited) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (node_id) DO UPDATE SET epoch=CASE WHEN EXCLUDED.read_at>=node_other_domain_state.read_at THEN EXCLUDED.epoch ELSE node_other_domain_state.epoch END,read_at=GREATEST(node_other_domain_state.read_at,EXCLUDED.read_at),observed_since=CASE WHEN EXCLUDED.read_at>=node_other_domain_state.read_at THEN EXCLUDED.observed_since ELSE node_other_domain_state.observed_since END,limited=CASE WHEN EXCLUDED.read_at>=node_other_domain_state.read_at THEN EXCLUDED.limited ELSE node_other_domain_state.limited OR EXCLUDED.limited END"))
         .bind(node).bind(&report.epoch).bind(report.read_at_unix_secs).bind(since).bind(limited).execute(&mut *tx).await?;
     // Trim only this node's heads, independently of the fleet's daily housekeeping clock.
-    sqlx::query(&kind.sql(
-        "DELETE FROM other_domain_counter_heads WHERE node_id=$1 AND (epoch<>$2 OR bucket < $3)",
-    ))
+    sqlx::query(
+        &kind.sql("DELETE FROM other_domain_counter_heads WHERE node_id=$1 AND bucket < $2"),
+    )
     .bind(node)
-    .bind(&report.epoch)
-    .bind(report.read_at_unix_secs / 3600 * 3600 - 3600)
+    .bind(retention_floor)
     .execute(&mut *tx)
     .await?;
     sqlx::query(&kind.sql("DELETE FROM user_other_domain_hourly WHERE ctid IN (SELECT ctid FROM user_other_domain_hourly WHERE node_id=$1 AND bucket < $2 ORDER BY bucket LIMIT 1024)"))
@@ -346,6 +468,7 @@ pub(crate) async fn query(
         DetailScope::User { tenant, user },
         period,
         DetailKind::Domain,
+        None,
     )
     .await
 }
@@ -356,12 +479,23 @@ pub(crate) async fn query_node(
     node: &str,
     period: SiteUsagePeriod,
 ) -> Result<UserOtherDomains> {
+    query_node_range(pool, actor, node, period, None).await
+}
+
+pub(crate) async fn query_node_range(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node: &str,
+    period: SiteUsagePeriod,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+) -> Result<UserOtherDomains> {
     query_for(
         pool,
         actor,
         DetailScope::Node(node),
         period,
         DetailKind::Domain,
+        range,
     )
     .await
 }
@@ -381,6 +515,7 @@ async fn query_for(
     scope: DetailScope<'_>,
     period: SiteUsagePeriod,
     kind: DetailKind,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
 ) -> Result<UserOtherDomains> {
     let nodes: Vec<_> = match scope {
         DetailScope::User { tenant, user } => {
@@ -393,18 +528,18 @@ async fn query_for(
         }
         DetailScope::Node(node) => crate::site_usage::classified_node(pool, actor, node).await?,
     };
-    let bounds = crate::site_usage::period_bounds(pool, period).await?;
+    let bounds = crate::site_usage::destination_bounds(pool, period, range).await?;
     let now = bounds.now;
     // Detail hours are kept for 24 hours (prune_for); a longer period starts at the oldest kept
     // hour and the returned range start says so.
-    let start = bounds.start.max((now / 3600 - 23) * 3600);
+    let start = bounds.start.max((bounds.clock / 3600 - 23) * 3600).min(now);
     let policy = policy_for(pool, kind).await?;
-    let state=sqlx::query(&kind.sql("SELECT count(*) FILTER (WHERE read_at >= $2)::bigint AS reporting,bool_or(limited) AS limited,max(observed_since) AS since,max(read_at) AS latest FROM node_other_domain_state WHERE node_id=ANY($1)")).bind(&nodes).bind(now-600).fetch_one(pool).await?;
+    let state=sqlx::query(&kind.sql("SELECT count(*) FILTER (WHERE read_at >= $2)::bigint AS reporting,bool_or(limited) AS limited,max(observed_since) AS since,max(read_at) AS latest FROM node_other_domain_state WHERE node_id=ANY($1)")).bind(&nodes).bind(bounds.clock-600).fetch_one(pool).await?;
     let rows = match scope {
         DetailScope::User { tenant, user } => sqlx::query(&kind.sql("SELECT domain,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down FROM user_other_domain_hourly WHERE tenant_id=$1 AND user_id=$2 AND bucket >= $3 AND bucket <= $4 GROUP BY domain ORDER BY sum(uplink_bytes::numeric+downlink_bytes::numeric) DESC,domain LIMIT $5"))
-            .bind(tenant).bind(user).bind(start).bind(now).bind(i64::from(policy.top_n)).fetch_all(pool).await?,
+            .bind(tenant).bind(user).bind(start).bind(if range.is_some() { now - 1 } else { now }).bind(i64::from(policy.top_n)).fetch_all(pool).await?,
         DetailScope::Node(node) => sqlx::query(&kind.sql("SELECT domain,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down FROM user_other_domain_hourly WHERE node_id=$1 AND bucket >= $2 AND bucket <= $3 AND ($5::text IS NULL OR tenant_id=$5 OR tenant_id LIKE $6 ESCAPE '\\') GROUP BY domain ORDER BY sum(uplink_bytes::numeric+downlink_bytes::numeric) DESC,domain LIMIT $4"))
-            .bind(node).bind(start).bind(now).bind(i64::from(policy.top_n)).bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(pool).await?,
+            .bind(node).bind(start).bind(if range.is_some() { now - 1 } else { now }).bind(i64::from(policy.top_n)).bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(pool).await?,
     };
     Ok(UserOtherDomains {
         collection_enabled: policy.enabled,
@@ -461,7 +596,8 @@ async fn prune_for_hours(
     head_hours: u32,
 ) -> Result<()> {
     let history_cutoff = i64::from(history_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let head_cutoff = i64::from(head_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
+    // A legacy two-hour override must not erase deduplication while v2 reports can replay.
+    let head_cutoff = i64::from(head_hours.clamp(24, crate::MAX_RETENTION_HOURS)) * 3_600;
     for (sql, cutoff) in [
         (
             "DELETE FROM user_other_domain_hourly WHERE ctid IN (SELECT ctid FROM user_other_domain_hourly WHERE bucket < extract(epoch FROM now())::bigint-$1 ORDER BY bucket LIMIT 10000)",
@@ -510,6 +646,7 @@ pub(crate) async fn record_failed(
         pool,
         node,
         report.map_counters(|r| brocade_deployment::other_domain::OtherDomainCounter {
+            counter_id: r.counter_id,
             bucket: r.bucket,
             label: r.label,
             domain: r.target,
@@ -527,7 +664,14 @@ pub(crate) async fn query_failed(
     user: &str,
     period: SiteUsagePeriod,
 ) -> Result<UserSniffingFailedTargets> {
-    failed_targets(pool, actor, DetailScope::User { tenant, user }, period).await
+    failed_targets(
+        pool,
+        actor,
+        DetailScope::User { tenant, user },
+        period,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn query_failed_node(
@@ -536,7 +680,17 @@ pub(crate) async fn query_failed_node(
     node: &str,
     period: SiteUsagePeriod,
 ) -> Result<UserSniffingFailedTargets> {
-    failed_targets(pool, actor, DetailScope::Node(node), period).await
+    query_failed_node_range(pool, actor, node, period, None).await
+}
+
+pub(crate) async fn query_failed_node_range(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node: &str,
+    period: SiteUsagePeriod,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+) -> Result<UserSniffingFailedTargets> {
+    failed_targets(pool, actor, DetailScope::Node(node), period, range).await
 }
 
 async fn failed_targets(
@@ -544,9 +698,10 @@ async fn failed_targets(
     actor: &AdminContext,
     scope: DetailScope<'_>,
     period: SiteUsagePeriod,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
 ) -> Result<UserSniffingFailedTargets> {
     Ok(
-        query_for(pool, actor, scope, period, DetailKind::FailedTarget)
+        query_for(pool, actor, scope, period, DetailKind::FailedTarget, range)
             .await?
             .map_rows(|r| UserSniffingFailedRow {
                 target: r.domain,
@@ -574,6 +729,7 @@ mod tests {
         report
             .counters
             .push(brocade_deployment::other_domain::OtherDomainCounter {
+                counter_id: 0,
                 bucket: 7200,
                 label: "a@t#i".into(),
                 domain: "https://secret.example/path".into(),

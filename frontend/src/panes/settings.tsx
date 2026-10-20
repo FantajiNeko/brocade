@@ -2,6 +2,7 @@ import { useServerForm } from '../ui/server-form';
 import { ReverseHealthSettings, reversePoliciesError } from '../reverse-health-settings';
 import { useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { binaryReleaseVersion } from '../ui/binary-release-version';
 import {
   DEFAULT_HOP_MUX,
   DEFAULT_REVERSE_HEALTH,
@@ -15,6 +16,7 @@ import {
   saveBranding,
   scanCerts,
   fetchDistribution,
+  fetchDeploymentSettings,
   fetchDataRetention,
   fetchAgentLogPolicy,
   fetchHostNetworkTuning,
@@ -26,6 +28,7 @@ import {
   fetchVpngateOverview,
   startVpngateIntelligenceRefresh,
   saveDistribution,
+  saveDeploymentSettings,
   saveDataRetention,
   saveAgentLogDefault,
   saveHostNetworkTuning,
@@ -52,6 +55,7 @@ import {
   type CertificateTrack,
   type BrandingSettings,
   type DistributionView,
+  type DeploymentSettings,
   type DataRetentionPolicy,
   type DataRetentionView,
   type AgentLogLimits,
@@ -321,18 +325,19 @@ const NAV: NavItem[] = [
   { id: 'set-branding', label: '站点外观', icon: 'settings' },
   { id: 'set-visitor', label: '访客模式', icon: 'access' },
   { id: 'set-dist', label: '分发', icon: 'deploy' },
-  { id: 'set-agent-logs', label: '日志保留', icon: 'artifacts' },
-  { id: 'set-host-network', label: '主网卡调优', icon: 'observe' },
-  { id: 'set-site-usage', label: '站点统计', icon: 'usage' },
+  { id: 'set-deployment', label: '发布', icon: 'deploy' },
   { id: 'set-cert', label: '证书', icon: 'certificate' },
-  { id: 'set-xray', label: 'XRAY', icon: 'protocol', key: 'xray' },
-  { id: 'set-conn', label: '连接策略', icon: 'config', key: 'connection' },
-  { id: 'set-wg', label: 'WireGuard', icon: 'tunnels', key: 'wireguard' },
-  { id: 'set-ports', label: '端口分配', icon: 'ingress', key: 'ports' },
+  { id: 'set-site-usage', label: '出流量统计', icon: 'usage' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
   { id: 'set-probe', label: '端到端探测', icon: 'observe', key: 'probe' },
   { id: 'set-ping-probe', label: 'Ping 链路探测', icon: 'diag' },
   { id: 'set-geodata', label: '规则库更新', icon: 'dns', key: 'geodata' },
+  { id: 'set-agent-logs', label: '日志保留', icon: 'artifacts' },
+  { id: 'set-ports', label: '端口分配', icon: 'ingress', key: 'ports' },
+  { id: 'set-host-network', label: '主网卡调优', icon: 'observe' },
+  { id: 'set-xray', label: 'XRAY', icon: 'protocol', key: 'xray' },
+  { id: 'set-conn', label: '连接策略', icon: 'config', key: 'connection' },
+  { id: 'set-wg', label: 'WireGuard', icon: 'tunnels', key: 'wireguard' },
   { id: 'set-vpngate', label: 'VPN Gate 能力', icon: 'tunnels' },
   { id: 'set-vpngate-intelligence', label: '情报任务', icon: 'observe' },
   { id: 'set-data-retention', label: '数据保留', icon: 'artifacts' },
@@ -798,11 +803,11 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             </div>
             <div>
               <dt>域名与验证</dt>
-              <dd>无需域名与 DNS 验证</dd>
+              <dd>无需域名与 DNS 验证。</dd>
             </div>
             <div>
               <dt>公开信息</dt>
-              <dd>不进入 CT 公开日志</dd>
+              <dd>不进入 CT 公开日志。</dd>
             </div>
           </dl>
         </details>
@@ -822,15 +827,15 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           <dl className="cert-config-notes" aria-label="Let's Encrypt 配置说明">
             <div>
               <dt>运行槽</dt>
-              <dd>数量不限，权威证书无需预先固定</dd>
+              <dd>数量不限，权威证书无需预先固定。</dd>
             </div>
             <div>
               <dt>域名与验证</dt>
-              <dd>独立域名，通过 Cloudflare DNS-01 验证</dd>
+              <dd>独立域名，通过 Cloudflare DNS-01 验证。</dd>
             </div>
             <div>
               <dt>公开信息</dt>
-              <dd>证书名称会进入 CT 公开日志</dd>
+              <dd>证书名称会进入 CT 公开日志。</dd>
             </div>
           </dl>
 
@@ -909,7 +914,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             savedText={saved ? '已保存，此配置可供新证书组使用' : null}
             editable={editable}
             disabled={!view.sealing_available}
-            title={view.sealing_available ? '' : '这台控制面没配 BROCADE_SECRET_KEY，存不了凭据'}
+            title={view.sealing_available ? '' : '这台控制面没配 BROCADE_SECRET_KEY，存不了凭据。'}
             label="保存配置"
             onSave={() => save.mutate(f)}
           />
@@ -924,7 +929,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             <button className="btn" disabled={!editable || scan.isPending || scanActive} onClick={() => scan.mutate()}>
               {scan.isPending ? '正在提交…' : scanActive ? '后台处理中…' : '立即签发与续期'}
             </button>
-            <span className="hint">只处理待签发、失败和即将到期的证书</span>
+            <span className="hint">只处理待签发、失败和即将到期的证书。</span>
           </div>
         </div>
 
@@ -1079,7 +1084,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
       <div className="certgroups-toolbar">
         <div>
           <b>证书组</b>
-          <span className="hint">按组查看完整的 SNI、签发记录和运行槽</span>
+          <span className="hint">按组查看完整的 SNI、签发记录和运行槽。</span>
         </div>
         <div className="v">
           <button
@@ -1197,7 +1202,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                     type="button"
                     className="btn sm"
                     disabled={!editable || pending !== null}
-                    title="再签一张同名证书；可保留多张，由你决定启用或删除"
+                    title="再签一张同名证书；可保留多张，由你决定启用或删除。"
                     onClick={() => run(`spare:${group.id}`, () => requestSpareCertificate(group.id))}
                   >
                     {pending === `spare:${group.id}` ? '正在申领…' : '＋ 增加证书'}
@@ -1327,12 +1332,12 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                                   }
                                   title={
                                     cert.status === 'compatible'
-                                      ? '切换到这张保留证书；当前证书将转为保留'
+                                      ? '切换到这张保留证书；当前证书将转为保留。'
                                       : cert.signing_method === 'self-signed'
                                         ? preloadPending
-                                          ? '等待主备槽预装确认后才能启用'
-                                          : '启用这张证书，更新新订阅的 SNI 与校验值'
-                                        : '让这个组改用这张同名公有证书'
+                                          ? '等待主备槽预装确认后才能启用。'
+                                          : '启用这张证书，更新新订阅的 SNI 与校验值。'
+                                        : '让这个组改用这张同名公有证书。'
                                   }
                                   onClick={() => run(`serve:${cert.id}`, () => serveCertificate(cert.id))}
                                 >
@@ -1350,7 +1355,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                                   disabled={!editable || pending !== null}
                                   title={
                                     cert.status === 'compatible'
-                                      ? '停止保留；仍使用旧配置的客户端将无法重新连接'
+                                      ? '停止保留；仍使用旧配置的客户端将无法重新连接。'
                                       : '删除这条证书记录'
                                   }
                                   onClick={() => {
@@ -1530,7 +1535,7 @@ function GroupForm({
               : value.signingMethod === 'self-signed'
                 ? '创建后立即生成并签发固定主备两份。'
                 : '创建后立即申领第一份证书，之后可按需继续增加。'
-            : '保存后立即更新组信息'}
+            : '保存后立即更新组信息。'}
         </span>
         <button type="button" className="btn" disabled={busy} onClick={onCancel}>
           取消
@@ -1598,7 +1603,7 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
       <header>
         <SettingsTitle id="set-branding">站点外观</SettingsTitle>
       </header>
-      <p className="cardsub">控制台左上角使用这里的名称和图标；它们也同步到登录页和浏览器标签页</p>
+      <p className="cardsub">控制台左上角使用这里的名称和图标；它们也同步到登录页和浏览器标签页。</p>
       {save.error && <ErrorBox error={save.error} />}
       {fileError && <div className="callout err">{fileError}</div>}
       <Group label="品牌标识">
@@ -1638,7 +1643,7 @@ function BrandingSection({ editable, data }: { editable: boolean; data: Branding
               恢复默认图标
             </button>
           )}
-          <span className="hint">PNG / JPEG / WebP，最大 256 KiB；建议使用正方形图片</span>
+          <span className="hint">PNG / JPEG / WebP，最大 256 KiB；建议使用正方形图片。</span>
         </Fld>
       </Group>
       <SettingsSaveBar
@@ -1665,7 +1670,7 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
         <SettingsTitle id="set-visitor">访客模式</SettingsTitle>
         <span className="sp" />
       </header>
-      <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客</p>
+      <p className="cardsub">开启后无需账号即可进入脱敏后的只读页面；关闭会立即退出现有访客。</p>
       {update.error && <ErrorBox error={update.error} />}
       <Group label="公开访问">
         <Fld label="访问状态">
@@ -1679,7 +1684,67 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
             ariaLabel="访客模式"
             onChange={next => update.mutate(next)}
           />
-          <span className="hint">管理员和用户登录不受影响</span>
+          <span className="hint">管理员和用户登录不受影响。</span>
+        </Fld>
+      </Group>
+    </section>
+  );
+}
+
+function DeploymentSection({ editable, settings }: { editable: boolean; settings: DeploymentSettings }) {
+  const qc = useQueryClient();
+  const update = useMutation({
+    onMutate: () => qc.cancelQueries({ queryKey: ['deployment-settings'] }),
+    mutationFn: (next: Partial<DeploymentSettings>) => saveDeploymentSettings(next),
+    onSuccess: async settings => {
+      await qc.cancelQueries({ queryKey: ['deployment-settings'] });
+      qc.setQueryData(['deployment-settings'], settings);
+      qc.invalidateQueries({ queryKey: ['deployments'] });
+      qc.invalidateQueries({ queryKey: ['plan-artifacts'] });
+    },
+  });
+
+  return (
+    <section className="panel config-panel" id="set-deployment">
+      <header>
+        <SettingsTitle id="set-deployment">发布</SettingsTitle>
+      </header>
+      <p className="cardsub">当前步骤成功后立即进入下一步，报错时暂停。</p>
+      {update.error && <ErrorBox error={update.error} />}
+      <Group label="配置发布">
+        <Fld label="无人值守发布">
+          <SegmentedControl
+            value={settings.unattended}
+            options={[
+              { value: false, label: '关闭' },
+              { value: true, label: '开启' },
+            ]}
+            disabled={!editable || update.isPending}
+            ariaLabel="无人值守发布"
+            onChange={next => update.mutate({ unattended: next })}
+          />
+          <span className="hint">默认开启；关闭后，涉及中断连接的后续步骤需要手动确认。保存立即生效。</span>
+        </Fld>
+      </Group>
+      <Group label="Beta 功能">
+        <Fld label="Xray 进程交接">
+          <SegmentedControl
+            value={settings.xray_handoff_beta ?? false}
+            options={[
+              { value: false, label: '关闭' },
+              { value: true, label: '开启' },
+            ]}
+            disabled={!editable || update.isPending}
+            ariaLabel="Xray 进程交接 Beta"
+            onChange={next => update.mutate({ xray_handoff_beta: next })}
+          />
+          <span className="hint">
+            默认关闭。配置优先热更新；不能热更新时，关闭则重启，开启则交接。交接时旧 TCP 最多保留 2
+            分钟，到期断开剩余连接，UDP 会话需重建。Xray 二进制升级始终默认重启，开启后可手动选择交接。
+          </span>
+          <span className="hint">
+            仅影响之后创建的发布单，不改变已有发布或进行中的交接；需 Agent 协议 37 或更新版本。
+          </span>
         </Fld>
       </Group>
     </section>
@@ -1732,10 +1797,10 @@ function DistributionSection({ editable, data }: { editable: boolean; data: Dist
         </Fld>
         <Fld label="内置 XRAY">
           <span className={effective.xray_version ? 'st st-ok' : 'st st-warn'}>
-            {effective.xray_version ? '内置可用' : '版本未知'}
+            {effective.xray_version ? '内置可用' : '构建未知'}
           </span>
-          {effective.xray_version && <code>{effective.xray_version}</code>}
-          <span className="hint">随当前控制台构建提供，不支持在设置中覆盖</span>
+          <code>{binaryReleaseVersion('xray', data.xray_source_revision ?? '')}</code>
+          <span className="hint">随当前控制台构建提供，不支持在设置中覆盖。</span>
         </Fld>
         <div className="guard">
           版本与二进制由控制台一同内置，机器安装时会校验文件摘要。升级 XRAY
@@ -1929,7 +1994,7 @@ export function AgentLogPolicySection({ editable, data }: { editable: boolean; d
       <header>
         <SettingsTitle id="set-agent-logs">日志保留</SettingsTitle>
       </header>
-      <p className="cardsub">只设置全局默认值；单台机器的覆盖项在对应机器配置中管理</p>
+      <p className="cardsub">只设置全局默认值；单台机器的覆盖项在对应机器配置中管理。</p>
       {save.error && <ErrorBox error={save.error} />}
       <Group label="全局日志上限 · 每类独立">
         <div className="agent-log-scope" aria-label="日志额度作用范围">
@@ -2108,7 +2173,7 @@ export function DataRetentionSection({ editable, data }: { editable: boolean; da
       <summary>
         <SettingsTitle id="set-data-retention">数据保留</SettingsTitle>
       </summary>
-      <p className="cardsub">只列出可按时间安全清理的历史与临时表；核心模型、发布审计和长期汇总不在此处</p>
+      <p className="cardsub">只列出可按时间安全清理的历史与临时表；核心模型、发布审计和长期汇总不在此处。</p>
       <p className="settings-block-note data-retention-warning">
         保存后不产生修订，也不需要发布。缩短 TTL 不会立即锁表清空，后台会按原有批次逐步清理；已删除的数据无法恢复。
       </p>
@@ -2186,7 +2251,7 @@ export function HostNetworkTuningSection({ editable, data }: { editable: boolean
       <header>
         <SettingsTitle id="set-host-network">主网卡调优</SettingsTitle>
       </header>
-      <p className="cardsub">由 Agent 写入主路由网卡；保存后下一轮生效，不重启 XRAY</p>
+      <p className="cardsub">由 Agent 写入主路由网卡；保存后下一轮生效，不重启 XRAY。</p>
       {save.error && <ErrorBox error={save.error} />}
       <Group label="Virtio / NAPI 软件中断合并" className="settings-field-grid-container">
         <div className="settings-field-grid settings-field-grid-two host-network-tuning-grid">
@@ -2729,7 +2794,7 @@ function VpngateCapabilitiesSection({
         <SettingsTitle id="set-vpngate">VPN Gate 能力</SettingsTitle>
         <span className="vpngate-selected-count">目录 {catalogueSelected}</span>
       </header>
-      <p className="cardsub">统一控制目录同步、候选拨测与出口 IP 情报，不改变已发布的 Chain</p>
+      <p className="cardsub">统一控制目录同步、候选拨测与出口 IP 情报，不改变已发布的 Chain。</p>
       <div className="vpngate-capabilities-layout">
         <div className="setgrp settings-block">
           <Fld label="整体开关">
@@ -3011,7 +3076,7 @@ function VpngateIntelligenceSection({
         <SettingsTitle id="set-vpngate-intelligence">情报任务</SettingsTitle>
         <span className="vpngate-selected-count">IP {intelligenceSelected}</span>
       </header>
-      <p className="cardsub">集中管理出口 IP 情报</p>
+      <p className="cardsub">集中管理出口 IP 情报。</p>
       <div className="vpngate-intelligence-layout">
         <section className="setgrp settings-block vpngate-settings-section vpngate-intelligence-policy-card">
           <div className="vpngate-settings-card-head">
@@ -3095,12 +3160,12 @@ function VpngateIntelligenceSection({
                 </button>
               </div>
             </div>
-            <span className="hint">已保存的 Key 仅显示首尾各 6 位；追加不会覆盖 · 最多 32 个，随机起点轮换</span>
+            <span className="hint">已保存的 Key 仅显示首尾各 6 位；追加不会覆盖 · 最多 32 个，随机起点轮换。</span>
           </Fld>
           {saveIntelligenceCredentials.error && <ErrorBox error={saveIntelligenceCredentials.error} />}
           {(['ffraud', 'iplogs'] as const).map(provider => (
             <Fld label={`${VPNGATE_PROVIDER_LABEL[provider]} API`} key={provider}>
-              <span className="hint">无需配置 API Key</span>
+              <span className="hint">无需配置 API Key。</span>
             </Fld>
           ))}
           <Fld label="查询策略">
@@ -3230,6 +3295,7 @@ export function SettingsPane() {
     },
   });
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
+  const deploymentSettings = useQuery({ queryKey: ['deployment-settings'], queryFn: fetchDeploymentSettings });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
   const dataRetention = useQuery({ queryKey: ['data-retention'], queryFn: fetchDataRetention });
   const hostNetworkTuning = useQuery({
@@ -3391,6 +3457,7 @@ export function SettingsPane() {
     visitor.isPending ||
     certs.isPending ||
     dist.isPending ||
+    deploymentSettings.isPending ||
     logPolicy.isPending ||
     dataRetention.isPending ||
     hostNetworkTuning.isPending ||
@@ -3405,6 +3472,7 @@ export function SettingsPane() {
     visitor.error ??
     certs.error ??
     dist.error ??
+    deploymentSettings.error ??
     logPolicy.error ??
     dataRetention.error ??
     hostNetworkTuning.error ??
@@ -3445,28 +3513,215 @@ export function SettingsPane() {
             ) : (
               <BrandingSection editable={editable} data={branding.data!} />
             )}
+
             {visitor.error ? (
               <ErrorBox error={visitor.error} />
             ) : (
               <VisitorAccessSection editable={editable} enabled={visitor.data!.public_open} />
             )}
+
             {dist.error ? (
               <ErrorBox error={dist.error} />
             ) : (
               <DistributionSection editable={editable} data={dist.data!} />
             )}
+
+            <DeploymentSection editable={editable} settings={deploymentSettings.data!} />
+
+            {certs.error ? <ErrorBox error={certs.error} /> : <CertSection editable={editable} view={certs.data!} />}
+
+            <SiteUsageSettingsCard editable={editable} />
+
+            <Section
+              id="set-probe"
+              name="端到端探测"
+              sub="由入口节点为每条链发起一次探测。改完最长等待一个原有周期。"
+              {...secProps('probe')}
+            >
+              <Group label="探测计划">
+                <Fld label="请求哪个地址">
+                  <input
+                    className={chg('probeUrl')}
+                    style={{ width: 330 }}
+                    placeholder={PROBE_URL_DEFAULT}
+                    value={form.probeUrl}
+                    onChange={e => setForm({ ...form, probeUrl: e.target.value })}
+                  />
+                </Fld>
+                <Fld label="超时（秒）">
+                  <input
+                    className={chg('probeTimeout')}
+                    style={{ width: 90 }}
+                    value={form.probeTimeout}
+                    onChange={e => setForm({ ...form, probeTimeout: e.target.value })}
+                  />
+                  <span className="hint">超过该时间仍未收到首字节即判定为断。范围 1–120。</span>
+                </Fld>
+                <Fld label="多久探一轮">
+                  <input
+                    className={chg('probeInterval')}
+                    style={{ width: 90 }}
+                    value={form.probeInterval}
+                    onChange={e => setForm({ ...form, probeInterval: e.target.value })}
+                  />
+                  <span className="hint">秒。默认 60，范围 15–86400。</span>
+                </Fld>
+                <div className="guard">
+                  落点需为<b>明文 HTTP</b>，返回纯文本且包含 <code>ip=</code>。探测使用隐藏凭据，不占名额。
+                </div>
+              </Group>
+            </Section>
+
+            {pingProbe.error ? (
+              <ErrorBox error={pingProbe.error} />
+            ) : (
+              <PingProbeSettingsSection editable={editable} data={pingProbe.data!} />
+            )}
+
+            {/* 不提供开关是有意的：规则表中的 geosite: / geoip: 依赖这两个文件，文件过期不会报错，
+          而是导致规则匹配失败、流量走兜底规则且无提示。因此此处只能配置更新时间和
+          更新来源，不能配置是否更新。 */}
+            <Section
+              id="set-geodata"
+              name="规则库更新"
+              sub="每台机器按计划自行拉取 geoip.dat / geosite.dat，热加载、不重启、不断开连接。"
+              {...secProps('geodata')}
+            >
+              <Group label="更新计划与来源">
+                <Fld label="什么时候更新">
+                  <input
+                    className={chg('geodataCron')}
+                    style={{ width: 260 }}
+                    placeholder={GEODATA_CRON_DEFAULT}
+                    value={form.geodataCron}
+                    onChange={e => setForm({ ...form, geodataCron: e.target.value })}
+                  />
+                  <span className="hint">
+                    支持五段 cron（分 时 日 月 周）及 <code>@daily</code> 等简写。
+                    <b>
+                      不要去掉前缀 <code>CRON_TZ=</code>
+                    </b>
+                    ：不带前缀时按每台机器自身的时区解释，同一个表达式在不同机器上会相差数小时。默认 6:30（UTC+8）＝
+                    22:30 UTC，比上游发布晚半小时。
+                  </span>
+                </Fld>
+                <Fld label="geoip.dat">
+                  <input
+                    className={chg('geodataGeoip')}
+                    style={{ width: 430 }}
+                    placeholder={GEOIP_URL_DEFAULT}
+                    value={form.geodataGeoip}
+                    onChange={e => setForm({ ...form, geodataGeoip: e.target.value })}
+                  />
+                </Fld>
+                <Fld label="geosite.dat">
+                  <input
+                    className={chg('geodataGeosite')}
+                    style={{ width: 430 }}
+                    placeholder={GEOSITE_URL_DEFAULT}
+                    value={form.geodataGeosite}
+                    onChange={e => setForm({ ...form, geodataGeosite: e.target.value })}
+                  />
+                </Fld>
+                <div className="guard">
+                  下载<b>不验签不校验和</b>，推荐改为自建镜像。更新走 <code>out:internal</code>，不经过用户链。
+                </div>
+                <div className="guard">
+                  落地文件名固定，不可配置：<code>geosite:</code> 在 XRAY 内部会被改写成 <code>ext:geosite.dat:</code>
+                  ，改名后将无法读取。
+                </div>
+              </Group>
+            </Section>
+
             {logPolicy.error ? (
               <ErrorBox error={logPolicy.error} />
             ) : (
               <AgentLogPolicySection editable={editable} data={logPolicy.data!} />
             )}
+
+            <Section
+              id="set-ports"
+              name="端口分配"
+              sub="自动分配端口时的起始值，仅影响新建，现有端口不变。"
+              {...secProps('ports')}
+            >
+              <Group label="新建资源端口基线" className="settings-field-grid-container">
+                <div className="settings-field-grid port-allocation-grid">
+                  <Fld label="VLESS · TLS / REALITY">
+                    <input
+                      className={chg('ingressBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.ingressBase}
+                      onChange={e => setForm({ ...form, ingressBase: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="VLESS · Encryption">
+                    <input
+                      className={chg('vlessEncryptionBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      aria-label="VLESS · Encryption 起始端口"
+                      value={form.vlessEncryptionBase}
+                      onChange={e => setForm({ ...form, vlessEncryptionBase: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="AnyTLS · TCP">
+                    <input
+                      className={chg('anytlsBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.anytlsBase}
+                      onChange={e => setForm({ ...form, anytlsBase: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="Hysteria 2 · UDP">
+                    <input
+                      className={chg('hy2Base')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.hy2Base}
+                      onChange={e => setForm({ ...form, hy2Base: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="MTProxy · TCP">
+                    <input
+                      className={chg('mtprotoBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.mtprotoBase}
+                      onChange={e => setForm({ ...form, mtprotoBase: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="中转端口">
+                    <input
+                      aria-label="中转端口起始值"
+                      className={chg('hopBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.hopBase}
+                      onChange={e => setForm({ ...form, hopBase: e.target.value })}
+                    />
+                  </Fld>
+                </div>
+              </Group>
+            </Section>
+          </fieldset>
+        </div>
+
+        <div className="col">
+          <fieldset className="settings-column-fields" disabled={!editable}>
             {hostNetworkTuning.error ? (
               <ErrorBox error={hostNetworkTuning.error} />
             ) : (
               <HostNetworkTuningSection editable={editable} data={hostNetworkTuning.data!} />
             )}
-            <SiteUsageSettingsCard editable={editable} />
-            {certs.error ? <ErrorBox error={certs.error} /> : <CertSection editable={editable} view={certs.data!} />}
 
             <Section id="set-xray" name="XRAY" sub="伪装站点、接入兼容与 AnyTLS 全局填充" {...secProps('xray')}>
               <div className="xray-settings-grid">
@@ -3487,7 +3742,7 @@ export function SettingsPane() {
                       value={form.names}
                       onChange={e => setForm({ ...form, names: e.target.value })}
                     />
-                    <span className="hint">多个名称用逗号分隔</span>
+                    <span className="hint">多个名称用逗号分隔。</span>
                   </Fld>
                   <Fld label="TLS 指纹">
                     <select
@@ -3554,7 +3809,7 @@ export function SettingsPane() {
                         className={`${chg('anyTlsPadding')} xray-padding`}
                         rows={5}
                         value={form.anyTlsPadding}
-                        readOnly
+                        onChange={e => setForm({ ...form, anyTlsPadding: e.target.value })}
                         aria-label="AnyTLS 全局 Padding Scheme"
                       />
                       <button
@@ -3565,30 +3820,13 @@ export function SettingsPane() {
                       >
                         重新生成
                       </button>
-                      <span className="hint">所有留空的 AnyTLS 入口跟随这套四阶段方案。</span>
+                      <span className="hint">所有留空的 AnyTLS 入口跟随此方案，也可直接编辑规则。</span>
                     </Fld>
                   </Group>
                 )}
               </div>
             </Section>
-            <VpngateCapabilitiesSection
-              status={vpngate.data!.status}
-              nodes={nodes.data!.nodes}
-              admissionPolicy={vpngate.data!.admission_policy}
-              editable={editable}
-            />
-            <VpngateIntelligenceSection
-              nodes={nodes.data!.nodes}
-              intelligencePolicy={vpngate.data!.intelligence_policy ?? DEFAULT_VPNGATE_INTELLIGENCE_POLICY}
-              intelligenceCredentials={vpngate.data!.intelligence_credentials}
-              globalEnabled={vpngate.data!.status.enabled}
-              editable={editable}
-            />
-          </fieldset>
-        </div>
 
-        <div className="col">
-          <fieldset className="settings-column-fields" disabled={!editable}>
             {/* 位于 XRAY 之后、WIREGUARD 之前：上一段是接入面的服务端参数，本段是同一个
           xray 进程的另一部分——连接的存活时长和内存占用。两者都属于 xray，
           先说明对外配置再说明内部配置。 */}
@@ -3608,8 +3846,8 @@ export function SettingsPane() {
                     onChange={e => setForm({ ...form, connIdle: e.target.value })}
                   />
                   <span className="hint">
-                    多久没有数据往返就回收该连接。默认 300，范围 10–86400。
-                    <b>中转节点的内存主要消耗在这里</b>：空闲连接会持续占用下面的两个缓冲区
+                    多久没有数据往返就回收该连接。默认 300，可按需设置正整数秒。
+                    <b>中转节点的内存主要消耗在这里</b>：空闲连接会持续占用下面的两个缓冲区。
                   </span>
                 </Fld>
                 <Fld label="转发缓冲（KiB）">
@@ -3622,7 +3860,7 @@ export function SettingsPane() {
                   />
                   <span className="hint">
                     收发之间的队列，<b>每条连接每个方向一个</b>。<b>推荐留空</b>：不写该项时 XRAY 按 CPU
-                    架构自行决定。填 0 表示不缓冲，与留空不同
+                    架构自行决定。填 0 表示不缓冲，与留空不同。
                   </span>
                 </Fld>
                 <Fld label="UplinkOnly 等待（秒）">
@@ -3632,7 +3870,7 @@ export function SettingsPane() {
                     ariaLabel="UplinkOnly 等待秒数"
                     onPick={v => setForm({ ...form, connUplink: v })}
                   />
-                  <span className="hint">对端服务器先关闭下行、连接只剩上行时，再等待这么久后整条断开。默认 2</span>
+                  <span className="hint">对端服务器先关闭下行、连接只剩上行时，再等待这么久后整条断开。默认 2。</span>
                 </Fld>
                 <Fld label="DownlinkOnly 等待（秒）">
                   <Secs
@@ -3641,7 +3879,7 @@ export function SettingsPane() {
                     ariaLabel="DownlinkOnly 等待秒数"
                     onPick={v => setForm({ ...form, connDownlink: v })}
                   />
-                  <span className="hint">相反方向：客户端先关闭上行、只剩下行。默认 5</span>
+                  <span className="hint">相反方向：客户端先关闭上行、只剩下行。默认 5。</span>
                 </Fld>
                 <Fld label="握手超时（秒）">
                   <input
@@ -3653,7 +3891,7 @@ export function SettingsPane() {
                   <span className="hint">
                     <b>无明确理由不要修改</b>，也不支持按机器单独设置。60 是 XRAY 为对齐 nginx 的{' '}
                     <code>client_header_timeout</code> 选定的，目的是让这个值不暴露后端是什么。
-                    改成其他值即产生一处可测量的差异；每台各设一个值，则形成一组可分别识别的机器
+                    改成其他值即产生一处可测量的差异；每台各设一个值，则形成一组可分别识别的机器。
                   </span>
                 </Fld>
                 <Fld label="在线来源">
@@ -3834,7 +4072,7 @@ export function SettingsPane() {
                     value={form.keepalive}
                     onChange={e => setForm({ ...form, keepalive: e.target.value })}
                   />
-                  <span className="hint">默认 25。NAT 表项老化较快的环境应调小</span>
+                  <span className="hint">默认 25。NAT 表项老化较快的环境应调小。</span>
                 </Fld>
                 <Fld label="全局 MTU">
                   <input
@@ -3844,7 +4082,7 @@ export function SettingsPane() {
                     onChange={e => setForm({ ...form, mtu: e.target.value })}
                   />
                   <span className="hint">
-                    范围 1000–9000。仅影响未单独设置的机器。修改会重新生成 wg 配置并断开一次链路
+                    范围 1000–9000。仅影响未单独设置的机器。修改会重新生成 wg 配置并断开一次链路。
                   </span>
                 </Fld>
                 <Fld>
@@ -3854,180 +4092,21 @@ export function SettingsPane() {
               </Group>
             </Section>
 
-            <Section
-              id="set-ports"
-              name="端口分配"
-              sub="自动分配端口时的起始值，仅影响新建，现有端口不变"
-              {...secProps('ports')}
-            >
-              <Group label="新建资源端口基线" className="settings-field-grid-container">
-                <div className="settings-field-grid port-allocation-grid">
-                  <Fld label="VLESS · TLS / REALITY">
-                    <input
-                      className={chg('ingressBase')}
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={form.ingressBase}
-                      onChange={e => setForm({ ...form, ingressBase: e.target.value })}
-                    />
-                  </Fld>
-                  <Fld label="VLESS · Encryption">
-                    <input
-                      className={chg('vlessEncryptionBase')}
-                      type="number"
-                      min={1}
-                      max={65535}
-                      aria-label="VLESS · Encryption 起始端口"
-                      value={form.vlessEncryptionBase}
-                      onChange={e => setForm({ ...form, vlessEncryptionBase: e.target.value })}
-                    />
-                  </Fld>
-                  <Fld label="AnyTLS · TCP">
-                    <input
-                      className={chg('anytlsBase')}
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={form.anytlsBase}
-                      onChange={e => setForm({ ...form, anytlsBase: e.target.value })}
-                    />
-                  </Fld>
-                  <Fld label="Hysteria 2 · UDP">
-                    <input
-                      className={chg('hy2Base')}
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={form.hy2Base}
-                      onChange={e => setForm({ ...form, hy2Base: e.target.value })}
-                    />
-                  </Fld>
-                  <Fld label="MTProxy · TCP">
-                    <input
-                      className={chg('mtprotoBase')}
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={form.mtprotoBase}
-                      onChange={e => setForm({ ...form, mtprotoBase: e.target.value })}
-                    />
-                  </Fld>
-                  <Fld label="中转端口">
-                    <input
-                      aria-label="中转端口起始值"
-                      className={chg('hopBase')}
-                      type="number"
-                      min={1}
-                      max={65535}
-                      value={form.hopBase}
-                      onChange={e => setForm({ ...form, hopBase: e.target.value })}
-                    />
-                  </Fld>
-                </div>
-              </Group>
-            </Section>
+            <VpngateCapabilitiesSection
+              status={vpngate.data!.status}
+              nodes={nodes.data!.nodes}
+              admissionPolicy={vpngate.data!.admission_policy}
+              editable={editable}
+            />
 
-            <Section
-              id="set-probe"
-              name="端到端探测"
-              sub="由入口节点为每条链发起一次探测。改完最长等待一个原有周期"
-              {...secProps('probe')}
-            >
-              <Group label="探测计划">
-                <Fld label="请求哪个地址">
-                  <input
-                    className={chg('probeUrl')}
-                    style={{ width: 330 }}
-                    placeholder={PROBE_URL_DEFAULT}
-                    value={form.probeUrl}
-                    onChange={e => setForm({ ...form, probeUrl: e.target.value })}
-                  />
-                </Fld>
-                <Fld label="超时（秒）">
-                  <input
-                    className={chg('probeTimeout')}
-                    style={{ width: 90 }}
-                    value={form.probeTimeout}
-                    onChange={e => setForm({ ...form, probeTimeout: e.target.value })}
-                  />
-                  <span className="hint">超过该时间仍未收到首字节即判定为断。范围 1–120</span>
-                </Fld>
-                <Fld label="多久探一轮">
-                  <input
-                    className={chg('probeInterval')}
-                    style={{ width: 90 }}
-                    value={form.probeInterval}
-                    onChange={e => setForm({ ...form, probeInterval: e.target.value })}
-                  />
-                  <span className="hint">秒。默认 60，范围 15–86400</span>
-                </Fld>
-                <div className="guard">
-                  落点需为<b>明文 HTTP</b>，返回纯文本且包含 <code>ip=</code>。探测使用隐藏凭据，不占名额。
-                </div>
-              </Group>
-            </Section>
+            <VpngateIntelligenceSection
+              nodes={nodes.data!.nodes}
+              intelligencePolicy={vpngate.data!.intelligence_policy ?? DEFAULT_VPNGATE_INTELLIGENCE_POLICY}
+              intelligenceCredentials={vpngate.data!.intelligence_credentials}
+              globalEnabled={vpngate.data!.status.enabled}
+              editable={editable}
+            />
 
-            {pingProbe.error ? (
-              <ErrorBox error={pingProbe.error} />
-            ) : (
-              <PingProbeSettingsSection editable={editable} data={pingProbe.data!} />
-            )}
-
-            {/* 不提供开关是有意的：规则表中的 geosite: / geoip: 依赖这两个文件，文件过期不会报错，
-          而是导致规则匹配失败、流量走兜底规则且无提示。因此此处只能配置更新时间和
-          更新来源，不能配置是否更新。 */}
-            <Section
-              id="set-geodata"
-              name="规则库更新"
-              sub="每台机器按计划自行拉取 geoip.dat / geosite.dat，热加载、不重启、不断开连接"
-              {...secProps('geodata')}
-            >
-              <Group label="更新计划与来源">
-                <Fld label="什么时候更新">
-                  <input
-                    className={chg('geodataCron')}
-                    style={{ width: 260 }}
-                    placeholder={GEODATA_CRON_DEFAULT}
-                    value={form.geodataCron}
-                    onChange={e => setForm({ ...form, geodataCron: e.target.value })}
-                  />
-                  <span className="hint">
-                    五段 cron：分 时 日 月 周。
-                    <b>
-                      不要去掉前缀 <code>CRON_TZ=</code>
-                    </b>
-                    ：不带前缀时按每台机器自身的时区解释，同一个表达式在不同机器上会相差数小时。默认 6:30（UTC+8）＝
-                    22:30 UTC，比上游发布晚半小时
-                  </span>
-                </Fld>
-                <Fld label="geoip.dat">
-                  <input
-                    className={chg('geodataGeoip')}
-                    style={{ width: 430 }}
-                    placeholder={GEOIP_URL_DEFAULT}
-                    value={form.geodataGeoip}
-                    onChange={e => setForm({ ...form, geodataGeoip: e.target.value })}
-                  />
-                </Fld>
-                <Fld label="geosite.dat">
-                  <input
-                    className={chg('geodataGeosite')}
-                    style={{ width: 430 }}
-                    placeholder={GEOSITE_URL_DEFAULT}
-                    value={form.geodataGeosite}
-                    onChange={e => setForm({ ...form, geodataGeosite: e.target.value })}
-                  />
-                </Fld>
-                <div className="guard">
-                  下载<b>不验签不校验和</b>，推荐改为自建镜像。更新走 <code>out:internal</code>，不经过用户链。
-                </div>
-                <div className="guard">
-                  落地文件名固定，不可配置：<code>geosite:</code> 在 XRAY 内部会被改写成 <code>ext:geosite.dat:</code>
-                  ，改名后将无法读取。
-                </div>
-              </Group>
-            </Section>
             {dataRetention.error ? (
               <ErrorBox error={dataRetention.error} />
             ) : (

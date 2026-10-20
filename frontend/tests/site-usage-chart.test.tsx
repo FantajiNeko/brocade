@@ -73,3 +73,25 @@ it('distinguishes unobserved buckets, observed zeroes and future buckets in the 
   expect(formatter([{ seriesIndex: 0, value: [3.5, 0] }])).toContain('无流量');
   expect(formatter([{ seriesIndex: 0, value: [7.5, null] }])).toBe('');
 });
+
+it('lists forwarding first in the tooltip and keeps the other categories in stack order', () => {
+  render(
+    <SiteUsageChart
+      {...props}
+      series={[
+        { key: 'forwarding', name: '端口转发', color: { token: '--observe-2' }, values: [10, 0, 0, 0] },
+        ...props.series,
+        { key: 'github', name: 'GitHub', color: { token: '--observe-6' }, values: [100, 0, 0, 0] },
+      ]}
+    />,
+  );
+  const formatter = mock.chart.setOption.mock.calls[0][0].tooltip.formatter;
+  const text: string = formatter([
+    { seriesIndex: 0, value: [0.5, 10] },
+    { seriesIndex: 1, value: [0.5, 1000] },
+    { seriesIndex: 2, value: [0.5, 100] },
+  ]);
+  for (const name of ['端口转发', 'GitHub', 'YouTube']) expect(text).toContain(name);
+  expect(text.indexOf('端口转发')).toBeLessThan(text.indexOf('GitHub'));
+  expect(text.indexOf('GitHub')).toBeLessThan(text.indexOf('YouTube'));
+});

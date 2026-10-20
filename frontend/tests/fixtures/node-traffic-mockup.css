@@ -502,11 +502,6 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.nti-tenant {
-  flex: none;
-  color: var(--ink-4);
-  font-size: 11px;
-}
 .nti-num {
   color: var(--ink);
   font: 500 12.5px/18px var(--sans);

@@ -21,7 +21,7 @@ const recoveredFleetEvent: MachineEventList = {
     {
       id: 6,
       node_id: 'mo-1',
-      node_name: '澳门 AKILE',
+      node_name: '澳门示例 01',
       event_kind: 'node_online',
       family: null,
       previous_value: 'offline',
@@ -32,7 +32,7 @@ const recoveredFleetEvent: MachineEventList = {
     {
       id: 5,
       node_id: 'hk-1',
-      node_name: '香港 AKILE',
+      node_name: '香港示例 01',
       event_kind: 'node_online',
       family: null,
       previous_value: 'offline',
@@ -43,7 +43,7 @@ const recoveredFleetEvent: MachineEventList = {
     {
       id: 4,
       node_id: 'mo-2',
-      node_name: '澳门 AKILE II',
+      node_name: '澳门示例 02',
       event_kind: 'node_online',
       family: null,
       previous_value: 'offline',
@@ -54,7 +54,7 @@ const recoveredFleetEvent: MachineEventList = {
     {
       id: 3,
       node_id: 'mo-1',
-      node_name: '澳门 AKILE',
+      node_name: '澳门示例 01',
       event_kind: 'node_offline',
       family: null,
       previous_value: 'online',
@@ -65,7 +65,7 @@ const recoveredFleetEvent: MachineEventList = {
     {
       id: 2,
       node_id: 'mo-2',
-      node_name: '澳门 AKILE II',
+      node_name: '澳门示例 02',
       event_kind: 'node_offline',
       family: null,
       previous_value: 'online',
@@ -76,7 +76,7 @@ const recoveredFleetEvent: MachineEventList = {
     {
       id: 1,
       node_id: 'hk-1',
-      node_name: '香港 AKILE',
+      node_name: '香港示例 01',
       event_kind: 'node_offline',
       family: null,
       previous_value: 'online',
@@ -97,7 +97,7 @@ const activeStealEvent: MachineEventList = {
     {
       event_id: 8,
       node_id: 'mo-1',
-      node_name: '澳门 AKILE',
+      node_name: '澳门示例 01',
       incident_kind: 'cpu_steal',
       started_at: '2026-10-06T17:15:00+08:00',
       detected_at: '2026-10-06T17:16:02+08:00',
@@ -110,7 +110,7 @@ const activeStealEvent: MachineEventList = {
     {
       id: 8,
       node_id: 'mo-1',
-      node_name: '澳门 AKILE',
+      node_name: '澳门示例 01',
       event_kind: 'cpu_steal_started',
       family: null,
       previous_value: 'normal',
@@ -135,7 +135,7 @@ const activeControlObservationIncident: MachineEventList = {
     {
       event_id: 7,
       node_id: 'mo-1',
-      node_name: '澳门 AKILE',
+      node_name: '澳门示例 01',
       incident_kind: 'control_plane_offline',
       started_at: '2026-10-06T18:18:22+08:00',
       detected_at: '2026-10-06T18:20:05+08:00',
@@ -148,7 +148,7 @@ const activeControlObservationIncident: MachineEventList = {
     {
       id: 7,
       node_id: 'mo-1',
-      node_name: '澳门 AKILE',
+      node_name: '澳门示例 01',
       event_kind: 'node_offline',
       family: null,
       previous_value: 'online',
@@ -187,7 +187,7 @@ it('把同一时间窗内的多节点恢复聚合为一次 Console-Agent 链路�
   const groups = groupMachineIncidents(recoveredFleetEvent);
   expect(groups).toHaveLength(1);
   expect(groups[0]?.status).toBe('recovered');
-  expect(groups[0]?.incidents.map(item => item.nodeName)).toEqual(['澳门 AKILE', '澳门 AKILE II', '香港 AKILE']);
+  expect(groups[0]?.incidents.map(item => item.nodeName)).toEqual(['澳门示例 01', '澳门示例 02', '香港示例 01']);
   expect(groups[0]?.unread).toBe(true);
 });
 
@@ -236,7 +236,7 @@ it('按异常开始时间合并一分钟内采样窗口错开的多机 CPU steal
       {
         event_id: 9,
         node_id: 'mo-2',
-        node_name: '澳门 AKILE II',
+        node_name: '澳门示例 02',
         incident_kind: 'cpu_steal',
         started_at: '2026-10-06T17:15:59+08:00',
         detected_at: '2026-10-06T17:17:03+08:00',
@@ -250,7 +250,7 @@ it('按异常开始时间合并一分钟内采样窗口错开的多机 CPU steal
 
   const groups = groupMachineIncidents(staggered);
   expect(groups).toHaveLength(1);
-  expect(groups[0]?.incidents.map(item => item.nodeName)).toEqual(['澳门 AKILE II', '澳门 AKILE']);
+  expect(groups[0]?.incidents.map(item => item.nodeName)).toEqual(['澳门示例 02', '澳门示例 01']);
 });
 
 it('在全局通知气泡显示事故，打开后持久标记已读并可进入机器', async () => {
@@ -303,7 +303,7 @@ it('在全局通知气泡显示事故，打开后持久标记已读并可进入�
   }));
   await waitFor(() => expect(fetcher.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1));
 
-  fireEvent.click(screen.getByRole('button', { name: /香港 AKILE/ }));
+  fireEvent.click(screen.getByRole('button', { name: /香港示例 01/ }));
   expect(onNode).toHaveBeenCalledWith('hk-1');
 });
 
@@ -352,7 +352,7 @@ it('访客读取独立的脱敏缓存且不会提交已读游标', async () => {
       {
         id: 8,
         node_id: 'hk-1',
-        node_name: '香港 AKILE',
+        node_name: '香港示例 01',
         event_kind: 'public_ip_changed',
         family: 4,
         previous_value: '198.51.***.***',
@@ -384,7 +384,7 @@ it('清空机器告警后仍保留已有的公网 IP 变化通知', async () => 
   const publicIpEvent: MachineEventList['events'][number] = {
     id: 7,
     node_id: 'hk-1',
-    node_name: '香港 AKILE',
+    node_name: '香港示例 01',
     event_kind: 'public_ip_changed',
     family: 4,
     previous_value: '198.51.100.20',
@@ -424,11 +424,11 @@ it('清空机器告警后仍保留已有的公网 IP 变化通知', async () => 
     '只清空当前账号的链路与宿主机告警；公网 IP 变化通知会保留',
   );
   expect(screen.getByText('Console-Agent 链路已恢复')).toBeTruthy();
-  expect(screen.getByText('香港 AKILE 公网 IPv4 已变化')).toBeTruthy();
+  expect(screen.getByText('香港示例 01 公网 IPv4 已变化')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: '清空告警' }));
 
   await waitFor(() => expect(screen.queryByText('Console-Agent 链路已恢复')).toBeNull());
-  expect(screen.getByText('香港 AKILE 公网 IPv4 已变化')).toBeTruthy();
+  expect(screen.getByText('香港示例 01 公网 IPv4 已变化')).toBeTruthy();
   expect(screen.getByText('198.51.100.20 → 203.0.113.42')).toBeTruthy();
   expect((screen.getByRole('button', { name: '清空告警' }) as HTMLButtonElement).disabled).toBe(true);
 });
@@ -546,7 +546,7 @@ it('清空进行中事故后不再显示，后续恢复仍展示原来的起止�
       {
         id: 8,
         node_id: 'mo-1',
-        node_name: '澳门 AKILE',
+        node_name: '澳门示例 01',
         event_kind: 'node_online',
         family: null,
         previous_value: 'offline',
@@ -577,7 +577,7 @@ it('进行中的事故始终使用红色活动角标，即使事件已经读过'
       {
         event_id: 7,
         node_id: 'hk-1',
-        node_name: '香港 AKILE',
+        node_name: '香港示例 01',
         incident_kind: 'control_plane_offline',
         started_at: '2026-10-06T16:20:00+08:00',
         detected_at: '2026-10-06T16:21:31+08:00',

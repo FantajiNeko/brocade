@@ -90,7 +90,7 @@ test('写操作不渲染额外的生效提示组件', () => {
 
 test('受管实体在页面级文案中统一称为机器', () => {
   assert.match(files.get('panes/nodes.tsx'), /title="纳管机器"/);
-  assert.match(files.get('panes/tenants.tsx'), /<th>机器<\/th>/);
+  assert.equal(files.has('panes/tenants.tsx'), false);
   assert.match(files.get('panes/artifact.tsx'), /grp: '机器产物'/);
   assert.match(files.get('preview/provision.tsx'), /title="创建预览机器"/);
 });

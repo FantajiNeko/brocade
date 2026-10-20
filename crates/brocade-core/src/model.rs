@@ -423,6 +423,8 @@ impl Default for OverlaySettings {
     }
 }
 
+pub const DEFAULT_TLS_FINGERPRINT: &str = "safari";
+
 /// The globally defaulted REALITY site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealitySite {
@@ -443,7 +445,7 @@ impl Default for RealitySite {
         Self {
             dest: Some("addons.mozilla.org:443".to_owned()),
             server_names: vec!["addons.mozilla.org".to_owned()],
-            fingerprint: Some("chrome".to_owned()),
+            fingerprint: Some(DEFAULT_TLS_FINGERPRINT.to_owned()),
             flow: Some(DEFAULT_REALITY_FLOW.to_owned()),
         }
     }
@@ -1200,7 +1202,7 @@ pub enum ExternalOutboundSecurity {
     None,
     Tls {
         server_name: String,
-        #[serde(default = "external_fingerprint_chrome")]
+        #[serde(default = "default_tls_fingerprint")]
         fingerprint: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         alpn: Vec<String>,
@@ -1215,7 +1217,7 @@ pub enum ExternalOutboundSecurity {
         server_name: String,
         public_key: String,
         short_id: String,
-        #[serde(default = "external_fingerprint_chrome")]
+        #[serde(default = "default_tls_fingerprint")]
         fingerprint: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mldsa65_verify: Option<String>,
@@ -1224,8 +1226,8 @@ pub enum ExternalOutboundSecurity {
     },
 }
 
-fn external_fingerprint_chrome() -> String {
-    "chrome".to_owned()
+fn default_tls_fingerprint() -> String {
+    DEFAULT_TLS_FINGERPRINT.to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

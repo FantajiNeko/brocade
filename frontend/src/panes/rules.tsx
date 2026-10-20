@@ -56,6 +56,7 @@ import { Icon, PanelTitle } from '../ui/icons';
 import { freePortAcross, occupiedPorts, type PortOwners } from './ports';
 import { externalImportCanSave, serverNameAfterAddressChange, vlessEncryptionIsValid } from '../external-outbound';
 import {
+  DEFAULT_TLS_FINGERPRINT,
   REALITY_FINGERPRINT_OPTIONS,
   realityFingerprintIsValid,
   realityPublicKeyIsValid,
@@ -1916,8 +1917,10 @@ function RuleEditorReady({
   // （steps 主键为 chain_id + node_id）。
   const ownRules = useState<Rule[]>(() => pinTerminalRules(initial));
   const [rules, setRules] = shared ? [shared.rules, shared.setRules] : ownRules;
-  const initialRulesKey = JSON.stringify(initial);
-  const rulesKey = JSON.stringify(rules);
+  // 快照经 serde_json::Value 返回，字段顺序可能与本地对象不同；只比较内容，
+  // 否则保存后仍会判定为未保存，后续丢弃草稿也无法跟随基线恢复。
+  const initialRulesKey = stableJson(initial);
+  const rulesKey = stableJson(rules);
   const syncedRulesKey = useRef(initialRulesKey);
   useEffect(() => {
     const previous = syncedRulesKey.current;
@@ -2109,7 +2112,7 @@ function RuleEditorReady({
   // `fallback` comes from a compiled table. A locally written Any may still be present in the
   // last fetched compilation; it is not a second row in this editor.
   const visibleFallbackRules = (fallback?.rules ?? []).filter(rule => {
-    if (rules.some(written => JSON.stringify(written) === JSON.stringify(rule))) return false;
+    if (rules.some(written => stableJson(written) === stableJson(rule))) return false;
     return true;
   });
   const displayedRuleCount = rules.length;
@@ -2200,7 +2203,7 @@ function RuleEditorReady({
     orderedNodeDnsPolicies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0') !==
     nodeDnsPolicies.map(policy => egressDnsSelectorKey(policy.selector)).join('\0');
   const structuralDirty =
-    JSON.stringify(rules) !== JSON.stringify(initial) ||
+    rulesKey !== initialRulesKey ||
     (isForwardTarget && !accept) ||
     normalTargets.some(to => {
       const peer = peerOf(to);
@@ -3736,7 +3739,7 @@ function RuleEditorReady({
           {bus ? (
             dirty && <span className="st st-warn">有改动，未落草稿</span>
           ) : (
-            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate({})}>
+            <button className="btn primary" disabled={save.isPending || !dirty} onClick={() => save.mutate({})}>
               {save.isPending ? '保存中…' : '保存到草稿'}
             </button>
           )}
@@ -4151,7 +4154,7 @@ function parseExternalDownloadSecurity(
   }
   const settings = externalObject(download[kind === 'tls' ? 'tlsSettings' : 'realitySettings']) ?? {};
   const serverName = externalString(settings.serverName) ?? fallbackAddress;
-  const fingerprint = externalString(settings.fingerprint) ?? 'chrome';
+  const fingerprint = externalString(settings.fingerprint) ?? DEFAULT_TLS_FINGERPRINT;
   if (kind === 'tls') {
     const alpn = Array.isArray(settings.alpn)
       ? settings.alpn.filter((value): value is string => typeof value === 'string')
@@ -4421,7 +4424,10 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
       protocol: { t: 'anytls', v: { credential: decodeURIComponent(url.username) } },
       security: {
         t: 'tls',
-        v: { server_name: url.searchParams.get('sni') || address, fingerprint: url.searchParams.get('fp') || 'chrome' },
+        v: {
+          server_name: url.searchParams.get('sni') || address,
+          fingerprint: url.searchParams.get('fp') || DEFAULT_TLS_FINGERPRINT,
+        },
       },
     };
   }
@@ -4473,7 +4479,7 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
       throw new Error('当前 Xray 不能在单个 VLESS outbound 上关闭 UDP，udp 参数必须为 1 或 true');
     }
     const serverName = sni || peer || url.hostname;
-    const fingerprint = fp || legacyFingerprint || 'chrome';
+    const fingerprint = fp || legacyFingerprint || DEFAULT_TLS_FINGERPRINT;
     const alpnValue = url.searchParams.get('alpn');
     const alpn = alpnValue === null ? [] : alpnValue.split(',');
     if (alpn.some(value => !value || /\s/.test(value))) throw new Error('ALPN 必须使用英文逗号分隔且不能包含空白');
@@ -4548,7 +4554,7 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
       },
       security:
         url.protocol === 'https:'
-          ? { t: 'tls', v: { server_name: url.hostname, fingerprint: 'chrome' } }
+          ? { t: 'tls', v: { server_name: url.hostname, fingerprint: DEFAULT_TLS_FINGERPRINT } }
           : { t: 'none' },
     };
   }
@@ -4693,7 +4699,8 @@ function externalXhttpDraft(protocol: ExternalOutboundProtocol | null | undefine
     downloadMode: download?.mode ?? 'auto',
     downloadSecurityKind: downloadSecurity?.t === 'reality' ? 'reality' : 'tls',
     downloadServerName: downloadSecurity && downloadSecurity.t !== 'none' ? downloadSecurity.v.server_name : '',
-    downloadFingerprint: downloadSecurity && downloadSecurity.t !== 'none' ? downloadSecurity.v.fingerprint : 'chrome',
+    downloadFingerprint:
+      downloadSecurity && downloadSecurity.t !== 'none' ? downloadSecurity.v.fingerprint : DEFAULT_TLS_FINGERPRINT,
     downloadAlpn: downloadSecurity?.t === 'tls' ? (downloadSecurity.v.alpn ?? []).join(',') : '',
     downloadEchConfigList: downloadSecurity?.t === 'tls' ? (downloadSecurity.v.ech_config_list ?? '') : '',
     downloadPinnedPeerCertSha256:
@@ -4958,7 +4965,9 @@ export function ExternalOutboundEditor({
     existing?.security.t === 'none' ? '' : (existing?.security.v.server_name ?? ''),
   );
   const [fingerprint, setFingerprint] = useState(
-    existing?.security.t === 'none' ? 'chrome' : (existing?.security.v.fingerprint ?? 'chrome'),
+    existing?.security.t === 'none'
+      ? DEFAULT_TLS_FINGERPRINT
+      : (existing?.security.v.fingerprint ?? DEFAULT_TLS_FINGERPRINT),
   );
   const [publicKey, setPublicKey] = useState(existing?.security.t === 'reality' ? existing.security.v.public_key : '');
   const [shortId, setShortId] = useState(existing?.security.t === 'reality' ? existing.security.v.short_id : '');
@@ -5196,7 +5205,7 @@ export function ExternalOutboundEditor({
           t: 'tls',
           v: {
             server_name: xhttp.downloadServerName.trim(),
-            fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
+            fingerprint: xhttp.downloadFingerprint.trim() || DEFAULT_TLS_FINGERPRINT,
             ...(xhttp.downloadAlpn.trim() ? { alpn: xhttp.downloadAlpn.split(',') } : {}),
             ...(xhttp.downloadEchConfigList ? { ech_config_list: xhttp.downloadEchConfigList } : {}),
             ...(xhttp.downloadPinnedPeerCertSha256
@@ -5213,7 +5222,7 @@ export function ExternalOutboundEditor({
             server_name: xhttp.downloadServerName.trim(),
             public_key: xhttp.downloadPublicKey.trim(),
             short_id: xhttp.downloadShortId.trim(),
-            fingerprint: xhttp.downloadFingerprint.trim() || 'chrome',
+            fingerprint: xhttp.downloadFingerprint.trim() || DEFAULT_TLS_FINGERPRINT,
             ...(xhttp.downloadMldsa65Verify ? { mldsa65_verify: xhttp.downloadMldsa65Verify } : {}),
             ...(xhttp.downloadSpiderX ? { spider_x: xhttp.downloadSpiderX } : {}),
           },
@@ -5307,7 +5316,7 @@ export function ExternalOutboundEditor({
             t: 'tls',
             v: {
               server_name: serverName.trim(),
-              fingerprint: fingerprint.trim() || 'chrome',
+              fingerprint: fingerprint.trim() || DEFAULT_TLS_FINGERPRINT,
               ...(alpn.trim() ? { alpn: alpn.split(',') } : {}),
               ...(echConfigList ? { ech_config_list: echConfigList } : {}),
               ...(pinnedPeerCertSha256 ? { pinned_peer_cert_sha256: pinnedPeerCertSha256 } : {}),
@@ -5320,7 +5329,7 @@ export function ExternalOutboundEditor({
               server_name: serverName.trim(),
               public_key: publicKey.trim(),
               short_id: shortId.trim(),
-              fingerprint: fingerprint.trim() || 'chrome',
+              fingerprint: fingerprint.trim() || DEFAULT_TLS_FINGERPRINT,
               ...(mldsa65Verify ? { mldsa65_verify: mldsa65Verify } : {}),
               ...(spiderX ? { spider_x: spiderX } : {}),
             },
@@ -5355,7 +5364,7 @@ export function ExternalOutboundEditor({
     address: '',
     port: 443,
     protocol: { t: 'vless', v: { credential: '', encryption: 'none', flow: null, transport: { t: 'raw' } } },
-    security: { t: 'tls', v: { server_name: '', fingerprint: 'chrome' } },
+    security: { t: 'tls', v: { server_name: '', fingerprint: DEFAULT_TLS_FINGERPRINT } },
     bindings: [],
   };
   const localDirty = shareLink.trim() !== '' || stableJson(outbound) !== stableJson(initialOutbound);
@@ -6179,7 +6188,7 @@ export function ExternalOutboundEditor({
                                   <input
                                     className="f mono"
                                     aria-label="下载 TLS 指纹"
-                                    placeholder="chrome"
+                                    placeholder={DEFAULT_TLS_FINGERPRINT}
                                     value={xhttp.downloadFingerprint}
                                     onChange={event => patchXhttp({ downloadFingerprint: event.target.value })}
                                   />

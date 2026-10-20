@@ -240,7 +240,6 @@ export function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Sess
       className="login-form"
       onSubmit={e => {
         e.preventDefault();
-        // public readonly 账号是唯一允许空密码的身份，服务端会校验该约束。
         if (operatorId.trim()) login.mutate();
       }}
     >

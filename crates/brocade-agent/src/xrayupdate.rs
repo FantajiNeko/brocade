@@ -35,6 +35,9 @@ use crate::{
 };
 
 mod crash_recovery;
+mod startup;
+
+pub(crate) use startup::failure as xray_startup_failure;
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -609,9 +612,9 @@ fn validate_handoff_manifest_path(path: &Path) -> Result<(), String> {
         }
         let mode = metadata.mode() & 0o7777;
         if exact_parent {
-            if metadata.uid() != unsafe { libc::geteuid() } || mode & 0o777 != 0o700 {
+            if metadata.uid() != unsafe { libc::geteuid() } || mode & 0o077 != 0 {
                 return Err(format!(
-                    "代际 manifest 目录 {} 必须由 Agent 账号持有且权限为 0700（当前 {:04o}）",
+                    "代际 manifest 目录 {} 必须由 Agent 账号持有且不向其他账号开放（当前 {:04o}）",
                     parent.display(),
                     mode & 0o7777
                 ));
@@ -719,7 +722,7 @@ fn read_handoff_manifest_identity(path: &Path) -> Result<HandoffManifestIdentity
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.nlink() != 1
-        || metadata.mode() & 0o777 != 0o600
+        || metadata.mode() & 0o077 != 0
         || metadata.len() == 0
         || metadata.len() > MAX_HANDOFF_MESSAGE_BYTES as u64
     {
@@ -1408,6 +1411,9 @@ fn launch_handoff_candidate(
     let observation = (|| {
         let deadline = Instant::now() + HANDOFF_CANDIDATE_START_TIMEOUT;
         loop {
+            if let Some(error) = startup::root_failure(&candidate.manifest, spawned_process) {
+                return Err(error);
+            }
             match handoff_status_any(&candidate.manifest) {
                 Ok(status) => {
                     let ticks = status
@@ -1430,27 +1436,25 @@ fn launch_handoff_candidate(
                     thread::sleep(STARTUP_HEALTH_INTERVAL);
                 }
                 Err(error) => {
-                    let tail = fs::read_to_string(&log_path).unwrap_or_default();
-                    return Err(format!(
-                        "候选 Xray 控制端没有就绪：{error}；日志末尾：{}",
-                        tail.chars()
-                            .rev()
-                            .take(4_000)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect::<String>()
+                    return Err(xray_startup_failure(
+                        &log_path,
+                        &format!("候选 Xray 控制端没有就绪：{error}"),
+                        Some(&candidate.manifest_path),
+                        spawned_process,
                     ));
                 }
             }
         }
     })();
-    if observation.is_err() {
+    let observation = observation.map_err(|error| {
+        startup::root_failure(&candidate.manifest, spawned_process).unwrap_or(error)
+    });
+    if let Err(error) = &observation {
         // This child cannot admit business traffic before the caller's fenced resume. Reap a
         // failed startup as well, even when it never created its private control socket.
         if let Some(process) = spawned_process {
             crate::terminate_processes(&[process], crate::XRAY_TERM_GRACE, crate::XRAY_KILL_GRACE)
-                .map_err(|error| format!("候选启动失败且清理失败：{error}"))?;
+                .map_err(|cleanup| format!("{error}；清理候选进程失败：{cleanup}"))?;
         }
     }
     observation
@@ -3179,8 +3183,11 @@ pub(crate) fn begin_config_handoff(
     let api_address = crate::xray_api_address(&desired).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
     // Preparation admission is enabled only after Core.Start. Reading the candidate API also
     // prevents sealing a process whose Unix control socket appeared before its core was ready.
-    let api_ready = wait_for_candidate_api(api_address);
+    let api_ready =
+        wait_for_candidate_api(api_address, &candidate_handoff.manifest, candidate_process);
     if let Err(error) = api_ready {
+        let error = startup::root_failure(&candidate_handoff.manifest, Some(candidate_process))
+            .unwrap_or_else(|| format!("候选 API 没有就绪：{error}"));
         return rollback_config_handoff_before_switch(
             state_dir,
             &runtime,
@@ -3188,7 +3195,7 @@ pub(crate) fn begin_config_handoff(
             old_process,
             &exported_status,
             Some((&candidate_handoff.manifest, candidate_process)),
-            &format!("候选 API 没有就绪：{error}"),
+            &error,
         );
     }
     let recovery = crate::restore_xray_runtime_with_grants(
@@ -3315,10 +3322,17 @@ pub(crate) fn begin_config_handoff(
     Ok(())
 }
 
-fn wait_for_candidate_api(api_address: SocketAddr) -> Result<(), String> {
+fn wait_for_candidate_api(
+    api_address: SocketAddr,
+    manifest: &HandoffManifestIdentity,
+    process: crate::ProcessRef,
+) -> Result<(), String> {
     let deadline = Instant::now() + HANDOFF_CANDIDATE_START_TIMEOUT;
     loop {
-        match crate::xray_grpc::inbound_tags(api_address) {
+        if let Some(error) = startup::root_failure(manifest, Some(process)) {
+            return Err(error);
+        }
+        match crate::xray_grpc::inbound_tags_until(api_address, Some(deadline)) {
             Ok(_) => return Ok(()),
             Err(error) if Instant::now() >= deadline => return Err(error),
             Err(_) => thread::sleep(STARTUP_HEALTH_INTERVAL),
@@ -3752,6 +3766,8 @@ fn perform_handoff_update_at_target(
     let api_address = crate::xray_api_address(&config).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
     let recovery = crate::restore_xray_runtime(&options.state_dir, &config, api_address);
     if let Some(error) = recovery.error() {
+        let error = startup::root_failure(&candidate_handoff.manifest, Some(candidate_process))
+            .unwrap_or_else(|| format!("候选动态业务状态没有完整恢复：{error}"));
         return Some(rollback_handoff_before_switch(
             options,
             offer,
@@ -3761,7 +3777,7 @@ fn perform_handoff_update_at_target(
             Some((&candidate_handoff.manifest, candidate_process)),
             None,
             &backup,
-            &format!("候选动态业务状态没有完整恢复：{error}"),
+            &error,
         ));
     }
     let seal_epoch = candidate_status.epoch.saturating_add(1);
@@ -5431,6 +5447,33 @@ mod tests {
         path
     }
 
+    #[test]
+    fn handoff_identity_accepts_private_read_only_files_and_directories() {
+        let dir = temp_dir("read-only-manifest");
+        let path = dir.join("manifest.json");
+        crate::fsutil::atomic_write_private(
+            &path,
+            br#"{
+            "version":2,"scope":"whole-generation","generation_id":"generation-test-0001",
+            "control_path":"/private/control.sock","listeners":[]
+        }"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let path_result = validate_handoff_manifest_path(&path);
+        let read_result = read_handoff_manifest_identity(&path);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        path_result.unwrap();
+        assert_eq!(read_result.unwrap().generation_id, "generation-test-0001");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o440)).unwrap();
+        assert!(read_handoff_manifest_identity(&path).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(validate_handoff_manifest_path(&path).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn current_process() -> XrayUpgradeProcess {
         let pid = std::process::id() as i32;
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
@@ -5842,7 +5885,7 @@ mod tests {
         assert_eq!(runtime.phase, XrayUpgradePhase::CandidateReady);
         let candidate = exact_upgrade_process(runtime.candidate.as_ref().unwrap()).unwrap();
         let (manifest, mut status) = observe_handoff_process(candidate).unwrap();
-        wait_for_candidate_api(api).unwrap();
+        wait_for_candidate_api(api, &manifest, candidate).unwrap();
         assert!(!status.ready && !status.accepting);
 
         // Reproduce a partially restored candidate carrying revoked credentials. Its next
@@ -6683,7 +6726,7 @@ mod tests {
                     },
                     false,
                     Some((603, 0)),
-                    true,
+                    brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff,
                     Some(&added_grants),
                 )
                 .unwrap();
@@ -6804,7 +6847,7 @@ mod tests {
 
             // A real prepared candidate must roll back cleanly without any rmi having damaged
             // the old generation. Then remove every business listener while keeping its accepted
-            // TCP connection alive until natural retirement (the production WAWO shape).
+            // TCP connection alive until natural retirement.
             let mut retained = TcpStream::connect(("127.0.0.1", next_public_port)).unwrap();
             retained
                 .set_read_timeout(Some(Duration::from_secs(3)))
@@ -6827,7 +6870,7 @@ mod tests {
                 },
                 false,
                 Some((604, 0)),
-                true,
+                brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff,
                 Some(&[absent_grant]),
             )
             .unwrap_err();
@@ -6850,6 +6893,7 @@ mod tests {
                 .as_array_mut()
                 .unwrap()
                 .push(conflicting);
+            let conflict_started = Instant::now();
             let error = crate::converge_linux_xray(
                 &root,
                 &brocade_deployment::plan::DesiredArtifact::Present {
@@ -6858,11 +6902,22 @@ mod tests {
                 },
                 false,
                 Some((604, 1)),
-                true,
+                brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff,
                 Some(&added_grants),
             )
             .unwrap_err();
             assert!(error.contains("旧代已恢复"), "{error}");
+            assert!(error.contains("EADDRINUSE"), "{error}");
+            assert!(
+                error.contains(&occupied.local_addr().unwrap().to_string()),
+                "{error}"
+            );
+            assert!(!error.contains("日志末尾"), "{error}");
+            assert!(!error.contains("No such file"), "{error}");
+            assert!(
+                conflict_started.elapsed() < HANDOFF_CANDIDATE_START_TIMEOUT,
+                "typed failure waited for the control timeout"
+            );
             assert_eq!(fs::read_to_string(&config).unwrap(), desired);
             assert!(observe_upgrade_runtime(&root).is_none());
             assert_eq!(crate::serving_xray_processes_in(&root), vec![current]);
@@ -6887,7 +6942,7 @@ mod tests {
                 },
                 false,
                 Some((605, 0)),
-                true,
+                brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff,
                 Some(&[]),
             )
             .unwrap();

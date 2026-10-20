@@ -1,6 +1,6 @@
 // Mockup of the machine config tab 「流量统计」 card redesign. Synthetic data only; never imported by the app.
 // Serve frontend/ with Vite (configFile: false, plugins: [react()]) and open
-//   tests/fixtures/node-traffic-accounting-mockup.html?scene=pump
+//   tests/fixtures/node-traffic-accounting-mockup.html?scene=partial
 // Query: scene=<SCENES key>, reading=ledger|compact|all, role=system|readonly|public,
 //        edit=none|policy|calibrate|mode, view=page|compare, theme=dark|light, w=<frame width>,
 //        nav=0 hides the review bar.
@@ -869,9 +869,9 @@ function NodePage({ children }: { children: ReactNode }) {
             </span>
             <div className="nd-ident-text">
               <div className="nd-ident-row">
-                <h1 className="nd-id">香港 PUMP</h1>
+                <h1 className="nd-id">香港示例 01</h1>
               </div>
-              <span className="nd-ident-meta">38.76.***.***</span>
+              <span className="nd-ident-meta">203.0.113.20</span>
             </div>
           </div>
           <div className="nd-tabs" role="tablist" aria-label="机器详情页签">
@@ -907,10 +907,10 @@ function IdentityStub({ canEdit }: { canEdit: boolean }) {
       </header>
       <div className="fgrid one">
         <Row k="名称">
-          <input className="f" style={{ width: 220 }} defaultValue="香港 PUMP" disabled={!canEdit} />
+          <input className="f" style={{ width: 220 }} defaultValue="香港示例 01" disabled={!canEdit} />
         </Row>
         <Row k="公网 IPv4">
-          <input className="f" style={{ width: 220 }} defaultValue="38.76.***.***" disabled={!canEdit} />
+          <input className="f" style={{ width: 220 }} defaultValue="203.0.113.20" disabled={!canEdit} />
           <span className="egress ok">出口一致</span>
         </Row>
       </div>
@@ -962,7 +962,7 @@ const pick = <T extends string>(value: string | null, allowed: readonly T[], fal
 
 function App() {
   const [sceneKey, setSceneKey] = useState<SceneKey>(
-    pick(params.get('scene'), Object.keys(SCENES) as SceneKey[], 'pump'),
+    pick(params.get('scene'), Object.keys(SCENES) as SceneKey[], 'partial'),
   );
   const [reading, setReading] = useState<Variant | 'all'>(
     pick(params.get('reading'), ['ledger', 'compact', 'all'] as const, 'ledger'),

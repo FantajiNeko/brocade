@@ -81,7 +81,12 @@ import {
   type FallbackLimitDraft,
   type FallbackRateDraft,
 } from '../reality-fallback';
-import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
+import {
+  DEFAULT_TLS_FINGERPRINT,
+  REALITY_FINGERPRINT_OPTIONS,
+  realityFingerprintIsValid,
+  realityServerNameIsValid,
+} from '../reality';
 import { can, isVisitor, useSession } from '../session';
 import { Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { ConfigSecretInput } from '../ui/config-secret-input';
@@ -116,7 +121,8 @@ import {
 } from './rules';
 import { freePortAcross, freeSpanAcross, occupiedPorts, portClash, spanClash } from './ports';
 import { ingressPortMigrationConfirmation, planIngressPortMigration } from './ingress-port-migration';
-import { MTPROTO_DESCRIPTION, mtprotoNodeEligibility } from '../mtproto-capability';
+import { mtprotoNodeEligibility } from '../mtproto-capability';
+import { INGRESS_PROTOCOL_DESCRIPTIONS } from '../ingress-protocols';
 
 /* Hysteria 2 的端口从此值起分配，跳转区间的默认长度同此。与 model.rs 的
  * HYSTERIA2_PORT_BASE / DEFAULT_HYSTERIA2_HOP_SPAN 保持一致——两处不一致不会报错，
@@ -268,8 +274,7 @@ export function ChainsPane({ win }: { win: Win }) {
   return <ChainList go={go} />;
 }
 
-// 建链页。项目由路由传入（入口是该项目的「＋ 新建链」），
-// 链头由向导中路径的第一行指定。
+// 建链页。路由传入默认选中的分组，向导仍可切换；链头由路径的第一行指定。
 function NewChain({ app }: { app: string }) {
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
@@ -281,7 +286,7 @@ function NewChain({ app }: { app: string }) {
 
   return (
     <ChainWizard
-      fixedApp={{ id: a.id, label: a.label }}
+      defaultApp={{ id: a.id, label: a.label }}
       onDone={() => {
         qc.invalidateQueries({ queryKey: ['snapshot'] });
         qc.invalidateQueries({ queryKey: ['revisions'] });
@@ -1082,7 +1087,7 @@ function IngressRealityRow({
     source: initialSource,
     dest: ingressReality?.dest ?? global?.dest ?? '',
     names: (ingressReality?.server_names ?? global?.server_names ?? []).join(', '),
-    fingerprint: ingressReality?.fingerprint ?? global?.fingerprint ?? 'chrome',
+    fingerprint: ingressReality?.fingerprint ?? global?.fingerprint ?? DEFAULT_TLS_FINGERPRINT,
   };
   const [draft, setDraft] = useState<RealityCertificateForm | null>(null);
   const form = draft ?? initial;
@@ -2883,7 +2888,7 @@ export function IngressStreamRow({
                 <Icon of="xray" size={14} className="protocol-choice-icon" />
                 VLESS · TLS / REALITY
               </b>
-              <span className="note">TCP / XHTTP 入站；使用 TLS 或 REALITY 保护传输。</span>
+              <span className="note">{INGRESS_PROTOCOL_DESCRIPTIONS.vless}</span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -2902,7 +2907,7 @@ export function IngressStreamRow({
                 <Icon of="xray" size={14} className="protocol-choice-icon" />
                 VLESS · Encryption
               </b>
-              <span className="note">TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。</span>
+              <span className="note">{INGRESS_PROTOCOL_DESCRIPTIONS.encryption}</span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -2921,7 +2926,7 @@ export function IngressStreamRow({
                 <Icon of="bolt" size={14} className="protocol-choice-icon" />
                 AnyTLS
               </b>
-              <span className="note">TCP 入站；支持 TLS / REALITY、Padding 与连接复用。</span>
+              <span className="note">{INGRESS_PROTOCOL_DESCRIPTIONS.anytls}</span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -2940,7 +2945,7 @@ export function IngressStreamRow({
                 <Icon of="hysteria" size={14} className="protocol-choice-icon" />
                 Hysteria 2
               </b>
-              <span className="note">QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。</span>
+              <span className="note">{INGRESS_PROTOCOL_DESCRIPTIONS.hy2}</span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -2962,7 +2967,7 @@ export function IngressStreamRow({
                 MTProxy
               </b>
               <span className={mtprotoUnavailable ? 'note bad' : 'note'}>
-                {mtprotoUnavailable ?? MTPROTO_DESCRIPTION}
+                {mtprotoUnavailable ?? INGRESS_PROTOCOL_DESCRIPTIONS.mtproto}
               </span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
@@ -5065,8 +5070,8 @@ function ChainPath({
 //
 // 只有名称可修改。地区旗始终位于输入框之外，因此改名时不会把 emoji/地区代码写进名称；
 // id 只显示：`chains.id` 是全局主键，修改 id 不是重命名而是将该链连同规则表迁移到其他
-// 项目下（论证见 ports.ts），提供输入框会使该迁移易于误触发。租户同样只显示，但必须
-// 显示——见下面保存部分的说明：它是该操作中最易写错的字段。
+// 项目下（论证见 ports.ts），提供输入框会使该迁移易于误触发。租户仅作为内部归属保留，
+// 保存时必须原样回传，避免重命名意外改变权限边界。
 export function ChainTitle({
   appId,
   chain,

@@ -43,7 +43,6 @@ pub struct DataRetentionView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateDataRetentionPolicy {
     pub ttl_hours: u32,
 }
@@ -105,8 +104,32 @@ const fn temporary(
     }
 }
 
+const fn detail_heads(table_name: &'static str, title: &'static str) -> Definition {
+    Definition {
+        min_ttl_hours: 24,
+        ..temporary(
+            table_name,
+            title,
+            "明细计数段的幂等基线，至少覆盖 24 小时离线重放窗口。",
+            24,
+        )
+    }
+}
+
 /// Only tables whose rows can be deleted by age without changing model, billing or release truth.
 const DEFINITIONS: &[Definition] = &[
+    history(
+        "source_traffic_windows",
+        "来源流量窗口",
+        "用户、接入点与来源 IP 的 30 秒诊断观测；不参与计费。",
+        24,
+    ),
+    history(
+        "source_traffic_daily",
+        "来源流量日汇总",
+        "来源 IP 的每日诊断汇总；自选分钟区间依赖保留的来源窗口。",
+        31 * 24,
+    ),
     history(
         "node_ping_probe_samples",
         "Ping 探测样本",
@@ -245,18 +268,8 @@ const DEFINITIONS: &[Definition] = &[
         "端口转发用量上报的短期幂等响应。",
         7 * 24,
     ),
-    temporary(
-        "other_domain_counter_heads",
-        "其他域名临时计数头",
-        "生成域名小时增量所需的短期累计计数基线。",
-        2,
-    ),
-    temporary(
-        "sniffing_failed_counter_heads",
-        "识别失败临时计数头",
-        "生成识别失败小时增量所需的短期累计计数基线。",
-        2,
-    ),
+    detail_heads("other_domain_counter_heads", "其他域名临时计数头"),
+    detail_heads("sniffing_failed_counter_heads", "识别失败临时计数头"),
 ];
 
 fn definition(table_name: &str) -> Option<&'static Definition> {
@@ -297,7 +310,11 @@ pub(crate) async fn ttl_hours(pool: &sqlx::PgPool, table_name: &str) -> Result<u
             })
         })
         .transpose()
-        .map(|value| value.unwrap_or(item.default_ttl_hours))
+        .map(|value| {
+            value
+                .unwrap_or(item.default_ttl_hours)
+                .max(item.min_ttl_hours)
+        })
 }
 
 impl PgStore {
@@ -307,8 +324,8 @@ impl PgStore {
             .map(|item| (item.table_name.to_owned(), item.default_ttl_hours))
             .collect::<HashMap<_, _>>();
         for (table_name, ttl_hours) in load_overrides(self.pool()).await? {
-            if definition(&table_name).is_some() {
-                hours.insert(table_name, ttl_hours);
+            if let Some(item) = definition(&table_name) {
+                hours.insert(table_name, ttl_hours.max(item.min_ttl_hours));
             }
         }
         Ok(RetentionSchedule { hours })
@@ -352,7 +369,9 @@ impl PgStore {
                         title: item.title.to_owned(),
                         description: item.description.to_owned(),
                         category: item.category,
-                        ttl_hours: override_hours.unwrap_or(item.default_ttl_hours),
+                        ttl_hours: override_hours
+                            .unwrap_or(item.default_ttl_hours)
+                            .max(item.min_ttl_hours),
                         default_ttl_hours: item.default_ttl_hours,
                         min_ttl_hours: item.min_ttl_hours,
                         max_ttl_hours: MAX_RETENTION_HOURS,
@@ -432,6 +451,12 @@ impl PgStore {
         &self,
         schedule: &RetentionSchedule,
     ) -> Result<u64> {
+        crate::source_traffic::prune(
+            self.pool(),
+            schedule.ttl_hours("source_traffic_windows"),
+            schedule.ttl_hours("source_traffic_daily"),
+        )
+        .await?;
         crate::other_domain::prune_hours(
             self.pool(),
             schedule.ttl_hours("user_other_domain_hourly"),

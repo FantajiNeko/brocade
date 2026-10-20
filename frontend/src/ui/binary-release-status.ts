@@ -3,7 +3,7 @@ type ReleaseTone = 'ok' | 'warn' | 'run' | 'err' | 'none';
 export const BINARY_TARGET_STATUS: Record<BinaryReleaseTargetStatus, { tone: ReleaseTone; text: string }> = {
   pending: { tone: 'run', text: '待升级' },
   dispatched: { tone: 'run', text: '升级中' },
-  succeeded: { tone: 'ok', text: '本次已升级' },
+  succeeded: { tone: 'ok', text: '已升级' },
   unverified: { tone: 'err', text: '未通过验证' },
   'failed-recovered': { tone: 'err', text: '失败 · 原版本运行' },
   'failed-dirty': { tone: 'err', text: '失败 · 需处理' },

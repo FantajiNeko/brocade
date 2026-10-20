@@ -15,6 +15,7 @@ import {
   type ForwardingEntitlement,
   type ForwardingEntitlementWrite,
   type ForwardingOverview,
+  type ForwardingPort,
   type ForwardingProtocol,
   type ForwardingProbe,
   type ForwardingRule,
@@ -94,12 +95,17 @@ const PROTOCOL_LABEL: Record<ForwardingProtocol, string> = { tcp: 'TCP', udp: 'U
 // 新授权的默认策略：同时开放 TCP 与 UDP，使用完整的转发端口段，并允许内部目标。
 const GRANT_DEFAULTS = { start: 30_000, end: 59_999, max: 100, allowPrivate: true } as const;
 
+const writablePort = (port: ForwardingPort): number => {
+  if (typeof port !== 'number') throw new Error('脱敏的转发信息不能用于修改规则或授权');
+  return port;
+};
+
 const entitlementWrite = (entry: ForwardingEntitlement, enabled = entry.enabled): ForwardingEntitlementWrite => ({
   enabled,
   tcp_allowed: entry.tcp_allowed,
   udp_allowed: entry.udp_allowed,
-  listen_port_start: entry.listen_port_start,
-  listen_port_end: entry.listen_port_end,
+  listen_port_start: writablePort(entry.listen_port_start),
+  listen_port_end: writablePort(entry.listen_port_end),
   max_rules: entry.max_rules,
   allow_private_targets: entry.allow_private_targets,
 });
@@ -161,6 +167,7 @@ const nextFreePort = (
   protocol: ForwardingProtocol,
   excludeRuleId?: number,
 ) => {
+  if (typeof entry.listen_port_start !== 'number' || typeof entry.listen_port_end !== 'number') return null;
   for (let port = entry.listen_port_start; port <= entry.listen_port_end; port += 1) {
     if (!occupantOf(rules, entry.node_id, protocol, port, excludeRuleId)) return port;
   }
@@ -210,7 +217,7 @@ const clockText = (text: string) => {
 
 const rateText = (bytesPerSec: number) => observeBpsReading(bytesPerSec * 8);
 
-const entryAddress = (entry: ForwardingEntitlement, port: number, family: 'v4' | 'v6') => {
+const entryAddress = (entry: ForwardingEntitlement, port: ForwardingPort, family: 'v4' | 'v6') => {
   const host = family === 'v4' ? entry.public_ipv4 : entry.public_ipv6;
   return host ? endpointText(host, port) : null;
 };
@@ -235,6 +242,8 @@ function checkRule(
   let targetBad = false;
   let portBad = false;
   if (!entry) return { target, targetBad, portBad, problems: ['选择转发入口'], ok: false };
+  if (typeof entry.listen_port_start !== 'number' || typeof entry.listen_port_end !== 'number')
+    return { target, targetBad, portBad, problems: ['脱敏的转发信息仅供查看'], ok: false };
   if (!entry.enabled) return { target, targetBad, portBad, problems: [`${entry.node_name} 已停止转发`], ok: false };
   if ('error' in parsed) {
     if (draft.target.trim()) {
@@ -292,7 +301,9 @@ function checkPolicy(dialog: PolicyDialog, rules: ForwardingRule[]): PolicyCheck
   if (!/^\d+$/.test(draft.start.trim()) || !/^\d+$/.test(draft.end.trim())) rangeText = '填数字端口';
   else if (start < 1024 || end > 65_535 || end < start) rangeText = '范围在 1024–65535 内，结束不小于起始';
   else {
-    const outside = enabledRules.filter(rule => rule.listen_port < start || rule.listen_port > end);
+    const outside = enabledRules.filter(
+      rule => typeof rule.listen_port !== 'number' || rule.listen_port < start || rule.listen_port > end,
+    );
     rangeBad = outside.length > 0;
     rangeText = rangeBad
       ? `${outside.length} 条启用中的规则不在新范围内（${outside.map(rule => rule.listen_port).join('、')}）`
@@ -585,7 +596,8 @@ export function UserForwardingCard({
       return value ? value.down + value.up : 0;
     };
     const by: Record<RuleSort, (a: ForwardingRule, b: ForwardingRule) => number> = {
-      port: (a, b) => a.listen_port - b.listen_port,
+      port: (a, b) =>
+        typeof a.listen_port === 'number' && typeof b.listen_port === 'number' ? a.listen_port - b.listen_port : 0,
       month: (a, b) => totalOf(b) - totalOf(a),
       created: (a, b) => parseTimestamp(b.created_at) - parseTimestamp(a.created_at),
     };
@@ -648,9 +660,9 @@ export function UserForwardingCard({
         node_id: rule.node_id,
         name: rule.name,
         protocol: rule.protocol,
-        listen_port: rule.listen_port,
+        listen_port: writablePort(rule.listen_port),
         target_host: rule.target_host,
-        target_port: rule.target_port,
+        target_port: writablePort(rule.target_port),
         enabled: !rule.enabled,
       },
     });
@@ -1321,6 +1333,7 @@ function RuleItem({
   const target = endpointText(rule.target_host, rule.target_port);
   const v4 = entry ? entryAddress(entry, rule.listen_port, 'v4') : null;
   const v6 = entry ? entryAddress(entry, rule.listen_port, 'v6') : null;
+  const canCopy = typeof rule.listen_port === 'number';
   const state = effectiveStatus(rule, entry);
   const status = RULE_STATUS[state];
   const detailId = useId();
@@ -1340,7 +1353,7 @@ function RuleItem({
   ) : (
     <span className="fwd-idle">空闲</span>
   );
-  const hasMenu = canManage || !!v4 || !!v6;
+  const hasMenu = canManage || (canCopy && (!!v4 || !!v6));
   return (
     <div
       role="listitem"
@@ -1400,7 +1413,7 @@ function RuleItem({
               open={menuOpen}
               onOpenChange={onMenu}
             >
-              {v4 && (
+              {canCopy && v4 && (
                 <CopyButton text={v4} role="menuitem" label="复制 IPv4 入口">
                   {(state, label) => (
                     <>
@@ -1424,7 +1437,7 @@ function RuleItem({
                   onSelect={onToggleEnabled}
                 />
               )}
-              {v6 && (
+              {canCopy && v6 && (
                 <CopyButton text={v6} role="menuitem" label="复制 IPv6 入口">
                   {(state, stateLabel) => (
                     <>
@@ -1464,13 +1477,13 @@ function RuleItem({
                   {v4 && (
                     <span className="fwd-addr">
                       {v4}
-                      <AddressCopy text={v4} label="复制 IPv4 入口" />
+                      {canCopy && <AddressCopy text={v4} label="复制 IPv4 入口" />}
                     </span>
                   )}
                   {v6 && (
                     <span className="fwd-addr">
                       {v6}
-                      <AddressCopy text={v6} label="复制 IPv6 入口" />
+                      {canCopy && <AddressCopy text={v6} label="复制 IPv6 入口" />}
                     </span>
                   )}
                   {!v4 && !v6 && <span className="fwd-dim">暂无公网地址</span>}

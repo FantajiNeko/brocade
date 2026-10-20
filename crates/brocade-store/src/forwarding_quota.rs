@@ -18,7 +18,6 @@ pub(crate) const MONTH_USED: &str = "((SELECT COALESCE(sum(s.uplink_bytes+s.down
              FROM users u WHERE u.tenant_id=e.tenant_id AND u.id=e.user_id),1))";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ForwardingQuotaWrite {
     pub limit_bytes: Option<u64>,
 }

@@ -14,6 +14,7 @@ const nodes = readFileSync(new URL('../src/panes/nodes.tsx', import.meta.url), '
 const provisionPreview = readFileSync(new URL('../src/preview/provision.tsx', import.meta.url), 'utf8');
 const usage = readFileSync(new URL('../src/panes/usage.tsx', import.meta.url), 'utf8');
 const tunnels = readFileSync(new URL('../src/panes/tunnels.tsx', import.meta.url), 'utf8');
+const roles = readFileSync(new URL('../src/ui/role-label.ts', import.meta.url), 'utf8');
 
 test('配置发布使用操作者可理解的阶段名称', () => {
   assert.doesNotMatch(deploy, /金丝雀/);
@@ -35,10 +36,11 @@ test('发布预览不向用户暴露内部字段或实现措辞', () => {
 
 test('单租户阶段不在导航菜单暴露租户页', () => {
   const more = shell.match(/const MORE: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
-  const offNav = shell.match(/const OFF_NAV: Face\[\] = \[([\s\S]*?)\n\];/)?.[1] ?? '';
+  const offNav = shell.match(/const OFF_NAV: Face\[\] = \[([\s\S]*?)\];/)?.[1] ?? '';
   assert.doesNotMatch(more, /key: 'tenants'/);
   assert.doesNotMatch(offNav, /key: 'tenants'/);
   const routable = state.match(/export const NAV_KEYS = \[([\s\S]*?)\n\]/)?.[1] ?? '';
+  assert.ok(more.length && offNav.length && routable.length, 'navigation definitions must exist');
   assert.doesNotMatch(routable, /'tenants'/);
   assert.doesNotMatch(panes, /TenantsPane|case 'tab:tenants'/);
 });
@@ -152,12 +154,14 @@ test('外观控制分开呈现明暗模式与当前色调', () => {
 
 test('访客登录与身份头对齐，登录后支持修改密码和退出登录', () => {
   const accountClass = shell.indexOf('className="fg-menu-item fg-account-action"');
-  const accountAction = shell.slice(
-    shell.lastIndexOf('<button', accountClass),
-    shell.indexOf('</button>', accountClass),
-  );
-  assert.match(shell, /const ROLE_LABEL: Record<AdminRole, string>/);
-  assert.match(shell, /'system-admin': '系统管理员'/);
+  assert.ok(accountClass >= 0, 'account action must exist');
+  const actionStart = shell.lastIndexOf('<button', accountClass);
+  const actionEnd = shell.indexOf('</button>', accountClass);
+  assert.ok(actionStart >= 0 && actionEnd > actionStart);
+  const accountAction = shell.slice(actionStart, actionEnd);
+  assert.match(shell, /import \{ ROLE_LABEL \} from '\.\.\/ui\/role-label'/);
+  assert.match(roles, /'system-admin': '系统管理员'/);
+  assert.match(roles, /'tenant-admin': '管理员'/);
   assert.match(accountAction, />退出登录</);
   assert.doesNotMatch(accountAction, /<small>/);
   // 访客的登录动作占用身份头；登录后账户名与角色留在同一位置，账号操作位于菜单尾部。

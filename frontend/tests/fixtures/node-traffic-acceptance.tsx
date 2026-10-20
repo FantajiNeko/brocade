@@ -7,8 +7,8 @@ import type {
   ConsoleSnapshot,
   NodeInflowUsage,
   NodeSiteUsage,
+  NodeTrafficHistory,
   SiteUsagePeriod,
-  UserTrafficHistory,
 } from '../../src/api';
 import type { NodeRealtimeEvent } from '../../src/node-realtime';
 import { NodeTrafficDialog } from '../../src/node-traffic';
@@ -113,7 +113,7 @@ function inflow(period: SiteUsagePeriod): NodeInflowUsage {
 }
 function sites(period: SiteUsagePeriod): NodeSiteUsage {
   const agg = aggregate(built, period),
-    rows = world.sites ? siteRowsOf(built, agg) : [];
+    rows = siteRowsOf(built, agg);
   return {
     period,
     collection_enabled: world.sites,
@@ -154,17 +154,36 @@ function sites(period: SiteUsagePeriod): NodeSiteUsage {
   };
 }
 const hour = liveHistory(built);
-const history: UserTrafficHistory = {
-  range_start_unix_secs: NOW - 3600,
-  range_end_unix_secs: NOW,
-  nodes: [{ node_id: 'n1', window_ends_unix_secs: hour.slots }],
-  series: [...hour.users].map(([user, values]) => ({
-    node_id: 'n1',
-    tenant_id: world.users.find(row => row.id === user)!.tenant,
-    user_id: user,
-    points: hour.slots.map((at, i) => [at, Math.round(values.up[i]), Math.round(values.down[i])]),
-  })),
-};
+function trafficHistory(period: SiteUsagePeriod, from: number | null, until: number | null): NodeTrafficHistory {
+  const agg = aggregate(built, period);
+  const start = from ?? agg.bounds.start,
+    end = until ?? NOW;
+  const step = from !== null ? 30 : { day: 300, week: 900, month: 3600 }[period];
+  const points: NodeTrafficHistory['points'] = [];
+  let recorded = 0;
+  for (let at = start; at < end; at += step) {
+    const index = Math.floor((at - agg.bounds.start) / agg.bounds.bucket);
+    const bucketEnd = Math.min(at + step, end);
+    if (!agg.buckets[index] || agg.buckets[index].observed === 'none') {
+      points.push([bucketEnd, null, null]);
+      continue;
+    }
+    const lanes = [...agg.lanes.values()];
+    const up = lanes.reduce((sum, lane) => sum + (lane.up[index] ?? 0), 0) / agg.bounds.bucket;
+    const down = lanes.reduce((sum, lane) => sum + (lane.down[index] ?? 0), 0) / agg.bounds.bucket;
+    recorded += (up + down) * (bucketEnd - at);
+    points.push([bucketEnd, up, down]);
+  }
+  return {
+    range_start_unix_secs: start,
+    range_end_unix_secs: end,
+    bucket_secs: step,
+    points,
+    recorded_bytes: recorded,
+    has_gap: agg.gapHours > 0,
+    has_unplaced: false,
+  };
+}
 function sample(second: number): NodeRealtimeEvent {
   return {
     node_id: 'n1',
@@ -224,11 +243,51 @@ window.fetch = async (input, init) => {
     latest_report_unix_secs: null,
     rows: [],
   };
-  if (url.pathname.endsWith('/inflow-usage')) return Response.json(inflow(period));
+  const from = Number(url.searchParams.get('start_unix_secs'));
+  const until = Number(url.searchParams.get('end_unix_secs'));
+  const custom = from > 0 && until > from;
+  if (url.pathname.endsWith('/inflow-usage')) {
+    const data = inflow(period);
+    return Response.json(
+      custom ? { ...data, range_start_unix_secs: from, range_end_unix_secs: until, period_end_unix_secs: until } : data,
+    );
+  }
+  if (url.pathname.endsWith('/inflow-details')) {
+    const data = inflow(period);
+    const user = url.searchParams.get('user_id');
+    const tenant = url.searchParams.get('tenant_id');
+    const input = data.rows.filter(row => row.user_id === user && row.tenant_id === tenant);
+    return Response.json({
+      range_start_unix_secs: custom ? from : data.range_start_unix_secs,
+      range_end_unix_secs: custom ? until : data.range_end_unix_secs,
+      observed_since_unix_secs: NOW - 3600,
+      latest_report_unix_secs: NOW,
+      limited: false,
+      accounting_mismatch: false,
+      accounting_uplink_bytes: input.reduce((sum, row) => sum + row.uplink_bytes, 0),
+      accounting_downlink_bytes: input.reduce((sum, row) => sum + row.downlink_bytes, 0),
+      rows: input.flatMap((row, i) => {
+        if (row.source !== 'chain') return [{ ...row, source_ip: null }];
+        if (i > 0) return [{ ...row, source_ip: `192.0.2.${i + 1}` }];
+        const up = Math.floor(row.uplink_bytes * 0.7),
+          down = Math.floor(row.downlink_bytes * 0.7);
+        return [
+          { ...row, uplink_bytes: up, downlink_bytes: down, source_ip: '192.0.2.1' },
+          {
+            ...row,
+            uplink_bytes: row.uplink_bytes - up,
+            downlink_bytes: row.downlink_bytes - down,
+            source_ip: '2001:db8:1234:5678::42',
+          },
+        ];
+      }),
+    });
+  }
   if (url.pathname.endsWith('/site-usage')) return Response.json(sites(period));
   if (url.pathname.endsWith('/other-domains') || url.pathname.endsWith('/sniffing-failed-targets'))
     return Response.json(detail);
-  if (url.pathname.endsWith('/user-history')) return Response.json(history);
+  if (url.pathname.endsWith('/traffic-history'))
+    return Response.json(trafficHistory(period, custom ? from : null, custom ? until : null));
   return nativeFetch(input, init);
 };
 const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

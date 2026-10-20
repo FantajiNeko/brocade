@@ -75,7 +75,6 @@ pub struct NodeLifecycleTransitionResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AbandonNodeRequest {
     #[serde(default = "default_true")]
     pub unregister_warp: bool,

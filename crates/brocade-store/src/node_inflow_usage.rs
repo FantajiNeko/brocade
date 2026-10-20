@@ -21,6 +21,7 @@ pub struct NodeInflowUsage {
     pub rows: Vec<NodeInflowRow>,
     /// Users with a grant or forwarding entitlement on this machine and no inflow in the period.
     pub idle_users: Vec<NodeInflowUser>,
+    pub range_limited: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -118,6 +119,16 @@ pub(crate) async fn query(
     node_id: &str,
     period: SiteUsagePeriod,
 ) -> Result<NodeInflowUsage> {
+    query_range(pool, actor, node_id, period, None).await
+}
+
+pub(crate) async fn query_range(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    period: SiteUsagePeriod,
+    range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+) -> Result<NodeInflowUsage> {
     // Same boundary as the machine's live user rates: signed-in operators only, with tenant-scoped
     // operators limited to their subtree. The caller resolves machine visibility.
     if !actor.can_view_user_realtime_traffic() {
@@ -125,7 +136,10 @@ pub(crate) async fn query(
             "machine inflow requires a signed-in operator".to_owned(),
         ));
     }
-    let bounds = crate::site_usage::period_bounds(pool, period).await?;
+    let bounds = crate::site_usage::range_bounds(pool, period, range).await?;
+    if range.is_some() {
+        return query_windows(pool, actor, node_id, period, bounds).await;
+    }
     let scope = actor.tenant_scope();
     let pattern = actor.tenant_scope_like_pattern();
     let mut tx = pool.begin().await?;
@@ -309,5 +323,76 @@ pub(crate) async fn query(
             )
             .collect(),
         idle_users,
+        range_limited: false,
+    })
+}
+
+async fn query_windows(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node: &str,
+    period: SiteUsagePeriod,
+    bounds: crate::site_usage::PeriodBounds,
+) -> Result<NodeInflowUsage> {
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(pool)
+        .await?;
+    let ttl = crate::retention::ttl_hours(pool, "usage_samples")
+        .await?
+        .min(crate::retention::ttl_hours(pool, "forwarding_usage_samples").await?);
+    let range_limited = bounds.start < now - i64::from(ttl) * 3600;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout='10s'")
+        .execute(&mut *tx)
+        .await?;
+    let records=sqlx::query("WITH entries AS (
+        SELECT s.tenant_id,s.user_id,s.app_id,coalesce(g.bindings->s.grant_label->>'chain_id',r.chain_id) AS chain_id,s.ingress_id,s.uplink_bytes,s.downlink_bytes,s.has_gap
+        FROM usage_samples s
+        LEFT JOIN usage_generations g ON g.id=s.generation_id
+        LEFT JOIN usage_user_ingress_rollups r ON r.node_id=s.node_id AND r.tenant_id=s.tenant_id AND r.user_id=s.user_id AND r.ingress_id=s.ingress_id
+          AND r.period_start=date_trunc('day',s.window_start AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong'
+        WHERE s.node_id=$1 AND s.window_start>=to_timestamp($2::bigint) AND s.window_start<to_timestamp($3::bigint)
+          AND ($4::text IS NULL OR s.tenant_id=$4 OR s.tenant_id LIKE $5 ESCAPE '\\')
+        ) SELECT tenant_id,user_id,'chain' AS source,app_id,chain_id,CASE WHEN chain_id IS NULL THEN ingress_id END AS ingress_id,
+        sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down,bool_or(has_gap) AS gap FROM entries GROUP BY 1,2,4,5,6
+        UNION ALL SELECT tenant_id,user_id,'forwarding',NULL,NULL,NULL,sum(uplink_bytes)::bigint,sum(downlink_bytes)::bigint,bool_or(has_gap)
+        FROM forwarding_usage_samples WHERE node_id=$1 AND window_start>=to_timestamp($2::bigint) AND window_start<to_timestamp($3::bigint)
+          AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\') GROUP BY 1,2")
+        .bind(node).bind(bounds.start).bind(bounds.now).bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(&mut *tx).await?;
+    let rows = records
+        .into_iter()
+        .map(|r| {
+            Ok(NodeInflowRow {
+                tenant_id: r.try_get("tenant_id")?,
+                user_id: r.try_get("user_id")?,
+                source: if r.get::<String, _>("source") == "chain" {
+                    NodeInflowSource::Chain
+                } else {
+                    NodeInflowSource::Forwarding
+                },
+                app_id: r.try_get("app_id")?,
+                chain_id: r.try_get("chain_id")?,
+                ingress_id: r.try_get("ingress_id")?,
+                uplink_bytes: bytes(r.try_get("up")?)?,
+                downlink_bytes: bytes(r.try_get("down")?)?,
+                has_gap: range_limited || r.try_get::<bool, _>("gap")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let latest=sqlx::query_scalar("SELECT greatest((SELECT extract(epoch FROM max(window_end))::bigint FROM usage_samples WHERE node_id=$1),(SELECT extract(epoch FROM max(read_at))::bigint FROM forwarding_usage_samples WHERE node_id=$1))")
+        .bind(node).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(NodeInflowUsage {
+        period,
+        range_start_unix_secs: bounds.start,
+        range_end_unix_secs: bounds.now,
+        period_end_unix_secs: bounds.end,
+        latest_report_unix_secs: latest,
+        rows,
+        idle_users: Vec::new(),
+        range_limited,
     })
 }

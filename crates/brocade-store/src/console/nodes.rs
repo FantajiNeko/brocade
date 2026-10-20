@@ -292,7 +292,6 @@ pub async fn remove_retired_nodes(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateNodeStatusRequest {
     /// `active` or `retired`
     pub status: String,

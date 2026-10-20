@@ -249,7 +249,7 @@
   </header>
   <main class="stage" id="mockup-stage">
     <div class="canvas">
-      <div class="shell-top"><b class="brand">TAT.AC</b><span>机器</span><span>线路</span><span>用量</span></div>
+      <div class="shell-top"><b class="brand">Brocade</b><span>机器</span><span>线路</span><span>用量</span></div>
       <div class="shell-main">
         <div class="shell-user"><span class="m-avatar">AL</span><h2>alice</h2><small>已授权 30 · 543.13 GiB</small><div class="shell-actions"><button class="m-button" data-open="nodes">节点</button><button class="m-button" data-open="subscription">订阅</button></div></div>
         <div class="shell-tabs"><b>接入</b><span>转发</span><span>统计</span></div>
@@ -282,9 +282,9 @@
     const routeSeed = [
       ['🇭🇰','香港 01 @ CN2','APAC Premium'],['🇭🇰','香港 02 @ CN2','APAC Premium'],
       ['🇹🇼','台湾 01 @ CN2','APAC Premium'],['🇯🇵','日本 01 @ CN2','APAC Premium'],
-      ['🇲🇾','大马 01 @ CN2','APAC Standard'],['🇭🇰','香港 01 @ Pump','APAC Standard'],
-      ['🇲🇴','澳门 01 @ Pump','APAC Standard'],['🇯🇵','日本 01 @ Bage','APAC Standard'],
-      ['🇺🇸','洛杉矶 01 @ DMIT','NORAM Premium'],['🇺🇸','圣何塞 01 @ Oracle','NORAM Standard'],
+      ['🇲🇾','大马 01 @ CN2','APAC Standard'],['🇭🇰','香港示例 01','APAC Standard'],
+      ['🇲🇴','澳门示例 01','APAC Standard'],['🇯🇵','日本示例 01','APAC Standard'],
+      ['🇺🇸','洛杉矶示例 01','NORAM Premium'],['🇺🇸','圣何塞示例 01','NORAM Standard'],
       ['🇩🇪','法兰克福 01 @ Demo','EMEA Premium'],['🇫🇷','巴黎 01 @ Demo','VPN Gate / Proxies'],
     ];
     const routes = Array.from({length:30}, (_, i) => ({id:i, flag:routeSeed[i%12][0], name:routeSeed[i%12][1] + (i>=12 ? ` · ${Math.floor(i/12)+1}` : ''), line:routeSeed[i%12][2], v6: i%5!==4}));

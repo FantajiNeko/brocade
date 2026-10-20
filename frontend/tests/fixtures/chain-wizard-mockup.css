@@ -723,25 +723,9 @@ input.f.cw-new-group {
 .cw-new-user input.f {
   width: 180px;
 }
-.cw-new-user select.f {
-  width: auto;
-  font-family: var(--sans);
-}
-.cw-user-groups {
+.cw-user-list {
   display: grid;
   gap: 16px;
-}
-.cw-user-group h4 {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin: 0 0 8px;
-  color: var(--ink-3);
-  font: 600 11.5px var(--sans);
-}
-.cw-user-group h4 small {
-  color: var(--ink-4);
-  font-weight: 400;
 }
 .cw-user-chips {
   display: flex;

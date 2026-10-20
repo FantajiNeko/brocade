@@ -9,13 +9,14 @@ const OLD_A = 'a'.repeat(64);
 const OLD_B = 'b'.repeat(64);
 const NEXT = 'c'.repeat(64);
 const RELEASE_ID = 'd'.repeat(64);
+const SOURCE_COMMIT = '77ae5216cf2132fcf300fac1a6a4998ea54378ba';
 
 const emptyView = (): BinaryReleaseView => ({
   available: {
     component: 'xray',
     build_id: RELEASE_ID,
     artifacts: [{ arch: 'x86_64', sha256: NEXT }],
-    version: '26.9.1',
+    version: SOURCE_COMMIT,
     source: 'embedded',
   },
   current: null,
@@ -99,7 +100,7 @@ function XrayHarness() {
 }
 
 const clients: QueryClient[] = [];
-function mount(view: BinaryReleaseView, nodeView = nodes) {
+function mount(view: BinaryReleaseView, nodeView = nodes, handoffBeta = false) {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
@@ -109,6 +110,7 @@ function mount(view: BinaryReleaseView, nodeView = nodes) {
   clients.push(client);
   client.setQueryData(['binary-releases', 'xray'], view);
   client.setQueryData(['nodes'], nodeView);
+  client.setQueryData(['deployment-settings'], { unattended: true, xray_handoff_beta: handoffBeta });
   return render(
     <QueryClientProvider client={client}>
       <XrayHarness />
@@ -127,6 +129,34 @@ afterEach(() => {
 });
 
 describe('Xray 升级', () => {
+  it('Beta 关闭只允许直接重启，不显示交接或排空选项', () => {
+    mount(emptyView());
+    expect(screen.getAllByRole('radio')).toHaveLength(1);
+    expect((screen.getByRole('radio', { name: '直接重启' }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.queryByRole('radio', { name: '双跑交接 Beta' })).toBeNull();
+    expect(screen.queryByRole('spinbutton', { name: '旧进程排空等待秒数' })).toBeNull();
+  });
+
+  it('关闭 Beta 后清除尚未批准的交接选择，再开启仍默认重启', async () => {
+    mount(emptyView(), nodes, true);
+    fireEvent.click(screen.getByRole('radio', { name: '双跑交接 Beta' }));
+    clients.at(-1)!.setQueryData(['deployment-settings'], { unattended: true, xray_handoff_beta: false });
+    await waitFor(() => expect(screen.queryByRole('radio', { name: '双跑交接 Beta' })).toBeNull());
+    clients.at(-1)!.setQueryData(['deployment-settings'], { unattended: true, xray_handoff_beta: true });
+    await waitFor(() => expect(screen.getByRole('radio', { name: '双跑交接 Beta' })).toBeTruthy());
+    expect((screen.getByRole('radio', { name: '直接重启' }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('显示源码 commit，按实际运行摘要识别当前构建，不显示上游版本号', () => {
+    mount(emptyView());
+    expect(screen.getByText('可发 commit')).toBeTruthy();
+    const current = screen.getByRole('rowheader', { name: '已经替换' }).closest<HTMLElement>('[role="row"]')!;
+    expect(within(current).getByText('77ae5216cf21')).toBeTruthy();
+    const old = screen.getByRole('rowheader', { name: '台北入口' }).closest<HTMLElement>('[role="row"]')!;
+    expect(within(old).getByText('commit 未知')).toBeTruthy();
+    expect(screen.queryByText(/v?26\.(8|9)\.1/)).toBeNull();
+  });
+
   it('默认直接重启，显式选择双跑交接 Beta 后默认排空 120 秒', async () => {
     const view = emptyView();
     let sent: unknown;
@@ -140,7 +170,7 @@ describe('Xray 升级', () => {
         return json(view);
       }),
     );
-    mount(view);
+    mount(view, nodes, true);
 
     expect(screen.getAllByRole('radio')).toHaveLength(2);
     expect((screen.getByRole('radio', { name: '直接重启' }) as HTMLInputElement).checked).toBe(true);
@@ -160,10 +190,12 @@ describe('Xray 升级', () => {
     fireEvent.click(screen.getByLabelText('升级 东京中继'));
     expect(screen.getByText('已选 2 台')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '批准' }));
-    expect(screen.getByText('确认允许超时后强制退役？')).toBeTruthy();
+    const confirmation = screen.getByRole('dialog', { name: '确认双跑升级？' });
     expect(screen.getByText(/旧连接最多保留 120 秒/)).toBeTruthy();
+    expect(within(confirmation).queryByText(/超时|破坏性/)).toBeNull();
+    expect(within(confirmation).getByRole('button', { name: '确认升级' }).classList.contains('danger')).toBe(false);
     expect(sent).toBeUndefined();
-    fireEvent.click(screen.getByRole('button', { name: '确认破坏性升级' }));
+    fireEvent.click(within(confirmation).getByRole('button', { name: '确认升级' }));
 
     await waitFor(() =>
       expect(sent).toEqual({
@@ -205,7 +237,7 @@ describe('Xray 升级', () => {
         return json(view);
       }),
     );
-    mount(view);
+    mount(view, nodes, true);
     fireEvent.click(screen.getByRole('radio', { name: '双跑交接 Beta' }));
     fireEvent.change(screen.getByRole('spinbutton', { name: '旧进程排空等待秒数' }), {
       target: { value: '240' },
@@ -214,7 +246,7 @@ describe('Xray 升级', () => {
     fireEvent.click(screen.getByRole('button', { name: '批准' }));
     expect(screen.getByText(/旧连接最多保留 240 秒/)).toBeTruthy();
     expect(sent).toBeUndefined();
-    fireEvent.click(screen.getByRole('button', { name: '确认破坏性升级' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认升级' }));
 
     await waitFor(() =>
       expect(sent).toEqual({
@@ -294,7 +326,7 @@ describe('Xray 升级', () => {
     );
     mount(view);
 
-    expect(screen.getByText('本次已升级', { selector: '.cgc-st' })).toBeTruthy();
+    expect(screen.getByText('已升级', { selector: '.cgc-st' })).toBeTruthy();
     expect(screen.getByText('失败 · 原版本运行', { selector: '.cgc-st' })).toBeTruthy();
     // 失败原因写在机器名下；进行中不能再勾选新的机器。
     expect(screen.getByText('启动检查失败')).toBeTruthy();
@@ -520,7 +552,11 @@ describe('Xray 升级', () => {
     expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
   });
 
-  it('把异常后自动恢复和强制退役成功与普通成功分开显示', () => {
+  it.each([
+    [false, false],
+    [true, false],
+    [true, true],
+  ])('强制退役=%s、恢复=%s 的成功统一显示绿色已升级，真实异常恢复仍保留说明', (forced, recovered) => {
     const release: BinaryRelease = {
       id: 20,
       component: 'xray',
@@ -551,8 +587,8 @@ describe('Xray 升级', () => {
           reported_service_enabled: true,
           reported_installed_sha256: NEXT,
           reported_running_sha256: NEXT,
-          reported_forced_retirement: true,
-          recovered_after_dirty: false,
+          reported_forced_retirement: forced,
+          recovered_after_dirty: recovered,
           verification: 'receipt',
           retryable: false,
           dispatched_at: '2026-10-15T00:00:10Z',
@@ -599,11 +635,43 @@ describe('Xray 升级', () => {
       ],
     };
 
-    mount({ ...emptyView(), current: release });
+    const nodeView = {
+      nodes: nodes.nodes.map(node =>
+        node.node_id === 'edge-a'
+          ? {
+              ...node,
+              xray_upgrade: {
+                release_id: 20,
+                attempt: 1,
+                strategy: 'handoff-force' as const,
+                phase: 'blocked' as const,
+                old: {
+                  pid: 101,
+                  pid_start_ticks: 1001,
+                  boot_id: '01234567-89ab-cdef-0123-456789abcdef',
+                  sha256: OLD_A,
+                  alive: true,
+                  accepting: false,
+                  active_connections: 4,
+                },
+                blocked_reason: '旧代仍有 4 条连接，继续保留并等待自然排空',
+              },
+            }
+          : node,
+      ),
+    };
+    mount({ ...emptyView(), current: release }, nodeView);
 
-    expect(screen.getByText('强制退役完成', { selector: '.cgc-st' })).toBeTruthy();
+    const upgraded = screen.getByText('已升级', { selector: '.cgc-st' });
+    expect(upgraded.closest('.cgc-tr')?.classList.contains('ok')).toBe(true);
+    const ledger = screen.getByRole('region', { name: '已升级' });
+    expect(within(ledger).getByText('已升级', { selector: 'dt' }).closest('div')?.classList.contains('cgc-io-ok')).toBe(
+      true,
+    );
+    expect(screen.queryByText('强制退役完成')).toBeNull();
     expect(screen.getByText('自动恢复完成', { selector: '.cgc-st' })).toBeTruthy();
-    expect(screen.getByText(/旧进程未在等待期内自然排空/)).toBeTruthy();
+    expect(screen.queryByText(/旧进程未在等待期内自然排空/)).toBeNull();
+    expect(screen.queryByText(/旧代仍有 4 条连接/)).toBeNull();
     expect(screen.getByText(/Agent 随后完成本地恢复/)).toBeTruthy();
   });
 

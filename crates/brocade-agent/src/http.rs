@@ -29,6 +29,10 @@ use std::{
 
 use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
+mod response;
+#[cfg(test)]
+pub(crate) use response::{decode_chunked_body, parse_http_response};
+
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -291,36 +295,7 @@ impl HttpClient {
             .write_all(body.bytes)
             .map_err(|error| error.to_string())?;
 
-        let mut raw = Vec::new();
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let read = match stream.read(&mut buffer) {
-                Ok(read) => read,
-                // rustls reports UnexpectedEof when the peer drops the connection
-                // without sending close_notify, which is common under
-                // `Connection: close` (on the plaintext path the kernel just
-                // hands up an EOF and the two are indistinguishable). Treat it as
-                // end of response: whether the response is complete is decided by
-                // the parsing below, which rejects a missing `\r\n\r\n` and a
-                // truncated chunked body — the same bar as the plaintext path.
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error.to_string()),
-            };
-            if read == 0 {
-                break;
-            }
-            let new_len = raw
-                .len()
-                .checked_add(read)
-                .ok_or("HTTP response length overflow")?;
-            if new_len > MAX_HTTP_RESPONSE_BYTES {
-                return Err(format!(
-                    "HTTP response exceeds {MAX_HTTP_RESPONSE_BYTES} byte limit"
-                ));
-            }
-            raw.extend_from_slice(&buffer[..read]);
-        }
-        parse_http_response(&raw)
+        response::read_response(&mut stream, method)
     }
 
     pub(crate) fn connect(&self) -> Result<TcpStream, String> {
@@ -539,86 +514,6 @@ impl HttpResponse {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
-    }
-}
-
-pub(crate) fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
-    if raw.len() > MAX_HTTP_RESPONSE_BYTES {
-        return Err(format!(
-            "HTTP response exceeds {MAX_HTTP_RESPONSE_BYTES} byte limit"
-        ));
-    }
-    let header_end = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or("HTTP response missing header terminator")?;
-    let head = String::from_utf8_lossy(&raw[..header_end]);
-    let mut body = raw[header_end + 4..].to_vec();
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or("HTTP response missing status")?
-        .parse::<u16>()
-        .map_err(|_| "HTTP response has invalid status".to_owned())?;
-    let headers = head
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
-        .collect::<BTreeMap<_, _>>();
-    let transfer_encoding = headers
-        .get("transfer-encoding")
-        .map(|value| value.to_ascii_lowercase());
-    if transfer_encoding
-        .as_deref()
-        .is_some_and(|value| value.split(',').any(|part| part.trim() == "chunked"))
-    {
-        body = decode_chunked_body(&body)?;
-    }
-    Ok(HttpResponse {
-        status,
-        body: String::from_utf8(body).map_err(|error| error.to_string())?,
-        headers,
-    })
-}
-
-pub(crate) fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, String> {
-    let mut decoded = Vec::new();
-    loop {
-        let line_end = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or("chunked response missing chunk size")?;
-        let size_line =
-            std::str::from_utf8(&body[..line_end]).map_err(|error| error.to_string())?;
-        let size_text = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|_| "chunked response has invalid chunk size".to_owned())?;
-        body = &body[line_end + 2..];
-        if size == 0 {
-            return Ok(decoded);
-        }
-        let new_len = decoded
-            .len()
-            .checked_add(size)
-            .ok_or("chunked response body length overflow")?;
-        if new_len > MAX_HTTP_RESPONSE_BYTES {
-            return Err(format!(
-                "chunked response body exceeds {MAX_HTTP_RESPONSE_BYTES} byte limit"
-            ));
-        }
-        let chunk_with_crlf = size
-            .checked_add(2)
-            .ok_or("chunked response chunk size overflow")?;
-        if body.len() < chunk_with_crlf {
-            return Err("chunked response ended inside a chunk".to_owned());
-        }
-        decoded.extend_from_slice(&body[..size]);
-        if &body[size..size + 2] != b"\r\n" {
-            return Err("chunked response chunk missing trailing CRLF".to_owned());
-        }
-        body = &body[size + 2..];
     }
 }
 
@@ -926,7 +821,7 @@ mod tests {
         for head in [
             "Transfer-Encoding: chunked",
             "transfer-encoding: Chunked",
-            "Transfer-Encoding:  gzip, chunked ",
+            "Transfer-Encoding:  chunked ",
         ] {
             let raw = format!("HTTP/1.1 200 OK\r\n{head}\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
             let response = parse_http_response(raw.as_bytes()).unwrap();

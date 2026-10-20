@@ -82,8 +82,35 @@ struct TestPg {
     url: String,
 }
 
+#[path = "cases/node_initialization.rs"]
+mod node_initialization_tests;
+
+#[path = "cases/unattended_deployment.rs"]
+mod unattended_deployment_tests;
+
+#[path = "cases/xray_handoff_beta.rs"]
+mod xray_handoff_beta_tests;
+
 #[path = "cases/forwarding_quota.rs"]
 mod forwarding_quota_tests;
+
+#[path = "cases/validation_limits.rs"]
+mod validation_limits_tests;
+
+#[path = "cases/node_outflow.rs"]
+mod node_outflow_tests;
+
+#[path = "cases/detail_checkpoints.rs"]
+mod detail_checkpoint_tests;
+
+#[path = "cases/node_inflow_sources.rs"]
+mod node_inflow_source_tests;
+
+#[path = "cases/node_traffic_history.rs"]
+mod node_traffic_history_tests;
+
+#[path = "cases/deployment_artifact_preview.rs"]
+mod deployment_artifact_preview_tests;
 
 impl TestPg {
     async fn start_if_enabled() -> Option<Self> {
@@ -5833,13 +5860,34 @@ async fn xray_handoff_release_requires_live_readiness_and_freezes_its_strategy()
     .await
     .unwrap();
     request.idempotency_key = "handoff-gate-ready".to_owned();
+    assert!(matches!(
+        db.store.create_xray_release(&system_admin(), request.clone(), build).await,
+        Err(StoreError::InvalidData(message)) if message.contains("Beta")
+    ));
+    sqlx::query("UPDATE control_state SET xray_handoff_beta=TRUE")
+        .execute(db.pool())
+        .await
+        .unwrap();
     let release = db
         .store
-        .create_xray_release(&system_admin(), request, build)
+        .create_xray_release(&system_admin(), request.clone(), build)
         .await
         .unwrap();
     assert_eq!(release.xray_strategy, Some(XrayReleaseStrategy::Handoff));
     assert_eq!(release.xray_drain_timeout_secs, Some(300));
+    sqlx::query("UPDATE control_state SET xray_handoff_beta=FALSE")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let repeated = db
+        .store
+        .create_xray_release(&system_admin(), request, build)
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated.id, release.id,
+        "disabling Beta does not revoke an existing approval"
+    );
     let offer = db
         .store
         .claim_xray_release("n1", "x86_64", &build_id)
@@ -5931,6 +5979,10 @@ async fn xray_handoff_release_requires_live_readiness_and_freezes_its_strategy()
         XrayReleaseStatus::Succeeded
     );
 
+    sqlx::query("UPDATE control_state SET xray_handoff_beta=TRUE")
+        .execute(db.pool())
+        .await
+        .unwrap();
     let recovery_release = db
         .store
         .create_xray_release(
@@ -8672,7 +8724,32 @@ async fn connection_policy_bounds_hold_on_both_the_node_and_the_settings() {
         .unwrap_err();
     assert!(matches!(error, StoreError::InvalidData(_)), "{error:?}");
 
-    // Handshake has no per-node column, and its own bound is enforced here.
+    // Short idle timers and long waits are valid even outside the former recommended range.
+    db.store
+        .update_node(
+            &system_admin(),
+            "n1",
+            UpdateNodeRequest {
+                connection: Some(NodeConnection {
+                    conn_idle_secs: Some(1),
+                    uplink_only_secs: Some(7200),
+                    downlink_only_secs: Some(7200),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut extended = settings.clone();
+    extended.connection.conn_idle_secs = 3 * 86400;
+    extended.connection.handshake_secs = 1200;
+    db.store
+        .update_settings(&system_admin(), extended)
+        .await
+        .unwrap();
+
+    // Handshake has no per-node column, and its positive interval is enforced here.
     let error = db
         .store
         .update_settings(
@@ -9108,7 +9185,8 @@ async fn visitor_access_can_be_enabled_disabled_and_enabled_again() {
     .execute(db.pool())
     .await
     .unwrap();
-    db.store
+    let administrator = db
+        .store
         .init_admin(AdminInitRequest {
             operator_id: "admin".to_owned(),
             display_name: "管理员".to_owned(),
@@ -9116,6 +9194,7 @@ async fn visitor_access_can_be_enabled_disabled_and_enabled_again() {
         })
         .await
         .unwrap();
+    assert!(db.store.public_identity().await.unwrap().is_none());
 
     let enabled = db
         .store
@@ -9123,39 +9202,65 @@ async fn visitor_access_can_be_enabled_disabled_and_enabled_again() {
         .await
         .unwrap();
     assert!(enabled.public_open);
-    let scope: String =
-        sqlx::query_scalar("SELECT tenant_scope FROM admin_operators WHERE id = 'public'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(scope, "platform");
+    let sessions_before: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_sessions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        let visitor = db.store.public_identity().await.unwrap().unwrap();
+        assert_eq!(visitor.operator_id, "public");
+        assert_eq!(visitor.role, AdminRole::Readonly);
+        assert_eq!(visitor.tenant_scope.as_deref(), Some("platform"));
+        assert!(visitor.token_prefix.is_none());
+        assert!(visitor.self_user.is_none());
+    }
+    let sessions_after: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_sessions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions_after, sessions_before);
     let tenants = db.store.list_tenants(&system_admin()).await.unwrap();
     assert!(tenants
         .tenants
         .iter()
         .all(|tenant| tenant.operator_count == 1));
 
-    let login = db
+    let legacy_token = "legacy-public-session-test-only";
+    sqlx::query(
+        "INSERT INTO admin_sessions (token_hash, operator_id, expires_at)
+         VALUES ($1, 'public', now() + interval '1 hour')",
+    )
+    .bind(brocade_store::admin_session_token_hash(legacy_token))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(db
         .store
-        .login_admin(AdminLoginRequest {
-            operator_id: "public".to_owned(),
-            password: String::new(),
-        })
+        .authenticate_admin_session(legacy_token)
         .await
-        .unwrap();
+        .unwrap()
+        .is_none());
+    db.store.migrate().await.unwrap();
+    let legacy_sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM admin_sessions WHERE operator_id = 'public'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(legacy_sessions, 0);
+    assert!(db
+        .store
+        .authenticate_admin_session(&administrator.session.token)
+        .await
+        .unwrap()
+        .is_some());
+
     let disabled = db
         .store
         .set_public_access(&system_admin(), false)
         .await
         .unwrap();
     assert!(!disabled.public_open);
-    assert!(db
-        .store
-        .authenticate_admin_session(&login.session.token)
-        .await
-        .unwrap()
-        .is_none());
-
+    assert!(db.store.public_identity().await.unwrap().is_none());
     assert!(db
         .store
         .set_public_access(&tenant_admin("platform"), true)
@@ -9168,6 +9273,7 @@ async fn visitor_access_can_be_enabled_disabled_and_enabled_again() {
             .unwrap()
             .public_open
     );
+    assert!(db.store.public_identity().await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -10099,11 +10205,9 @@ async fn user_direct_login_requires_uuid_and_rotating_token_invalidates_the_old_
     );
 }
 
-/// Passwordless login is a named public surface, never a property that can be attached to an
-/// arbitrary operator or privileged role.
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn only_the_public_readonly_operator_can_log_in_without_a_password() {
+async fn stateless_visitors_cannot_log_in_or_hold_api_tokens() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -10112,24 +10216,13 @@ async fn only_the_public_readonly_operator_can_log_in_without_a_password() {
         .execute(db.pool())
         .await
         .unwrap();
-
-    let created = db
-        .store
-        .create_admin_operator(
-            &system_admin(),
-            CreateAdminOperatorRequest {
-                id: "public".to_owned(),
-                display_name: "Public".to_owned(),
-                role: AdminRole::Readonly,
-                tenant_scope: Some("platform.acme".to_owned()),
-                password: None,
-            },
-        )
+    db.store
+        .set_public_access(&system_admin(), true)
         .await
         .unwrap();
-    assert!(created.passwordless);
+    assert!(db.store.public_identity().await.unwrap().is_some());
 
-    // The schema enforces the same invariant against direct SQL writes.
+    // The visitor configuration remains the only non-user identity without a password.
     let invalid = sqlx::query(
         "INSERT INTO admin_operators (id, display_name, role, tenant_scope, password_hash)
          VALUES ('passwordless-editor', 'Passwordless Editor', 'editor', 'platform.acme', NULL)",
@@ -10137,67 +10230,51 @@ async fn only_the_public_readonly_operator_can_log_in_without_a_password() {
     .execute(db.pool())
     .await;
     assert!(invalid.is_err());
+    for password in ["", "whatever"] {
+        let denied = db
+            .store
+            .login_admin(AdminLoginRequest {
+                operator_id: "public".to_owned(),
+                password: password.to_owned(),
+            })
+            .await;
+        assert!(matches!(denied, Err(StoreError::Unauthorized(_))));
+    }
+    let denied = db.store.issue_admin_token(&system_admin(), "public").await;
+    assert!(matches!(denied, Err(StoreError::Forbidden(_))));
+    let legacy_token = "legacy-public-api-token-test-only";
+    sqlx::query("UPDATE admin_operators SET token_hash = $1 WHERE id = 'public'")
+        .bind(brocade_store::admin_token_hash(legacy_token))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .authenticate_admin_token(legacy_token)
+        .await
+        .unwrap()
+        .is_none());
 
-    let session = db
+    // A credential accidentally assigned to the reserved identity must not enable account login.
+    sqlx::query("UPDATE admin_operators SET password_hash = 'fixture' WHERE id = 'public'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(!db.store.admin_auth_state().await.unwrap().public_open);
+    assert!(db.store.public_identity().await.unwrap().is_none());
+    let denied = db
         .store
         .login_admin(AdminLoginRequest {
             operator_id: "public".to_owned(),
-            password: String::new(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(session.admin.role, AdminRole::Readonly);
-
-    // Passwordless does not mean accepting anything: a password typed at random still does not
-    // get in, or the login form is decorative
-    let wrong = db
-        .store
-        .login_admin(AdminLoginRequest {
-            operator_id: "public".to_owned(),
-            password: "whatever".to_owned(),
-        })
-        .await;
-    assert!(matches!(wrong, Err(StoreError::Unauthorized(_))));
-
-    // A passwordless account setting its own password leaves the current one blank — requiring
-    // it to supply a current password first would leave such an account unable to ever set
-    // one.
-    db.store
-        .change_admin_password(
-            "public",
-            None,
-            ChangeAdminPasswordRequest {
-                current_password: String::new(),
-                new_password: "set-by-myself".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-
-    // Once set it is no longer passwordless: an empty password no longer gets in, and the
-    // passwordless warning badge in the list should come down
-    let listed = db
-        .store
-        .list_admin_operators(&system_admin())
-        .await
-        .unwrap();
-    let public = listed.iter().find(|o| o.id == "public").unwrap();
-    assert!(!public.passwordless);
-    let empty_denied = db
-        .store
-        .login_admin(AdminLoginRequest {
-            operator_id: "public".to_owned(),
-            password: String::new(),
+            password: "fixture".to_owned(),
         })
         .await;
-    assert!(matches!(empty_denied, Err(StoreError::Unauthorized(_))));
-    db.store
-        .login_admin(AdminLoginRequest {
-            operator_id: "public".to_owned(),
-            password: "set-by-myself".to_owned(),
-        })
+    assert!(matches!(denied, Err(StoreError::Unauthorized(_))));
+    let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_sessions")
+        .fetch_one(db.pool())
         .await
         .unwrap();
+    assert_eq!(sessions, 0);
 }
 
 #[tokio::test]
@@ -13165,6 +13242,17 @@ async fn load_desired_for_node_gates_later_waves_until_current_wave_finishes() {
     insert_second_node(db.pool()).await;
     let admin = system_admin();
 
+    db.store
+        .update_deployment_settings(
+            &admin,
+            brocade_store::UpdateDeploymentSettings {
+                unattended: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
     let created = db
         .store
         .create_deployment(&admin, create_deployment_request(1, "desired-waves"))
@@ -14060,8 +14148,21 @@ async fn sniffing_failed_usage_is_bounded_idempotent_and_operator_scoped() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     let policy = db.store.sniffing_failed_policy().await.unwrap();
-    assert!(!db.store.other_domain_policy().await.unwrap().enabled);
-    assert_eq!(policy, SniffingFailedPolicy::default());
+    assert!(db.store.other_domain_policy().await.unwrap().enabled);
+    assert_eq!(
+        policy,
+        SniffingFailedPolicy {
+            enabled: true,
+            ..Default::default()
+        }
+    );
+    db.store
+        .update_site_usage_policy(
+            &system_admin(),
+            brocade_deployment::site_usage::SiteUsagePolicy { enabled: false },
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         db.store
             .update_sniffing_failed_policy(
@@ -14108,6 +14209,7 @@ async fn sniffing_failed_usage_is_bounded_idempotent_and_operator_scoped() {
     let generation =
         install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
     let row = |domain: &str, up, down| SniffingFailedCounter {
+        counter_id: 0,
         bucket: base / 3600 * 3600,
         label: "alice@platform.acme#ing-a1b2".into(),
         target: domain.into(),
@@ -14254,7 +14356,13 @@ async fn sniffing_failed_usage_is_bounded_idempotent_and_operator_scoped() {
         .await
         .is_err());
     db.store
-        .update_sniffing_failed_policy(&system_admin(), policy)
+        .update_sniffing_failed_policy(
+            &system_admin(),
+            SniffingFailedPolicy {
+                enabled: false,
+                ..policy
+            },
+        )
         .await
         .unwrap();
     report.counters.clear();
@@ -14314,7 +14422,7 @@ async fn sniffing_failed_compatibility_script_preserves_default_off_and_ownershi
     let owners:Vec<String>=sqlx::query_scalar("SELECT tableowner FROM pg_tables WHERE schemaname='public' AND tablename IN ('user_sniffing_failed_hourly','sniffing_failed_counter_heads','node_sniffing_failed_state')")
         .fetch_all(db.pool()).await.unwrap();
     assert_eq!(owners, vec!["observation_app"; 3]);
-    assert!(!db.store.other_domain_policy().await.unwrap().enabled);
+    assert!(db.store.other_domain_policy().await.unwrap().enabled);
 }
 
 #[tokio::test]
@@ -14329,7 +14437,20 @@ async fn other_domain_usage_is_bounded_idempotent_and_operator_scoped() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     let policy = db.store.other_domain_policy().await.unwrap();
-    assert_eq!(policy, OtherDomainPolicy::default());
+    assert_eq!(
+        policy,
+        OtherDomainPolicy {
+            enabled: true,
+            ..Default::default()
+        }
+    );
+    db.store
+        .update_site_usage_policy(
+            &system_admin(),
+            brocade_deployment::site_usage::SiteUsagePolicy { enabled: false },
+        )
+        .await
+        .unwrap();
     assert!(matches!(
         db.store
             .update_other_domain_policy(
@@ -14376,6 +14497,7 @@ async fn other_domain_usage_is_bounded_idempotent_and_operator_scoped() {
     let generation =
         install_usage_generation(db.pool(), "n1", alice_usage_bindings(), base - 60).await;
     let row = |domain: &str, up, down| OtherDomainCounter {
+        counter_id: 0,
         bucket: base / 3600 * 3600,
         label: "alice@platform.acme#ing-a1b2".into(),
         domain: domain.into(),
@@ -14531,7 +14653,13 @@ async fn other_domain_usage_is_bounded_idempotent_and_operator_scoped() {
         .await
         .is_err());
     db.store
-        .update_other_domain_policy(&system_admin(), policy)
+        .update_other_domain_policy(
+            &system_admin(),
+            OtherDomainPolicy {
+                enabled: false,
+                ..policy
+            },
+        )
         .await
         .unwrap();
     report.counters.clear();
@@ -14565,13 +14693,32 @@ async fn other_domain_usage_is_bounded_idempotent_and_operator_scoped() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn geodata_schedule_descriptors_are_not_blocked_by_the_database() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    for cron in ["@daily", "CRON_TZ=UTC @weekly", "@every 12h"] {
+        let stored: String = sqlx::query_scalar(
+            "UPDATE control_state SET geodata_cron=$1 WHERE id=TRUE RETURNING geodata_cron",
+        )
+        .bind(cron)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored, cron);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn user_site_usage_is_idempotent_non_billable_and_operator_scoped() {
     use brocade_deployment::site_usage::{SiteUsageCounter, SiteUsageReport};
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
     db.store.migrate().await.unwrap();
-    assert!(!db.store.site_usage_policy().await.unwrap().enabled);
+    assert!(db.store.site_usage_policy().await.unwrap().enabled);
     assert!(matches!(
         db.store
             .update_site_usage_policy(
@@ -14818,12 +14965,22 @@ async fn user_site_usage_is_idempotent_non_billable_and_operator_scoped() {
         limited: false,
         counters: vec![site("unknown-domain.example", 10, 10)],
     });
-    assert!(db.store.record_usage_report("n1", invalid).await.is_err());
+    let accepted = db.store.record_usage_report("n1", invalid).await.unwrap();
+    assert!(
+        !accepted.duplicate,
+        "optional categories must not block billing"
+    );
+    assert_eq!(accepted.accepted_readings, 1);
+    assert_eq!(accepted.inserted_samples, 1);
     let legacy = current_usage(generation, 4, base + 90, "boot-a:100", 40, 80);
-    db.store
-        .record_usage_report("n1", legacy.clone())
-        .await
-        .unwrap();
+    assert!(
+        db.store
+            .record_usage_report("n1", legacy.clone())
+            .await
+            .unwrap()
+            .duplicate,
+        "billing identity excludes optional observations"
+    );
     let mut lost_ack = legacy;
     lost_ack.site_usage = Some(SiteUsageReport {
         activation_id: None,
@@ -16853,7 +17010,7 @@ async fn a_grants_deployment_carries_no_config_for_the_agent_to_apply() {
 
     let desired = db
         .store
-        .claim_desired_for_node("n1")
+        .claim_desired_for_node_with_protocol("n1", 36)
         .await
         .unwrap()
         .expect("权限单该派得下来");
@@ -17800,21 +17957,13 @@ async fn report_target_success_advances_waves_and_final_success_releases_active(
     assert_eq!(first.target_status, "succeeded");
     assert_eq!(first.deployment_status, "running");
 
+    assert!(db.store.deployment_settings().await.unwrap().unattended);
     assert!(db
         .store
-        .claim_desired_for_node("n2")
+        .load_desired_for_node("n2")
         .await
         .unwrap()
-        .is_none());
-    db.store
-        .confirm_deployment_wave(
-            &system_admin(),
-            created.deployment_id,
-            2,
-            Some("tester".to_owned()),
-        )
-        .await
-        .unwrap();
+        .is_some());
 
     let n2 = db
         .store
@@ -19066,11 +19215,23 @@ async fn migration_enforces_reality_client_policy_shape() {
     .await;
     assert!(bad_range.is_err(), "min > max should fail");
 
+    for accepted in [
+        86_400_001_u64,
+        brocade_core::model::MAX_REALITY_TIME_DIFF_MS,
+    ] {
+        let accepted = i64::try_from(accepted).unwrap();
+        sqlx::query("UPDATE control_state SET reality_max_time_diff_ms=$1 WHERE id=TRUE")
+            .bind(accepted)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
     let bad_time = sqlx::query(
         "UPDATE control_state
-         SET reality_max_time_diff_ms = 86400001
+         SET reality_max_time_diff_ms = $1
          WHERE id = TRUE",
     )
+    .bind(i64::try_from(brocade_core::model::MAX_REALITY_TIME_DIFF_MS + 1).unwrap())
     .execute(db.pool())
     .await;
     assert!(bad_time.is_err(), "excessive max time diff should fail");

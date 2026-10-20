@@ -19,8 +19,8 @@ const LABELS: Record<ForwardingTcpPingResult['code'], string> = {
   'dns-busy': 'DNS 正忙，请重试',
   'dns-empty': 'DNS 未返回地址',
   'address-blocked': '目标不符合入口的网络授权',
-  'connect-failed': 'TCP 建连失败',
-  timeout: 'TCP Ping 超时',
+  'connect-failed': 'TCP 建连失败，请检查远程 TCP 监听和网络连通性',
+  timeout: '超时或远程地址非 TCP 监听',
   'agent-upgrade-required': '入口 Agent 需升级后才能执行 TCP Ping',
 };
 

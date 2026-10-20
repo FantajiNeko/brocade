@@ -35,6 +35,142 @@ const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn distribution_exposes_xray_source_revision_separately_from_install_version() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let (app, token) = admin_app(&db).await;
+    let (status, view) = get_json(&app, &token, "/distribution").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        view["xray_source_revision"],
+        env!("BROCADE_XRAY_SOURCE_REVISION")
+    );
+    assert_eq!(
+        view["effective"]["xray_version"],
+        brocade_console::http::BROCADE_XRAY_VERSION
+    );
+    assert_ne!(
+        view["xray_source_revision"],
+        view["effective"]["xray_version"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn deployment_settings_api_defaults_to_unattended_and_requires_system_admin_to_write() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform', 'Platform')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (app, token) = admin_app(&db).await;
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::get("/deployment-settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!unauthenticated.status().is_success());
+    assert_eq!(
+        get_json(&app, &token, "/deployment-settings").await,
+        (
+            StatusCode::OK,
+            json!({"unattended": true, "xray_handoff_beta": false})
+        )
+    );
+    assert_eq!(
+        put_json(
+            &app,
+            &token,
+            "/deployment-settings",
+            json!({"unattended": false})
+        )
+        .await,
+        (
+            StatusCode::OK,
+            json!({"unattended": false, "xray_handoff_beta": false})
+        )
+    );
+    assert_eq!(
+        get_json(&app, &token, "/deployment-settings").await.1,
+        json!({"unattended": false, "xray_handoff_beta": false})
+    );
+    assert_eq!(
+        put_json(
+            &app,
+            &token,
+            "/deployment-settings",
+            json!({"xray_handoff_beta":true})
+        )
+        .await,
+        (
+            StatusCode::OK,
+            json!({"unattended":false,"xray_handoff_beta":true})
+        )
+    );
+    assert_eq!(
+        put_json(
+            &app,
+            &token,
+            "/deployment-settings",
+            json!({"unattended":false})
+        )
+        .await
+        .1,
+        json!({"unattended":false,"xray_handoff_beta":true}),
+        "legacy clients cannot clear Beta by saving another field"
+    );
+    let invalid = app
+        .clone()
+        .oneshot(
+            Request::put("/deployment-settings")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"unattended":"true"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let created = post_json(&app, &token, "/admin/operators", json!({"id":"deploy-reader","display_name":"Reader","role":"readonly","password":"deployment-test-password-only","tenant_scope":"platform"})).await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let issued = post_json(
+        &app,
+        &token,
+        "/admin/operators/deploy-reader/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED);
+    let reader = issued.1["token"].as_str().unwrap();
+    assert_eq!(
+        get_json(&app, reader, "/deployment-settings").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_json(
+            &app,
+            reader,
+            "/deployment-settings",
+            json!({"unattended": true})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!db.store.deployment_settings().await.unwrap().unattended);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn data_retention_api_lists_only_bounded_tables_and_updates_without_a_revision() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -97,7 +233,7 @@ async fn data_retention_api_lists_only_bounded_tables_and_updates_without_a_revi
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn sniffing_failed_api_is_operator_scoped_default_off_and_never_cached() {
+async fn sniffing_failed_api_is_operator_scoped_default_on_and_never_cached() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -116,7 +252,7 @@ async fn sniffing_failed_api_is_operator_scoped_default_off_and_never_cached() {
     assert!(!response.status().is_success());
     let (status, policy) = get_json(&app, &token, "/sniffing-failed/settings").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(policy["enabled"], false);
+    assert_eq!(policy["enabled"], true);
     assert_eq!(policy["top_n"], 128);
     assert_eq!(policy["max_targets_per_user"], 1024);
     let response = app
@@ -199,6 +335,8 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
     assert!(!response.status().is_success(), "anonymous is refused");
     for path in [
         "/nodes/n1/inflow-usage?period=week",
+        "/nodes/n1/traffic-history?period=week",
+        "/nodes/n1/inflow-details?tenant_id=platform.acme&user_id=alice",
         "/nodes/n1/site-usage?period=month",
         "/nodes/n1/other-domains?period=day",
         "/nodes/n1/sniffing-failed-targets",
@@ -224,6 +362,25 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sites["bucket_secs"], 86_400);
     assert!(sites["series"].is_array() && sites["top_users"].is_array());
+    let end: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint / 30 * 30")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for suffix in [
+        "inflow-usage",
+        "traffic-history",
+        "inflow-details?tenant_id=platform.acme&user_id=alice",
+    ] {
+        let separator = if suffix.contains('?') { '&' } else { '?' };
+        let path = format!(
+            "/nodes/n1/{suffix}{separator}start_unix_secs={}&end_unix_secs={end}",
+            end - 300
+        );
+        let (status, body) = get_json(&app, &token, &path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body["range_start_unix_secs"], end - 300);
+        assert_eq!(body["range_end_unix_secs"], end);
+    }
     assert_eq!(
         get_json(&app, &token, "/nodes/missing/inflow-usage")
             .await
@@ -232,6 +389,8 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
     );
     for path in [
         "/nodes/n1/inflow-usage?period=year",
+        "/nodes/n1/traffic-history?period=year",
+        "/nodes/n1/traffic-history?start_unix_secs=300",
         "/nodes/n1/site-usage?period=",
     ] {
         let response = app
@@ -252,9 +411,10 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
             .0,
         StatusCode::OK
     );
-    let public_cookie = login_cookie(&app, "public", "").await;
     for private_path in [
         "/nodes/n1/inflow-usage",
+        "/nodes/n1/traffic-history",
+        "/nodes/n1/inflow-details?tenant_id=platform.acme&user_id=alice",
         "/nodes/n1/site-usage",
         "/nodes/n1/other-domains",
         "/nodes/n1/sniffing-failed-targets",
@@ -264,9 +424,7 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
         "/users/platform.acme/alice/sniffing-failed-targets",
     ] {
         assert_eq!(
-            get_json_with_cookie(&app, private_path, &public_cookie)
-                .await
-                .0,
+            get_json_without_credentials(&app, private_path).await.0,
             StatusCode::FORBIDDEN,
             "visitor cannot read {private_path}"
         );
@@ -290,7 +448,11 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
         .await;
         assert_eq!(issued.0, StatusCode::CREATED);
         let scoped = issued.1["token"].as_str().unwrap();
-        for path in ["/nodes/n1/inflow-usage", "/nodes/n1/site-usage"] {
+        for path in [
+            "/nodes/n1/inflow-usage",
+            "/nodes/n1/traffic-history",
+            "/nodes/n1/site-usage",
+        ] {
             assert_eq!(
                 get_json(&app, scoped, path).await.0,
                 StatusCode::OK,
@@ -302,7 +464,7 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn other_domain_api_is_operator_scoped_default_off_and_never_cached() {
+async fn other_domain_api_is_operator_scoped_default_on_and_never_cached() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -321,7 +483,7 @@ async fn other_domain_api_is_operator_scoped_default_off_and_never_cached() {
     assert!(!response.status().is_success());
     let (status, policy) = get_json(&app, &token, "/other-domain/settings").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(policy["enabled"], false);
+    assert_eq!(policy["enabled"], true);
     assert_eq!(policy["top_n"], 128);
     assert_eq!(policy["max_domains_per_user"], 1024);
     let response = app
@@ -947,8 +1109,7 @@ async fn proxycheck_credential_http_api_returns_only_masked_keys_to_system_admin
     }
     let enabled = put_json(&app, &token, "/visitor-access", json!({ "enabled": true })).await;
     assert_eq!(enabled.0, StatusCode::OK);
-    let visitor_cookie = login_cookie(&app, "public", "").await;
-    let visitor = get_json_with_cookie(&app, "/vpngate", &visitor_cookie).await;
+    let visitor = get_json_without_credentials(&app, "/vpngate").await;
     assert_eq!(visitor.0, StatusCode::OK);
     assert_eq!(
         visitor.1["intelligence_credentials"],
@@ -1309,7 +1470,7 @@ async fn initial_html_uses_current_branding_without_default_title_flash() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn http_warp_binding_route_updates_endpoint_and_rejects_removed_options() {
+async fn http_warp_binding_route_updates_endpoint_and_ignores_additional_options() {
     std::env::set_var(
         brocade_store::secrets::SECRET_KEY_ENV,
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -1408,7 +1569,7 @@ async fn http_warp_binding_route_updates_endpoint_and_rejects_removed_options() 
     let updated = response_json(updated).await;
     assert_eq!(updated["binding"]["endpoint_address"], "162.159.193.10");
     assert_eq!(updated["binding"]["endpoint_port"], 500);
-    let removed_option = app
+    let additional_option = app
         .clone()
         .oneshot(
             Request::put(uri)
@@ -1419,7 +1580,13 @@ async fn http_warp_binding_route_updates_endpoint_and_rejects_removed_options() 
         )
         .await
         .unwrap();
-    assert_eq!(removed_option.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(additional_option.status(), StatusCode::OK);
+    let additional_option = response_json(additional_option).await;
+    assert_eq!(
+        additional_option["binding"]["endpoint_address"],
+        Value::Null
+    );
+    assert_eq!(additional_option["binding"]["endpoint_port"], Value::Null);
     let blank_address = app
         .clone()
         .oneshot(
@@ -2008,9 +2175,8 @@ async fn fleet_realtime_allows_public_rates_and_scopes_signed_in_operators() {
             .0,
         StatusCode::OK
     );
-    let cookie = login_cookie(&app, "public", "").await;
     let path = "/realtime/fleet-traffic/snapshot";
-    let public = get_json_with_cookie(&app, path, &cookie).await;
+    let public = get_json_without_credentials(&app, path).await;
     assert_eq!(public.0, StatusCode::OK);
     assert_eq!(public.1["expected"].as_array().unwrap().len(), 1);
 
@@ -2148,7 +2314,7 @@ async fn fleet_realtime_allows_public_rates_and_scopes_signed_in_operators() {
         .await
         .unwrap();
 
-    let public = get_json_with_cookie(&app, path, &cookie).await;
+    let public = get_json_without_credentials(&app, path).await;
     assert_eq!(public.0, StatusCode::OK);
     assert_eq!(public.1["expected"].as_array().unwrap().len(), 1);
     assert_eq!(
@@ -2272,7 +2438,6 @@ async fn fleet_realtime_allows_public_rates_and_scopes_signed_in_operators() {
         .clone()
         .oneshot(
             Request::get("/realtime/fleet-traffic/events")
-                .header("cookie", &cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2297,13 +2462,13 @@ async fn fleet_realtime_allows_public_rates_and_scopes_signed_in_operators() {
     assert_no_private_fields(&streamed);
     drop(body);
     assert_eq!(
-        get_json_with_cookie(&app, "/realtime/settings", &cookie)
+        get_json_without_credentials(&app, "/realtime/settings")
             .await
             .0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        get_json_with_cookie(&app, "/users/platform.acme/alice/realtime/history", &cookie)
+        get_json_without_credentials(&app, "/users/platform.acme/alice/realtime/history")
             .await
             .0,
         StatusCode::FORBIDDEN
@@ -3738,9 +3903,8 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         .get("x-brocade-agent-upgrade-required")
         .is_none());
 
-    // Protocol v32 fails closed and can drain gracefully, but it cannot guarantee that an expired
-    // old generation is retired. Keep desired state withheld until the v33 Agent can make every
-    // configuration release use the bounded force policy by default.
+    // Older Agents would ignore the frozen policy and silently hand off with Beta disabled.
+    // Withhold desired work until v37 can obey the approved restart/handoff choice.
     let pre_handoff_only_protocol = agent
         .clone()
         .oneshot(
@@ -3750,9 +3914,8 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
                 .header("authorization", format!("Bearer {}", issued.token))
                 .header(
                     "x-brocade-protocol-version",
-                    (brocade_deployment::protocol::CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION
-                        - 1)
-                    .to_string(),
+                    (brocade_deployment::protocol::CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION - 1)
+                        .to_string(),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -4529,6 +4692,69 @@ async fn http_deployment_detail_includes_raw_state_and_opt_in_content() {
     assert!(body["targets"][0]["observed_before"]["xray"]
         .get("content")
         .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_deployment_artifact_preview_has_empty_new_baseline_and_restricts_source() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let revision: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id=TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let body = json!({"revision_id":revision});
+    let (status, preview) = post_json(
+        &app,
+        &token,
+        "/deployments/plan/artifacts?include=content",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(
+        preview["targets"][0]["observed_before"]["wireguard"]["state"],
+        "absent"
+    );
+    assert!(
+        preview["targets"][0]["desired_structure"]["wireguard"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("wg-private")
+    );
+    let created=post_json(&app,&token,"/admin/operators",json!({"id":"artifact-publisher","display_name":"Artifact publisher","role":"publisher","tenant_scope":"platform.acme","password":"artifact-test-password-only"})).await;
+    assert_eq!(created.0, StatusCode::CREATED);
+    let issued = post_json(
+        &app,
+        &token,
+        "/admin/operators/artifact-publisher/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED);
+    let publisher = issued.1["token"].as_str().unwrap();
+    let metadata = post_json(&app, publisher, "/deployments/plan/artifacts", body.clone()).await;
+    assert_eq!(metadata.0, StatusCode::OK);
+    assert!(!metadata.1.to_string().contains("wg-private"));
+    assert!(metadata.1["targets"][0]["desired_structure"]["wireguard"]
+        .get("content")
+        .is_none());
+    assert_eq!(
+        post_json(
+            &app,
+            publisher,
+            "/deployments/plan/artifacts?include=content",
+            body
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
 }
 
 /// Probing over the full HTTP path: the agent POSTs with a node token and the admin side reads back
@@ -5972,7 +6198,7 @@ async fn http_forwarding_tcp_ping_is_manual_scoped_fenced_and_shared_across_list
         .await
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
-    // An administrator cannot turn this into an arbitrary-address scanner either.
+    // Unknown members are ignored; they cannot replace the persisted destination, even for admins.
     let injected = app
         .clone()
         .oneshot(
@@ -5984,7 +6210,8 @@ async fn http_forwarding_tcp_ping_is_manual_scoped_fenced_and_shared_across_list
         )
         .await
         .unwrap();
-    assert_eq!(injected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(injected.status(), StatusCode::ACCEPTED);
+    assert_eq!(response_json(injected).await["id"], job);
     async fn claim(app: &Router, token: &str) -> Value {
         let response = app
             .clone()
@@ -6090,6 +6317,119 @@ async fn http_forwarding_tcp_ping_is_manual_scoped_fenced_and_shared_across_list
     assert_eq!(
         usage, 1,
         "Only the explicitly inserted quota fixture can affect usage"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_forwarding_public_overview_is_masked_and_read_only() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let base = "/users/platform.acme/alice";
+    let granted = put_json(
+        &app,
+        &token,
+        &format!("{base}/forwarding-nodes/n1"),
+        json!({
+            "enabled": true, "listen_port_start": 30000, "listen_port_end": 59999
+        }),
+    )
+    .await;
+    assert_eq!(granted.0, StatusCode::OK, "{}", granted.1);
+    let created = post_json(
+        &app,
+        &token,
+        &format!("{base}/forwarding"),
+        json!({
+            "node_id": "n1", "name": "Web target.example.net:18443", "protocol": "tcp",
+            "listen_port": 30442, "target_host": "target.example.net", "target_port": 18443,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let rule_id = created.1["rules"][0]["id"].as_i64().unwrap();
+    let admin_view = get_json(&app, &token, &format!("{base}/forwarding")).await;
+    assert_eq!(admin_view.0, StatusCode::OK);
+    assert_eq!(
+        admin_view.1["entitlements"][0]["public_ipv4"],
+        "n1.example.net"
+    );
+    assert_eq!(
+        admin_view.1["rules"][0]["target_host"],
+        "target.example.net"
+    );
+    assert_eq!(admin_view.1["rules"][0]["target_port"], 18443);
+    assert_eq!(
+        admin_view.1["rules"][0]["name"],
+        "Web target.example.net:18443"
+    );
+
+    assert_eq!(
+        put_json(&app, &token, "/visitor-access", json!({"enabled": true}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, view) = get_json_without_credentials(&app, &format!("{base}/forwarding")).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["tenant_id"], "platform.acme");
+    assert_eq!(view["user_id"], "alice");
+    assert_eq!(view["entitlements"][0]["public_ipv4"], "***.net");
+    assert_eq!(view["entitlements"][0]["listen_port_start"], "***");
+    assert_eq!(view["entitlements"][0]["listen_port_end"], "***");
+    assert_eq!(view["rules"][0]["id"], rule_id);
+    assert_eq!(view["rules"][0]["protocol"], "tcp");
+    assert_eq!(view["rules"][0]["runtime_status"], "pending");
+    assert_eq!(view["rules"][0]["uplink_bytes"], 0);
+    assert_eq!(view["rules"][0]["name"], "");
+    assert_eq!(view["rules"][0]["target_host"], "***.net");
+    assert_eq!(view["rules"][0]["listen_port"], "***");
+    assert_eq!(view["rules"][0]["target_port"], "***");
+    let encoded = view.to_string();
+    for secret in [
+        "n1.example.net",
+        "target.example.net",
+        "30442",
+        "18443",
+        "30000",
+        "59999",
+    ] {
+        assert!(!encoded.contains(secret), "{secret} leaked in {encoded}");
+    }
+    for (method, path) in [
+        ("POST", format!("{base}/forwarding")),
+        ("PUT", format!("{base}/forwarding/{rule_id}")),
+        ("DELETE", format!("{base}/forwarding/{rule_id}")),
+        ("PUT", format!("{base}/forwarding-nodes/n1")),
+        ("DELETE", format!("{base}/forwarding-nodes/n1")),
+        ("PUT", format!("{base}/forwarding-nodes/n1/quota")),
+        ("GET", format!("{base}/forwarding-nodes/n1/quota/jobs")),
+        ("POST", format!("{base}/forwarding/{rule_id}/tcp-ping")),
+        ("GET", format!("{base}/forwarding/tcp-pings")),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    let after = get_json(&app, &token, &format!("{base}/forwarding")).await;
+    assert_eq!(
+        after, admin_view,
+        "visitor reads and refused writes must not change forwarding state"
     );
 }
 
@@ -6315,13 +6655,16 @@ async fn http_forwarding_quota_routes_authorize_admins_and_expose_durable_jobs()
                 .header("authorization", format!("Bearer {token}"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"limit_bytes":100,"suspended":false}).to_string(),
+                    json!({"limit_bytes":100,"suspended":true}).to_string(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(unknown_field.status(), StatusCode::OK);
+    let unchanged = response_json(unknown_field).await;
+    assert_eq!(unchanged["entitlements"][0]["monthly_limit_bytes"], 100);
+    assert_eq!(unchanged["entitlements"][0]["quota_suspended"], false);
     let absent = app
         .clone()
         .oneshot(
@@ -6716,8 +7059,8 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
         "a2335a6d.huacu.io"
     );
 
-    // `public` 访客走相同的服务端边界。单独从访客 cookie 读一次，避免只证明普通 readonly
-    // 账号被遮住，却让真正的免密访客因为路由或中间件次序不同而拿到原值。
+    // `public` 访客走相同的服务端边界。单独从无凭据请求读一次，避免只证明普通 readonly
+    // 账号被遮住，却让真正的匿名访客因为路由或中间件次序不同而拿到原值。
     let visitor_enabled = put_json(
         &app,
         &admin_token,
@@ -6726,14 +7069,13 @@ async fn http_console_hides_asset_addresses_from_a_readonly_viewer() {
     )
     .await;
     assert_eq!(visitor_enabled.0, StatusCode::OK);
-    let visitor_cookie = login_cookie(&app, "public", "").await;
-    let visitor_certs = get_json_with_cookie(&app, "/certs", &visitor_cookie).await;
+    let visitor_certs = get_json_without_credentials(&app, "/certs").await;
     assert_eq!(visitor_certs.0, StatusCode::OK);
     assert_eq!(
         visitor_certs.1["groups"][0]["certificates"][0]["sha256"],
         "***"
     );
-    let visitor_snapshot = get_json_with_cookie(&app, "/model/snapshot", &visitor_cookie).await;
+    let visitor_snapshot = get_json_without_credentials(&app, "/model/snapshot").await;
     assert_eq!(visitor_snapshot.0, StatusCode::OK);
     let visitor_node = &visitor_snapshot.1["snapshot"]["nodes"][0];
     let visitor_ingress = &visitor_snapshot.1["snapshot"]["apps"][0]["ingresses"][0];
@@ -8381,7 +8723,6 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     };
     db.store.migrate().await.unwrap();
     insert_node(db.pool()).await;
-    let _worker = brocade_console::certs::spawn(db.store.clone());
     let (app, token) = admin_app(&db).await;
 
     let response = app
@@ -8436,7 +8777,15 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         )
         .await
         .unwrap();
-    let lock = db.store.try_certificate_scan_lock().await.unwrap().unwrap();
+    // The scheduler immediately scans on startup. Hold the lock before spawning it so it cannot
+    // issue the fixture's certificate or race the test's lock acquisition.
+    let lock = db
+        .store
+        .try_certificate_scan_lock()
+        .await
+        .unwrap()
+        .expect("the scan lock must be free before the scheduler starts");
+    let _worker = brocade_console::certs::spawn(db.store.clone());
     let queued = app
         .clone()
         .oneshot(
@@ -8450,6 +8799,10 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     assert_eq!(queued.status(), StatusCode::ACCEPTED);
     let queued = response_json(queued).await;
     assert_eq!(queued["status"], "queued");
+    let pending = db.store.latest_certificate_scan().await.unwrap().unwrap();
+    assert_eq!(pending.id, queued["id"].as_i64().unwrap());
+    assert_eq!(pending.status, brocade_store::CertificateScanStatus::Queued);
+    assert_eq!(pending.issued_items, 0);
     drop(lock);
     assert_eq!(
         wait_certificate_scan(db.pool(), queued["id"].as_i64().unwrap()).await,
@@ -8815,14 +9168,12 @@ async fn http_operator_password_lifecycle() {
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(response_json(response).await["passwordless"], true);
 
-    let guest_cookie = login_cookie(&app, "public", "").await;
     let guest = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
                 .uri("/whoami")
-                .header("cookie", &guest_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -9021,6 +9372,139 @@ async fn agent_ping_targets_follow_the_agent_protocol() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn stateless_visitor_reads_never_issue_sessions_and_preserve_operator_authentication() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let (app, admin_token) = admin_app(&db).await;
+    let administrator_cookie = login_cookie(&app, "test-admin", ADMIN_PASSWORD).await;
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform', 'Platform')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        get_json_without_credentials(&app, "/whoami").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        put_json(
+            &app,
+            &admin_token,
+            "/visitor-access",
+            json!({"enabled": true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('outside', 'Outside')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let sessions_before: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_sessions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        let (status, bootstrap) = get_json_without_credentials(&app, "/bootstrap").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bootstrap["who"]["operator_id"], "public");
+        assert_eq!(bootstrap["who"]["role"], "readonly");
+        assert_eq!(bootstrap["who"]["tenant_scope"], "platform");
+        assert_eq!(bootstrap["who"]["masked_assets"], true);
+    }
+    let sessions_after: i64 = sqlx::query_scalar("SELECT count(*) FROM admin_sessions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions_after, sessions_before);
+    let (_, tenants) = get_json_without_credentials(&app, "/tenants").await;
+    assert_eq!(tenants["tenants"].as_array().unwrap().len(), 1);
+    assert_eq!(tenants["tenants"][0]["id"], "platform");
+
+    for (name, value) in [
+        ("authorization", "Bearer invalid-operator-token"),
+        ("authorization", "Basic invalid-credentials"),
+        ("cookie", "brocade_session=stale-session"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/whoami")
+                    .header(name, value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+    }
+    let administrator = get_json_with_cookie(&app, "/whoami", &administrator_cookie).await;
+    assert_eq!(administrator.0, StatusCode::OK);
+    assert_eq!(administrator.1["operator_id"], "test-admin");
+    assert_eq!(
+        get_json(&app, &admin_token, "/whoami").await.1["operator_id"],
+        "test-admin"
+    );
+    let denied = post_json(
+        &app,
+        &admin_token,
+        "/auth/login",
+        json!({"operator_id": "public", "password": ""}),
+    )
+    .await;
+    assert_eq!(denied.0, StatusCode::UNAUTHORIZED);
+    let denied = post_json(
+        &app,
+        &admin_token,
+        "/admin/operators/public/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(denied.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        get_json_without_credentials(&app, "/onboarding").await.0,
+        StatusCode::FORBIDDEN
+    );
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::put("/visitor-access")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        put_json(
+            &app,
+            &admin_token,
+            "/visitor-access",
+            json!({"enabled": false})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_json_without_credentials(&app, "/whoami").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_json_with_cookie(&app, "/whoami", &administrator_cookie)
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -9093,8 +9577,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     .await;
     assert_eq!(enabled.0, StatusCode::OK);
     assert_eq!(enabled.1["public_open"], true);
-    let cookie = login_cookie(&app, "public", "").await;
-    let bootstrap = get_json_with_cookie(&app, "/bootstrap", &cookie).await;
+    let bootstrap = get_json_without_credentials(&app, "/bootstrap").await;
     assert_eq!(bootstrap.0, StatusCode::OK);
     assert_eq!(bootstrap.1["who"]["operator_id"], "public");
     assert_eq!(bootstrap.1["initial"]["node_count"], 1);
@@ -9103,7 +9586,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         json!([["app-a1b2", 1]])
     );
 
-    let notifications = get_json_with_cookie(&app, "/notifications?limit=10", &cookie).await;
+    let notifications = get_json_without_credentials(&app, "/notifications?limit=10").await;
     assert_eq!(notifications.0, StatusCode::OK);
     let denied = app
         .clone()
@@ -9111,7 +9594,6 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
             Request::builder()
                 .method("POST")
                 .uri("/notifications/clear")
-                .header("cookie", &cookie)
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"through_event_id":1}"#))
                 .unwrap(),
@@ -9149,25 +9631,25 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "/vpngate/countries/JP/servers",
     ] {
         assert_eq!(
-            get_json_with_cookie(&app, path, &cookie).await.0,
+            get_json_without_credentials(&app, path).await.0,
             StatusCode::OK,
             "public read-only view stayed closed: {path}"
         );
     }
-    let directory = get_json_with_cookie(&app, "/vpngate/countries/JP/servers", &cookie).await;
+    let directory = get_json_without_credentials(&app, "/vpngate/countries/JP/servers").await;
     assert_eq!(directory.0, StatusCode::OK);
     assert!(directory.1["items"].is_array());
     assert_eq!(directory.1["page"], 1);
     assert_eq!(directory.1["page_size"], 100);
     assert!(directory.1["total"].is_number());
     let oversized =
-        get_json_with_cookie(&app, "/vpngate/countries/JP/servers?page_size=101", &cookie).await;
+        get_json_without_credentials(&app, "/vpngate/countries/JP/servers?page_size=101").await;
     assert_eq!(oversized.0, StatusCode::BAD_REQUEST);
-    let log_policy = get_json_with_cookie(&app, "/agent-log-policy", &cookie).await;
+    let log_policy = get_json_without_credentials(&app, "/agent-log-policy").await;
     assert_eq!(log_policy.0, StatusCode::OK);
     assert_eq!(log_policy.1["nodes"][0]["node_id"], "n1");
     let probe_plan =
-        get_json_with_cookie(&app, "/users/platform.acme/alice/grant-probes", &cookie).await;
+        get_json_without_credentials(&app, "/users/platform.acme/alice/grant-probes").await;
     assert!(
         matches!(
             probe_plan.0,
@@ -9176,13 +9658,13 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "public probe plan was refused by authorization: {}",
         probe_plan.0
     );
-    let users = get_json_with_cookie(&app, "/users?include_disabled=true", &cookie).await;
+    let users = get_json_without_credentials(&app, "/users?include_disabled=true").await;
     let listed_user = &users.1["users"][0];
     assert_eq!(listed_user["id"], "alice");
     assert!(listed_user.get("uuid").is_none());
     assert!(listed_user.get("login_enabled").is_none());
 
-    let snapshot = get_json_with_cookie(&app, "/model/snapshot", &cookie).await;
+    let snapshot = get_json_without_credentials(&app, "/model/snapshot").await;
     assert_eq!(snapshot.0, StatusCode::OK);
     assert_eq!(snapshot.1["snapshot"]["users"][0]["id"], "alice");
     assert!(snapshot.1["snapshot"]["users"][0].get("uuid").is_none());
@@ -9198,7 +9680,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "chn-b2c3-d4e5"
     );
 
-    let list = get_json_with_cookie(&app, "/ping-probe/nodes?window_secs=3600", &cookie).await;
+    let list = get_json_without_credentials(&app, "/ping-probe/nodes?window_secs=3600").await;
     assert_eq!(list.0, StatusCode::OK);
     assert_eq!(list.1["nodes"][0]["node_id"], "n1");
     assert_eq!(
@@ -9218,7 +9700,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "probe address leaked: {list_address}"
     );
 
-    let latest = get_json_with_cookie(&app, "/ping-probe/nodes/latest", &cookie).await;
+    let latest = get_json_without_credentials(&app, "/ping-probe/nodes/latest").await;
     assert_eq!(latest.0, StatusCode::OK);
     assert_eq!(latest.1["interval_secs"], 60);
     assert_eq!(latest.1["nodes"][0]["node_id"], "n1");
@@ -9235,7 +9717,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "latest probe address leaked: {latest_address}"
     );
 
-    let detail = get_json_with_cookie(&app, "/ping-probe/nodes/n1?window_secs=3600", &cookie).await;
+    let detail = get_json_without_credentials(&app, "/ping-probe/nodes/n1?window_secs=3600").await;
     assert_eq!(detail.0, StatusCode::OK);
     assert_eq!(
         detail.1["targets"][0]["ipv4"]["samples"][0]["latency_us"],
@@ -9246,12 +9728,8 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         .unwrap()
         .starts_with("tcp://"));
 
-    let compact_ping = get_json_with_cookie(
-        &app,
-        "/ping-probe/nodes/n1/series?window_secs=3600",
-        &cookie,
-    )
-    .await;
+    let compact_ping =
+        get_json_without_credentials(&app, "/ping-probe/nodes/n1/series?window_secs=3600").await;
     assert_eq!(compact_ping.0, StatusCode::OK);
     assert_eq!(
         compact_ping.1["targets"][0]["ipv4"]["probed_at_unix_secs"]
@@ -9268,28 +9746,27 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         .get("samples")
         .is_none());
 
-    let overview = get_json_with_cookie(&app, "/load/nodes/n1/overview?windows=24", &cookie).await;
+    let overview = get_json_without_credentials(&app, "/load/nodes/n1/overview?windows=24").await;
     assert_eq!(overview.0, StatusCode::OK);
     assert_eq!(overview.1["node_id"], "n1");
     assert_eq!(overview.1["series"]["window_end_unix_secs"], json!([]));
     assert!(overview.1["series"].is_object());
-    let metrics = get_json_with_cookie(
+    let metrics = get_json_without_credentials(
         &app,
         "/load/nodes/n1/metrics?windows=24&metrics=cpu.iowait_pct",
-        &cookie,
     )
     .await;
     assert_eq!(metrics.0, StatusCode::OK);
     assert_eq!(metrics.1["node_id"], "n1");
     assert_eq!(metrics.1["metrics"]["cpu.iowait_pct"], json!([]));
 
-    let nic = get_json_with_cookie(&app, "/load/nodes/nic?windows=24", &cookie).await;
+    let nic = get_json_without_credentials(&app, "/load/nodes/nic?windows=24").await;
     assert_eq!(nic.0, StatusCode::OK);
     assert_eq!(nic.1["nodes"][0]["node_id"], "n1");
     assert_eq!(nic.1["nodes"][0]["series"], json!([]));
     assert!(nic.1["nodes"][0].get("host").is_none());
 
-    let settings = get_json_with_cookie(&app, "/ping-probe/settings", &cookie).await;
+    let settings = get_json_without_credentials(&app, "/ping-probe/settings").await;
     assert_eq!(settings.0, StatusCode::FORBIDDEN);
 
     let disabled = put_json(
@@ -9302,9 +9779,9 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     assert_eq!(disabled.0, StatusCode::OK);
     assert_eq!(disabled.1["public_open"], false);
     assert_eq!(
-        get_json_with_cookie(&app, "/whoami", &cookie).await.0,
+        get_json_without_credentials(&app, "/whoami").await.0,
         StatusCode::UNAUTHORIZED,
-        "disabling visitor access must close existing visitor sessions"
+        "disabling visitor access must close anonymous requests"
     );
 }
 
@@ -9336,6 +9813,20 @@ async fn login_cookie(app: &Router, operator_id: &str, password: &str) -> String
         .to_str()
         .unwrap();
     set_cookie.split(';').next().unwrap().to_owned()
+}
+
+async fn get_json_without_credentials(app: &Router, uri: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !response.headers().contains_key("set-cookie"),
+        "anonymous reads must never issue a session cookie"
+    );
+    let status = response.status();
+    (status, response_json(response).await)
 }
 
 async fn get_json_with_cookie(app: &Router, uri: &str, cookie: &str) -> (StatusCode, Value) {

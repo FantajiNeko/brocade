@@ -3,7 +3,7 @@ import {
   ApiError,
   fetchConsoleBootstrap,
   fetchSessionWhoami,
-  loginAdmin,
+  logoutAdmin,
   type AdminRole,
   type ConsoleInitialData,
   type Whoami,
@@ -87,9 +87,8 @@ export function SessionProvider({
       if (event.key === SESSION_REVISION_KEY) void verifyIdentity();
     };
 
-    // An open console is an active session even when its current page has no polling query. The
-    // server throttles durable expiry updates, so this lightweight identity read cannot turn into
-    // an unbounded write rate.
+    // Keep signed-in sessions active even on pages without polling. For stateless visitors this
+    // only checks the current access switch and identity; the server writes no visitor state.
     const timer = window.setInterval(() => void verifyIdentity(), SESSION_KEEPALIVE_INTERVAL_MS);
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
@@ -112,8 +111,7 @@ export function useSession(): Session {
   return s;
 }
 
-/* 免密的公开账户。id 是约定值：服务端使用同一个 id（PUBLIC_OPERATOR_ID），
-   两侧必须一致。 */
+/* 无状态访客的固定身份；服务端使用同一个 id（PUBLIC_OPERATOR_ID）。 */
 export const PUBLIC_ID = 'public';
 
 /** 表示未登录的公开访客，而非已登录的操作者。顶栏只为其保留「机器」和「项目」。 */
@@ -122,7 +120,7 @@ export const isVisitor = (who: Whoami) => isPublic(who) || who.role === 'user';
 
 export const canViewUserRealtimeTraffic = (who: Whoami) => !isVisitor(who);
 
-/* 该标签页中已执行退出的标记：设置后不再自动登录为 public，否则退出后的下一帧
+/* 该标签页中已执行退出的标记：设置后不再自动进入访客视角，否则退出后的下一帧
    会回到访客视角，无法显示登录表单。使用 sessionStorage 而非 localStorage：
    关闭标签页后应清除，否则一次退出会使该设备之后不再自动进入。 */
 const NO_AUTO_PUBLIC = 'brocade.no-auto-public';
@@ -131,15 +129,14 @@ export const autoPublicSuppressed = () => !!sessionStorage.getItem(NO_AUTO_PUBLI
 export const suppressAutoPublic = () => sessionStorage.setItem(NO_AUTO_PUBLIC, '1');
 
 /**
- * 以公开访客身份登录。手动触发（登录页的「访客模式」）和自动登录使用同一路径。
+ * 进入无状态访客视角。先退出可能残留的账号，再读取服务端当前允许的访客身份。
  *
  * 同时清除上述标记：显式点击「访客模式」表示需要进入访客视角，刷新后应保持该状态——
  * 否则该按钮的效果在刷新后失效。
  */
 export async function enterPublic() {
+  await logoutAdmin();
   sessionStorage.removeItem(NO_AUTO_PUBLIC);
-  // 免密账户使用空密码登录（服务端 authenticate_admin_password）。
-  await loginAdmin({ operator_id: PUBLIC_ID, password: '' });
   return fetchConsoleBootstrap();
 }
 
@@ -159,7 +156,7 @@ const RANK: Record<AdminRole, number> = {
 // tenant-admin 在 API 侧同时具备 edit 和 publish 权限，因此使用序号比较而非集合。
 export function can(
   role: AdminRole,
-  need: 'read' | 'artifacts' | 'edit' | 'publish' | 'manage-tenants' | 'system',
+  need: 'read' | 'artifacts' | 'edit' | 'publish' | 'manage-operators' | 'system',
 ): boolean {
   switch (need) {
     case 'read':
@@ -173,8 +170,8 @@ export function can(
       return RANK[role] >= RANK.editor;
     case 'publish':
       return RANK[role] >= RANK.publisher;
-    /* 创建租户和管理操作者使用同一权限：API 侧的 ManageOperators */
-    case 'manage-tenants':
+    /* 对应 API 的 ManageOperators 权限。 */
+    case 'manage-operators':
       return role === 'tenant-admin' || role === 'system-admin';
     case 'system':
       return role === 'system-admin';

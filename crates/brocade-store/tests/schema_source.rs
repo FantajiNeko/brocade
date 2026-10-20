@@ -120,7 +120,7 @@ fn sniffing_failed_compatibility_sql_matches_fresh_schema() {
         .1;
     let normalize = |v: &str| v.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     assert_eq!(normalize(fresh), normalize(ddl));
-    assert!(INITIAL_SCHEMA.contains("\"enabled\":false,\"top_n\":128,\"max_targets_per_user\":1024,\"node_capacity\":4096,\"report_interval_secs\":30"));
+    assert!(INITIAL_SCHEMA.contains("\"enabled\":true,\"top_n\":128,\"max_targets_per_user\":1024,\"node_capacity\":4096,\"report_interval_secs\":30"));
     assert!(compat.contains("SET LOCAL ROLE :\"app_role\""));
 }
 
@@ -147,7 +147,7 @@ fn other_domain_compatibility_sql_matches_fresh_schema() {
         .1;
     let normalize = |v: &str| v.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     assert_eq!(normalize(fresh), normalize(ddl));
-    assert!(INITIAL_SCHEMA.contains("\"enabled\":false,\"top_n\":128,\"max_domains_per_user\":1024,\"node_capacity\":4096,\"report_interval_secs\":30"));
+    assert!(INITIAL_SCHEMA.contains("\"enabled\":true,\"top_n\":128,\"max_domains_per_user\":1024,\"node_capacity\":4096,\"report_interval_secs\":30"));
     assert!(compat.contains("SET LOCAL ROLE :\"app_role\""));
 }
 
@@ -160,7 +160,7 @@ fn site_usage_compatibility_sql_matches_fresh_schema() {
         .split_once("-- END USER SITE USAGE SCHEMA")
         .unwrap()
         .0;
-    assert!(INITIAL_SCHEMA.contains("site_usage_enabled BOOLEAN NOT NULL DEFAULT FALSE"));
+    assert!(INITIAL_SCHEMA.contains("site_usage_enabled BOOLEAN NOT NULL DEFAULT TRUE"));
     let compat = include_str!("../../../scripts/compat-user-site-usage.sql")
         .split_once("ALTER TABLE control_state ADD COLUMN site_usage_enabled BOOLEAN NOT NULL DEFAULT FALSE;")
         .unwrap()

@@ -45,7 +45,7 @@ try {
             return { x, y, width, height };
           };
           return {
-            rangeBox: box('[aria-label="流入与流出统计范围"]'),
+            rangeBox: box('[aria-label="流量统计范围"]'),
             closeBox: box('[aria-label="关闭机器用量"]'),
             flagBox: box('.geo-flag.square'),
           };
@@ -57,12 +57,13 @@ try {
           assert.ok(closeBox.width >= 44 && closeBox.height >= 44, 'touch close target is at least 44px');
         assert.equal(await close.innerText(), '', 'close is icon-only');
         assert.equal(await header.locator('p').count(), 0, 'no machine subtitle');
-        assert.equal(await page.locator('.node-usage-body [aria-label="流入与流出统计范围"]').count(), 0);
+        assert.equal(await page.locator('.node-usage-body [aria-label="流量统计范围"]').count(), 0);
         await page.locator('.nti-body[aria-busy="false"]').waitFor();
         await page.locator('.site-usage-body[aria-busy="false"]').waitFor();
         await page.getByText('实时 · 每秒更新', { exact: true }).waitFor();
         const live = await page.locator('.rut-node').elementHandle();
         await page.locator('.rut-hour .ndtp-bars canvas').waitFor();
+        await page.getByText('当天 · 每 5 分钟 · 已观测窗口均值', { exact: true }).waitFor();
         assert.equal(
           await page.locator('.rut-access-grid, .rut-node .rut-main').count(),
           0,
@@ -103,16 +104,23 @@ try {
             await user.focus();
             assert.ok((await page.locator('.ntf-link.dim').count()) > 0);
             await user.click();
-            await page.locator('.nti-detail').waitFor();
-            await user.click();
+            await page.locator('.nid-table').waitFor();
+            await page.keyboard.press('Escape');
+            await page.locator('.node-inflow-dialog').waitFor({ state: 'detached' });
+            assert.equal(
+              await user.evaluate(el => document.activeElement === el),
+              true,
+              'detail focus returns to the user',
+            );
           } else {
             const legend = page.locator('.nti-key').first();
             await legend.click();
             assert.equal(await legend.getAttribute('aria-pressed'), 'true');
             const user = page.locator('.nti-bar-btn').first();
             await user.click();
-            await page.locator('.nti-detail').waitFor();
-            await user.click();
+            await page.locator('.nid-table').waitFor();
+            await page.keyboard.press('Escape');
+            await page.locator('.node-inflow-dialog').waitFor({ state: 'detached' });
           }
 
           const site = page.locator('.site-usage-key button.site-usage-row').first();
@@ -121,12 +129,23 @@ try {
           assert.ok((await page.locator('.node-site-users').innerText()).includes('本机主要用户'));
           await site.click();
           await page.getByRole('button', { name: '当周', exact: true }).click();
+          await page.getByText('当周 · 每 15 分钟 · 已观测窗口均值', { exact: true }).waitFor();
           await page.locator('.site-usage-body[aria-busy="false"]').waitFor();
           assert.equal(await live.evaluate(el => el === document.querySelector('.rut-node')), true);
+          await page.getByRole('button', { name: '当月', exact: true }).click();
+          await page.getByText('当月 · 每 1 小时 · 已观测窗口均值', { exact: true }).waitFor();
           await page.getByRole('button', { name: '当天', exact: true }).click();
         }
         // Offscreen ECharts surfaces draw on entry. Visit each before the full-page screenshot.
         await page.locator('.site-usage').scrollIntoViewIfNeeded();
+        if (scene === 'typical' || scene === 'sites-off') {
+          const forwarding = page.locator('.site-usage-key button.site-usage-row').filter({ hasText: '端口转发' });
+          await forwarding.waitFor();
+          assert.equal(await forwarding.locator('.site-brand-icon svg').count(), 1, 'forwarding has its own icon');
+          await forwarding.click();
+          await page.getByLabel('端口转发的主要用户', { exact: true }).waitFor();
+          await forwarding.click();
+        }
         assert.ok(
           await page.locator('.node-usage-body').evaluate(el => el.scrollTop > 0 || el.scrollHeight <= el.clientHeight),
           `${scene}: dialog body scrolls`,

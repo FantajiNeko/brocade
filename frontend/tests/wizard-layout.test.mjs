@@ -75,8 +75,9 @@ test('建链沿用公共纸面、面板、规则树与授权卡，不用页面�
   assert.match(source, /className="user-new-row"/);
   assert.match(source, /className="grant-card cc-user"/);
   assert.match(source, /<GeneratedUserAvatar id=\{user\.id\} variant="cell" \/>/);
-  assert.match(source, /className="chain-path cc-route"/);
-  assert.match(source, /className="cp-wire"/);
+  assert.match(source, /<WizardPathEditor/);
+  assert.doesNotMatch(source, /cc-route|当前链路径/);
+  assert.doesNotMatch(styles, /\.cc-route\b/);
   assert.doesNotMatch(source, /出口地区标识|wzg-|wzi(?:-col)?|wz-app|wz-auto-region|wz-inline-alert/);
   assert.doesNotMatch(styles, /\.wzg-[\w-]+|\.wzi(?:-col)?\b|\.wz-app\b|\.wz-auto-region[\w-]*|\.wz-inline-alert/);
 

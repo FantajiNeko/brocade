@@ -758,7 +758,7 @@ export function siteRowsOf(built: Built, agg: Agg): SiteRow[] {
     }
     return { id: user.id, values, down, up, weights: weightsOf(user.id) };
   });
-  return [...SITES, ...NON_SITES]
+  const rows = (built.world.sites ? [...SITES, ...NON_SITES] : [])
     .map(([id, name]) => {
       const values = Array.from({ length: agg.bounds.count }, () => 0);
       const users: { id: string; total: number }[] = [];
@@ -778,6 +778,28 @@ export function siteRowsOf(built: Built, agg: Agg): SiteRow[] {
       users.sort((a, b) => b.total - a.total);
       return { id, name, values, down, up, total: down + up, users };
     })
-    .filter(row => row.total > 0)
-    .sort((a, b) => b.total - a.total);
+    .filter(row => row.total > 0);
+  const forwarding: SiteRow = {
+    id: 'forwarding',
+    name: '端口转发',
+    down: 0,
+    up: 0,
+    total: 0,
+    values: Array.from({ length: agg.bounds.count }, () => 0),
+    users: [],
+  };
+  for (const user of built.world.users) {
+    const lane = agg.lanes.get(`${user.id}/${FWD}`);
+    if (!lane || lane.total === 0) continue;
+    forwarding.down += lane.downTotal;
+    forwarding.up += lane.upTotal;
+    forwarding.total += lane.total;
+    forwarding.users.push({ id: user.id, total: lane.total });
+    for (let index = 0; index < forwarding.values.length; index++) {
+      forwarding.values[index] += lane.down[index] + lane.up[index];
+    }
+  }
+  forwarding.users.sort((a, b) => b.total - a.total);
+  if (forwarding.total > 0) rows.push(forwarding);
+  return rows.sort((a, b) => b.total - a.total);
 }

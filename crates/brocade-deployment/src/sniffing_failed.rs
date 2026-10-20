@@ -7,7 +7,7 @@ pub const SNIFFING_FAILED_POLICY_HEADER: &str = "x-brocade-sniffing-failed-polic
 pub const SNIFFING_FAILED_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SniffingFailedPolicy {
     pub enabled: bool,
     pub top_n: u32,
@@ -63,6 +63,8 @@ pub fn valid_target(value: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SniffingFailedCounter {
+    #[serde(default, skip_serializing_if = "crate::other_domain::is_zero")]
+    pub counter_id: u64,
     pub bucket: i64,
     pub label: String,
     pub target: String,

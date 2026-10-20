@@ -120,7 +120,7 @@ function PolicyFields({
             </div>
           </div>
         </div>
-        <p className="hint settings-parameter-note">选择保留时停止分配新请求，已有请求自然结束后再回收隧道</p>
+        <p className="hint settings-parameter-note">选择保留时停止分配新请求，已有请求自然结束后再回收隧道。</p>
       </div>
       {GROUPS.map(group => (
         <div className="settings-parameter-group" key={group.name}>

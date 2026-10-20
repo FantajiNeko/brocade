@@ -322,7 +322,6 @@ impl VpngateDirectorySort {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VpngateServerPageRequest {
     #[serde(default = "default_vpngate_directory_page")]
     pub page: u32,
@@ -445,7 +444,6 @@ pub struct VpngateRuntimeView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RequestVpngatePoolSwitch {
     pub expected_server_id: String,
 }
@@ -471,7 +469,6 @@ pub struct UpdateVpngateCatalogSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateVpngateProbeSettings {
     pub success_cooldown_secs: u32,
     pub performance_cooldown_secs: u32,
@@ -487,7 +484,6 @@ pub struct VpngateIntelligenceCredentials {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateVpngateIntelligenceCredentials {
     pub proxycheck_api_keys: Vec<String>,
     #[serde(default)]
@@ -521,7 +517,6 @@ pub enum VpngateStaleIntelligencePolicy {
 /// successful evidence participates in admission. It is deliberately independent from model
 /// revisions and from provider-local risk thresholds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VpngateIntelligencePolicy {
     pub refresh_mode: VpngateIntelligenceRefreshMode,
     pub refresh_interval_hours: u32,
@@ -554,7 +549,6 @@ pub struct VpngateReportReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateVpngateProbeNode {
     pub enabled: bool,
     #[serde(default)]
@@ -589,7 +583,6 @@ pub struct VpngateProbeNodeOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateVpngateCatalogNode {
     pub enabled: bool,
 }
@@ -602,7 +595,6 @@ pub struct VpngateCatalogNodeSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateVpngateIntelligenceNode {
     pub enabled: bool,
 }

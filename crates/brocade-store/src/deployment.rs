@@ -1,3 +1,9 @@
+#[path = "node_initialization.rs"]
+pub(crate) mod initialization;
+
+mod artifact_preview;
+pub(crate) use artifact_preview::plan_deployment_artifacts;
+
 use brocade_core::client_config::{ClientProjectionDownloadEndpoint, SubscriptionClientConfig};
 use brocade_core::hash::sha256_hex;
 use brocade_core::model::{
@@ -19,9 +25,9 @@ use brocade_deployment::protocol::{
     DeploymentListItem, DeploymentTargetDetail, DeploymentWaveConfirmationResult,
     DeploymentWaveProgress, IsolateDeploymentTargetRequest, IsolateNodeRequest,
     NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState,
-    TargetApplyResult, TargetConvergenceReport, XrayReleaseStrategy, XrayUpgradePhase,
-    XrayUpgradeRuntime, XrayUpgradeSource, CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION,
-    MIN_AGENT_PROTOCOL_VERSION,
+    TargetApplyResult, TargetConvergenceReport, XrayConfigUpdatePolicy, XrayReleaseStrategy,
+    XrayUpgradePhase, XrayUpgradeRuntime, XrayUpgradeSource,
+    CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
@@ -467,7 +473,7 @@ pub async fn create_deployment(
     // Scope by the operator's tenant subtree first, then narrow to this kind of deployment. The
     // order cannot invert: narrowing recomputes the summary, and narrowing before scoping leaves
     // machines outside the subtree in it.
-    let mut plan = narrow_to_kind(
+    let plan = narrow_to_kind(
         scope_plan(
             pool,
             actor,
@@ -491,8 +497,19 @@ pub async fn create_deployment(
     }
 
     let mut tx = pool.begin().await?;
-    lock_deployment_isolation_tx(&mut tx).await?;
-    let isolated = isolated_node_ids(&mut *tx).await?;
+    let result = create_from_plan_tx(&mut tx, request, plan).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+// Shared persistence keeps automatic initialization on the same immutable release/claim path.
+async fn create_from_plan_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    request: CreateDeploymentRequest,
+    mut plan: DeploymentPlan,
+) -> Result<CreateDeploymentResult> {
+    lock_deployment_isolation_tx(tx).await?;
+    let isolated = isolated_node_ids(&mut **tx).await?;
     mark_isolated_targets(&mut plan, &isolated);
 
     if let Some(existing) = sqlx::query(
@@ -501,7 +518,7 @@ pub async fn create_deployment(
          WHERE idempotency_key = $1",
     )
     .bind(&request.idempotency_key)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     {
         let existing_revision = revision_to_u64(existing.try_get("revision_id")?)?;
@@ -513,7 +530,6 @@ pub async fn create_deployment(
         }
         let deployment_id = existing.try_get("id")?;
         let status = existing.try_get("status")?;
-        tx.commit().await?;
         return Ok(CreateDeploymentResult {
             deployment_id,
             status,
@@ -543,7 +559,7 @@ pub async fn create_deployment(
     if let Some(active) =
         sqlx::query("SELECT id FROM deployments WHERE active = TRUE AND kind = $1 LIMIT 1")
             .bind(request.kind.as_str())
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
     {
         return Err(StoreError::Unsupported(format!(
@@ -559,10 +575,10 @@ pub async fn create_deployment(
     let active = Some(true);
     let warnings = serde_json::to_value(&plan.warnings)?;
     let revision_id = revision_to_i64(request.revision_id)?;
-    let base_revision_id = last_succeeded_revision(&mut *tx, request.kind).await?;
+    let base_revision_id = last_succeeded_revision(&mut **tx, request.kind).await?;
     let note = match request.note.as_deref().map(str::trim) {
         Some(written) if !written.is_empty() => written.to_owned(),
-        _ => default_note(&mut tx, request.revision_id, &plan).await?,
+        _ => default_note(tx, request.revision_id, &plan).await?,
     };
 
     let row = sqlx::query(
@@ -584,14 +600,14 @@ pub async fn create_deployment(
     .bind(&note)
     .bind(request.kind.as_str())
     .bind(base_revision_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     let deployment_id = row.try_get("id")?;
 
     for target in &plan.targets {
-        insert_target(&mut tx, deployment_id, target).await?;
+        insert_target(tx, deployment_id, target).await?;
     }
-    record_current_wave_entered_tx(&mut tx, deployment_id).await?;
+    record_current_wave_entered_tx(tx, deployment_id).await?;
 
     let result_status = if plan
         .targets
@@ -600,10 +616,9 @@ pub async fn create_deployment(
     {
         status.to_owned()
     } else {
-        refresh_deployment_status(&mut tx, deployment_id, "deferred").await?
+        refresh_deployment_status(tx, deployment_id, "deferred").await?
     };
 
-    tx.commit().await?;
     Ok(CreateDeploymentResult {
         deployment_id,
         status: result_status,
@@ -1733,7 +1748,7 @@ pub async fn list_deployments(
                     -- 判据跟 dispatch 里那道波闸一模一样（wave_gate）：当前波里有破坏性
                     -- 目标，且这一波是第二波往后、或者动作里带着 disable-*，而这一波还
                     -- 没有确认记录。抄一份而不是共用，是因为那边是逐台取任务、这边是
-                    -- 整单汇总——两个形状，同一条规矩。
+                    -- 整单汇总——两个形状，同一条规矩。无人值守开启时不等待人工确认。
                     COALESCE((
                       WITH cur AS (
                         SELECT min(dts2.wave) AS wave
@@ -1764,7 +1779,8 @@ pub async fn list_deployments(
                       WHERE dt2.deployment_id = d.id
                         AND dt2.status IN ('pending', 'dispatched', 'converging')
                         AND dts2.wave = (SELECT wave FROM cur)
-                    ), FALSE) AS awaiting_confirmation
+                    ), FALSE)
+                    AND NOT (SELECT deployment_unattended FROM control_state WHERE id = TRUE) AS awaiting_confirmation
              FROM deployments d
              LEFT JOIN deployment_targets dt
                ON dt.deployment_id = d.id
@@ -1822,7 +1838,7 @@ pub async fn list_deployments(
                     -- 判据跟 dispatch 里那道波闸一模一样（wave_gate）：当前波里有破坏性
                     -- 目标，且这一波是第二波往后、或者动作里带着 disable-*，而这一波还
                     -- 没有确认记录。抄一份而不是共用，是因为那边是逐台取任务、这边是
-                    -- 整单汇总——两个形状，同一条规矩。
+                    -- 整单汇总——两个形状，同一条规矩。无人值守开启时不等待人工确认。
                     COALESCE((
                       WITH cur AS (
                         SELECT min(dts2.wave) AS wave
@@ -1853,7 +1869,8 @@ pub async fn list_deployments(
                       WHERE dt2.deployment_id = d.id
                         AND dt2.status IN ('pending', 'dispatched', 'converging')
                         AND dts2.wave = (SELECT wave FROM cur)
-                    ), FALSE) AS awaiting_confirmation
+                    ), FALSE)
+                    AND NOT (SELECT deployment_unattended FROM control_state WHERE id = TRUE) AS awaiting_confirmation
              FROM deployments d
              JOIN deployment_targets dt
                ON dt.deployment_id = d.id
@@ -2341,7 +2358,8 @@ pub async fn load_desired_for_node(
            AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
            AND lifecycle.phase IN ('active', 'retiring')
            AND dts.wave = cw.wave
-           AND (NOT wg.requires_confirmation OR wg.confirmed)",
+           AND (NOT wg.requires_confirmation OR wg.confirmed
+                OR (SELECT deployment_unattended FROM control_state WHERE id = TRUE))",
     )
     .bind(node_id)
     .fetch_optional(pool)
@@ -2367,6 +2385,25 @@ pub async fn load_desired_for_node(
 pub async fn claim_desired_for_node(
     pool: &PgPool,
     node_id: &str,
+) -> Result<Option<NodeDesiredDeployment>> {
+    claim_desired_for_node_with_protocol(
+        pool,
+        node_id,
+        brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
+    )
+    .await
+}
+
+fn supports_config_policy(desired: &NodeDesiredDeployment, protocol: u32) -> bool {
+    protocol >= brocade_deployment::protocol::CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION
+        || desired.xray_config_update_policy.is_none()
+        || !desired.actions.contains(&PlannedAction::ApplyXray)
+}
+
+pub async fn claim_desired_for_node_with_protocol(
+    pool: &PgPool,
+    node_id: &str,
+    protocol: u32,
 ) -> Result<Option<NodeDesiredDeployment>> {
     let mut tx = pool.begin().await?;
     // `load_current_snapshot_tx` is several SELECTs. Repeatable Read makes them one model view;
@@ -2435,7 +2472,7 @@ pub async fn claim_desired_for_node(
         let Some(obligation) = obligation else {
             let desired = load_resigned_environment_desired_connection(&mut tx, node_id).await?;
             tx.commit().await?;
-            return Ok(desired);
+            return Ok(desired.filter(|d| supports_config_policy(d, protocol)));
         };
         let deployment_id: i64 = obligation.try_get("deployment_id")?;
         let lifecycle_epoch: i64 = obligation.try_get("lifecycle_epoch")?;
@@ -2460,6 +2497,10 @@ pub async fn claim_desired_for_node(
         .await?;
         desired.claim_generation = i64_to_u64("obligation claim_generation", claim_generation)?;
         desired.usage_generation_id = obligation.try_get("usage_generation_id")?;
+        if !supports_config_policy(&desired, protocol) {
+            tx.commit().await?;
+            return Ok(None);
+        }
         sqlx::query(
             "UPDATE node_convergence_obligations
                 SET status = 'dispatched',
@@ -2483,7 +2524,7 @@ pub async fn claim_desired_for_node(
     }
     if let Some(desired) = load_resigned_environment_desired_connection(&mut tx, node_id).await? {
         tx.commit().await?;
-        return Ok(Some(desired));
+        return Ok(supports_config_policy(&desired, protocol).then_some(desired));
     }
     let Some(row) = sqlx::query(
         // Same ordering as the read-only path above. A dispatched config keeps its lease; a
@@ -2572,7 +2613,8 @@ pub async fn claim_desired_for_node(
            AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
            AND lifecycle.phase IN ('active', 'retiring')
            AND dts.wave = cw.wave
-           AND (NOT wg.requires_confirmation OR wg.confirmed)
+           AND (NOT wg.requires_confirmation OR wg.confirmed
+                OR (SELECT deployment_unattended FROM control_state WHERE id = TRUE))
            AND (
                 dt.status = 'pending'
                 OR COALESCE(dts.dispatched_at, '-infinity'::timestamptz)
@@ -2606,6 +2648,10 @@ pub async fn claim_desired_for_node(
     )
     .await?;
     let dispatched_grants = serde_json::to_value(&grants)?;
+    if !supports_config_policy(&desired, protocol) {
+        tx.commit().await?;
+        return Ok(None);
+    }
 
     // A node claim is not the wave start. This is only a compatibility guard for an active order
     // created before wave progress existed; normal orders already recorded the entry transition.
@@ -5750,9 +5796,9 @@ async fn attach_known_artifact_content(
 }
 
 fn collect_content_shas(value: &Value, shas: &mut Vec<String>) {
-    collect_artifact_sha(value.get("phantun"), shas);
-    collect_artifact_sha(value.get("wireguard"), shas);
-    collect_artifact_sha(value.get("xray"), shas);
+    for kind in ConfigArtifact::ALL {
+        collect_artifact_sha(value.get(kind.field()), shas);
+    }
 }
 
 fn collect_artifact_sha(value: Option<&Value>, shas: &mut Vec<String>) {
@@ -5768,9 +5814,9 @@ fn collect_artifact_sha(value: Option<&Value>, shas: &mut Vec<String>) {
 }
 
 fn attach_content_to_value(value: &mut Value, content_by_sha: &BTreeMap<String, (String, i32)>) {
-    attach_artifact_content(value.get_mut("phantun"), content_by_sha);
-    attach_artifact_content(value.get_mut("wireguard"), content_by_sha);
-    attach_artifact_content(value.get_mut("xray"), content_by_sha);
+    for kind in ConfigArtifact::ALL {
+        attach_artifact_content(value.get_mut(kind.field()), content_by_sha);
+    }
 }
 
 fn attach_artifact_content(
@@ -6009,6 +6055,11 @@ async fn desired_deployment_from_structure_connection(
         wave: u32::try_from(wave)
             .map_err(|_| StoreError::InvalidData("deployment wave is out of range".to_owned()))?,
         actions,
+        xray_config_update_policy: desired_structure
+            .get("xray_config_update_policy")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?,
         usage_generation_id,
         // The distribution source is filled in by the HTTP layer: it is configuration of the
         // runtime environment (env), which store should not know about.
@@ -6099,6 +6150,19 @@ async fn load_resigned_environment_desired_connection(
     let Some(deployment_id) = xray_source.or_else(|| source_deployments.into_iter().max()) else {
         return Ok(None);
     };
+    let xray_config_update_policy = if let Some(source_id) = xray_source {
+        let policy: Option<Value> = sqlx::query_scalar(
+            "SELECT desired_structure->'xray_config_update_policy' FROM deployment_target_state
+             WHERE deployment_id = $1 AND node_id = $2",
+        )
+        .bind(source_id)
+        .bind(node_id)
+        .fetch_one(&mut *connection)
+        .await?;
+        policy.map(serde_json::from_value).transpose()?
+    } else {
+        None
+    };
 
     let mut actions = Vec::new();
     for (artifact, state) in desired.artifacts() {
@@ -6142,6 +6206,7 @@ async fn load_resigned_environment_desired_connection(
         claim_generation: i64_to_u64("re-signed environment claim generation", claim_generation)?,
         wave: 0,
         actions,
+        xray_config_update_policy,
         usage_generation_id: None,
         phantun_binary: None,
         desired,
@@ -6258,6 +6323,15 @@ async fn insert_target(
         PlannedTargetStatus::Skipped => "skipped",
     };
     let lifecycle_epoch = crate::lifecycle::current_epoch_tx(tx, &target.node_id).await?;
+    // Hold a shared row lock until every target in this transaction is frozen. A settings save
+    // must not split one approval into a mixture of restart and handoff policies.
+    let beta: bool =
+        sqlx::query_scalar("SELECT xray_handoff_beta FROM control_state WHERE id = TRUE FOR SHARE")
+            .fetch_one(&mut **tx)
+            .await?;
+    let mut structure = desired_structure_json(target)?;
+    structure["xray_config_update_policy"] =
+        serde_json::to_value(XrayConfigUpdatePolicy::from_handoff_beta(beta))?;
     sqlx::query(
         "INSERT INTO deployment_targets (deployment_id, node_id, status)
          VALUES ($1, $2, $3)",
@@ -6281,7 +6355,7 @@ async fn insert_target(
         StoreError::InvalidData(format!("deployment wave out of range: {}", target.wave))
     })?)
     .bind(target.disruptive)
-    .bind(desired_structure_json(target)?)
+    .bind(structure)
     .bind(serde_json::to_value(&target.desired.grants)?)
     .bind(lifecycle_epoch)
     .execute(&mut **tx)
@@ -6439,7 +6513,20 @@ async fn insert_or_supersede_obligation_tx(
         .await?;
     }
 
-    let desired_structure = desired_structure_json(target)?;
+    let mut desired_structure = desired_structure_json(target)?;
+    // Isolation may carry a full configuration instead of the narrowed target, but its
+    // execution policy must still be the exact one approved for that original target.
+    let policy: Option<Value> = sqlx::query_scalar(
+        "SELECT desired_structure->'xray_config_update_policy' FROM deployment_target_state
+         WHERE deployment_id = $1 AND node_id = $2",
+    )
+    .bind(deployment_id)
+    .bind(&target.node_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if let Some(policy) = policy {
+        desired_structure["xray_config_update_policy"] = policy;
+    }
     let desired_grants = serde_json::to_value(&target.desired.grants)?;
     let desired_fingerprint = sha256_hex(&serde_json::to_vec(&json!({
         "structure": desired_structure,

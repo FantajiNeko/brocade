@@ -237,6 +237,11 @@ export default function SiteUsageChart({
             const rows = [...list]
               .reverse()
               .filter(item => (item.value[1] ?? 0) > 0)
+              .sort(
+                (a, b) =>
+                  Number(series[b.seriesIndex].key === 'forwarding') -
+                  Number(series[a.seriesIndex].key === 'forwarding'),
+              )
               .map(
                 item =>
                   `<div style="display:flex;gap:10px;justify-content:space-between"><span><i style="display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:6px;background:${colors[item.seriesIndex]}"></i>${series[item.seriesIndex].name}</span><b style="color:${ink};font-weight:500">${bytes(item.value[1] ?? 0)}</b></div>`,

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BinaryReleaseHistory } from '../src/panes/binary-release-history';
 import { BinaryReleaseTab, useBinaryRelease } from '../src/panes/binary-release';
@@ -151,7 +151,7 @@ describe('二进制发布共用视图', () => {
     expect(calls).toEqual([]);
     fireEvent.click(screen.getByRole('button', { name: '发布历史' }));
     fireEvent.click(await screen.findByRole('button', { name: /#7/ }));
-    fireEvent.click(await screen.findByRole('button', { name: /edge · 本次已升级/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /edge · 已升级/ }));
     expect(await screen.findByText('下载超时')).toBeTruthy();
     expect(screen.getByText('第 1 次 · 失败 · 原版本运行')).toBeTruthy();
     expect(screen.getByText('观测确认 · 未领取')).toBeTruthy();
@@ -213,7 +213,7 @@ describe('二进制发布共用视图', () => {
     expect(screen.getByText('还没有上报有效的 Agent 摘要')).toBeTruthy();
   });
 
-  it('历史记录明确区分强制退役成功和异常后自动恢复', async () => {
+  it('历史将按授权强制退役显示为绿色已升级，保留异常后自动恢复审计', async () => {
     const release = {
       id: 11,
       component: 'xray',
@@ -279,7 +279,9 @@ describe('二进制发布共用视图', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '发布历史' }));
     fireEvent.click(await screen.findByRole('button', { name: /#11/ }));
-    expect(await screen.findByRole('button', { name: /force-node · 强制退役完成/ })).toBeTruthy();
+    const upgraded = await screen.findByRole('button', { name: /force-node · 已升级/ });
+    expect(within(upgraded).getByText('已升级').classList.contains('st-ok')).toBe(true);
+    expect(screen.queryByText('强制退役完成')).toBeNull();
     expect(screen.getByRole('button', { name: /recovered-node · 自动恢复完成/ })).toBeTruthy();
     expect(screen.getByText(/异常后自动恢复完成 · recovered-node/)).toBeTruthy();
     expect(screen.getByText('恢复前异常：动态转发恢复仍在重试')).toBeTruthy();

@@ -4,7 +4,7 @@ use brocade_core::{
     model::{
         ConnectionSettings, DisabledWireGuardLink, GeodataSettings, HopMux, ModelSettings,
         NodeConnection, OverlaySettings, PortSettings, ProbeSettings, RealityClientPolicy,
-        RealitySite,
+        RealitySite, MAX_REALITY_TIME_DIFF_MS,
     },
     text::{
         is_nonzero_host_port, is_reality_fingerprint, is_reality_server_name, normalize_host_port,
@@ -16,7 +16,56 @@ use sqlx::{PgPool, Row};
 
 use crate::{AdminContext, Result, StoreError};
 
-const MAX_REALITY_TIME_DIFF_MS: u64 = 24 * 60 * 60 * 1000;
+/// Live release policy; it changes no model revision or generated artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeploymentSettings {
+    pub unattended: bool,
+    pub xray_handoff_beta: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateDeploymentSettings {
+    pub unattended: Option<bool>,
+    pub xray_handoff_beta: Option<bool>,
+}
+
+pub async fn load_deployment_settings(pool: &PgPool) -> Result<DeploymentSettings> {
+    let row = sqlx::query(
+        "SELECT deployment_unattended, xray_handoff_beta FROM control_state WHERE id = TRUE",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(DeploymentSettings {
+        unattended: row.try_get("deployment_unattended")?,
+        xray_handoff_beta: row.try_get("xray_handoff_beta")?,
+    })
+}
+
+pub async fn update_deployment_settings(
+    pool: &PgPool,
+    actor: &AdminContext,
+    settings: UpdateDeploymentSettings,
+) -> Result<DeploymentSettings> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can update deployment settings".to_owned(),
+        ));
+    }
+    let row = sqlx::query(
+        "UPDATE control_state SET
+        deployment_unattended = COALESCE($1, deployment_unattended),
+        xray_handoff_beta = COALESCE($2, xray_handoff_beta)
+        WHERE id = TRUE RETURNING deployment_unattended, xray_handoff_beta",
+    )
+    .bind(settings.unattended)
+    .bind(settings.xray_handoff_beta)
+    .fetch_one(pool)
+    .await?;
+    Ok(DeploymentSettings {
+        unattended: row.try_get("deployment_unattended")?,
+        xray_handoff_beta: row.try_get("xray_handoff_beta")?,
+    })
+}
 
 /// The non-empty values flow may take. Xray-core's vless inbound accepts only `vless.XRV` and
 /// the empty string, answering anything else with `unknown request flow`;
@@ -713,7 +762,8 @@ fn validate_settings(settings: &ModelSettings) -> Result<()> {
         settings.reality_site.flow.as_deref(),
         "settings.reality_site.flow",
     )?;
-    validate_anytls_padding_scheme(&settings.anytls_padding_scheme)?;
+    // Padding syntax is validated by the compiler for each effective AnyTLS ingress.
+    // The compact generated default is a recommendation, not a limit on custom schemes.
 
     validate_geodata(&settings.geodata)?;
     validate_connection_settings(&settings.connection)?;
@@ -773,10 +823,10 @@ fn validate_relay_mux(mux: &HopMux) -> Result<()> {
     Ok(())
 }
 
-/// A global scheme is intentionally narrower than the full AnyTLS grammar accepted by an
-/// ingress override. The UI only generates this four-stage form, and enforcing that shape here
-/// preserves its useful guarantee: it can never spend more padding than the built-in scheme.
-fn validate_anytls_padding_scheme(lines: &[String]) -> Result<()> {
+/// The random generator's compact four-stage budget is a promise of that generator.
+/// Custom global and ingress schemes can use the full AnyTLS grammar independently.
+#[cfg(test)]
+fn validate_generated_anytls_padding_budget(lines: &[String]) -> Result<()> {
     if lines.len() != 5 || lines.first().map(String::as_str) != Some("stop=4") {
         return Err(StoreError::InvalidData(
             "settings.anytls_padding_scheme 必须是 stop=4 加 0–3 四条精简规则".to_owned(),
@@ -854,22 +904,14 @@ fn random_anytls_padding_scheme() -> Result<Vec<String>> {
     ])
 }
 
-/// What the four timeouts and the buffer are allowed to be. `handshake` is here too even
-/// though no machine can override it — the range belongs to the field, not to the page it
-/// is edited on.
-///
-/// The lower bounds mark where a value stops meaning what it says, not where it stops being
-/// wise. `connIdle` at 0 reaps a connection the moment it falls quiet, so 0 is refused;
-/// `uplinkOnly` at 0 legitimately means "close as soon as the other direction has", which is
-/// a choice somebody may want, so 0 is allowed. Nothing in between is judged: an operator who
-/// wants a 15-second idle timeout knows something about their fleet that this file does not.
-///
-/// The upper bounds are only there so that a slipped keystroke is refused where it is typed
-/// rather than three layers down. 64 MB per connection is already past any real answer.
-const CONN_IDLE_RANGE: RangeInclusive<u32> = 10..=86_400;
-const CONN_HALF_CLOSE_RANGE: RangeInclusive<u32> = 0..=3_600;
+/// Timeouts share the actual PostgreSQL integer range. Operational recommendations belong in
+/// defaults and hints, rather than rejecting short idle timers or long handshake/half-close waits.
+/// Zero remains meaningful for half-close; idle and handshake need a positive waiting interval.
+const CONN_IDLE_RANGE: RangeInclusive<u32> = 1..=i32::MAX as u32;
+const CONN_HALF_CLOSE_RANGE: RangeInclusive<u32> = 0..=i32::MAX as u32;
+// This is a per-connection allocation budget, rather than a timeout recommendation.
 const CONN_BUFFER_KB_RANGE: RangeInclusive<u32> = 0..=65_536;
-const CONN_HANDSHAKE_RANGE: RangeInclusive<u32> = 1..=600;
+const CONN_HANDSHAKE_RANGE: RangeInclusive<u32> = 1..=i32::MAX as u32;
 
 /// One table for both pages. A bound enforced on the global default but not on a machine's
 /// override is a bound an operator walks around by typing the number on the other screen.
@@ -937,27 +979,13 @@ fn conn_in_range(location: &str, value: Option<u32>, range: &RangeInclusive<u32>
     }
 }
 
-/// The database has the same CHECK; this blocks it as a 400 first and states the shape.
-///
-/// It checks only the shape, not whether the cron expression itself is valid. That is judged
-/// by xray's cron library, and reproducing a parser here means two implementations that
-/// eventually disagree — the right number of fields passes, and getting it wrong costs that
-/// machine its updates and nothing else.
+/// Xray's cron parser owns the expression syntax, including descriptors such as @daily.
+/// Counting fields here rejects valid schedules without proving a five-field expression valid.
 fn validate_geodata(settings: &GeodataSettings) -> Result<()> {
-    // A `CRON_TZ=` / `TZ=` prefix is allowed (robfig/cron v3's extension) and is stripped
-    // before counting fields. Whether the prefix itself is valid (whether the zone name is
-    // known) is judged by xray's `time.LoadLocation`.
-    let spec = settings.cron.trim();
-    let fields = spec
-        .strip_prefix("CRON_TZ=")
-        .or_else(|| spec.strip_prefix("TZ="))
-        .and_then(|rest| rest.split_once(char::is_whitespace))
-        .map_or(spec, |(_zone, rest)| rest);
-    if fields.split_whitespace().count() != 5 {
-        return Err(StoreError::InvalidData(format!(
-            "settings.geodata.cron 要五段（分 时 日 月 周），可选前缀 CRON_TZ=<时区>；收到 {:?}",
-            settings.cron
-        )));
+    if settings.cron.trim().is_empty() {
+        return Err(StoreError::InvalidData(
+            "settings.geodata.cron 不能为空".to_owned(),
+        ));
     }
     for (location, url) in [
         ("settings.geodata.geoip_url", &settings.geoip_url),
@@ -1009,13 +1037,54 @@ fn optional_i64(location: &str, value: Option<u64>) -> Result<Option<i64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{random_anytls_padding_scheme, validate_anytls_padding_scheme};
+    use super::{random_anytls_padding_scheme, validate_generated_anytls_padding_budget};
+
+    #[test]
+    fn reality_clock_tolerance_is_limited_by_xray_duration_not_one_day() {
+        let mut settings = brocade_core::model::ModelSettings::default();
+        for value in [0, 86_400_001, super::MAX_REALITY_TIME_DIFF_MS] {
+            settings.reality_client.max_time_diff_ms = Some(value);
+            super::validate_settings(&settings).unwrap();
+        }
+        settings.reality_client.max_time_diff_ms = Some(super::MAX_REALITY_TIME_DIFF_MS + 1);
+        assert!(super::validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn geodata_cron_syntax_is_delegated_to_the_xray_parser() {
+        let mut settings = brocade_core::model::GeodataSettings::default();
+        for cron in ["@daily", "@every 12h", "CRON_TZ=UTC @weekly", "30 6 * * *"] {
+            settings.cron = cron.into();
+            super::validate_geodata(&settings).unwrap();
+        }
+        settings.cron = "   ".into();
+        assert!(super::validate_geodata(&settings).is_err());
+    }
+
+    #[test]
+    fn connection_timeouts_accept_supported_values_outside_the_old_recommendations() {
+        let node = brocade_core::model::NodeConnection {
+            conn_idle_secs: Some(1),
+            uplink_only_secs: Some(7200),
+            downlink_only_secs: Some(7200),
+            ..Default::default()
+        };
+        super::validate_node_connection(&node).unwrap();
+        let mut connection = brocade_core::model::ConnectionSettings {
+            conn_idle_secs: 3 * 86400,
+            handshake_secs: 1200,
+            ..Default::default()
+        };
+        super::validate_connection_settings(&connection).unwrap();
+        connection.conn_idle_secs = u32::MAX;
+        assert!(super::validate_connection_settings(&connection).is_err());
+    }
 
     #[test]
     fn generated_anytls_padding_is_always_within_the_compact_budget() {
         for _ in 0..256 {
             let scheme = random_anytls_padding_scheme().unwrap();
-            validate_anytls_padding_scheme(&scheme).unwrap();
+            validate_generated_anytls_padding_budget(&scheme).unwrap();
             assert_eq!(scheme[0], "stop=4");
             assert_eq!(scheme[3].matches(",c,").count(), 1);
             assert!(!scheme[1].contains(",c,"));
@@ -1025,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn global_anytls_padding_rejects_native_or_more_expensive_shapes() {
+    fn global_anytls_padding_accepts_native_schemes_beyond_the_generated_default() {
         let native = [
             "stop=8",
             "0=30-30",
@@ -1040,6 +1109,10 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-        assert!(validate_anytls_padding_scheme(&native).is_err());
+        let settings = brocade_core::model::ModelSettings {
+            anytls_padding_scheme: native,
+            ..Default::default()
+        };
+        super::validate_settings(&settings).unwrap();
     }
 }

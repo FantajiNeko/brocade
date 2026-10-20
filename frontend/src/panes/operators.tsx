@@ -15,6 +15,7 @@ import { Ago, Empty, ErrorBox, Loading } from '../ui/bits';
 import { CopyButton } from '../ui/copy-button';
 import { PASSWORD_MIN_LENGTH } from '../ui/password-policy';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
+import { ROLE_LABEL } from '../ui/role-label';
 
 // 五个角色等级，由高到低。该顺序即版面顺序——`can()` 使用序号比较
 // （`RANK[role] >= RANK.editor`），五档严格递进，不存在「可发布但不可修改」这类组合。
@@ -24,7 +25,7 @@ import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard
 // 才不需要将基础权限重复五次。依据是 session.tsx 的 can() 及各页面的调用点。
 const LADDER: { role: AdminRole; adds: string; where: string }[] = [
   { role: 'system-admin', adds: '改设置、机器身份与退役、建链、回滚', where: '外加下面所有档的' },
-  { role: 'tenant-admin', adds: '建租户、管操作者', where: '管的是自己 scope 底下那棵子树' },
+  { role: 'tenant-admin', adds: '管理操作者', where: '管理当前工作区的账号' },
   { role: 'publisher', adds: '把草稿发出去', where: '发布要盖修订' },
   { role: 'editor', adds: '改用户、改链路', where: '写进草稿，不发布' },
   { role: 'readonly', adds: '只看', where: '' },
@@ -32,7 +33,7 @@ const LADDER: { role: AdminRole; adds: string; where: string }[] = [
 
 const ROLES: AdminRole[] = ['readonly', 'editor', 'publisher', 'tenant-admin', 'system-admin'];
 
-const EMPTY_OPERATOR_FORM = { id: '', role: 'readonly' as AdminRole, scope: '', password: '' };
+const EMPTY_OPERATOR_FORM = { id: '', role: 'readonly' as AdminRole, password: '' };
 
 export function OperatorsPane() {
   const { who } = useSession();
@@ -40,7 +41,7 @@ export function OperatorsPane() {
   const operators = useQuery({ queryKey: ['operators'], queryFn: () => fetchOperators() });
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants() });
 
-  const [form, setForm] = useState<{ id: string; role: AdminRole; scope: string; password: string }>(() => ({
+  const [form, setForm] = useState<{ id: string; role: AdminRole; password: string }>(() => ({
     ...EMPTY_OPERATOR_FORM,
   }));
   const [creating, setCreating] = useState(false);
@@ -68,7 +69,7 @@ export function OperatorsPane() {
         display_name: form.id.trim(),
         role: form.role,
         /* system-admin 不允许设置 scope，其他角色必须设置 */
-        tenant_scope: form.role === 'system-admin' ? null : form.scope || defaultScope,
+        tenant_scope: form.role === 'system-admin' ? null : defaultScope,
         /* 只有固定的 public readonly 账号允许免密。 */
         password: form.password || undefined,
       }),
@@ -103,8 +104,10 @@ export function OperatorsPane() {
   if (operators.error || tenants.error) return <ErrorBox error={operators.error ?? tenants.error} />;
 
   const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
-  const defaultScope = tenantOptions.find(t => t.id === who.tenant_scope)?.id ?? tenantOptions[0]?.id ?? '';
-  const manage = can(who.role, 'manage-tenants');
+  const defaultScope =
+    tenantOptions.find(t => t.id === who.tenant_scope)?.id ?? (tenantOptions.length === 1 ? tenantOptions[0].id : '');
+  const scopeReady = form.role === 'system-admin' || !!defaultScope;
+  const manage = can(who.role, 'manage-operators');
   const list = operators.data.operators;
 
   return (
@@ -124,13 +127,21 @@ export function OperatorsPane() {
           onSubmit={e => {
             e.preventDefault();
             const publicReadonly = form.id.trim() === 'public' && form.role === 'readonly';
-            if (form.id.trim() && (publicReadonly || form.password.length >= PASSWORD_MIN_LENGTH)) create.mutate();
+            if (
+              manage &&
+              scopeReady &&
+              !create.isPending &&
+              form.id.trim() &&
+              (publicReadonly || form.password.length >= PASSWORD_MIN_LENGTH)
+            )
+              create.mutate();
           }}
         >
           <p className="fh">新操作者</p>
           <div className="row">
             <input
               className="f"
+              aria-label="操作者 ID"
               style={{ width: 150 }}
               placeholder="operator id"
               value={form.id}
@@ -138,30 +149,16 @@ export function OperatorsPane() {
             />
             <select
               className="f"
+              aria-label="操作者角色"
               value={form.role}
               onChange={e => setForm({ ...form, role: e.target.value as AdminRole })}
             >
               {ROLES.map(r => (
                 <option key={r} value={r}>
-                  {r}
+                  {ROLE_LABEL[r]}
                 </option>
               ))}
             </select>
-            {form.role === 'system-admin' ? (
-              <span className="hint mono">scope —（system-admin 不带租户范围）</span>
-            ) : (
-              <select
-                className="f"
-                value={form.scope || defaultScope}
-                onChange={e => setForm({ ...form, scope: e.target.value })}
-              >
-                {tenantOptions.map(t => (
-                  <option key={t.id} value={t.id}>
-                    {t.id}
-                  </option>
-                ))}
-              </select>
-            )}
             <input
               className="f"
               style={{ width: 170 }}
@@ -180,6 +177,7 @@ export function OperatorsPane() {
               type="submit"
               disabled={
                 !manage ||
+                !scopeReady ||
                 create.isPending ||
                 !form.id.trim() ||
                 (!(form.id.trim() === 'public' && form.role === 'readonly') &&
@@ -189,6 +187,11 @@ export function OperatorsPane() {
               {create.isPending ? '提交中…' : '建操作者'}
             </button>
           </div>
+          {!scopeReady && (
+            <p className="hint bad" role="alert">
+              当前账户配置不可用，无法创建该角色的操作者。
+            </p>
+          )}
           <p className="hint" style={{ marginTop: 8 }}>
             只有固定的 <span className="mono">public</span> + <span className="mono">readonly</span> 账号可留空，
             用于访客页面；其他操作者必须设置至少 {PASSWORD_MIN_LENGTH} 位密码。
@@ -202,7 +205,7 @@ export function OperatorsPane() {
 
       {/* 规则说明位于名单之前。角色是本页需要表达的核心内容，此前它只是表格中的一个字符串标签。 */}
       <div className="rulebox">
-        <p className="rh">角色是一条线上的五档，不是五个平行的角色</p>
+        <p className="rh">角色权限逐级递增</p>
         <div className="rolestep">
           {[...LADDER].reverse().map(step => (
             <div
@@ -211,17 +214,14 @@ export function OperatorsPane() {
                 .filter(Boolean)
                 .join(' ')}
             >
-              <div className="r">{step.role}</div>
+              <div className="r">{ROLE_LABEL[step.role]}</div>
               <div className="c">{step.role === 'readonly' ? step.adds : `＋ ${step.adds}`}</div>
               {step.where && <div className="cum">{step.where}</div>}
               {step.role === who.role && <div className="me">当前角色</div>}
             </div>
           ))}
         </div>
-        <p className="note">
-          高一档的角色包含低档的全部能力：<span className="mono">can()</span> 比较的是序号而非能力集合，因此不存在
-          「能发布但不能修改」这样的组合。按角色隐藏入口只是<b>避免无效操作</b>，服务端每个写入口都会再鉴权一次。
-        </p>
+        <p className="note">高一级角色包含低一级角色的全部权限。每次操作均由服务端校验权限。</p>
       </div>
 
       {issuedPassword && (
@@ -265,7 +265,7 @@ export function OperatorsPane() {
           return (
             <div className={step.role === 'system-admin' ? 'op-rank top' : 'op-rank'} key={step.role}>
               <div className="rh">
-                <span className="r">{step.role}</span>
+                <span className="r">{ROLE_LABEL[step.role]}</span>
                 <span className="can">{step.role === 'readonly' ? step.adds : `＋ ${step.adds}`}</span>
                 <span className="rule" />
                 {/* 空档同样占一行：某个角色没有成员本身即是需要呈现的信息 */}
@@ -317,7 +317,6 @@ function OperatorCard({
           {op.id}
           {op.display_name !== op.id && <span className="dim"> {op.display_name}</span>}
         </div>
-        <div className="sc">{op.tenant_scope == null ? '全局 · 不带租户范围' : op.tenant_scope}</div>
       </div>
 
       <div className="cred">

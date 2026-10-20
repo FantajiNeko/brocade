@@ -2,12 +2,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { UserTrafficHistory } from '../src/api';
+import type { NodeTrafficHistory, SiteUsagePeriod, TrafficTimeRange, UserTrafficHistory } from '../src/api';
 import { NodeRealtimeProvider } from '../src/node-realtime';
 import {
   aggregateUserTraffic,
   fallbackSource,
   hourModel,
+  nodeHistoryModel,
   mergeRetained,
   nextListOrder,
   NodeUserTrafficCard,
@@ -73,6 +74,7 @@ const history = (
 });
 
 let served: UserTrafficHistory;
+let servedNode: NodeTrafficHistory;
 /** ['nodes'] 查询的回包；为 null 时该请求一直挂起（大多数用例不需要机器名称与地区）。 */
 let servedNodes: { nodes: { node_id: string; name: string; public_ipv4_country: string | null }[] } | null;
 const renderCard = (card: ReactNode) =>
@@ -96,12 +98,22 @@ beforeEach(() => {
   vi.useFakeTimers({ now: T * 1000 });
   vi.stubGlobal('EventSource', Events);
   served = history({ n1: [] });
+  servedNode = {
+    range_start_unix_secs: T - 86_400,
+    range_end_unix_secs: T,
+    bucket_secs: 300,
+    points: [[T - 300, 10, 20]],
+    recorded_bytes: 900,
+    has_gap: true,
+    has_unplaced: false,
+  };
   servedNodes = null;
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
-      if (path.endsWith('/user-history') || path.endsWith('/realtime/history')) return Response.json(served);
+      if (path.includes('/traffic-history?')) return Response.json(servedNode);
+      if (path.endsWith('/realtime/history')) return Response.json(served);
       if (path.endsWith('/nodes/agent-state') && servedNodes) return Response.json(servedNodes);
       return new Promise<Response>(() => {});
     }),
@@ -131,44 +143,41 @@ describe('realtime user traffic data', () => {
 
   it('uses actual forwarding windows and keeps unplaced legacy bytes out of the curve', () => {
     const end = Math.floor(T / 30) * 30;
-    const model = hourModel(
-      {
-        range_start_unix_secs: end - 60,
-        range_end_unix_secs: end,
-        nodes: [
-          {
-            node_id: 'n1',
-            window_ends_unix_secs: [],
-            windows: [],
-            forwarding_windows: [
-              [end - 60, end - 45],
-              [end - 45, end - 30],
-              [end - 30, end - 15],
-              [end - 15, end],
-            ],
-          },
-        ],
-        series: [
-          {
-            node_id: 'n1',
-            tenant_id: 'platform',
-            user_id: 'alice',
-            forwarding: true,
-            points: [],
-            windows: [
-              [end - 60, end - 45, 15, 30],
-              [end - 45, end - 30, 15, 30],
-              [end - 30, end - 15, 15, 30],
-              [end - 15, end, 15, 30],
-            ],
-            unplaced_uplink_bytes: 7,
-            unplaced_downlink_bytes: 11,
-          },
-        ],
-      },
-      'node',
-    );
-    expect(model.rows.get('platform/alice')).toMatchObject({
+    const model = hourModel({
+      range_start_unix_secs: end - 60,
+      range_end_unix_secs: end,
+      nodes: [
+        {
+          node_id: 'n1',
+          window_ends_unix_secs: [],
+          windows: [],
+          forwarding_windows: [
+            [end - 60, end - 45],
+            [end - 45, end - 30],
+            [end - 30, end - 15],
+            [end - 15, end],
+          ],
+        },
+      ],
+      series: [
+        {
+          node_id: 'n1',
+          tenant_id: 'platform',
+          user_id: 'alice',
+          forwarding: true,
+          points: [],
+          windows: [
+            [end - 60, end - 45, 15, 30],
+            [end - 45, end - 30, 15, 30],
+            [end - 30, end - 15, 15, 30],
+            [end - 15, end, 15, 30],
+          ],
+          unplaced_uplink_bytes: 7,
+          unplaced_downlink_bytes: 11,
+        },
+      ],
+    });
+    expect(model.rows.get('n1')).toMatchObject({
       up: [30, 30],
       down: [60, 60],
       hourUp: 67,
@@ -180,33 +189,30 @@ describe('realtime user traffic data', () => {
 
   it('does not turn missing forwarding collection into zero when access still reports', () => {
     const end = Math.floor(T / 30) * 30;
-    const model = hourModel(
-      {
-        range_start_unix_secs: end - 60,
-        range_end_unix_secs: end,
-        nodes: [
-          {
-            node_id: 'n1',
-            window_ends_unix_secs: [],
-            windows: [[end - 60, end]],
-            forwarding_windows: [[end - 30, end]],
-          },
-        ],
-        series: [
-          { node_id: 'n1', tenant_id: 'platform', user_id: 'alice', points: [], windows: [[end - 60, end, 60, 120]] },
-          {
-            node_id: 'n1',
-            tenant_id: 'platform',
-            user_id: 'alice',
-            forwarding: true,
-            points: [],
-            windows: [[end - 30, end, 30, 60]],
-          },
-        ],
-      },
-      'node',
-    );
-    expect(model.rows.get('platform/alice')?.down).toEqual([null, 120]);
+    const model = hourModel({
+      range_start_unix_secs: end - 60,
+      range_end_unix_secs: end,
+      nodes: [
+        {
+          node_id: 'n1',
+          window_ends_unix_secs: [],
+          windows: [[end - 60, end]],
+          forwarding_windows: [[end - 30, end]],
+        },
+      ],
+      series: [
+        { node_id: 'n1', tenant_id: 'platform', user_id: 'alice', points: [], windows: [[end - 60, end, 60, 120]] },
+        {
+          node_id: 'n1',
+          tenant_id: 'platform',
+          user_id: 'alice',
+          forwarding: true,
+          points: [],
+          windows: [[end - 30, end, 30, 60]],
+        },
+      ],
+    });
+    expect(model.rows.get('n1')?.down).toEqual([null, 120]);
     expect(model.totalDown).toEqual([null, 120]);
   });
   it('groups one user across ingress labels without combining tenants', () => {
@@ -227,9 +233,8 @@ describe('realtime user traffic data', () => {
           ],
         ],
       ]),
-      'node',
     );
-    const row = model.rows.get('platform/alice');
+    const row = model.rows.get('n1');
     const last = model.slots.length - 1;
     expect(row?.down.slice(last - 3)).toEqual([60, 0, 6, null]);
     expect(row?.down[0]).toBeNull();
@@ -243,7 +248,6 @@ describe('realtime user traffic data', () => {
         ['n1', 'alice', [[T - 30, 1, 2]]],
         ['n2', 'alice', [[T - 30, 3, 4]]],
       ]),
-      'user',
     );
     expect([...model.rows.keys()].sort()).toEqual(['n1', 'n2']);
     expect(model.totalDown[model.slots.length - 2]).toBe(6);
@@ -275,9 +279,9 @@ describe('realtime user traffic data', () => {
         },
       ],
     };
-    const model = hourModel(input, 'node');
+    const model = hourModel(input);
     expect(model.totalDown).toEqual([0, 150, 300]);
-    expect(model.rows.get('platform/alice')).toMatchObject({ hourDown: 450, hourUp: 90 });
+    expect(model.rows.get('n1')).toMatchObject({ hourDown: 450, hourUp: 90 });
     expect(model.peak).toBe(12);
   });
 
@@ -304,10 +308,10 @@ describe('realtime user traffic data', () => {
         },
       ],
     };
-    const model = hourModel(input, 'node');
+    const model = hourModel(input);
     expect(model.totalDown).toEqual([null, 300, 0, 300]);
     expect(model.totalUp).toEqual([null, 30, 0, 30]);
-    expect(model.rows.get('platform/alice')).toMatchObject({ hourDown: 600, hourUp: 60 });
+    expect(model.rows.get('n1')).toMatchObject({ hourDown: 600, hourUp: 60 });
   });
 
   it('clips boundary windows while retaining the right rate for a partial 30-second slot', () => {
@@ -326,9 +330,9 @@ describe('realtime user traffic data', () => {
         },
       ],
     };
-    const model = hourModel(input, 'node');
+    const model = hourModel(input);
     expect(model.totalDown).toEqual([300, 300]);
-    expect(model.rows.get('platform/alice')?.hourDown).toBe(300);
+    expect(model.rows.get('n1')?.hourDown).toBe(300);
     expect(model.peak).toBe(10);
   });
 
@@ -396,8 +400,7 @@ describe('machine user traffic card', () => {
     expect(screen.getByText('转发实时待升级 Agent')).toBeTruthy();
     expect(screen.getByRole('region', { name: '当前速率' }).textContent).toContain('—');
   });
-  it('shows the hour as bars without the matrix and retains readings when the channel drops', async () => {
-    served = history({ n1: [T - 90, T - 60, T - 30] }, [['n1', 'bob', [[T - 60, 300, 600]]]]);
+  it('shows selected history as bars without the matrix and retains readings when the channel drops', async () => {
     renderCard(
       <NodeRealtimeProvider nodeId="n1">
         <NodeUserTrafficCard nodeId="n1" />
@@ -405,14 +408,15 @@ describe('machine user traffic card', () => {
     );
     await settle();
     const overview = screen.getByRole('region', { name: '实时流量' });
-    expect(within(overview).getByRole('region', { name: '近 1 小时' }).textContent).toContain('900B');
+    expect(within(overview).getByRole('region', { name: '所选区间历史流量' }).textContent).toContain('900B');
+    expect(within(overview).getByText('当天 · 每 5 分钟 · 已观测窗口均值')).toBeTruthy();
     expect(screen.queryByRole('table')).toBeNull();
     expect(screen.queryByRole('group', { name: '排序' })).toBeNull();
     expect(screen.queryByRole('searchbox')).toBeNull();
     const now = screen.getByRole('region', { name: '当前速率' });
     act(() => Events.sources[0].send('sample', event('n1', [rate('alice')])));
     expect(now.querySelector('.user-usage-hero-value')?.textContent).toContain('24.6');
-    expect(now.querySelector('.rut-hero-sub')?.textContent).toContain('共 2 位');
+    expect(now.querySelector('.rut-hero-sub')?.textContent).toContain('共 1 位');
     act(() => vi.advanceTimersByTime(1_000));
     act(() => Events.sources[0].send('status', { node_id: 'n1', connected: false }));
     expect(screen.getByText('实时通道未连接')).toBeTruthy();
@@ -710,5 +714,77 @@ describe('user realtime traffic card', () => {
     expect(screen.getByText('正在建立速率基线')).toBeTruthy();
     view.unmount();
     expect(Events.sources[1].closed).toBe(true);
+  });
+});
+
+describe('machine history period', () => {
+  it('keeps gaps, rates and recorded totals independent of bucket width', () => {
+    const model = nodeHistoryModel({
+      ...servedNode,
+      bucket_secs: 3600,
+      points: [
+        [T - 3600, null, null],
+        [T, 10, 20],
+      ],
+    });
+    expect(model.totalUp).toEqual([null, 300]);
+    expect(model.totalDown).toEqual([null, 600]);
+    expect(model.recordedBytes).toBe(900);
+    expect(model.slots).toEqual([T - 3600, T]);
+  });
+
+  it('reloads every selection without reopening the live stream or displaying the previous range', async () => {
+    const requests: URL[] = [];
+    let finish: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input), 'http://localhost');
+        if (!url.pathname.endsWith('/traffic-history')) return new Promise<Response>(() => {});
+        requests.push(url);
+        if (url.searchParams.get('period') === 'week')
+          return new Promise<Response>(resolve => {
+            finish = resolve;
+          });
+        return Response.json({ ...servedNode, bucket_secs: url.searchParams.get('period') === 'month' ? 3600 : 300 });
+      }),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const card = (period: SiteUsagePeriod, range?: TrafficTimeRange) => (
+      <QueryClientProvider client={client}>
+        <NodeRealtimeProvider nodeId="n1">
+          <NodeUserTrafficCard nodeId="n1" period={period} range={range} />
+        </NodeRealtimeProvider>
+      </QueryClientProvider>
+    );
+    const view = render(card('day'));
+    await settle();
+    const live = screen.getByRole('region', { name: '当前速率' });
+    act(() => Events.sources[0].send('sample', event()));
+    const reading = live.textContent;
+    view.rerender(card('week'));
+    await settle();
+    expect(screen.queryByText('当天 · 每 5 分钟 · 已观测窗口均值')).toBeNull();
+    expect(screen.getByRole('region', { name: '所选区间历史流量' }).textContent).not.toContain('900B');
+    await act(async () => {
+      finish!(Response.json({ ...servedNode, bucket_secs: 900, recorded_bytes: 1800 }));
+    });
+    await settle();
+    expect(screen.getByText('当周 · 每 15 分钟 · 已观测窗口均值')).toBeTruthy();
+    view.rerender(card('month'));
+    await settle();
+    expect(screen.getByText('当月 · 每 1 小时 · 已观测窗口均值')).toBeTruthy();
+    const range = { start_unix_secs: T - 600, end_unix_secs: T - 30 };
+    view.rerender(card('day', range));
+    await settle();
+    const last = requests.at(-1)!;
+    expect(last.searchParams.get('start_unix_secs')).toBe(String(range.start_unix_secs));
+    expect(last.searchParams.get('end_unix_secs')).toBe(String(range.end_unix_secs));
+    expect(requests.map(url => url.searchParams.get('period'))).toEqual(['day', 'week', 'month', 'day']);
+    expect(screen.getByText('自选区间 · 每 5 分钟 · 已观测窗口均值')).toBeTruthy();
+    expect(screen.getByRole('region', { name: '当前速率' })).toBe(live);
+    expect(live.textContent).toBe(reading);
+    expect(Events.sources).toHaveLength(1);
+    expect(Events.sources[0].closed).toBe(false);
   });
 });

@@ -62,7 +62,8 @@ test('代码分包与首次 API 请求共用一个持续加载边界', () => {
   assert.doesNotMatch(panes, /<LoadingBoundary[^>]*\bkey=/);
   assert.match(panes, /routeKey=\{paneLoadingRouteKey\(win\.key, win\.data\)\}/);
   assert.match(shell, /<LoadingBoundary fallback=\{<Loading variant="canvas" \/>\} variant="canvas">/);
-  assert.match(usage, /monthly\.isPending[\s\S]*?return <Loading variant="usage" \/>/);
+  assert.doesNotMatch(usage, /monthly\.isPending[\s\S]*?return <Loading variant="usage" \/>/);
+  assert.match(usage, /monthly\.isPending[\s\S]*?<PanelLoading label="读取月度用量" announce=\{false\} \/>/);
   assert.match(usage, /placeholderData: previous => previous/);
   assert.match(capacity, /queryKey: \['usage-machine-model'\]/);
 });

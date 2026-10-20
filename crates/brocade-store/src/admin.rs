@@ -136,16 +136,13 @@ pub struct IssuedAdminSession {
     pub expires_at: String,
 }
 
-/// The operator whose existence opens the console to anybody who loads the page.
-///
-/// It remains a fixed internal login identity, while the product exposes it as a simple visitor
-/// switch rather than general operator management.
+/// The fixed identity holding visitor-access configuration, never a login credential or session.
 pub const PUBLIC_OPERATOR_ID: &str = "public";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminAuthState {
     pub initialized: bool,
-    /// Whether the fixed passwordless visitor identity exists.
+    /// Whether anonymous requests may use the fixed stateless visitor identity.
     pub public_open: bool,
 }
 
@@ -340,7 +337,7 @@ pub async fn admin_auth_state(pool: &PgPool) -> Result<AdminAuthState> {
         "SELECT EXISTS (SELECT 1 FROM admin_operators) AS initialized,
                 EXISTS (
                     SELECT 1 FROM admin_operators
-                    WHERE id = $1 AND password_hash IS NULL
+                    WHERE id = $1 AND role = 'readonly' AND password_hash IS NULL
                 ) AS public_open",
     )
     .bind(PUBLIC_OPERATOR_ID)
@@ -352,11 +349,38 @@ pub async fn admin_auth_state(pool: &PgPool) -> Result<AdminAuthState> {
     })
 }
 
+/// Resolve the current visitor scope without issuing credentials or touching last-used state.
+pub async fn public_identity(pool: &PgPool) -> Result<Option<AuthenticatedAdmin>> {
+    let scope = sqlx::query_scalar::<_, String>(
+        "SELECT tenant_scope FROM admin_operators
+         WHERE id = $1 AND role = 'readonly' AND password_hash IS NULL",
+    )
+    .bind(PUBLIC_OPERATOR_ID)
+    .fetch_optional(pool)
+    .await?;
+    Ok(scope.map(|tenant_scope| AuthenticatedAdmin {
+        operator_id: PUBLIC_OPERATOR_ID.to_owned(),
+        role: AdminRole::Readonly,
+        tenant_scope: Some(tenant_scope),
+        token_prefix: None,
+        self_user: None,
+    }))
+}
+
+/// Retire sessions issued by the former passwordless visitor login during startup.
+pub(crate) async fn remove_public_sessions(pool: &PgPool) -> Result<()> {
+    sqlx::query("DELETE FROM admin_sessions WHERE operator_id = $1")
+        .bind(PUBLIC_OPERATOR_ID)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Turn the fixed visitor identity on or off without exposing general operator management.
 ///
-/// Disabling deletes the row so its browser sessions disappear through the session foreign key.
-/// Enabling recreates it as a passwordless readonly identity scoped to the installation's root
-/// tenant. User login identities are separate and are not affected.
+/// Disabling deletes the configuration, so the next anonymous request has no visitor identity.
+/// Enabling recreates a readonly scope under the installation's root tenant. User login
+/// identities are separate and are not affected.
 pub async fn set_public_access(
     pool: &PgPool,
     actor: &AdminContext,
@@ -425,7 +449,7 @@ pub async fn set_public_access(
 }
 
 pub async fn init_admin(pool: &PgPool, request: AdminInitRequest) -> Result<AdminInitResult> {
-    let operator_id = required_text(&request.operator_id, "admin operator id")?;
+    let operator_id = initial_admin_operator_id(&request.operator_id)?;
     let display_name = required_text(&request.display_name, "admin operator display_name")?;
     let password_hash = hash_admin_password(&request.password)?;
 
@@ -484,7 +508,7 @@ pub async fn init_admin(pool: &PgPool, request: AdminInitRequest) -> Result<Admi
 /// user is an operator choice made later in that resumable flow; initialization must not invent
 /// an identity such as `zero`.
 pub async fn init_system(pool: &PgPool, request: SystemInitRequest) -> Result<SystemInitResult> {
-    let operator_id = required_text(&request.operator_id, "admin operator id")?;
+    let operator_id = initial_admin_operator_id(&request.operator_id)?;
     let display_name = required_text(&request.display_name, "admin operator display_name")?;
     let root_tenant = required_text(&request.root_tenant, "root tenant")?;
     let password_hash = hash_admin_password(&request.password)?;
@@ -532,6 +556,16 @@ pub async fn init_system(pool: &PgPool, request: SystemInitRequest) -> Result<Sy
         },
         session,
     })
+}
+
+fn initial_admin_operator_id(value: &str) -> Result<String> {
+    let operator_id = required_text(value, "admin operator id")?;
+    if operator_id == PUBLIC_OPERATOR_ID {
+        return Err(StoreError::InvalidData(
+            "public is reserved for stateless visitor access".to_owned(),
+        ));
+    }
+    Ok(operator_id)
 }
 
 pub async fn login_admin(pool: &PgPool, request: AdminLoginRequest) -> Result<AdminLoginResult> {
@@ -604,7 +638,7 @@ pub async fn create_admin_operator(
     let will_be_passwordless = request.password.is_none() && existing_passwordless.unwrap_or(true);
     if will_be_passwordless && !(id == PUBLIC_OPERATOR_ID && request.role == AdminRole::Readonly) {
         return Err(StoreError::InvalidData(
-            "passwordless login is reserved for the public readonly operator".to_owned(),
+            "a passwordless operator is reserved for stateless visitor access".to_owned(),
         ));
     }
     let password_hash = request
@@ -1126,6 +1160,11 @@ pub async fn issue_admin_token(
         ));
     }
     ensure_admin_operator_access_allowed(pool, actor, operator_id).await?;
+    if operator_id == PUBLIC_OPERATOR_ID {
+        return Err(StoreError::Forbidden(
+            "stateless visitors cannot hold admin API tokens".to_owned(),
+        ));
+    }
     if load_admin_operator_identity(pool, operator_id)
         .await?
         .is_some_and(|operator| operator.role == AdminRole::User)
@@ -1178,10 +1217,12 @@ pub async fn authenticate_admin_token(
                  OR token_last_used_at < now() - ($2::int * interval '1 second')) AS touch_last_used
          FROM admin_operators
          WHERE token_hash = $1
-           AND token_revoked_at IS NULL",
+           AND token_revoked_at IS NULL
+           AND id <> $3",
     )
     .bind(&token_hash)
     .bind(ADMIN_LAST_USED_TOUCH_SECONDS)
+    .bind(PUBLIC_OPERATOR_ID)
     .fetch_optional(pool)
     .await?;
 
@@ -1245,10 +1286,12 @@ pub async fn authenticate_admin_session_with_refresh(
          WHERE s.operator_id = o.id
            AND s.token_hash = $1
            AND s.revoked_at IS NULL
-           AND s.expires_at > now()",
+           AND s.expires_at > now()
+           AND o.id <> $3",
     )
     .bind(&token_hash)
     .bind(ADMIN_LAST_USED_TOUCH_SECONDS)
+    .bind(PUBLIC_OPERATOR_ID)
     .fetch_optional(pool)
     .await?;
 
@@ -1336,6 +1379,9 @@ async fn authenticate_admin_password(
     operator_id: &str,
     password: &str,
 ) -> Result<Option<AuthenticatedAdmin>> {
+    if operator_id == PUBLIC_OPERATOR_ID {
+        return Ok(None);
+    }
     let Some(row) = sqlx::query(
         "SELECT id, role, tenant_scope, password_hash, user_tenant_id, user_id
          FROM admin_operators
@@ -1349,20 +1395,11 @@ async fn authenticate_admin_password(
     };
     let role = parse_admin_role(row.try_get("role")?)?;
     let password_hash: Option<String> = row.try_get("password_hash")?;
-    match password_hash {
-        // Apply the invariant while authenticating as well as while writing. Authentication must
-        // fail closed even if the database invariant was bypassed outside this process.
-        None => {
-            let id: String = row.try_get("id")?;
-            if !password.is_empty() || id != PUBLIC_OPERATOR_ID || role != AdminRole::Readonly {
-                return Ok(None);
-            }
-        }
-        Some(password_hash) => {
-            if !verify_admin_password(password, &password_hash)? {
-                return Ok(None);
-            }
-        }
+    let Some(password_hash) = password_hash else {
+        return Ok(None);
+    };
+    if !verify_admin_password(password, &password_hash)? {
+        return Ok(None);
     }
 
     Ok(Some(AuthenticatedAdmin {
@@ -1657,7 +1694,17 @@ fn authenticated_user_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<Aut
 
 #[cfg(test)]
 mod tests {
-    use super::{tenant_in_scope, tenant_scope_like_pattern, AdminContext, AdminRole};
+    use super::{
+        initial_admin_operator_id, tenant_in_scope, tenant_scope_like_pattern, AdminContext,
+        AdminRole,
+    };
+
+    #[test]
+    fn initial_administrator_cannot_use_the_stateless_visitor_identity() {
+        assert!(initial_admin_operator_id("public").is_err());
+        assert!(initial_admin_operator_id(" public ").is_err());
+        assert_eq!(initial_admin_operator_id("root").unwrap(), "root");
+    }
 
     #[test]
     fn realtime_user_traffic_is_for_signed_in_operators_but_not_visitors_or_users() {

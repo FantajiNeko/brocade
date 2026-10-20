@@ -89,15 +89,6 @@ interface WizardPathEditorProps {
   onDnsChange: (node: string, selector: DestMatch, resolution: EgressDnsResolution | null) => void;
 }
 
-const MATCH_PREFERENCE: readonly DestMatch['t'][] = ['geosite', 'domain_keyword'];
-const wizardMatchPriority = (kind: DestMatch['t']) => {
-  const index = MATCH_PREFERENCE.indexOf(kind);
-  return index < 0 ? MATCH_PREFERENCE.length : index;
-};
-const WIZARD_MATCH_KINDS = [...MATCH_KINDS].sort(
-  (left, right) => wizardMatchPriority(left.t) - wizardMatchPriority(right.t),
-);
-
 /** The creation page edits the same Rule/Step graph as the chain detail page. */
 export function WizardPathEditor(props: WizardPathEditorProps) {
   const {
@@ -379,7 +370,7 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
     const rows = [...(tables[source] ?? [fallbackFor(source)])];
     const terminal = rows.findIndex(isPinnedTerminalRule);
     rows.splice(terminal < 0 ? rows.length : terminal, 0, {
-      m: buildMatch(MATCH_PREFERENCE[0], ''),
+      m: buildMatch(MATCH_KINDS.some(kind => kind.t === 'geosite') ? 'geosite' : 'domain_keyword', ''),
       a: egressAllowed(source) ? { t: 'egress', send_through: null } : { t: 'block' },
     });
     commit({ ...tables, [source]: pinTerminalRules(rows) });
@@ -617,7 +608,7 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
                                 })
                               }
                             >
-                              {WIZARD_MATCH_KINDS.map(kind => (
+                              {MATCH_KINDS.map(kind => (
                                 <option
                                   key={kind.t}
                                   value={kind.t}

@@ -7,7 +7,7 @@ import { SessionProvider } from '../src/session';
 
 const initial = { node_count: 0, chain_group_count: [] };
 
-function mount() {
+function mount(current: number | undefined) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
@@ -23,7 +23,7 @@ function mount() {
           },
         }}
       >
-        <DraftBar current={6} />
+        <DraftBar current={current} />
       </SessionProvider>
     </QueryClientProvider>,
   );
@@ -60,11 +60,29 @@ describe('draft submission result', () => {
         }),
       }),
     );
-    const view = mount();
+    const view = mount(6);
 
     fireEvent.click(view.getByRole('button', { name: '提交' }));
 
     await waitFor(() => expect(view.queryByRole('button', { name: '提交' })).toBeNull());
     expect(view.queryByText(/已提交修订|客户端配置|节点产物变化|拓扑发布/)).toBeNull();
+  });
+});
+
+describe('draft explanation', () => {
+  it.each([
+    [1956, '提交后将合并生成一个新修订（当前修订 1956）。'],
+    [undefined, '提交后将合并生成一个新修订。'],
+  ])('describes one new revision without predicting its ID (%s)', (current, expected) => {
+    draft.push({ op: 'upsert_app', app: { id: 'app-main', label: 'Main' } });
+    const view = mount(current);
+
+    expect(view.container.querySelector('.fg-draft-head .note')?.textContent).toBe(expected);
+    expect(view.queryByText(/写入库|的下一个|1957/)).toBeNull();
+    const toggle = view.getByRole('button', { name: /1 处未提交/ });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(view.container.querySelector('.fg-draft-list')).not.toBeNull();
   });
 });

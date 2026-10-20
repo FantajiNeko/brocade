@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Stable stdout line from `brocade-agent self-test`. It requires no credentials, filesystem or network access and
+/// certifies that the executable contains the Agent daemon entry point. Keep v1 available
+/// across CLI help/localization changes so installers can probe older and newer releases.
+pub const AGENT_SELF_TEST_RESPONSE: &str = "brocade-agent-self-test-v1";
+
 use crate::plan::{
     AppliedArtifactState, AppliedGrantsState, ConfigArtifact, DeploymentKind, DeploymentPlan,
     NodeDesiredState, PlannedAction,
@@ -11,7 +16,11 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 36;
+pub const AGENT_PROTOCOL_VERSION: u32 = 38;
+
+/// First Agent that obeys a frozen configuration restart/handoff policy. Older Agents would
+/// ignore the added field and silently use handoff even when Beta is disabled.
+pub const CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION: u32 = 37;
 
 /// Single on-demand TCP pings are independent of listener convergence and accounting.
 pub const FORWARDING_PROBE_PROTOCOL_VERSION: u32 = 36;
@@ -914,6 +923,10 @@ pub struct NodeDesiredDeployment {
     pub claim_generation: u64,
     pub wave: u32,
     pub actions: Vec<PlannedAction>,
+    /// Frozen at approval, not read from live settings at execution time. Absent only for
+    /// pre-policy work orders, which retain their approved handoff-only behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_config_update_policy: Option<XrayConfigUpdatePolicy>,
     /// Immutable ownership map for the Xray counters created by this work order.  It advances
     /// only after the agent has converged the target, so a reading queued before a permission or
     /// topology change is never interpreted through the model that happened to be current when
@@ -931,6 +944,25 @@ pub struct NodeDesiredDeployment {
     /// Empty means the control plane has no distribution source configured and the agent can use
     /// only what the machine already holds. Absent, the agent reports an explicit error.
     pub phantun_binary: Option<PhantunBinaries>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XrayConfigUpdatePolicy {
+    /// Try safe in-process updates first; otherwise stop/start. Never initiate handoff.
+    Restart,
+    /// Try safe in-process updates first; otherwise handoff. Never fall back to stop/start.
+    Handoff,
+}
+
+impl XrayConfigUpdatePolicy {
+    pub fn from_handoff_beta(enabled: bool) -> Self {
+        if enabled {
+            Self::Handoff
+        } else {
+            Self::Restart
+        }
+    }
 }
 
 /// The answer to `/agent/v1/desired`.
@@ -1161,6 +1193,33 @@ pub struct AgentReleaseReport {
 mod agent_release_compat_tests {
     use super::*;
     #[test]
+    fn config_policy_is_explicit_for_new_orders_and_absent_for_legacy_orders() {
+        let disabled = serde_json::json!({"state":"disabled","reason":"test"});
+        let mut wire = serde_json::json!({
+            "deployment_id":1,"node_id":"node-a","claim_generation":0,"wave":0,
+            "actions":["apply-xray"],"usage_generation_id":null,"phantun_binary":null,
+            "desired":{"phantun":disabled,"wireguard":disabled,"xray":disabled,
+                "hy2_port_hop":disabled,"grants":disabled}
+        });
+        assert_eq!(
+            serde_json::from_value::<NodeDesiredDeployment>(wire.clone())
+                .unwrap()
+                .xray_config_update_policy,
+            None
+        );
+        for (enabled, expected) in [
+            (false, XrayConfigUpdatePolicy::Restart),
+            (true, XrayConfigUpdatePolicy::Handoff),
+        ] {
+            assert_eq!(XrayConfigUpdatePolicy::from_handoff_beta(enabled), expected);
+            wire["xray_config_update_policy"] = serde_json::to_value(expected).unwrap();
+            let parsed: NodeDesiredDeployment = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(parsed.xray_config_update_policy, Some(expected));
+        }
+        wire["xray_config_update_policy"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<NodeDesiredDeployment>(wire).is_err());
+    }
+    #[test]
     fn self_update_uses_additive_fields_without_raising_protocol_minimum() {
         let offer = AgentReleaseOffer {
             url: "https://console.example/brocade-agent/x86_64".to_owned(),
@@ -1177,7 +1236,8 @@ mod agent_release_compat_tests {
         assert_eq!(new.release_id, None);
         assert_eq!(new.attempt, None);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
-        assert_eq!(AGENT_PROTOCOL_VERSION, 36);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 38);
+        assert_eq!(CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION, 37);
         assert_eq!(CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION, 32);
         assert_eq!(CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, 33);
     }
@@ -2006,7 +2066,6 @@ impl E2eProbeTargetList {
 /// subscription (`brocade_core::physical::probe`); one differing parameter would measure a
 /// different path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct E2eProbeTarget {
     pub app_id: Option<String>,
     pub chain_id: String,
@@ -3892,7 +3951,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 36);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 38);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,
@@ -4317,12 +4376,18 @@ mod tests {
         let target: E2eProbeTarget = serde_json::from_value(current.clone()).unwrap();
         assert!(matches!(target.security, E2eProbeSecurity::Tls(_)));
 
-        let mut contradictory = current;
-        contradictory
+        let mut extended = current.clone();
+        extended
             .as_object_mut()
             .unwrap()
             .insert("reality".to_owned(), serde_json::json!({}));
-        assert!(serde_json::from_value::<E2eProbeTarget>(contradictory).is_err());
+        assert_eq!(
+            serde_json::from_value::<E2eProbeTarget>(extended).unwrap(),
+            target
+        );
+        let mut unsupported = current;
+        unsupported["security"]["type"] = serde_json::json!("future_security");
+        assert!(serde_json::from_value::<E2eProbeTarget>(unsupported).is_err());
     }
 
     #[test]

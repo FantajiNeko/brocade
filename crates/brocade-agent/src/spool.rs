@@ -7,6 +7,7 @@
 use std::{
     borrow::Cow,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -64,6 +65,25 @@ pub(crate) const FORWARDING_USAGE_SPOOL: Spool = Spool {
     terminal_statuses: &[],
 };
 
+// Optional detail checkpoints are durable before Xray may reuse their resident slots.
+// They have independent file/network locks and never evict an unacknowledged checkpoint.
+pub(crate) const DOMAIN_DETAIL_SPOOL: Spool = Spool {
+    file: "other-domain.spool.jsonl",
+    endpoint: "/agent/v1/other-domain-usage",
+    max: 720,
+    what: "other-domain",
+    unit: "明细检查点",
+    dropped_kind: DroppedKind::Detail,
+    terminal_statuses: &[],
+};
+pub(crate) const FAILED_DETAIL_SPOOL: Spool = Spool {
+    file: "sniffing-failed.spool.jsonl",
+    endpoint: "/agent/v1/sniffing-failed-usage",
+    what: "sniffing-failed",
+    ..DOMAIN_DETAIL_SPOOL
+};
+const DETAIL_SPOOL_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 /// The observation spool is far shorter than the usage one because it cannot
 /// naturally accumulate: an entry appears only after desired was fetched and one
 /// convergence ran, and when the control plane is unreachable `desired_request`
@@ -98,6 +118,7 @@ pub(crate) enum DroppedKind {
     Usage,
     Observation,
     Load,
+    Detail,
 }
 
 impl DroppedKind {
@@ -106,6 +127,7 @@ impl DroppedKind {
             Self::Usage => "spool-dropped-usage",
             Self::Observation => "spool-dropped-observation",
             Self::Load => "spool-dropped-load",
+            Self::Detail => "spool-dropped-detail",
         }
     }
 }
@@ -130,12 +152,18 @@ static OBSERVATION_DRAIN_LOCK: Mutex<()> = Mutex::new(());
 static LOAD_DRAIN_LOCK: Mutex<()> = Mutex::new(());
 static OTHER_DRAIN_LOCK: Mutex<()> = Mutex::new(());
 static DROPPED_LOCK: Mutex<()> = Mutex::new(());
+static DOMAIN_FILE_LOCK: Mutex<()> = Mutex::new(());
+static DOMAIN_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+static FAILED_FILE_LOCK: Mutex<()> = Mutex::new(());
+static FAILED_DRAIN_LOCK: Mutex<()> = Mutex::new(());
 
 fn file_lock(spool: Spool) -> &'static Mutex<()> {
     match spool.file {
         file if file == USAGE_SPOOL.file => &USAGE_FILE_LOCK,
         file if file == OBSERVATION_SPOOL.file => &OBSERVATION_FILE_LOCK,
         file if file == LOAD_SPOOL.file => &LOAD_FILE_LOCK,
+        file if file == DOMAIN_DETAIL_SPOOL.file => &DOMAIN_FILE_LOCK,
+        file if file == FAILED_DETAIL_SPOOL.file => &FAILED_FILE_LOCK,
         _ => &OTHER_FILE_LOCK,
     }
 }
@@ -145,6 +173,8 @@ fn drain_lock(spool: Spool) -> &'static Mutex<()> {
         file if file == USAGE_SPOOL.file => &USAGE_DRAIN_LOCK,
         file if file == OBSERVATION_SPOOL.file => &OBSERVATION_DRAIN_LOCK,
         file if file == LOAD_SPOOL.file => &LOAD_DRAIN_LOCK,
+        file if file == DOMAIN_DETAIL_SPOOL.file => &DOMAIN_DRAIN_LOCK,
+        file if file == FAILED_DETAIL_SPOOL.file => &FAILED_DRAIN_LOCK,
         _ => &OTHER_DRAIN_LOCK,
     }
 }
@@ -433,9 +463,32 @@ fn spool_push_inner<T: serde::Serialize>(
     if unique && lines.iter().any(|existing| existing == &line) {
         return Ok(());
     }
-    lines.push(line);
+    let merged = if spool.dropped_kind == DroppedKind::Detail {
+        lines
+            .last()
+            .map(|previous| merge_detail_checkpoint(spool, previous, &line))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(merged) = merged {
+        *lines
+            .last_mut()
+            .expect("a merged checkpoint has an existing tail") = merged;
+    } else {
+        lines.push(line);
+    }
+    if spool.dropped_kind == DroppedKind::Detail
+        && lines.iter().map(|line| line.len() + 1).sum::<usize>() > DETAIL_SPOOL_MAX_BYTES
+    {
+        return Err(format!(
+            "{}: detail queue byte limit reached; preserved all checkpoints",
+            spool.what
+        ));
+    }
     if lines.len() > spool.max {
-        if spool.dropped_kind == DroppedKind::Usage {
+        if matches!(spool.dropped_kind, DroppedKind::Usage | DroppedKind::Detail) {
             return Err(format!(
                 "{}: accounting queue is full ({}); preserved all checkpoints",
                 spool.what, spool.max
@@ -454,6 +507,96 @@ fn spool_push_inner<T: serde::Serialize>(
     spool_write_unlocked(spool, state_dir, &lines)
 }
 
+// Only the pending tail may be coalesced. Each segment stays cumulative and retains its epoch,
+// ownership generation and hour, so replays after an in-flight response are still idempotent.
+fn merge_detail_checkpoint(
+    spool: Spool,
+    previous: &str,
+    incoming: &str,
+) -> Result<Option<String>, String> {
+    use brocade_deployment::{
+        other_domain::{
+            OtherDomainCounter, OtherDomainReport, DETAIL_CHECKPOINT_VERSION, OTHER_DOMAIN_MAX_ROWS,
+        },
+        sniffing_failed::{SniffingFailedCounter, SniffingFailedReport},
+    };
+    let decode = |line: &str| -> Result<OtherDomainReport, String> {
+        if spool.file == FAILED_DETAIL_SPOOL.file {
+            serde_json::from_str::<SniffingFailedReport>(line)
+                .map(|report| {
+                    report.map_counters(|r| OtherDomainCounter {
+                        counter_id: r.counter_id,
+                        bucket: r.bucket,
+                        label: r.label,
+                        domain: r.target,
+                        uplink_bytes: r.uplink_bytes,
+                        downlink_bytes: r.downlink_bytes,
+                    })
+                })
+                .map_err(|_| "cannot decode failed-target checkpoint".into())
+        } else {
+            serde_json::from_str(line).map_err(|_| "cannot decode domain checkpoint".into())
+        }
+    };
+    let old = decode(previous)?;
+    let mut next = decode(incoming)?;
+    if old.version != DETAIL_CHECKPOINT_VERSION
+        || next.version != DETAIL_CHECKPOINT_VERSION
+        || old.epoch != next.epoch
+        || old.activation_unix_secs != next.activation_unix_secs
+        || old.usage_generation_id != next.usage_generation_id
+        || old.read_at_unix_secs / 3600 != next.read_at_unix_secs / 3600
+    {
+        return Ok(None);
+    }
+    let mut counters = std::collections::BTreeMap::new();
+    for row in old.counters.into_iter().chain(next.counters) {
+        let key = (
+            row.bucket,
+            row.label.clone(),
+            row.domain.clone(),
+            row.counter_id,
+        );
+        let previous = counters.entry(key).or_insert((0, 0));
+        previous.0 = previous.0.max(row.uplink_bytes);
+        previous.1 = previous.1.max(row.downlink_bytes);
+    }
+    if counters.len() > OTHER_DOMAIN_MAX_ROWS {
+        return Ok(None);
+    }
+    next.read_at_unix_secs = next.read_at_unix_secs.max(old.read_at_unix_secs);
+    next.limited |= old.limited;
+    next.counters = counters
+        .into_iter()
+        .map(
+            |((bucket, label, domain, counter_id), (uplink_bytes, downlink_bytes))| {
+                OtherDomainCounter {
+                    counter_id,
+                    bucket,
+                    label,
+                    domain,
+                    uplink_bytes,
+                    downlink_bytes,
+                }
+            },
+        )
+        .collect();
+    if spool.file == FAILED_DETAIL_SPOOL.file {
+        serde_json::to_string(&next.map_counters(|r| SniffingFailedCounter {
+            counter_id: r.counter_id,
+            bucket: r.bucket,
+            label: r.label,
+            target: r.domain,
+            uplink_bytes: r.uplink_bytes,
+            downlink_bytes: r.downlink_bytes,
+        }))
+    } else {
+        serde_json::to_string(&next)
+    }
+    .map(Some)
+    .map_err(|_| "cannot encode merged detail checkpoint".into())
+}
+
 pub(crate) fn spool_read(spool: Spool, state_dir: &Path) -> Result<Vec<String>, String> {
     let _guard = file_lock(spool)
         .lock()
@@ -462,7 +605,21 @@ pub(crate) fn spool_read(spool: Spool, state_dir: &Path) -> Result<Vec<String>, 
 }
 
 fn spool_read_unlocked(spool: Spool, state_dir: &Path) -> Result<Vec<String>, String> {
-    match fs::read_to_string(spool_path(spool, state_dir)) {
+    let path = spool_path(spool, state_dir);
+    let contents = if spool.dropped_kind == DroppedKind::Detail {
+        fs::File::open(path).and_then(|file| {
+            let mut text = String::new();
+            file.take(DETAIL_SPOOL_MAX_BYTES as u64 + 1)
+                .read_to_string(&mut text)?;
+            if text.len() > DETAIL_SPOOL_MAX_BYTES {
+                return Err(std::io::Error::other("detail spool exceeds byte limit"));
+            }
+            Ok(text)
+        })
+    } else {
+        fs::read_to_string(path)
+    };
+    match contents {
         Ok(text) => Ok(text
             .lines()
             .map(str::trim)
@@ -836,6 +993,115 @@ mod tests {
         assert_eq!(left.len(), 1);
         assert!(left[0].contains("\"n\":1"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detail_coalescing_during_delivery_preserves_the_newer_checkpoint() {
+        use brocade_deployment::other_domain::{OtherDomainCounter, OtherDomainReport};
+        let spool = super::DOMAIN_DETAIL_SPOOL;
+        let dir = state_dir("detail-merge-in-flight");
+        let report = |up| OtherDomainReport {
+            version: 2,
+            epoch: "a".repeat(32),
+            activation_unix_secs: 7200,
+            read_at_unix_secs: 7300,
+            usage_generation_id: 1,
+            limited: false,
+            counters: vec![OtherDomainCounter {
+                counter_id: 1,
+                bucket: 7200,
+                label: "a@t#i".into(),
+                domain: "a.example".into(),
+                uplink_bytes: up,
+                downlink_bytes: 0,
+            }],
+        };
+        spool_push(spool, &dir, &report(10)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = read_request_body(&mut stream);
+            accepted_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            body
+        });
+        let drain_options = options(&server, &dir);
+        let drain = thread::spawn(move || spool_drain(spool, &drain_options));
+        accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        spool_push(spool, &dir, &report(15)).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(
+            drain.join().unwrap().is_err(),
+            "a changed in-flight body must remain queued"
+        );
+        assert_eq!(
+            serde_json::from_str::<OtherDomainReport>(&worker.join().unwrap())
+                .unwrap()
+                .counters[0]
+                .uplink_bytes,
+            10
+        );
+        let remaining = spool_read(spool, &dir).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<OtherDomainReport>(&remaining[0])
+                .unwrap()
+                .counters[0]
+                .uplink_bytes,
+            15
+        );
+        let (server, worker) = fake_control_plane(vec![200]);
+        assert!(spool_drain(spool, &options(&server, &dir)).unwrap());
+        assert_eq!(worker.join().unwrap().len(), 1);
+        assert!(spool_read(spool, &dir).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_detail_coalescing_keeps_target_identity_and_ownership_boundaries() {
+        use brocade_deployment::sniffing_failed::{SniffingFailedCounter, SniffingFailedReport};
+        let dir = state_dir("failed-detail-coalescing");
+        let spool = super::FAILED_DETAIL_SPOOL;
+        let mut report = SniffingFailedReport {
+            version: 2,
+            epoch: "a".repeat(32),
+            activation_unix_secs: 7200,
+            read_at_unix_secs: 7300,
+            usage_generation_id: 1,
+            limited: false,
+            counters: vec![SniffingFailedCounter {
+                counter_id: 1,
+                bucket: 7200,
+                label: "a@t#i".into(),
+                target: "tcp://192.0.2.1:443".into(),
+                uplink_bytes: 10,
+                downlink_bytes: 0,
+            }],
+        };
+        spool_push(spool, &dir, &report).unwrap();
+        report.counters[0].uplink_bytes = 15;
+        spool_push(spool, &dir, &report).unwrap();
+        let queued = spool_read(spool, &dir).unwrap();
+        assert_eq!(queued.len(), 1);
+        let checkpoint: SniffingFailedReport = serde_json::from_str(&queued[0]).unwrap();
+        assert_eq!(checkpoint.counters[0].uplink_bytes, 15);
+        assert_eq!(checkpoint.counters[0].target, "tcp://192.0.2.1:443");
+        report.usage_generation_id = 2;
+        spool_push(spool, &dir, &report).unwrap();
+        report.epoch = "b".repeat(32);
+        spool_push(spool, &dir, &report).unwrap();
+        assert_eq!(
+            spool_read(spool, &dir).unwrap().len(),
+            3,
+            "ownership and counter lifetimes cannot be merged"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// With the control plane unreachable, nothing may be lost. This is the whole

@@ -1,6 +1,13 @@
 import { useMetricQuery } from './ui/metric-cadence';
 import { lazy, memo, Suspense, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { fetchNodeUserTrafficHistory, fetchUserTrafficHistory, type UserTrafficHistory } from './api';
+import {
+  fetchNodeTrafficHistory,
+  fetchUserTrafficHistory,
+  type NodeTrafficHistory,
+  type SiteUsagePeriod,
+  type TrafficTimeRange,
+  type UserTrafficHistory,
+} from './api';
 import { useNodeRealtime, type RealtimeUserTrafficRate } from './node-realtime';
 import { throughputAxis } from './panes/telemetry-format';
 import { SegmentedControl } from './ui/bits';
@@ -14,8 +21,8 @@ import { PARTIAL_TEXT, PHASE_TEXT, RATE_SUM_NOTE, type TrafficPhase } from './us
 import { FRESH_MILLIS, useUserTrafficSource, type UserTrafficNode } from './user-traffic-source';
 
 /* 用户实时流量卡（用量中的机器弹层 / 用户详情）。两路数据分开呈现，不拼接：
- * - 近 1 小时：Agent 每 30 秒上报的计费窗口，打开时读取、每 30 秒重读，画成每格的走势；
- *   机器弹层用它画本机合计柱状图，用户详情用它呈现入口机器合计图和每台机器的走势。
+ * - 历史：从 Agent 记账窗口读取，每 30 秒刷新。机器弹层随统计区间汇总本机柱状图；
+ *   用户详情保留近 1 小时的入口机器合计图和每台机器的走势。
  * - 当前：打开页面后按需订阅的每秒速率，以读数呈现（左侧合计加上下行占比条）。打开前没有秒级数据，
  *   画成时间序列会在打开时出现空图。
  * 出现过的行保留到离开页面：机器详情的 all 模式不上报速率为 0 的用户，按最新报告重建列表
@@ -100,6 +107,8 @@ interface HourModel {
   totalUp: (number | null)[];
   /** 全体对象的窗口平均速率峰值（B/s），各行走势的缩放下限由它决定。 */
   peak: number;
+  /** 机器统计返回已记录总量；其曲线以已观测窗口的均值表示，不能反推累计量。 */
+  recordedBytes?: number;
 }
 
 export interface CardRow {
@@ -169,7 +178,7 @@ export function aggregateUserTraffic(users: RealtimeUserTrafficRate[]): LiveTraf
 
 /** 近 1 小时的窗口落在 30 秒格上（与机器详情 XRAY 流量同一对齐方式）。格内有窗口而没有字节是
  * 空闲，记 0；格内没有窗口是未采集，记 null。用户详情的合计跨机器相加，任一台采集到即算采集。 */
-function legacyHourModel(history: UserTrafficHistory, page: 'node' | 'user'): HourModel {
+function legacyHourModel(history: UserTrafficHistory): HourModel {
   const last = slotOf(history.range_end_unix_secs);
   const slots = Array.from({ length: SLOTS }, (_, index) => last - (SLOTS - 1 - index) * SLOT_SECS);
   const indexOf = new Map(slots.map((slot, index) => [slot, index]));
@@ -189,9 +198,9 @@ function legacyHourModel(history: UserTrafficHistory, page: 'node' | 'user'): Ho
     return row;
   };
   // 用户详情列出该用户的全部入口机器，近 1 小时没有流量的也列出。
-  if (page === 'user') history.nodes.forEach(node => rowFor(node.node_id, node.node_id));
+  history.nodes.forEach(node => rowFor(node.node_id, node.node_id));
   for (const series of history.series) {
-    const key = page === 'node' ? userKey(series.tenant_id, series.user_id) : series.node_id;
+    const key = series.node_id;
     const row = rowFor(key, series.node_id);
     row.tenant = series.tenant_id;
     row.user = series.user_id;
@@ -274,8 +283,8 @@ const overlap = (start: number, end: number, intervals: readonly Interval[]) =>
 /** Use actual measured intervals, not the report's endpoint bucket. Long cumulative windows
  * preserve byte totals and draw their average rate across every covered slot. Only confirmed
  * downtime is zero; uncovered time remains null. This is chart resampling, not ledger rewriting. */
-export function hourModel(history: UserTrafficHistory, page: 'node' | 'user'): HourModel {
-  if (history.nodes.every(node => node.windows === undefined)) return legacyHourModel(history, page);
+export function hourModel(history: UserTrafficHistory): HourModel {
+  if (history.nodes.every(node => node.windows === undefined)) return legacyHourModel(history);
   const rangeStart = history.range_start_unix_secs;
   const rangeEnd = history.range_end_unix_secs;
   const first = slotOf(rangeStart);
@@ -298,12 +307,10 @@ export function hourModel(history: UserTrafficHistory, page: 'node' | 'user'): H
       ]),
     ]),
   );
-  const rowKey = (series: UserTrafficHistory['series'][number]) =>
-    page === 'node' ? userKey(series.tenant_id, series.user_id) : series.node_id;
   const measuredByRow = new Map<string, Interval[]>();
   const sourcesByRow = new Map<string, UserTrafficHistory['series']>();
   for (const series of history.series) {
-    const key = rowKey(series);
+    const key = series.node_id;
     const grouped = sourcesByRow.get(key) ?? [];
     grouped.push(series);
     sourcesByRow.set(key, grouped);
@@ -336,9 +343,9 @@ export function hourModel(history: UserTrafficHistory, page: 'node' | 'user'): H
     }
     return row;
   };
-  if (page === 'user') history.nodes.forEach(node => rowFor(node.node_id, node.node_id));
+  history.nodes.forEach(node => rowFor(node.node_id, node.node_id));
   for (const series of history.series) {
-    const row = rowFor(page === 'node' ? userKey(series.tenant_id, series.user_id) : series.node_id, series.node_id);
+    const row = rowFor(series.node_id, series.node_id);
     row.tenant = series.tenant_id;
     row.user = series.user_id;
     row.forwarding ||= !!series.forwarding;
@@ -793,6 +800,8 @@ interface TrafficCardProps {
   /** 最新报告完整时，不在报告里的已知对象当前为 0。 */
   complete: boolean;
   history: { model: HourModel | null; pending: boolean; failed: boolean };
+  historyLabel?: string;
+  historyNote?: string;
   nameOf: (key: string) => string;
   /** 用户详情：入口机器公网 IPv4 的归属地区，给身份牌的地区旗用。 */
   countryOf?: (key: string) => string | null;
@@ -812,6 +821,8 @@ function TrafficCard({
   live,
   complete,
   history,
+  historyLabel = '近 1 小时 · 每 30 秒',
+  historyNote = '按真实采样窗口计算平均速率；确认重启停机期间为 0，未知缺失仍为空',
   nameOf,
   countryOf,
   targets = NO_TARGETS,
@@ -928,7 +939,7 @@ function TrafficCard({
       rx,
       tx,
       unit: throughputAxis(rx, tx).unit,
-      total: [...model.rows.values()].reduce((sum, row) => sum + row.hourDown + row.hourUp, 0),
+      total: model.recordedBytes ?? [...model.rows.values()].reduce((sum, row) => sum + row.hourDown + row.hourUp, 0),
     };
   }, [history.model]);
 
@@ -1085,7 +1096,7 @@ function TrafficCard({
   const staleNotice = stale && (
     <p className="rut-notice" role="status">
       <i className="node-lamp warn" />
-      实时通道未连接：当前速率停在 {clockText(staleSince)}，近 1 小时仍每 30 秒更新
+      实时通道未连接：当前速率停在 {clockText(staleSince)}，{users ? '所选区间历史' : '近 1 小时'}仍每 30 秒更新
     </p>
   );
 
@@ -1168,9 +1179,9 @@ function TrafficCard({
   );
 
   const hourPanel = (
-    <section className="rut-hour" aria-label="近 1 小时">
+    <section className="rut-hour" aria-label={users ? '所选区间历史流量' : '近 1 小时'}>
       <div className="rut-hour-head">
-        <span title="按真实采样窗口计算平均速率；确认重启停机期间为 0，未知缺失仍为空">近 1 小时 · 每 30 秒</span>
+        <span title={historyNote}>{historyLabel}</span>
         {chart && <span className="chart-unit">({chart.unit.name})</span>}
         <span className="rut-legend" aria-hidden="true">
           <i className="d" />
@@ -1179,7 +1190,7 @@ function TrafficCard({
           上行
         </span>
         {chart && (
-          <b>
+          <b title={users ? '所选区间保留的记账窗口总量' : undefined}>
             <Bytes value={chart.total} />
           </b>
         )}
@@ -1200,9 +1211,9 @@ function TrafficCard({
       ) : (
         <div className="rut-chart-wait">
           {history.failed ? (
-            <span className="rut-chart-note">近 1 小时数据暂不可用</span>
+            <span className="rut-chart-note">{users ? '所选区间' : '近 1 小时'}数据暂不可用</span>
           ) : history.model ? (
-            <span className="rut-chart-note">近 1 小时没有上报记录</span>
+            <span className="rut-chart-note">{users ? '所选区间' : '近 1 小时'}没有保留的上报记录</span>
           ) : null}
         </div>
       )}
@@ -1280,14 +1291,14 @@ function TrafficCard({
 const clockText = (millis: number | null) =>
   millis === null ? '—' : new Date(millis).toLocaleTimeString('zh-CN', { hour12: false });
 
-function useHourHistory(queryKey: readonly unknown[], load: () => Promise<UserTrafficHistory>, page: 'node' | 'user') {
+function useHourHistory(queryKey: readonly unknown[], load: () => Promise<UserTrafficHistory>) {
   const history = useMetricQuery({
     queryKey,
     queryFn: load,
     refetchInterval: HISTORY_REFRESH_MILLIS,
     staleTime: HISTORY_REFRESH_MILLIS / 2,
   });
-  const model = useMemo(() => (history.data ? hourModel(history.data, page) : null), [history.data, page]);
+  const model = useMemo(() => (history.data ? hourModel(history.data) : null), [history.data]);
   return { model, pending: history.isPending, failed: history.isError && !history.data };
 }
 
@@ -1298,22 +1309,32 @@ export function NodeUserTrafficCard({
   nodeId,
   sourceOf,
   targets = NO_TARGETS,
+  period = 'day',
+  range,
 }: {
   nodeId: string;
   sourceOf?: (key: string) => TrafficSource;
   targets?: readonly string[];
+  period?: SiteUsagePeriod;
+  range?: TrafficTimeRange;
 }) {
-  return <NodeTrafficCard key={nodeId} nodeId={nodeId} sourceOf={sourceOf} targets={targets} />;
+  return (
+    <NodeTrafficCard key={nodeId} nodeId={nodeId} sourceOf={sourceOf} targets={targets} period={period} range={range} />
+  );
 }
 
 function NodeTrafficCard({
   nodeId,
   sourceOf,
   targets,
+  period,
+  range,
 }: {
   nodeId: string;
   sourceOf?: (key: string) => TrafficSource;
   targets: readonly string[];
+  period: SiteUsagePeriod;
+  range?: TrafficTimeRange;
 }) {
   const { last, now, connected, enabled, observingSince } = useNodeRealtime(nodeId);
   const report = last?.event.sample.user_traffic;
@@ -1340,11 +1361,24 @@ function NodeTrafficCard({
   const retained = useRetained(at, liveRows, complete, last?.event);
   if (phase === 'pending' && report?.state === 'warming' && retained.at !== null && now - retained.at <= FRESH_MILLIS)
     phase = 'recovering';
-  const history = useHourHistory(
-    ['user-traffic-history', 'node', nodeId],
-    () => fetchNodeUserTrafficHistory(nodeId),
-    'node',
-  );
+  const query = useMetricQuery({
+    queryKey: ['node-traffic-history', nodeId, period, range ?? null],
+    queryFn: () => fetchNodeTrafficHistory(nodeId, period, range),
+    refetchInterval: HISTORY_REFRESH_MILLIS,
+    staleTime: HISTORY_REFRESH_MILLIS / 2,
+  });
+  const model = useMemo(() => (query.data ? nodeHistoryModel(query.data) : null), [query.data]);
+  const history = { model, pending: query.isPending, failed: query.isError && !query.data };
+  const periodLabel = range ? '自选区间' : { day: '当天', week: '当周', month: '当月' }[period];
+  const step = query.data?.bucket_secs;
+  const stepLabel =
+    step === undefined
+      ? ''
+      : step < 60
+        ? `每 ${step} 秒`
+        : step < 3600
+          ? `每 ${step / 60} 分钟`
+          : `每 ${step / 3600} 小时`;
   const nameOf = useMemo(() => (key: string) => key, []);
   return (
     <TrafficCard
@@ -1356,11 +1390,29 @@ function NodeTrafficCard({
       live={retained.rows}
       complete={complete}
       history={history}
+      historyLabel={`${periodLabel}${stepLabel ? ` · ${stepLabel}` : ''} · 已观测窗口均值`}
+      historyNote={`仅汇总保留的真实记账窗口；未采集或已清理的时段为空${query.data?.has_gap ? '；部分区间采样不完整' : ''}${query.data?.has_unplaced ? '；无时间边界的累计量未绘入图表' : ''}`}
       nameOf={nameOf}
       sourceOf={sourceOf}
       targets={targets}
     />
   );
+}
+
+/** 共用图表模型仍以每 30 秒等效字节表示速率，累计量直接采用服务端窗口总量。 */
+export function nodeHistoryModel(history: NodeTrafficHistory): HourModel {
+  const totalDown = history.points.map(point => (point[2] === null ? null : point[2] * SLOT_SECS));
+  const totalUp = history.points.map(point => (point[1] === null ? null : point[1] * SLOT_SECS));
+  return {
+    rangeStart: history.range_start_unix_secs,
+    rangeEnd: history.range_end_unix_secs,
+    slots: history.points.map(point => point[0]),
+    totalDown,
+    totalUp,
+    rows: new Map(),
+    peak: Math.max(0, ...history.points.flatMap(point => [point[1] ?? 0, point[2] ?? 0])),
+    recordedBytes: history.recorded_bytes,
+  };
 }
 
 /* ── 用户详情 ── */
@@ -1451,10 +1503,8 @@ function UserTrafficCard({ tenantId, userId, nameOf }: UserTrafficCardProps) {
     }
     return next;
   }, [nodes, retained]);
-  const history = useHourHistory(
-    ['user-traffic-history', 'user', tenantId, userId],
-    () => fetchUserTrafficHistory(tenantId, userId),
-    'user',
+  const history = useHourHistory(['user-traffic-history', 'user', tenantId, userId], () =>
+    fetchUserTrafficHistory(tenantId, userId),
   );
   const targets = useMemo(() => (payload?.nodes ?? []).map(node => node.node_id), [payload]);
   const countryOf = useNodeCountries();

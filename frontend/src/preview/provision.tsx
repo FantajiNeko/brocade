@@ -1,3 +1,4 @@
+import { nodeInitializationView } from '../node-initialization';
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchNodes, fetchRevisions, fetchTenants } from '../api';
@@ -36,6 +37,7 @@ const PREVIEW_FORM_DEFAULTS = {
   public_ipv4_nat: false,
   public_ipv6_nat: false,
   egress_allowed: true,
+  overlay: false,
 };
 
 export function PreviewProvision({
@@ -89,12 +91,7 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
   const clearUnsavedChanges = useUnsavedChanges(dirty, 'Preview 纳管表单', guardScope);
 
   const idError = nodeIdError(form.id, new Set((existingNodes.data?.nodes ?? []).map(node => node.node_id)));
-  const tenantError =
-    options.length === 0
-      ? '当前账号没有可用于创建预览机器的租户'
-      : options.length > 1
-        ? '当前流程要求恰好一个可见租户，请先收窄账号范围'
-        : null;
+  const tenantError = options.length === 1 ? null : '当前账户配置不可用，无法创建预览机器。';
 
   const provision = useMutation({
     mutationFn: () =>
@@ -105,6 +102,7 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
         public_ipv4_nat: form.public_ipv4_nat,
         public_ipv6_nat: form.public_ipv6_nat,
         egress_allowed: form.egress_allowed,
+        overlay: form.overlay,
         dns: { t: 'system' },
       }),
     onSuccess: next => {
@@ -260,7 +258,17 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
         </div>
       </div>
 
-      {/* ── 角色：preview 的容器一律加入 overlay，因此只保留出网这一项 ── */}
+      {/* ── 角色：preview 默认不加入 overlay，显式开启时交由人工确认发布 ── */}
+      <div className="wz-fld">
+        <span>WireGuard</span>
+        <SegSwitch
+          checked={form.overlay}
+          onChange={overlay => setForm({ ...form, overlay })}
+          off="关闭"
+          on="启用"
+          ariaLabel="WireGuard overlay"
+        />
+      </div>
       <h4 className="sec">
         角色
         <span className="rule" />
@@ -281,9 +289,9 @@ function PreviewForm({ go, status }: { go: (d: Drill) => void; status: PreviewSt
         </div>
       </div>
 
-      {tenants.data && tenants.data.tenants.length !== 1 && (
+      {tenantError && (
         <div className="callout warn" style={{ marginTop: 12 }}>
-          系统归属配置异常：当前必须恰好有一条，实际为 {tenants.data.tenants.length} 条。
+          {tenantError}
         </div>
       )}
       {provision.error && <ErrorBox error={provision.error} />}
@@ -338,10 +346,11 @@ function PreviewInstall({
   const nodeRow = (nodes.data?.nodes ?? []).find(x => x.node_id === node);
   const nodeLabel = nodeRow?.name || node;
   const tenant = result?.node.tenant_id ?? nodeRow?.tenant_id ?? '';
-  const target = result?.revision_id ?? current;
   // 上线判定与纳管流程使用同一个 hook：token 被使用 → agent 启动 → 首次 desired 心跳。
   const probe = useAgentLiveness(nodeRow);
   const online = probe?.state === 'online';
+  const initialization = nodeRow?.initialization;
+  const initializationView = nodeInitializationView(initialization);
   const redeemed = probe?.state === 'polling' || online;
 
   const [userId, setUserId] = useState('');
@@ -362,7 +371,7 @@ function PreviewInstall({
         stages={[
           { label: '登记配置', state: 'done' },
           { label: '启动容器', state: redeemed ? 'done' : 'current' },
-          { label: '上线验证', state: online ? 'done' : redeemed ? 'current' : 'next' },
+          { label: '初始化', state: initialization?.state === 'succeeded' ? 'done' : redeemed ? 'current' : 'next' },
         ]}
         aside={<span className="wz-mode preview">Docker Preview</span>}
       />
@@ -478,8 +487,8 @@ function PreviewInstall({
 
       <div className="wz-foot">
         <span className="wz-submit-note" aria-live="polite">
-          <b>{online ? '预览机器已就绪' : redeemed ? '正在等待 Agent' : '容器正在安装'}</b>
-          <small>{online ? '可先验证订阅，也可以直接查看发布计划。' : '日志和上线状态每 3 秒自动刷新。'}</small>
+          <b>{online ? initializationView.title : redeemed ? '正在等待 Agent' : '容器正在安装'}</b>
+          <small>{online ? initializationView.description : '日志和上线状态每 3 秒自动刷新。'}</small>
         </span>
         <span className="sp" />
         <button type="button" className="btn" onClick={() => returnTo('nodes')}>
@@ -491,13 +500,15 @@ function PreviewInstall({
         <button
           type="button"
           className="btn primary"
-          disabled={target == null || probe?.state !== 'online'}
-          title={probe?.state === 'online' ? '' : '等 agent 上线后再发布'}
+          disabled={!online || initializationView.action === 'waiting'}
           onClick={() => {
-            navigate('deploy', { p: 'plan', revision: target });
+            if (initializationView.action === 'details') go({ p: 'node', id: node });
+            else if (initializationView.action === 'deployment' && initialization?.deployment_id != null)
+              navigate('deploy', { p: 'detail', id: initialization.deployment_id });
+            else if (initializationView.action === 'plan') navigate('deploy', { p: 'plan', revision: current });
           }}
         >
-          {probe?.state === 'online' ? `去发布 · 计划预览（修订 ${target ?? '…'}）` : '等 agent 上线…'}
+          {online ? initializationView.actionLabel : '等 Agent 上线…'}
         </button>
       </div>
     </>

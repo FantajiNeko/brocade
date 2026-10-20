@@ -694,7 +694,7 @@ describe('user roster rows', () => {
     // 其他站点与嗅探失败的明细并入站点流量卡，不再是单独的卡片。
     expect(view.queryByRole('region', { name: '其他站点 Top N' })).toBeNull();
     expect(report.closest('.user-split-detail')?.querySelector('.dname')?.textContent).toContain('alice');
-    expect(view.queryByRole('region', { name: '全局站点统计' })).toBeNull();
+    expect(view.queryByRole('region', { name: '全局出流量统计' })).toBeNull();
     expect(
       vi.mocked(fetch).mock.calls.some(([path]) => String(path) === `/users/${tenant}/alice/site-usage?period=day`),
     ).toBe(true);
@@ -737,7 +737,7 @@ describe('user roster rows', () => {
     expect(view.getByRole('tabpanel', { name: '转发' })).toBeTruthy();
     expect(view.queryByRole('region', { name: '本月接入' })).toBeNull();
   });
-  it('hides forwarding from the public visitor without starting its protected request', async () => {
+  it('lets public visitors read forwarding while keeping statistics and write actions closed', async () => {
     const { view, selectUser } = mount('readonly', 'public');
 
     await act(async () => {
@@ -745,10 +745,18 @@ describe('user roster rows', () => {
       await Promise.resolve();
     });
 
-    expect(view.queryByRole('tablist')).toBeNull();
-    expect(view.queryByRole('tabpanel', { name: '接入' })).toBeTruthy();
-    expect(view.queryByText('转发入口')).toBeNull();
-    expect(vi.mocked(fetch).mock.calls.some(([input]) => isForwardingRead(String(input)))).toBe(false);
+    expect(view.getAllByRole('tab').map(tab => tab.textContent)).toEqual(['接入', '转发']);
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    const panel = view.getByRole('tabpanel', { name: '转发' });
+    expect(within(panel).getByRole('heading', { name: '转发入口' })).toBeTruthy();
+    expect(within(panel).queryByRole('button', { name: /新建规则|授权机器|编辑|TCP Ping/ })).toBeNull();
+    expect(view.queryByRole('tab', { name: '统计' })).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => isForwardingRead(String(input)))).toBe(true);
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.some(([input]) => /tcp-pings|quota\/jobs|realtime|presence-history/.test(String(input))),
+    ).toBe(false);
   });
 
   it.each([

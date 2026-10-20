@@ -4,9 +4,10 @@ import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboard
 import { useQuery } from '@tanstack/react-query';
 import { fetchUsageMonthly, type UsageDailyRow, type UsageMonthlySummary } from '../api';
 import { isVisitor, useSession } from '../session';
-import { ErrorBox, Loading } from '../ui/bits';
+import { ErrorBox } from '../ui/bits';
 import { bytes, shareOf } from '../ui/format';
 import { Icon } from '../ui/icons';
+import { PanelLoading } from '../ui/loading';
 import { FleetTrafficTab } from './fleet-traffic';
 
 const monthLabel = (s: string) => `${s.slice(0, 4)} 年 ${parseInt(s.slice(5, 7), 10)} 月`;
@@ -93,8 +94,6 @@ export function UsagePane() {
     window.requestAnimationFrame(() => document.getElementById(tabId(key))?.focus());
   };
 
-  if (tab === 'monthly' && monthly.isPending) return <Loading variant="usage" />;
-
   return (
     <div className="nd-sheet nd-page usage-page">
       <div className="fg-sheet nd-paper">
@@ -127,7 +126,7 @@ export function UsagePane() {
           </div>
           {tab === 'monthly' && (
             <div className="nd-tools">
-              {monthly.isFetching && <span className="usage-refreshing">读取中</span>}
+              {monthly.isFetching && monthly.data && <span className="usage-refreshing">读取中</span>}
               <div className="segsw usage-month-tabs" role="group" aria-label="用量月份">
                 <button type="button" aria-pressed={monthOffset === 0} onClick={() => setMonthOffset(0)}>
                   本月
@@ -148,6 +147,11 @@ export function UsagePane() {
         >
           {tab === 'monthly' ? (
             <>
+              {monthly.isPending && (
+                <div className="usage-month-loading">
+                  <PanelLoading label="读取月度用量" announce={false} />
+                </div>
+              )}
               {/* Refresh failures keep the selected month on screen with an explicit error. */}
               {monthly.error && <ErrorBox error={monthly.error} />}
               {monthly.data && (

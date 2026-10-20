@@ -88,7 +88,6 @@ pub struct NodeAgentStateList {
 /// rows, and deleting them in separate transactions could leave half the requested machines (and
 /// half their chains) behind after one failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RemoveRetiredNodesRequest {
     pub node_ids: Vec<String>,
 }
@@ -111,6 +110,8 @@ pub(crate) fn non_empty_json(value: serde_json::Value) -> Option<serde_json::Val
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeAgentStateItem {
+    #[serde(default)]
+    pub initialization: Option<crate::NodeInitialization>,
     pub node_id: String,
     pub tenant_id: String,
     pub name: String,
@@ -258,7 +259,6 @@ pub struct NodeAgentStateItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateNodeRegionRequest {
     /// Uppercase ISO alpha-2 code after normalization. `null` restores automatic GeoIP detection.
     pub country_code: Option<String>,
@@ -451,7 +451,6 @@ pub struct UserAppQuota {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SetUserAppQuotaRequest {
     pub tenant_id: String,
     pub user_id: String,
@@ -479,7 +478,6 @@ pub struct DeploymentVerification {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VerifyDeploymentRequest {
     #[serde(default)]
     pub revision_id: Option<u64>,
@@ -493,7 +491,6 @@ pub struct ModelWriteResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateTenantRequest {
     pub id: String,
     pub name: String,
@@ -508,7 +505,6 @@ pub struct UpsertTenantResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
     pub tenant_id: String,
     pub id: String,
@@ -517,7 +513,6 @@ pub struct CreateUserRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateUserStatusRequest {
     pub status: String,
     #[serde(default)]
@@ -525,7 +520,6 @@ pub struct UpdateUserStatusRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateUserProfileRequest {
     pub account_type: UserAccountType,
     #[serde(default)]
@@ -551,7 +545,6 @@ pub struct UpdateUserStatusResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateGrantRequest {
     pub app_id: String,
     pub tenant_id: String,
@@ -570,7 +563,6 @@ pub struct UpsertGrantResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateAppRequest {
     pub id: String,
     pub label: String,
@@ -585,7 +577,6 @@ pub struct UpsertAppResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpsertExternalOutboundRequest {
     pub id: String,
     pub tenant_id: String,
@@ -627,7 +618,6 @@ pub struct RegisterWarpBindingResult {
 /// Replaces the optional route overrides for one already-registered WARP machine identity.
 /// `None` means inherit that endpoint field from the logical tunnel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateWarpBindingRequest {
     pub tenant_id: String,
     pub outbound_id: String,
@@ -688,7 +678,6 @@ pub struct RemoveWarpBindingResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateChainRequest {
     pub id: String,
     pub tenant_id: String,
@@ -706,7 +695,6 @@ pub struct UpsertChainResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateFrontRequest {
     /// Revision observed by the editor. A Front save replaces complete ordered member and target
     /// collections, so accepting a stale document would silently discard another operator's edit.
@@ -757,7 +745,6 @@ pub struct FrontRouteAnalysisView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DeleteFrontRequest {
     pub expected_revision: u64,
 }
@@ -776,7 +763,7 @@ pub struct DeleteFrontResult {
 /// generated here and never accepted from a caller, so the request carries the overrides and
 /// this carries the shape.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TransportRequest {
     #[default]
     VlessReality,
@@ -810,7 +797,6 @@ pub struct WiresRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VlessEncryptionRequest {
     pub port: u16,
     #[serde(default)]
@@ -836,7 +822,7 @@ impl<'de> Deserialize<'de> for WiresRequest {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
+
         struct Wire {
             #[serde(default)]
             vless_encryption: Option<VlessEncryptionRequest>,
@@ -900,7 +886,6 @@ impl TransportRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateIngressRequest {
     pub id: String,
     pub chain_id: String,
@@ -926,7 +911,6 @@ pub struct CreateIngressRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CreateRealityIngressRequest {
     /// Explicit provenance of the fallback target.
     pub fallback_mode: RealityFallbackMode,
@@ -953,7 +937,6 @@ pub struct UpsertIngressResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PutStepRequest {
     #[serde(default)]
     pub accept: Option<StepAcceptRequest>,
@@ -970,7 +953,6 @@ pub struct PutStepRequest {
 /// A relay port's request shape. Keys are not supplied by the caller, on the same line as
 /// `HopWireRequest`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HopInRequest {
     /// The listening port. `0` turns off this chain's relay port on this machine.
     ///
@@ -983,7 +965,6 @@ pub struct HopInRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StepAcceptRequest {
     #[serde(default)]
     pub uuid: Option<String>,
@@ -1039,7 +1020,6 @@ pub(crate) struct DeleteStepOutcome {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateNodeRequest {
     #[serde(default)]
     pub tenant_id: Option<String>,
@@ -1215,18 +1195,22 @@ mod tests {
             .as_object_mut()
             .expect("test request is an object")
             .insert("front_id".to_owned(), serde_json::json!("front-a1b2"));
-        assert!(serde_json::from_value::<CreateIngressRequest>(request).is_err());
+        let parsed = serde_json::from_value::<CreateIngressRequest>(request).unwrap();
+        assert_eq!(parsed.node_id, "n1");
     }
 
     #[test]
-    fn transport_request_rejects_unknown_tls_fields() {
+    fn transport_request_accepts_additional_tls_fields() {
         let request = serde_json::from_value::<TransportRequest>(serde_json::json!({
             "kind": "vless-tls-xhttp",
             "fingerprint": "none",
             "alpn": "http1",
             "xhttp": { "path": "/probe" }
         }));
-        assert!(request.is_err());
+        assert!(matches!(
+            request.unwrap(),
+            TransportRequest::VlessTlsXhttp { .. }
+        ));
     }
 
     #[test]

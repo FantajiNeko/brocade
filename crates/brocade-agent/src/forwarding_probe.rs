@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+const TIMEOUT: Duration = Duration::from_secs(3);
 static DNS_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 struct PendingReport {
@@ -141,6 +141,22 @@ fn resolve(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, 
 }
 
 fn tcp_ping(host: &str, port: u16, allow_private: bool, timeout: Duration) -> TcpPingResult {
+    tcp_ping_with_connect(
+        host,
+        port,
+        allow_private,
+        timeout,
+        TcpStream::connect_timeout,
+    )
+}
+
+fn tcp_ping_with_connect(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+    timeout: Duration,
+    mut connect: impl FnMut(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+) -> TcpPingResult {
     let started = Instant::now();
     let mut result = TcpPingResult::not_run(TcpPingCode::InvalidTarget);
     let host = host
@@ -186,7 +202,8 @@ fn tcp_ping(host: &str, port: u16, allow_private: bool, timeout: Duration) -> Tc
     }
     result.status = TcpPingStatus::Failed;
     result.code = TcpPingCode::ConnectFailed;
-    for address in addresses {
+    let address_count = addresses.len();
+    for (index, address) in addresses.into_iter().enumerate() {
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             result.code = TcpPingCode::Timeout;
@@ -196,7 +213,13 @@ fn tcp_ping(host: &str, port: u16, allow_private: bool, timeout: Duration) -> Tc
         result.resolved_ip = Some(address.ip().to_string());
         // DNS answers are failover candidates, not repeated samples. Stop at the first successful
         // handshake; do not write/read payload or retain a target connection.
-        match TcpStream::connect_timeout(&address, remaining.min(Duration::from_secs(1))) {
+        // Reserve time for fallback answers; a single/final address gets the full remaining budget.
+        let attempt_timeout = if index + 1 < address_count {
+            remaining.min(Duration::from_secs(1))
+        } else {
+            remaining
+        };
+        match connect(&address, attempt_timeout) {
             Ok(stream) => {
                 result.status = TcpPingStatus::Reachable;
                 result.code = TcpPingCode::Connected;
@@ -330,10 +353,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        assert_eq!(
-            tcp_ping("127.0.0.1", port, true, TIMEOUT).status,
-            TcpPingStatus::Failed
-        );
+        let refused = tcp_ping("127.0.0.1", port, true, TIMEOUT);
+        assert_eq!(refused.status, TcpPingStatus::Failed);
+        assert_eq!(refused.code, TcpPingCode::ConnectFailed);
+        assert_eq!(refused.connect_ms, None);
         assert_eq!(
             tcp_ping("127.0.0.1", port, false, TIMEOUT).code,
             TcpPingCode::AddressBlocked
@@ -358,6 +381,23 @@ mod tests {
         assert_eq!(result.connect_ms, None);
         listener.set_nonblocking(true).unwrap();
         assert!(listener.accept().is_err());
+    }
+
+    #[test]
+    fn stalled_connection_gets_three_seconds_and_reports_timeout_without_latency() {
+        let mut attempts = 0;
+        let result = tcp_ping_with_connect("127.0.0.1", 443, true, TIMEOUT, |address, budget| {
+            attempts += 1;
+            assert_eq!(*address, "127.0.0.1:443".parse::<SocketAddr>().unwrap());
+            assert!(budget <= Duration::from_secs(3));
+            assert!(budget > Duration::from_secs(2), "budget was {budget:?}");
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(result.status, TcpPingStatus::Failed);
+        assert_eq!(result.code, TcpPingCode::Timeout);
+        assert_eq!(result.connect_ms, None);
+        assert_eq!(result.resolved_ip.as_deref(), Some("127.0.0.1"));
     }
 
     #[test]

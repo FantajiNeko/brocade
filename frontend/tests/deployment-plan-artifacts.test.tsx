@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ArtifactIndexEntry, DeploymentPlan } from '../src/api';
+import type { ArtifactIndexEntry, DeploymentPlan, DeploymentTargetDetail } from '../src/api';
 import type { Win } from '../src/wm/store';
 
 window.matchMedia = ((query: string) => ({
@@ -15,7 +15,7 @@ window.matchMedia = ((query: string) => ({
   dispatchEvent: () => false,
 })) as unknown as typeof window.matchMedia;
 
-const { ArtifactChanges, DeployPane } = await import('../src/panes/deploy');
+const { ArtifactChanges, DeployPane, PlanTargets } = await import('../src/panes/deploy');
 const { SessionProvider } = await import('../src/session');
 
 const json = (body: unknown) =>
@@ -40,6 +40,43 @@ const CONTENT: Record<string, { content: string; redacted: boolean }> = {
   'n1/xray?revision=20': { content: rules('aaaaaaaa', ['direct', 'proxy-a']), redacted: false },
   'n2/wireguard?revision=21': { content: '[Interface]\nPrivateKey = <redacted>\nListenPort = 51821\n', redacted: true },
   'n2/wireguard?revision=20': { content: '[Interface]\nPrivateKey = <redacted>\nListenPort = 51820\n', redacted: true },
+};
+
+const artifactTarget = (node: string, kind: string, before: unknown, after: unknown): DeploymentTargetDetail => ({
+  node_id: node,
+  status: 'pending',
+  wave: 1,
+  disruptive: true,
+  error: null,
+  observed_before: { [kind]: before },
+  desired_structure: { [kind]: after },
+  observed_after: null,
+  verdict: null,
+  dispatched_at: null,
+});
+const previewTargets = () => [
+  artifactTarget(
+    'n1',
+    'xray',
+    { state: 'present', sha256: 'actual-old', content: CONTENT['n1/xray?revision=20'].content },
+    { state: 'present', sha256: 'planned-new', content: CONTENT['n1/xray?revision=21'].content },
+  ),
+  artifactTarget(
+    'n2',
+    'wireguard',
+    { state: 'present', sha256: 'wg-old', content: CONTENT['n2/wireguard?revision=20'].content },
+    { state: 'present', sha256: 'wg-new', content: CONTENT['n2/wireguard?revision=21'].content },
+  ),
+];
+const session = {
+  initial: { node_count: 2, chain_group_count: [] },
+  who: {
+    operator_id: 'reviewer',
+    role: 'system-admin' as const,
+    tenant_scope: null,
+    token_prefix: null,
+    masked_assets: false,
+  },
 };
 
 function stubFetch() {
@@ -74,6 +111,7 @@ function queryClient() {
       { node_id: 'n2', name: '东京二号' },
     ],
   });
+  client.setQueryData(['plan-artifacts', 21, true], { revision: 21, targets: previewTargets() });
   client.setQueryData(['artifact-index', 21], {
     revision: 21,
     artifacts: [entry('n1', 'xray', 'x21'), entry('n2', 'wireguard', 'w21')],
@@ -91,11 +129,13 @@ afterEach(() => {
 });
 
 describe('创建变更单的产物差异', () => {
-  it('一台一行；没展开的机器也读出增删，打码的文件写明原因', async () => {
+  it('一台一行；使用实际已应用的内容计算增删，不重新读取历史修订文件', async () => {
     stubFetch();
     const view = render(
       <QueryClientProvider client={queryClient()}>
-        <ArtifactChanges revision={21} base={20} targets={[{ node_id: 'n1' }, { node_id: 'n2' }]} />
+        <SessionProvider value={session}>
+          <ArtifactChanges revision={21} base={20} targets={[{ node_id: 'n1' }, { node_id: 'n2' }]} />
+        </SessionProvider>
       </QueryClientProvider>,
     );
     const xray = await view.findByRole('button', { name: /xray\.json/ });
@@ -109,13 +149,12 @@ describe('创建变更单的产物差异', () => {
     expect(view.queryByText('私钥原文仅 system-admin 可见。')).toBeNull();
 
     fireEvent.click(wireguard);
-    expect(await view.findByText('私钥原文仅 system-admin 可见。')).toBeTruthy();
     const second = wireguard.closest('.cga-node')!;
     expect(second.querySelector('tr.add')?.textContent).toContain('ListenPort = 51821');
     expect(second.querySelector('tr.del')?.textContent).toContain('ListenPort = 51820');
   });
 
-  it('产物差异第一次展开时才拉取文件内容', async () => {
+  it('产物差异默认完整展示，面板没有折叠入口，也不额外请求历史机器原文', async () => {
     const fetchMock = stubFetch();
     const client = queryClient();
     const plan: DeploymentPlan = {
@@ -136,6 +175,7 @@ describe('创建变更单的产物差异', () => {
       ],
     };
     client.setQueryData(['plan', 21], plan);
+    client.setQueryData(['deployment-settings'], { unattended: true });
     client.setQueryData(['revisions'], {
       current_revision: 21,
       revisions: [
@@ -183,15 +223,93 @@ describe('创建变更单的产物差异', () => {
       </QueryClientProvider>,
     );
 
-    const details = view.getByText('产物差异').closest('details')!;
-    expect(details.open).toBe(false);
-    expect(view.queryByRole('button', { name: /xray\.json/ })).toBeNull();
-    expect(contentRequests(fetchMock)).toHaveLength(0);
-
-    details.open = true;
-    fireEvent(details, new Event('toggle'));
+    const panel = view.getByText('产物差异').closest('section')!;
+    expect(panel).toBeTruthy();
+    expect(view.getByText('产物差异').closest('details')).toBeNull();
     expect(await view.findByRole('button', { name: /xray\.json/ })).toBeTruthy();
-    // 两份变更文件，各拉本次与基线两个修订
-    await waitFor(() => expect(contentRequests(fetchMock)).toHaveLength(4));
+    expect(contentRequests(fetchMock)).toHaveLength(0);
+  });
+
+  it('两个修订重编结果相同，仍显示与实际旧产物不同的保活配置', async () => {
+    stubFetch();
+    const client = queryClient();
+    client.setQueryData(['artifact-index', 20], client.getQueryData(['artifact-index', 21]));
+    const before = '{"inbounds":[]}\n';
+    const after = '{"inbounds":[],"tcpKeepAliveIdle":300}\n';
+    client.setQueryData(['plan-artifacts', 21, true], {
+      revision: 21,
+      targets: [
+        artifactTarget(
+          'n1',
+          'xray',
+          { state: 'present', sha256: 'old', content: before },
+          { state: 'present', sha256: 'new', content: after },
+        ),
+      ],
+    });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <SessionProvider value={session}>
+          <ArtifactChanges revision={21} base={20} targets={[{ node_id: 'n1' }]} />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    expect(await view.findByRole('button', { name: /xray\.json/ })).toBeTruthy();
+    expect(view.container.querySelector('tr.add')?.textContent).toContain('tcpKeepAliveIdle');
+    expect(view.queryByText(/产物没有变化/)).toBeNull();
+  });
+
+  it('新机器按空集比较，整份文件逐行标为新增而非不可比较', async () => {
+    stubFetch();
+    const client = queryClient();
+    client.setQueryData(['plan-artifacts', 21, true], {
+      revision: 21,
+      targets: [
+        artifactTarget(
+          'n1',
+          'xray',
+          { state: 'absent' },
+          { state: 'present', sha256: 'new', content: '{\n  "newMachine": true\n}\n' },
+        ),
+      ],
+    });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <SessionProvider value={session}>
+          <ArtifactChanges revision={21} base={null} targets={[{ node_id: 'n1' }]} />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    const file = await view.findByRole('button', { name: /xray\.json/ });
+    expect(file.textContent).toContain('新增');
+    expect(view.container.querySelectorAll('tr.add')).toHaveLength(3);
+    expect(view.queryByText('不可比较')).toBeNull();
+  });
+
+  it('全量阶段跨波次共显示四台，查看更多可展开且重新渲染不丢状态', () => {
+    const client = queryClient();
+    const targets = Array.from({ length: 8 }, (_, index) => ({
+      node_id: `rollout-${index}`,
+      status: 'pending' as const,
+      wave: index === 0 ? 1 : index < 4 ? 2 : 3,
+      disruptive: true,
+      actions: ['apply-xray' as const],
+    }));
+    const content = () => (
+      <QueryClientProvider client={client}>
+        <PlanTargets targets={targets} unattended />
+      </QueryClientProvider>
+    );
+    const view = render(content());
+    const full = [...view.container.querySelectorAll('.cgr-group')].find(group =>
+      group.textContent?.includes('查看更多'),
+    )!;
+    expect(full.querySelectorAll('.cgr-row')).toHaveLength(4);
+    fireEvent.click(view.getByRole('button', { name: '查看更多（剩余 3 台）' }));
+    expect(full.querySelectorAll('.cgr-row')).toHaveLength(7);
+    view.rerender(content());
+    expect(full.querySelectorAll('.cgr-row')).toHaveLength(7);
+    fireEvent.click(view.getByRole('button', { name: '收起机器列表' }));
+    expect(full.querySelectorAll('.cgr-row')).toHaveLength(4);
   });
 });

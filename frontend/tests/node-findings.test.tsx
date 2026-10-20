@@ -59,7 +59,7 @@ describe('WireGuard runtime finding', () => {
       error: null,
       peers: [
         {
-          peer_node_id: 'akko-lon',
+          peer_node_id: 'example-uk-edge',
           overlay_ip: '10.66.0.11',
           handshake_age_secs: 302_867,
           status: 'down',
@@ -79,7 +79,7 @@ describe('WireGuard runtime finding', () => {
       error: null,
       peers: [
         {
-          peer_node_id: 'akko-lon',
+          peer_node_id: 'example-uk-edge',
           overlay_ip: '10.66.0.11',
           handshake_age_secs: 302_867,
           status: 'down',
@@ -88,9 +88,9 @@ describe('WireGuard runtime finding', () => {
       ],
     };
 
-    expect(runtimeFindings(value, undefined, new Set(['akko-lon'])).some(item => item.chip.startsWith('WG '))).toBe(
-      false,
-    );
+    expect(
+      runtimeFindings(value, undefined, new Set(['example-uk-edge'])).some(item => item.chip.startsWith('WG ')),
+    ).toBe(false);
     expect(runtimeFindings(value, undefined, new Set()).some(item => item.chip === 'WG 断链 1')).toBe(true);
   });
 
@@ -101,7 +101,7 @@ describe('WireGuard runtime finding', () => {
       error: null,
       peers: [
         {
-          peer_node_id: 'akko-lon',
+          peer_node_id: 'example-uk-edge',
           overlay_ip: '10.66.0.11',
           handshake_age_secs: 3,
           status: 'up',

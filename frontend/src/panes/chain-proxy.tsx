@@ -220,8 +220,15 @@ function ChainProxyEditor({
   const qc = useQueryClient();
   const [selectedAppId, setSelectedAppId] = useState(initialApp.id);
   const selectedApp = apps.find(app => app.id === selectedAppId) ?? initialApp;
-  const initialTenant =
-    initialFront?.tenant ?? selectedApp.chains[0]?.tenant ?? tenantOptions[0]?.id ?? who.tenant_scope ?? '';
+  const tenantForApp = (app: SnapshotApp) => {
+    const owners = new Set(app.chains.map(chain => chain.tenant));
+    if (owners.size === 1) return [...owners][0];
+    if (owners.size > 1) return '';
+    return tenantOptions.length === 1
+      ? tenantOptions[0].id
+      : (tenantOptions.find(item => item.id === who.tenant_scope)?.id ?? '');
+  };
+  const initialTenant = initialFront?.tenant ?? tenantForApp(selectedApp);
   const [tenantId, setTenantId] = useState(initialTenant);
   const [name, setName] = useState(initialFront?.name ?? '新前置组');
   const [strategy, setStrategy] = useState<SnapshotFront['strategy']>(initialFront?.strategy ?? 'select');
@@ -326,13 +333,7 @@ function ChainProxyEditor({
   const changeApp = (next: string) => {
     setSelectedAppId(next);
     const app = apps.find(candidate => candidate.id === next);
-    setTenantId(app?.chains[0]?.tenant ?? tenantOptions[0]?.id ?? '');
-    setVia([]);
-    setExternalVia([]);
-    setTargets([]);
-  };
-  const changeTenant = (next: string) => {
-    setTenantId(next);
+    setTenantId(app ? tenantForApp(app) : '');
     setVia([]);
     setExternalVia([]);
     setTargets([]);
@@ -492,6 +493,7 @@ function ChainProxyEditor({
             </div>
           )}
           {error !== null && <ErrorBox error={error} />}
+          {!tenantId && <ErrorBox error="当前分组配置不可用，无法创建前置组。" />}
           <ConnectivityMatrix
             view={routeAnalysis.data}
             loading={valid && routeAnalysis.isPending}
@@ -520,7 +522,7 @@ function ChainProxyEditor({
               <section className="panel config-panel chain-proxy-panel">
                 <header>
                   <PanelTitle of="tunnels">共享定义</PanelTitle>
-                  <span className="hint">租户 / 项目保存一份</span>
+                  <span className="hint">项目内统一配置</span>
                 </header>
                 <div className="fgrid one chain-proxy-fields">
                   <label className="row">
@@ -535,23 +537,6 @@ function ChainProxyEditor({
                         {apps.map(app => (
                           <option key={app.id} value={app.id}>
                             {app.label || app.id}
-                          </option>
-                        ))}
-                      </select>
-                    </span>
-                  </label>
-                  <label className="row">
-                    <span className="k">租户</span>
-                    <span className="v">
-                      <select
-                        className="f"
-                        value={tenantId}
-                        disabled={!editable || !!initialFront}
-                        onChange={e => changeTenant(e.target.value)}
-                      >
-                        {tenantOptions.map(tenant => (
-                          <option key={tenant.id} value={tenant.id}>
-                            {tenant.name || tenant.id}
                           </option>
                         ))}
                       </select>
@@ -612,7 +597,7 @@ function ChainProxyEditor({
                   id: tunnel.id,
                   label: `${tunnel.name} · ${tunnel.protocol.t}`,
                 }))}
-                empty="该租户没有可下发的外部隧道；WARP 使用机器独立身份，不能作为前置成员。"
+                empty="没有可下发的外部隧道；WARP 使用机器独立身份，不能作为前置成员。"
                 onToggle={(id, enabled) => toggle(externalVia, id, enabled, setExternalVia)}
                 onMove={(index, offset) => move(externalVia, index, offset, setExternalVia)}
               />
@@ -667,13 +652,13 @@ function ChainProxyEditor({
                   >
                     {scopedUsers.map(user => (
                       <option key={userProjectionKey(user)} value={userProjectionKey(user)}>
-                        {user.id} · {user.tenant_id}
+                        {user.id}
                       </option>
                     ))}
                   </select>
                 </label>
                 {!previewUser ? (
-                  <p className="tunnel-inline-empty">该租户没有可预览的启用用户。</p>
+                  <p className="tunnel-inline-empty">没有可预览的启用用户。</p>
                 ) : !previewActive ? (
                   <div className="chain-proxy-projection-empty">
                     <b>Mihomo 中不会出现空卡片</b>

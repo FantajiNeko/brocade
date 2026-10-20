@@ -3,6 +3,7 @@ import { fetchArtifactContent, fetchArtifactIndex, fetchRevisions, type Artifact
 import { useSyncExternalStore } from 'react';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
 import { artifactPanel } from '../ui/artifact-panel';
+import { artifactTargetLabel } from '../forge/diff';
 import { can, useSession } from '../session';
 import { CopyButton } from '../ui/copy-button';
 import { fileBytes } from '../ui/format';
@@ -118,7 +119,7 @@ export function ArtifactPanel() {
                 {owners.map(owner => (
                   <div key={owner}>
                     <div className="cfg-owner">
-                      <span className="who">{owner}</span>
+                      <span className="who">{artifactTargetLabel(g.items[0].target_kind, owner)}</span>
                     </div>
                     {g.items
                       .filter(e => e.target_id === owner)
@@ -161,7 +162,8 @@ function ArtifactBody({ entry, revision }: { entry: ArtifactIndexEntry; revision
     <div className="cfg-main">
       <div className="cfg-bar">
         <span className="cfg-path">
-          {entry.target_kind === 'node' ? '机器产物' : '订阅'} / {entry.target_id} /&nbsp;
+          {entry.target_kind === 'node' ? '机器产物' : '订阅'} /{' '}
+          {artifactTargetLabel(entry.target_kind, entry.target_id)} /&nbsp;
         </span>
         <span className="cfg-file">{meta.file}</span>
         <span className={`cfg-fmt ${meta.lang}`}>{meta.lang}</span>

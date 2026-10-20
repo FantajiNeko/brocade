@@ -218,49 +218,17 @@ XRAY_ASSET_DIR=${BROCADE_XRAY_ASSET_DIR:-/usr/local/share/xray}
 # Xray's own release workflow pulls).
 GEODATA_BASE=${BROCADE_GEODATA_BASE:-https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release}
 
-# Whether the installed binary is exactly the pinned release. The tag carries a leading `v`
-# and the banner does not, so compare on the bare number; anything unparseable answers "no",
-# which costs one redundant download and never leaves a machine silently off the pin.
-xray_version_is() {
-    have=$(printf '%s' "$1" | sed -n 's/.*[Xx]ray[ v]*\([0-9][0-9.]*\).*/\1/p')
-    want=${2#v}
-    [ -n "$have" ] && [ "$have" = "$want" ]
-}
-
-# Confirm the machine really ended up on the pinned release, and refuse the installation if not.
-#
-# The check exists because the agent launches `xray` by name, not by path: whatever the PATH
-# resolves to is what serves traffic. A distribution package at /usr/bin/xray, or an image with one
-# baked in, can therefore win over the copy just written to $INSTALL_DIR — leaving a machine that
-# installed cleanly, reports nothing wrong, and runs a version the fleet is pinned away from. That
-# is the failure this pin exists to prevent, so it must not be possible to walk out of the installer
-# with it.
-#
-# Checked here rather than left to the agent: restarting a serving process because its version looks
-# wrong is a far heavier act than refusing an installation, and installation is the moment where
-# nothing is running yet and failing is free.
-#
-# An explicitly supplied URL is the operator escape hatch. The normal Console-selected path must
-# report the pinned version and have exactly the sha256 published by this Console; the Xray banner
-# remains upstream's and carries no Brocade marker.
+# Agent executes BROCADE_XRAY_BIN, which is the absolute path installed here. The published
+# digest identifies those bytes; another xray in PATH or a differently formatted version banner
+# must not reject them. An explicitly supplied URL remains the operator escape hatch.
 verify_xray_pin() {
     [ -z "$XRAY_BIN_URL_EXPLICIT" ] || return 0
 
-    actual_path=$(command -v xray 2>/dev/null || echo "$XRAY_BIN")
-    running=$("$actual_path" version 2>/dev/null | grep -i xray | head -n 1)
-    actual_sha=$(sha256sum "$actual_path" 2>/dev/null | cut -d' ' -f1)
-    if xray_version_is "$running" "$XRAY_VERSION" \
-       && [ -n "$XRAY_BIN_SHA256" ] && [ "$actual_sha" = "$XRAY_BIN_SHA256" ]; then
+    actual_sha=$(sha256sum "$XRAY_BIN" 2>/dev/null | cut -d' ' -f1)
+    if [ -n "$XRAY_BIN_SHA256" ] && [ "$actual_sha" = "$XRAY_BIN_SHA256" ]; then
         return 0
     fi
-    echo "机队要求 Brocade Xray $XRAY_VERSION，但这台上会被执行的是：" >&2
-    echo "  $actual_path -> ${running:-（问不出版本）}" >&2
-    if [ "$actual_path" != "$XRAY_BIN" ]; then
-        echo "PATH 先找到的不是刚装的那份（$XRAY_BIN）。agent 是按名字起 xray 的，" >&2
-        echo "所以真正服务的会是上面那个。把它移开、或让 $INSTALL_DIR 排在 PATH 前面。" >&2
-    else
-        echo "刚装的那份版本或 sha256 不对；拒绝把非 Console 分发的字节当作机队版本。" >&2
-    fi
+    echo "安装的 Xray（$XRAY_BIN）sha256 与 Console 分发的 Brocade Xray $XRAY_VERSION 不一致。" >&2
     return 1
 }
 
@@ -686,36 +654,23 @@ else
     exit 1
 fi
 
-# The binary must support the command the unit will use, or the unit written below never starts.
-#
-# The test reads its own usage output: fed a nonexistent subcommand, it lists what it supports.
-# --server and --token must both be supplied, because argument validation precedes command
-# dispatch — with one missing, all one sees is a missing argument.
-#
-# Self-update gates on this same output before it replaces a running binary
-# (brocade-agent/src/selfupdate.rs, `probe`). The two must keep agreeing: loosen it there and a
-# binary this installer would refuse can still arrive by the other road, onto a machine nobody can
-# log in to.
-probe_out=$("$AGENT_BIN" --server http://127.0.0.1:1 --token probe __brocade_probe 2>&1 || true)
-if ! printf '%s' "$probe_out" | grep -qE 'expected[^|]*\brun\b'; then
-    # Distinguish an executable/architecture failure from a command-contract mismatch so the
-    # operator gets the right repair instructions.
-    case "$probe_out" in
-        *"Exec format error"*|*"cannot execute"*|*"not found"*|"")
-            echo "「$AGENT_BIN」跑不起来（本机架构 $(uname -m)）。" >&2
-            echo "控制面分发的 agent 二进制多半不是这个架构的——" >&2
-            echo "在这个架构上自己编一个，用 --agent-bin-url 指过去：" >&2
-            echo "  cargo build --release --target <triple> -p brocade-agent" >&2
-            ;;
-        *)
-            echo "这个 brocade-agent 不符合当前命令契约：缺少 'run'（$AGENT_BIN）。" >&2
-            echo "unit 会用 'run' 启动，写下去只会起不来——先把二进制换掉：" >&2
-            echo "  重跑本脚本并带上 --agent-bin-url <控制面地址>/brocade-agent" >&2
-            echo "  或让控制面配好 BROCADE_AGENT_BIN_URL，脚本会自己去 \$SERVER/enroll/dist 取" >&2
-            ;;
-    esac
-    exit 1
-fi
+# Prefer the stable read-only self-test. Existing published Agents without it still use
+# the compatibility usage probe; only the command token matters, not English help prose.
+probe_agent() {
+    if probe_out=$("$AGENT_BIN" self-test 2>/dev/null); then
+        if printf '%s\n' "$probe_out" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+           | grep -Fxq 'brocade-agent-self-test-v1'; then
+            return 0
+        fi
+    fi
+    probe_out=$("$AGENT_BIN" --server http://127.0.0.1:1 --token probe __brocade_probe 2>&1 || true)
+    if printf '%s\n' "$probe_out" | grep -qE '(^|[^[:alnum:]_-])run([^[:alnum:]_-]|$)'; then
+        return 0
+    fi
+    echo "「$AGENT_BIN」未通过 Agent 自检，旧版命令列表也没有 run（本机架构 $(uname -m)）。" >&2
+    return 1
+}
+probe_agent || exit 1
 
 # linux mode really touches the system, so the data-plane dependencies are installed here in one go
 # rather than leaving anything to be prepared by hand first.

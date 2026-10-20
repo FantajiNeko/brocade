@@ -233,7 +233,7 @@ pub enum UserTrafficHistoryScope<'a> {
     },
 }
 
-/// The card renders one hour of 30-second windows; longer ranges belong to the usage page.
+/// The user detail retains its recent per-machine history. Machine statistics use calendar bounds.
 const USER_TRAFFIC_HISTORY_MAX_SECS: u32 = 3_600;
 
 /// Recent per-user accounting windows for the realtime user-traffic card.
@@ -249,12 +249,29 @@ pub async fn list_user_traffic_history(
     scope: UserTrafficHistoryScope<'_>,
     window_secs: u32,
 ) -> Result<UserTrafficHistory> {
+    let range_end: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(pool)
+        .await?;
+    let range_start = range_end - i64::from(window_secs.clamp(60, USER_TRAFFIC_HISTORY_MAX_SECS));
+    traffic_history_range(pool, actor, scope, range_start, range_end, false).await
+}
+
+/// Aggregate machine identities in SQL before loading long ranges. Complete detail preserves
+/// individual measurement bounds; independently retained machine windows use receipt bounds.
+/// The response is then reduced to bounded chart buckets instead of sending every user's month.
+pub(crate) async fn traffic_history_range(
+    pool: &PgPool,
+    actor: &AdminContext,
+    scope: UserTrafficHistoryScope<'_>,
+    range_start: i64,
+    range_end: i64,
+    aggregate_node: bool,
+) -> Result<UserTrafficHistory> {
     if !actor.can_view_user_realtime_traffic() {
         return Err(StoreError::Forbidden(
             "user traffic history requires a signed-in operator".to_owned(),
         ));
     }
-    let window_secs = window_secs.clamp(60, USER_TRAFFIC_HISTORY_MAX_SECS);
     // The user scope reuses the live authorization: tenant access, user existence and the
     // machines that currently hold the user's grants.
     let granted_nodes = match scope {
@@ -267,33 +284,67 @@ pub async fn list_user_traffic_history(
                 .collect()
         }
     };
-    let range_end: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
-        .fetch_one(pool)
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
         .await?;
-    let range_start = range_end - i64::from(window_secs);
-
+    sqlx::query("SET LOCAL statement_timeout = '10s'")
+        .execute(&mut *tx)
+        .await?;
     let rows = match scope {
         UserTrafficHistoryScope::Node(node_id) => {
             sqlx::query(
-                "SELECT node_id, tenant_id, user_id,
+                "WITH detail_totals AS MATERIALIZED (
+                     SELECT node_id,tenant_id,window_end,sum(uplink_bytes) AS up,sum(downlink_bytes) AS down
+                     FROM usage_samples WHERE node_id=$1
+                       AND window_end>to_timestamp($2::double precision)
+                       AND window_end<=to_timestamp($3::double precision)
+                     GROUP BY node_id,tenant_id,window_end
+                 )
+                 SELECT node_id, CASE WHEN $6 THEN '' ELSE tenant_id END AS tenant,
+                        CASE WHEN $6 THEN '' ELSE user_id END AS account,
                         extract(epoch FROM window_start)::bigint AS window_start,
                         extract(epoch FROM window_end)::bigint AS window_end,
                         sum(uplink_bytes)::bigint AS uplink_bytes,
                         sum(downlink_bytes)::bigint AS downlink_bytes
-                   FROM usage_samples
+                   FROM (
+                       SELECT node_id,tenant_id,user_id,window_start,window_end,uplink_bytes,downlink_bytes
+                         FROM usage_samples WHERE NOT $6
+                       UNION ALL
+                       SELECT s.node_id,s.tenant_id,s.user_id,s.window_start,s.window_end,s.uplink_bytes,s.downlink_bytes
+                         FROM usage_samples s
+                         JOIN usage_node_windows w ON w.node_id=s.node_id AND w.tenant_id=s.tenant_id AND w.window_end=s.window_end
+                         JOIN detail_totals t ON t.node_id=w.node_id AND t.tenant_id=w.tenant_id AND t.window_end=w.window_end
+                        WHERE $6 AND t.up=w.user_uplink_bytes AND t.down=w.user_downlink_bytes
+                       UNION ALL
+                       SELECT w.node_id,w.tenant_id,'' AS user_id,
+                              to_timestamp(r.window_start::double precision) AS window_start,
+                              w.window_end,w.user_uplink_bytes,w.user_downlink_bytes
+                         FROM usage_node_windows w
+                         LEFT JOIN (
+                             SELECT node_id,read_at,min((result->>'window_start_unix_secs')::bigint) AS window_start
+                             FROM usage_report_receipts WHERE node_id=$1
+                               AND read_at>to_timestamp($2::double precision)
+                               AND read_at<=to_timestamp($3::double precision)
+                             GROUP BY node_id,read_at
+                         ) r ON r.node_id=w.node_id AND r.read_at=w.window_end
+                         LEFT JOIN detail_totals t ON t.node_id=w.node_id AND t.tenant_id=w.tenant_id AND t.window_end=w.window_end
+                        WHERE $6 AND (t.up IS DISTINCT FROM w.user_uplink_bytes OR t.down IS DISTINCT FROM w.user_downlink_bytes)
+                   ) measured
                   WHERE node_id = $1
                     AND window_end > to_timestamp($2::double precision)
                     AND window_end <= to_timestamp($3::double precision)
                     AND ($4::text IS NULL OR tenant_id = $4 OR tenant_id LIKE $5 ESCAPE '\\')
-                  GROUP BY node_id, tenant_id, user_id, window_start, window_end
-                  ORDER BY node_id, tenant_id, user_id, window_end, window_start",
+                  GROUP BY node_id, tenant, account, window_start, window_end
+                  ORDER BY node_id, tenant, account, window_end, window_start",
             )
             .bind(node_id)
             .bind(range_start as f64)
             .bind(range_end as f64)
             .bind(actor.tenant_scope())
             .bind(actor.tenant_scope_like_pattern())
-            .fetch_all(pool)
+            .bind(aggregate_node)
+            .fetch_all(&mut *tx)
             .await?
         }
         UserTrafficHistoryScope::User { tenant_id, user_id } => {
@@ -315,7 +366,7 @@ pub async fn list_user_traffic_history(
             .bind(user_id)
             .bind(range_start as f64)
             .bind(range_end as f64)
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await?
         }
     };
@@ -323,19 +374,28 @@ pub async fn list_user_traffic_history(
     let mut series: Vec<UserTrafficHistorySeries> = Vec::new();
     for row in rows {
         let node_id: String = row.try_get("node_id")?;
-        let tenant_id: String = row.try_get("tenant_id")?;
-        let user_id: String = row.try_get("user_id")?;
+        let tenant_id: String =
+            row.try_get(if matches!(scope, UserTrafficHistoryScope::Node(_)) {
+                "tenant"
+            } else {
+                "tenant_id"
+            })?;
+        let user_id: String =
+            row.try_get(if matches!(scope, UserTrafficHistoryScope::Node(_)) {
+                "account"
+            } else {
+                "user_id"
+            })?;
         let point = (
             row.try_get::<i64, _>("window_end")?,
             i64_to_u64("uplink_bytes", row.try_get("uplink_bytes")?)?,
             i64_to_u64("downlink_bytes", row.try_get("downlink_bytes")?)?,
         );
-        let window = (
-            row.try_get::<i64, _>("window_start")?,
-            point.0,
-            point.1,
-            point.2,
-        );
+        let start: Option<i64> = row.try_get("window_start")?;
+        // Machine windows outlive user detail independently. Without either receipt or sample
+        // bounds these bytes have a ledger timestamp, but no measured duration for a rate.
+        let unplaced = start.is_none();
+        let window = start.map(|start| (start, point.0, point.1, point.2));
         match series.last_mut() {
             Some(last)
                 if last.node_id == node_id
@@ -356,17 +416,32 @@ pub async fn list_user_traffic_history(
                 } else {
                     last.points.push(point);
                 }
-                last.windows.push(window);
+                if let Some(window) = window {
+                    last.windows.push(window);
+                } else {
+                    last.unplaced_uplink_bytes = last
+                        .unplaced_uplink_bytes
+                        .checked_add(point.1)
+                        .ok_or_else(|| {
+                            StoreError::InvalidData("history uplink overflow".to_owned())
+                        })?;
+                    last.unplaced_downlink_bytes = last
+                        .unplaced_downlink_bytes
+                        .checked_add(point.2)
+                        .ok_or_else(|| {
+                            StoreError::InvalidData("history downlink overflow".to_owned())
+                        })?;
+                }
             }
             _ => series.push(UserTrafficHistorySeries {
                 node_id,
                 tenant_id,
                 user_id,
                 points: vec![point],
-                windows: vec![window],
+                windows: window.into_iter().collect(),
                 forwarding: false,
-                unplaced_uplink_bytes: 0,
-                unplaced_downlink_bytes: 0,
+                unplaced_uplink_bytes: if unplaced { point.1 } else { 0 },
+                unplaced_downlink_bytes: if unplaced { point.2 } else { 0 },
             }),
         }
     }
@@ -379,22 +454,29 @@ pub async fn list_user_traffic_history(
         }
     };
     let forwarding_rows = sqlx::query(
-        "SELECT node_id,tenant_id,user_id,extract(epoch FROM window_start)::bigint AS start,
+        "SELECT node_id,CASE WHEN $8 THEN '' ELSE tenant_id END AS tenant,
+                CASE WHEN $8 THEN '' ELSE user_id END AS account,extract(epoch FROM window_start)::bigint AS start,
                 extract(epoch FROM read_at)::bigint AS end,sum(uplink_bytes)::bigint AS up,
                 sum(downlink_bytes)::bigint AS down,bool_or(has_gap) AS has_gap
-         FROM forwarding_usage_samples
+         FROM (
+           SELECT node_id,tenant_id,user_id,window_start,read_at,uplink_bytes,downlink_bytes,has_gap
+           FROM forwarding_usage_samples WHERE NOT $8
+           UNION ALL
+           SELECT node_id,tenant_id,'' AS user_id,window_start,window_end AS read_at,uplink_bytes,downlink_bytes,has_gap
+           FROM forwarding_usage_windows WHERE $8
+         ) measured
          WHERE read_at>to_timestamp($1) AND read_at<=to_timestamp($2)
            AND ($3::text IS NULL OR node_id=$3)
            AND ($4::text IS NULL OR tenant_id=$4 AND user_id=$5)
            AND ($6::text IS NULL OR tenant_id=$6 OR tenant_id LIKE $7 ESCAPE '\\')
-         GROUP BY node_id,tenant_id,user_id,window_start,read_at ORDER BY node_id,tenant_id,user_id,read_at,window_start",
+         GROUP BY node_id,tenant,account,window_start,read_at ORDER BY node_id,tenant,account,read_at,window_start",
     ).bind(range_start as f64).bind(range_end as f64).bind(node_filter).bind(tenant_filter).bind(user_filter)
-     .bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(pool).await?;
+     .bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).bind(aggregate_node).fetch_all(&mut *tx).await?;
     let mut forwarded = BTreeMap::<(String, String, String), UserTrafficHistorySeries>::new();
     for row in forwarding_rows {
         let node_id: String = row.try_get("node_id")?;
-        let tenant_id: String = row.try_get("tenant_id")?;
-        let user_id: String = row.try_get("user_id")?;
+        let tenant_id: String = row.try_get("tenant")?;
+        let user_id: String = row.try_get("account")?;
         let entry = forwarded
             .entry((node_id.clone(), tenant_id.clone(), user_id.clone()))
             .or_insert_with(|| UserTrafficHistorySeries {
@@ -450,7 +532,7 @@ pub async fn list_user_traffic_history(
     .bind(&node_ids)
     .bind(range_start as f64)
     .bind(range_end as f64)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     let mut windows = node_ids
         .into_iter()
@@ -475,13 +557,26 @@ pub async fn list_user_traffic_history(
     .bind(windows.keys().collect::<Vec<_>>())
     .bind(range_start as f64)
     .bind(range_end as f64)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     let mut coverage = BTreeMap::<String, Vec<(i64, i64)>>::new();
     let mut zeros = BTreeMap::<String, Vec<(i64, i64)>>::new();
+    let ledger_ends: BTreeMap<_, BTreeSet<_>> = windows
+        .iter()
+        .map(|(node, ends)| (node.clone(), ends.iter().copied().collect()))
+        .collect();
     for row in receipt_rows {
         let node_id: String = row.try_get("node_id")?;
         let end: i64 = row.try_get("read_at")?;
+        // Receipts expire independently. A surviving receipt cannot certify that a missing
+        // machine chart window had zero bytes.
+        if aggregate_node
+            && !ledger_ends
+                .get(&node_id)
+                .is_some_and(|ends| ends.contains(&end))
+        {
+            continue;
+        }
         let result: UsageReportResult = serde_json::from_value(row.try_get("result")?)?;
         if let Some(start) = result.window_start_unix_secs {
             coverage
@@ -511,7 +606,7 @@ pub async fn list_user_traffic_history(
          AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\')
          GROUP BY node_id,window_start,window_end ORDER BY node_id,window_end,window_start",
     ).bind(windows.keys().collect::<Vec<_>>()).bind(range_start as f64).bind(range_end as f64)
-     .bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(pool).await?;
+     .bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(&mut *tx).await?;
     let mut forwarding_coverage = BTreeMap::<String, Vec<(i64, i64)>>::new();
     for row in forwarding_coverage_rows {
         forwarding_coverage
@@ -519,6 +614,7 @@ pub async fn list_user_traffic_history(
             .or_default()
             .push((row.try_get("start")?, row.try_get("end")?));
     }
+    tx.commit().await?;
     Ok(UserTrafficHistory {
         range_start_unix_secs: range_start,
         range_end_unix_secs: range_end,
@@ -528,8 +624,10 @@ pub async fn list_user_traffic_history(
                 window_ends_unix_secs.sort_unstable();
                 window_ends_unix_secs.dedup();
                 let mut node_windows = coverage.remove(&node_id).unwrap_or_default();
+                let covered_ends: BTreeSet<_> =
+                    node_windows.iter().map(|window| window.1).collect();
                 for &end in &window_ends_unix_secs {
-                    if !node_windows.iter().any(|window| window.1 == end) {
+                    if !aggregate_node && !covered_ends.contains(&end) {
                         node_windows.push((end - 30, end));
                     }
                 }
@@ -687,6 +785,8 @@ enum FrozenBinding {
         user_id: String,
         ingress_id: String,
         app_id: String,
+        #[serde(default)]
+        chain_id: Option<String>,
         /// Whether the first observed absolute counter is a baseline or billable from zero.
         first_reading: FirstReadingPolicy,
     },
@@ -850,6 +950,20 @@ pub(crate) async fn create_usage_generation_for_target(
         });
     if grants_only {
         if let Some(previous) = &previous {
+            // A grants update cannot move an existing source to an unshipped chain topology.
+            for (label, binding) in &mut bindings {
+                if let Some(prior) = previous.get(label) {
+                    if binding.same_user_owner(prior) {
+                        if let (
+                            FrozenBinding::User { chain_id, .. },
+                            FrozenBinding::User { chain_id: old, .. },
+                        ) = (binding, prior)
+                        {
+                            *chain_id = old.clone();
+                        }
+                    }
+                }
+            }
             // SyncGrants changes only runtime users; the Xray topology stays exactly as it was in
             // the previous generation, even when a newer unshipped model revision already exists.
             bindings.retain(|label, _| parse_grant_label(label).is_some());
@@ -1034,6 +1148,11 @@ fn frozen_bindings(
                     user_id: grant.user.clone(),
                     ingress_id: grant.ingress.clone(),
                     app_id: app.id.clone(),
+                    chain_id: app
+                        .ingresses
+                        .iter()
+                        .find(|i| i.id == grant.ingress)
+                        .map(|i| i.chain.clone()),
                     first_reading: FirstReadingPolicy::EstablishBaseline,
                 }
             } else {
@@ -1088,6 +1207,38 @@ pub(crate) async fn other_domain_owners(
             Some(CounterOwner::User(grant)) => {
                 Some((label.clone(), (grant.tenant_id, grant.user_id)))
             }
+            _ => None,
+        })
+        .collect())
+}
+
+pub(crate) async fn source_traffic_owners(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    generation_id: i64,
+) -> Result<BTreeMap<String, crate::source_traffic::SourceOwner>> {
+    let generation = resolve_usage_generation(tx, node_id, generation_id).await?;
+    Ok(generation
+        .bindings
+        .into_iter()
+        .filter_map(|(label, binding)| match binding {
+            FrozenBinding::User {
+                tenant_id,
+                user_id,
+                ingress_id,
+                app_id,
+                chain_id,
+                ..
+            } => Some((
+                label,
+                crate::source_traffic::SourceOwner {
+                    tenant_id,
+                    user_id,
+                    ingress_id,
+                    app_id,
+                    chain_id: chain_id.unwrap_or_default(),
+                },
+            )),
             _ => None,
         })
         .collect())
@@ -1196,10 +1347,10 @@ pub async fn record_usage_report(
     // block lost-ACK billing retries after rolling Console back to an older build.
     let site_usage = request.site_usage.take();
     let payload_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
-    request.site_usage = site_usage;
-    if let Some(report) = &request.site_usage {
-        crate::site_usage::validate(report)?;
-    }
+    // Optional observations must not block a billing receipt when an Agent has a newer
+    // catalog or report version. Treat invalid observations as absent; the existing gap
+    // path below clears their coverage head without changing billing or receipt identity.
+    request.site_usage = site_usage.filter(|report| crate::site_usage::validate(report).is_ok());
     let (agent_instance_id, sequence) = report_identity(&request)?;
     let sequence_i64 = u64_to_i64("sequence", sequence)?;
     let xray_epoch = request.xray_epoch.clone();
@@ -2874,6 +3025,7 @@ mod runtime_tests {
             user_id: user_id.to_owned(),
             ingress_id: "i-main".to_owned(),
             app_id: "app-main".to_owned(),
+            chain_id: Some("chain-main".to_owned()),
             first_reading,
         }
     }

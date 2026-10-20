@@ -292,7 +292,7 @@ function entryOf(op: ModelOp): DraftEntry {
         op,
       };
     case 'create_tenant':
-      return { key: `tenant:${op.tenant.id}`, label: '系统归属变更', op };
+      return { key: `tenant:${op.tenant.id}`, label: '账户配置变更', op };
     case 'create_user':
       return { key: `user:${op.user.tenant_id}/${op.user.id}`, label: `用户 ${op.user.id}`, op };
     case 'rotate_user_uuid':

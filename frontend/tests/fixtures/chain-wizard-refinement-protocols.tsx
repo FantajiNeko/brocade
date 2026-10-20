@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import type { RealityFallbackMode } from '../../src/api';
-import { MTPROTO_DESCRIPTION } from '../../src/mtproto-capability';
+import { INGRESS_PROTOCOL_DESCRIPTIONS } from '../../src/ingress-protocols';
 import { REALITY_FINGERPRINT_OPTIONS } from '../../src/reality';
 import { SegmentedControl } from '../../src/ui/bits';
 import { Icon, type IconName } from '../../src/ui/icons';
@@ -20,7 +20,6 @@ function ProtocolCard({
   transport,
   ports,
   errors,
-  requirement,
   open,
   onExpand,
   children,
@@ -34,7 +33,6 @@ function ProtocolCard({
   transport: 'TCP' | 'UDP';
   ports: ReactNode;
   errors: (string | null | undefined | false)[];
-  requirement?: string;
   open: boolean;
   onExpand: () => void;
   children?: ReactNode;
@@ -82,7 +80,6 @@ function ProtocolCard({
           </button>
         )}
       </div>
-      {requirement && <p className="cr-ingress-requirement">{requirement}</p>}
       {issues.length > 0 && (
         <ul className="cr-ingress-errors" role="alert">
           {issues.map(issue => (
@@ -133,9 +130,9 @@ export function RefinedIngressPanel({ d, act }: { d: Derived; act: Actions }) {
       <ul className="cr-ingress-list" aria-label="接入协议">
         <ProtocolCard
           id="vless"
-          name="VLESS · REALITY"
+          name="VLESS · TLS/REALITY"
           icon="xray"
-          description="TCP / XHTTP 入站；使用 REALITY 保护传输。"
+          description={INGRESS_PROTOCOL_DESCRIPTIONS.vless}
           enabled={p.vless}
           onToggle={vless => {
             act.setProto({ vless });
@@ -233,7 +230,7 @@ export function RefinedIngressPanel({ d, act }: { d: Derived; act: Actions }) {
           id="encryption"
           name="VLESS · Encryption"
           icon="xray"
-          description="TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。"
+          description={INGRESS_PROTOCOL_DESCRIPTIONS.encryption}
           enabled={p.encryption}
           onToggle={encryption => act.setProto({ encryption })}
           transport="TCP"
@@ -271,7 +268,7 @@ export function RefinedIngressPanel({ d, act }: { d: Derived; act: Actions }) {
           id="anytls"
           name="AnyTLS"
           icon="bolt"
-          description="TCP 入站；支持 TLS / REALITY、Padding 与连接复用。"
+          description={INGRESS_PROTOCOL_DESCRIPTIONS.anytls}
           enabled={p.anytls}
           onToggle={anytls => act.setProto({ anytls })}
           transport="TCP"
@@ -327,7 +324,7 @@ export function RefinedIngressPanel({ d, act }: { d: Derived; act: Actions }) {
           id="hy2"
           name="Hysteria 2"
           icon="hysteria"
-          description="QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。"
+          description={INGRESS_PROTOCOL_DESCRIPTIONS.hy2}
           enabled={p.hy2}
           onToggle={hy2 => act.setProto({ hy2 })}
           transport="UDP"
@@ -411,13 +408,12 @@ export function RefinedIngressPanel({ d, act }: { d: Derived; act: Actions }) {
           id="mtproto"
           name="MTProxy"
           icon="telegram"
-          description={MTPROTO_DESCRIPTION}
+          description={INGRESS_PROTOCOL_DESCRIPTIONS.mtproto}
           enabled={p.mtproto}
           onToggle={mtproto => act.setProto({ mtproto })}
           transport="TCP"
           open={false}
           onExpand={() => undefined}
-          requirement="入口需有直接配置在网卡上的公网 IPv4。"
           errors={p.mtproto ? [d.portIssue.mtproto, d.mtprotoUnavailable] : []}
           ports={
             <PortInput
@@ -437,7 +433,6 @@ export function RefinedIngressPanel({ d, act }: { d: Derived; act: Actions }) {
           至少开启一个接入协议。
         </p>
       )}
-      <p className="cr-ingress-defaults">其余参数使用默认值，建成后可在线路详情调整。</p>
     </div>
   );
 }

@@ -455,15 +455,20 @@ fn fetch(url: &str, into: &Path) -> Result<(), String> {
 
 /// Run the candidate once, before it replaces anything.
 ///
-/// The test is that it can execute and knows the subcommand the service starts it with. It is fed a
-/// command that does not exist, because that makes it print what it does support without doing
-/// anything: `--server` and `--token` are supplied only because argument validation runs before
-/// command dispatch, and this points at a port nothing listens on.
-///
-/// `install.sh` gates on the same output for the same reason; the two must keep agreeing, or a
-/// binary the installer would reject could still arrive this way.
+/// Prefer the stable, read-only self-test. Older releases predate that command, so the
+/// compatibility probe only requires their usage to name the daemon command, independent of
+/// the prose or language surrounding it. The installer uses the same two-step contract.
 fn probe(candidate: &Path) -> Result<(), String> {
     let candidate = candidate.to_string_lossy();
+    let output = capture_command_with_timeout(&candidate, &["self-test"], Duration::from_secs(10))
+        .map_err(|error| format!("候选 agent 自检无法执行：{error}"))?;
+    if output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE)
+    {
+        return Ok(());
+    }
     let out = capture_command_with_timeout(
         &candidate,
         &[
@@ -486,11 +491,11 @@ fn probe(candidate: &Path) -> Result<(), String> {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    if !said.contains("expected") || !said.contains("run") {
-        return Err(format!(
-            "候选 agent 不认识 run 子命令，装上去服务也起不来，没有安装。它说：{}",
-            said.trim()
-        ));
+    if !said
+        .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
+        .any(|word| word == "run")
+    {
+        return Err("候选 agent 未通过自检，旧版命令列表也没有 run，未安装".to_owned());
     }
     Ok(())
 }
@@ -670,6 +675,36 @@ mod tests {
     #[test]
     fn a_binary_that_runs_but_is_not_an_agent_is_refused() {
         assert!(probe(Path::new("/bin/true")).is_err());
+    }
+
+    #[test]
+    fn candidate_self_test_does_not_depend_on_usage_prose() {
+        let root =
+            std::env::temp_dir().join(format!("brocade-self-test-contract-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let candidate = root.join("candidate");
+        for body in [
+            format!(
+                "#!/bin/sh\n[ \"$1\" = self-test ] || exit 9\nprintf '%s\\n' '{}'\n",
+                brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE
+            ),
+            "#!/bin/sh\nprintf '可用命令：run、desired、health\\n' >&2\nexit 1\n".to_owned(),
+        ] {
+            let staging = root.join("staging");
+            fs::write(&staging, body).unwrap();
+            fs::set_permissions(&staging, permissions(0o700)).unwrap();
+            fs::rename(&staging, &candidate).unwrap();
+            probe(&candidate).unwrap();
+        }
+        fs::write(
+            root.join("staging"),
+            "#!/bin/sh\nprintf 'runner run-once\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(root.join("staging"), permissions(0o700)).unwrap();
+        fs::rename(root.join("staging"), &candidate).unwrap();
+        assert!(probe(&candidate).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// The order the whole design rests on: verify, then execute, then install.

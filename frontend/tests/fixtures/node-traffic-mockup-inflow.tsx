@@ -110,7 +110,6 @@ function Who({ row }: { row: InflowRow }) {
     <span className="nti-who">
       <GeneratedUserAvatar id={row.id} variant="mini" />
       <span className="nti-name">{row.id}</span>
-      <span className="nti-tenant">{row.tenant}</span>
     </span>
   );
 }

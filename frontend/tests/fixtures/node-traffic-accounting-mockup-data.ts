@@ -1,5 +1,4 @@
-// Scenes and derived readings for the 流量统计 card mockup. Synthetic data except the `pump` scene,
-// which copies the production /node-traffic row for pump-hk-plan-b-bgp read on 2026-10-19.
+// Scenes and derived readings for the 流量统计 card mockup. All identities and readings are synthetic.
 import type { NodeTrafficAccountingMode, NodeTrafficCycleKind, NodeTrafficItem } from '../../src/api';
 import { trafficGapReason } from '../../src/ui/traffic-gap';
 
@@ -9,8 +8,8 @@ const MiB = 1024 ** 2;
 export const GiB = 1024 ** 3;
 export const TiB = 1024 ** 4;
 
-/** 2026-10-19 10:15:11 UTC：香港 PUMP 最后一次上报之后 34 秒。 */
-export const NOW = 1_792_404_911;
+/** Fixed example clock keeps every scene and its derived readings reproducible. */
+export const NOW = Date.UTC(2026, 9, 20, 12) / 1000;
 const at = (iso: string) => Date.parse(iso) / 1000;
 
 /* ══ 读数格式 ══ */
@@ -212,9 +211,9 @@ function scene(raw: SceneInput): Scene {
     note: input.note,
     days,
     item: {
-      node_id: 'pump-hk-plan-b-bgp',
+      node_id: 'example-hk-edge-01',
       tenant_id: 'platform',
-      name: '香港 PUMP',
+      name: '香港示例 01',
       cycle_kind: cycle,
       accounting_mode: mode,
       reset_month: resetMonth,
@@ -227,7 +226,7 @@ function scene(raw: SceneInput): Scene {
       total_bytes: String(total),
       interface: input.iface === undefined ? 'eth0' : input.iface,
       tracking_started_at_unix_secs: tracking,
-      last_reported_at_unix_secs: input.reported === undefined ? NOW - 34 : input.reported,
+      last_reported_at_unix_secs: input.reported === undefined ? NOW - 30 : input.reported,
       calibrated_at_unix_secs: calibration?.at ?? null,
       last_gap_at_unix_secs: input.gap?.at ?? null,
       last_gap_reason: input.gap?.reason ?? null,
@@ -237,16 +236,15 @@ function scene(raw: SceneInput): Scene {
 }
 
 export const SCENES = {
-  pump: scene({
-    label: '香港 PUMP 实况',
-    note: '生产 10-19 18:15 的真实读数：10-12 起记账、10-18 重启、未校准，额度 2 TiB。逐日柱为合成数据。',
-    quota: 2_199_023_255_552,
-    rx: 646_862_548_718,
-    tx: 570_996_492_159,
-    total: 1_217_859_040_877,
-    tracking: 1_791_796_232,
-    gap: { at: 1_792_354_731, reason: 'machine-reboot' },
-    reported: 1_792_404_877,
+  partial: scene({
+    label: '中途起记 · 重启缺口',
+    note: '合成示例：10-08 起记账、最近一天有重启缺口，接收 480 GiB、发送 360 GiB，额度 2 TiB。',
+    quota: 2 * TiB,
+    rx: 480 * GiB,
+    tx: 360 * GiB,
+    tracking: at('2026-10-08T00:00:00Z'),
+    gap: { at: NOW - DAY, reason: 'machine-reboot' },
+    reported: NOW - 30,
     seed: 3,
   }),
   steady: scene({

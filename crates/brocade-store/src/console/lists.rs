@@ -190,12 +190,19 @@ pub async fn list_node_agent_states(
             .await?
     };
 
-    Ok(NodeAgentStateList {
-        nodes: rows
-            .iter()
-            .map(node_agent_state_from_row)
-            .collect::<Result<Vec<_>>>()?,
-    })
+    let mut nodes = rows
+        .iter()
+        .map(node_agent_state_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    let ids = nodes
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect::<Vec<_>>();
+    let mut initialization = crate::deployment::initialization::statuses(pool, &ids).await?;
+    for node in &mut nodes {
+        node.initialization = initialization.remove(&node.node_id);
+    }
+    Ok(NodeAgentStateList { nodes })
 }
 
 pub async fn list_revisions(

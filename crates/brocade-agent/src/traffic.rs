@@ -141,7 +141,6 @@ struct RawTraffic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TrafficMeterState {
     version: u32,
     meter_id: String,
@@ -391,6 +390,23 @@ mod tests {
             total_tx_bytes: 200,
             discontinuities: 0,
         }
+    }
+
+    #[test]
+    fn additional_meter_fields_keep_totals_but_versions_still_gate_semantics() {
+        let expected = state(raw(
+            "eth0",
+            "11111111-2222-3333-4444-555555555555",
+            1000,
+            2000,
+        ));
+        let mut document = serde_json::to_value(&expected).unwrap();
+        document["future_metadata"] = serde_json::json!(true);
+        let parsed: TrafficMeterState = serde_json::from_value(document.clone()).unwrap();
+        validate_state(&parsed).unwrap();
+        assert_eq!(parsed, expected);
+        document["version"] = serde_json::json!(STATE_VERSION + 1);
+        assert!(validate_state(&serde_json::from_value(document).unwrap()).is_err());
     }
 
     #[test]

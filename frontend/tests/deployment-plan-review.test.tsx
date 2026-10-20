@@ -96,7 +96,7 @@ afterEach(() => {
 });
 
 describe('发布计划审阅', () => {
-  it('按发布阶段审阅计划，把依赖批次收进全量发布，并保持创建参数不变', async () => {
+  it.each([true, false])('无人值守为 %s 时正确显示确认要求并保留创建参数', async unattended => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY }, mutations: { retry: false } },
     });
@@ -118,6 +118,8 @@ describe('发布计划审阅', () => {
       deployments: [{ id: 4, revision_id: 11, status: 'succeeded' }],
     });
     client.setQueryData(['plan', 12], plan);
+    client.setQueryData(['plan-artifacts', 12, true], { revision: 12, targets: [] });
+    client.setQueryData(['deployment-settings'], { unattended });
     client.setQueryData(['artifact-index', 12], { revision: 12, artifacts: [] });
     client.setQueryData(['artifact-index', 11], { revision: 11, artifacts: [] });
     client.setQueryData(['nodes'], {
@@ -172,12 +174,18 @@ describe('发布计划审阅', () => {
     expect(view.getAllByText('全量发布')).toHaveLength(1);
     expect(view.getByText('步骤 1/2')).toBeTruthy();
     expect(view.getByText('步骤 2/2')).toBeTruthy();
-    expect(view.getByText('产物差异').closest('details')?.open).toBe(false);
+    expect(view.getByText('产物差异').closest('details')).toBeNull();
     expect(view.getAllByText(/更新 Xray/)).toHaveLength(3);
     expect(view.queryByText('apply-xray')).toBeNull();
     expect(view.queryByText(/^波次 /)).toBeNull();
     expect(view.getByText('台北入口')).toBeTruthy();
     expect(view.getByText('新加坡中继')).toBeTruthy();
+    if (unattended) {
+      expect(view.getByText(/无人值守发布 · 出错时暂停/)).toBeTruthy();
+      expect(view.queryByText(/步需确认|开始前需要确认/)).toBeNull();
+    } else {
+      expect(view.getByText(/开始前需要确认/)).toBeTruthy();
+    }
 
     fireEvent.click(view.getByRole('button', { name: '创建变更单' }));
     await waitFor(() =>

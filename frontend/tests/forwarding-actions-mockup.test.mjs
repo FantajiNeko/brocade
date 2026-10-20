@@ -85,19 +85,20 @@ test('TCP Ping is manual, prevents repeat clicks, and shows connection, DNS and 
 });
 
 for (const [outcome, label] of [
-  ['connect-failed', 'TCP 建连失败'],
+  ['connect-failed', 'TCP 建连失败，请检查远程 TCP 监听和网络连通性'],
   ['dns-failed', 'DNS 解析失败'],
-  ['timeout', 'TCP Ping 超时'],
+  ['timeout', '超时或远程地址非 TCP 监听'],
   ['agent-upgrade-required', '入口 Agent 需升级后才能执行 TCP Ping'],
   ['expired', '机器未及时返回，请重试'],
 ]) {
   test(`TCP Ping presents ${outcome} without a fabricated latency`, async t => {
-    const page = await preview(t, { open: 'probe', ping: outcome });
+    const page = await preview(t, { open: 'probe', ping: outcome }, 390);
     const probe = ping(page);
     await probe.getByRole('button', { name: '测试延迟', exact: true }).click();
     await expect(probe.getByRole('status')).toHaveText(label);
     await expect(probe.getByRole('status')).not.toContainText('ms');
     await expect(probe.getByRole('button', { name: '测试延迟', exact: true })).toBeEnabled();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   });
 }
 

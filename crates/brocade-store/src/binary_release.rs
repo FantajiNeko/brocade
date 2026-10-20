@@ -543,6 +543,18 @@ pub async fn create_binary_release(
         tx.commit().await?;
         return load_binary_release(pool, component, existing_id, true).await;
     }
+    if component == BinaryComponent::Xray && xray_strategy != Some(XrayReleaseStrategy::Restart) {
+        let beta: bool = sqlx::query_scalar(
+            "SELECT xray_handoff_beta FROM control_state WHERE id = TRUE FOR SHARE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !beta {
+            return Err(StoreError::InvalidData(
+                "请先在设置中开启 Xray 进程交接 Beta；未开启时只能选择直接重启".to_owned(),
+            ));
+        }
+    }
     if let Some(active) = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM binary_releases WHERE active AND component = $1 LIMIT 1",
     )

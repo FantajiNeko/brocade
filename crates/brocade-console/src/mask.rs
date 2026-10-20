@@ -80,6 +80,7 @@ const HOST_KEYS: &[&str] = &[
     "switch_previous_server_id",
     "switch_selected_server_id",
     "sni",
+    "target_host",
 ];
 
 /// Keys whose value is prose. The sentence goes; nothing is masked inside it.
@@ -108,7 +109,9 @@ const PROSE_KEYS: &[&str] = &[
     "message",
     "note",
     "notes",
+    "quota_job_error",
     "reason",
+    "rule_name",
     "warning",
     "warnings",
 ];
@@ -157,10 +160,13 @@ const PORT_KEYS: &[&str] = &[
     "hy2_base",
     "ingress_base",
     "listen_port",
+    "listen_port_end",
+    "listen_port_start",
     // REALITY split-download's TLS origin port — the port the node actually listens on.
     "origin_port",
     "port",
     "start",
+    "target_port",
     // phantun's fake-TCP port. Not `wg_listen_port`, which is the UDP side already listed:
     // missed here, it was the one port on a node's agent state that survived masking.
     "wg_fake_tcp_port",
@@ -177,6 +183,13 @@ pub fn mask_json(value: &mut Value) {
         }
         Value::Array(items) => items.iter_mut().for_each(mask_json),
         Value::Object(map) => {
+            // Forwarding names are free text and default to the complete destination endpoint.
+            // Hiding the structured target alone would leave that endpoint in the rule label.
+            if map.contains_key("target_host") && map.contains_key("target_port") {
+                if let Some(name) = map.get_mut("name") {
+                    hide_prose(name);
+                }
+            }
             // VPN Gate uses the provider hostname itself as the catalogue row's `id`. Generic
             // `id` values are ordinary model identities and must remain readable, so recognize
             // this response shape before masking that one field. `hostname`, `ip` and every
@@ -1020,6 +1033,62 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("tcp://"));
+    }
+
+    #[test]
+    fn forwarding_destinations_ports_and_free_text_names_are_masked() {
+        let mut value = json!({
+            "tenant_id": "platform.acme", "user_id": "alice",
+            "entitlements": [{
+                "node_id": "n1", "node_name": "Tokyo", "public_ipv4": "192.0.2.19",
+                "public_ipv6": "2001:db8::19", "listen_port_start": 30000,
+                "listen_port_end": 59999, "rule_count": 2, "max_rules": 100,
+                "last_error": "listen 192.0.2.19:30442 failed",
+                "quota_job_error": "failed to close 192.0.2.19:30442"
+            }],
+            "rules": [
+                {"id": 42, "name": "Web at target.example.net:18443", "protocol": "tcp",
+                 "listen_port": 30442, "target_host": "target.example.net", "target_port": 18443,
+                 "runtime_status": "active", "uplink_bytes": 12345},
+                {"id": 43, "name": "[2001:db8::31]:18444", "protocol": "tcp_udp",
+                 "listen_port": 30443, "target_host": "[2001:db8::31]", "target_port": 18444}
+            ],
+            "forwarding": [{"rule_id": 42, "rule_name": "target.example.net:18443", "downlink_bytes": 67890}]
+        });
+        mask_json(&mut value);
+        assert_eq!(value["entitlements"][0]["listen_port_start"], "***");
+        assert_eq!(value["entitlements"][0]["listen_port_end"], "***");
+        assert_eq!(value["entitlements"][0]["quota_job_error"], "");
+        assert_eq!(value["rules"][0]["target_host"], "***.net");
+        assert_eq!(value["rules"][1]["target_host"], "[2001:db8:***]");
+        for rule in value["rules"].as_array().unwrap() {
+            assert_eq!(rule["name"], "");
+            assert_eq!(rule["listen_port"], "***");
+            assert_eq!(rule["target_port"], "***");
+        }
+        assert_eq!(value["rules"][0]["id"], 42);
+        assert_eq!(value["rules"][0]["protocol"], "tcp");
+        assert_eq!(value["rules"][0]["runtime_status"], "active");
+        assert_eq!(value["rules"][0]["uplink_bytes"], 12345);
+        assert_eq!(value["entitlements"][0]["rule_count"], 2);
+        assert_eq!(value["entitlements"][0]["node_name"], "Tokyo");
+        assert_eq!(value["forwarding"][0]["rule_name"], "");
+        assert_eq!(value["forwarding"][0]["downlink_bytes"], 67890);
+        let encoded = value.to_string();
+        for secret in [
+            "192.0.2.19",
+            "2001:db8::19",
+            "2001:db8::31",
+            "target.example.net",
+            "30000",
+            "59999",
+            "30442",
+            "30443",
+            "18443",
+            "18444",
+        ] {
+            assert!(!encoded.contains(secret), "{secret} leaked in {encoded}");
+        }
     }
 
     /// The three ports that used to survive masking: the hop range's `start`/`end` under a

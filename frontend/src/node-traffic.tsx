@@ -7,7 +7,10 @@ import {
   type NodeInflowRow,
   type NodeInflowUsage,
   type SiteUsagePeriod,
+  type TrafficTimeRange,
 } from './api';
+import { NodeInflowDetailsDialog } from './node-inflow-details';
+import { parseTrafficRange, trafficDateInput, trafficRangeText } from './node-traffic-range';
 import { fallbackSource, NodeUserTrafficCard, type TrafficSource } from './user-traffic-realtime';
 import { NodeRealtimeProvider } from './node-realtime';
 import { NodeSiteUsageCard } from './user-site-usage';
@@ -17,6 +20,7 @@ import { bytes, shareOf } from './ui/format';
 import { Icon, PanelTitle } from './ui/icons';
 import { PanelLoading } from './ui/loading';
 import { useMetricQuery } from './ui/metric-cadence';
+import { ObserveBrushProvider } from './ui/observe-brush';
 import { RegionFlag } from './ui/region-flag';
 import { GeneratedUserAvatar } from './ui/user-avatar';
 import './node-traffic.css';
@@ -25,6 +29,7 @@ const PERIODS = [
   { value: 'day', label: '当天' },
   { value: 'week', label: '当周' },
   { value: 'month', label: '当月' },
+  { value: 'custom', label: '自定义' },
 ] as const;
 const COLORS = ['--observe-1', '--observe-6', '--observe-4', '--observe-5', '--observe-7'];
 const FOLD = 12;
@@ -67,6 +72,7 @@ interface Cell {
 }
 interface InflowUser extends Cell {
   id: string;
+  tenantId: string;
   name: string;
   cells: Map<string, Cell>;
 }
@@ -87,6 +93,7 @@ function inflowModel(data: NodeInflowUsage, sourceOf: (key: string) => TrafficSo
     const userId = `${row.tenant_id}/${row.user_id}`;
     const user = users.get(userId) ?? {
       id: userId,
+      tenantId: row.tenant_id,
       name: row.user_id,
       total: 0,
       down: 0,
@@ -151,10 +158,9 @@ const cellText = (row: InflowUser, view: InflowSource) => {
   const cell = row.cells.get(view.id);
   return `${row.name} → ${view.name} · ${bytes(cell?.total ?? 0)} · 下行 ${bytes(cell?.down ?? 0)} · 上行 ${bytes(cell?.up ?? 0)}${cell?.gap ? ' · 采集有缺口，仅含已记录的流量' : ''}`;
 };
-type BodyProps = ReturnType<typeof inflowModel>;
-function BarsBody({ rows, views, grand }: BodyProps) {
+type BodyProps = ReturnType<typeof inflowModel> & { onUserSelect: (row: InflowUser) => void };
+function BarsBody({ rows, views, grand, onUserSelect }: BodyProps) {
   const [focus, setFocus] = useState<string | null>(null);
-  const [open, setOpen] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const ordered = focus
     ? [...views.filter(view => view.id === focus), ...views.filter(view => view.id !== focus)]
@@ -179,13 +185,13 @@ function BarsBody({ rows, views, grand }: BodyProps) {
       </div>
       <ol className="nti-bars">
         {(expanded ? rows : rows.slice(0, FOLD)).map(row => (
-          <li key={row.id} className={`nti-bar-row${open === row.id ? ' open' : ''}`}>
+          <li key={row.id} className="nti-bar-row">
             <button
               type="button"
               className="nti-bar-btn"
               aria-label={`${row.name} · ${bytes(row.total)}`}
-              aria-expanded={open === row.id}
-              onClick={() => setOpen(open === row.id ? null : row.id)}
+              aria-haspopup="dialog"
+              onClick={() => onUserSelect(row)}
             >
               <Who row={row} />
               <span className="nti-track">
@@ -208,23 +214,6 @@ function BarsBody({ rows, views, grand }: BodyProps) {
               <span className="nti-num">{bytes(row.total)}</span>
               <span className="nti-pct">{shareOf(row.total, grand)}</span>
             </button>
-            {open === row.id && (
-              <div className="nti-detail">
-                {views
-                  .filter(view => row.cells.has(view.id))
-                  .map(view => (
-                    <span key={view.id} className="nti-dchip" title={cellText(row, view)}>
-                      <Swatch view={view} />
-                      <ChainName view={view} />
-                      <b>{bytes(row.cells.get(view.id)!.total)}</b>
-                    </span>
-                  ))}
-                <span className="nti-detail-note">
-                  下行 {bytes(row.down)} · 上行 {bytes(row.up)}
-                  {row.gap && ' · 采集有缺口'}
-                </span>
-              </div>
-            )}
           </li>
         ))}
       </ol>
@@ -241,13 +230,12 @@ function BarsBody({ rows, views, grand }: BodyProps) {
     </>
   );
 }
-function FlowBody({ rows, views, grand }: BodyProps) {
+function FlowBody({ rows, views, grand, onUserSelect }: BodyProps) {
   const box = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const [narrow, setNarrow] = useState(true);
   const [hot, setHot] = useState<{ user: string | null; col: string | null } | null>(null);
   const [allUsers, setAllUsers] = useState(false);
-  const [selected, setSelected] = useState<string | null>(null);
   useLayoutEffect(() => {
     const element = box.current;
     if (!element) return;
@@ -265,6 +253,7 @@ function FlowBody({ rows, views, grand }: BodyProps) {
   const rest = allUsers ? [] : rows.slice(10);
   const restRow: InflowUser = {
     id: 'rest',
+    tenantId: '',
     name: `其余 ${rest.length} 位`,
     down: 0,
     up: 0,
@@ -339,7 +328,6 @@ function FlowBody({ rows, views, grand }: BodyProps) {
   );
   const state = (user: string | null, col: string | null) =>
     !hot ? '' : (hot.user === null || hot.user === user) && (hot.col === null || hot.col === col) ? ' on' : ' dim';
-  const selectedRow = left.find(row => row.id === selected);
   return (
     <div ref={box}>
       {!narrow ? (
@@ -354,8 +342,8 @@ function FlowBody({ rows, views, grand }: BodyProps) {
                   aria-label={`${row.name} · ${bytes(row.total)}`}
                   style={{ top: lp[i].y + lp[i].h / 2 }}
                   title={`${row.name} · 下行 ${bytes(row.down)} · 上行 ${bytes(row.up)}`}
-                  aria-expanded={selected === row.id}
-                  onClick={() => setSelected(selected === row.id ? null : row.id)}
+                  aria-haspopup={row.id === 'rest' ? undefined : 'dialog'}
+                  onClick={() => (row.id === 'rest' ? setAllUsers(true) : onUserSelect(row))}
                   onMouseEnter={() => setHot({ user: row.id, col: null })}
                   onFocus={() => setHot({ user: row.id, col: null })}
                   onBlur={() => setHot(null)}
@@ -430,17 +418,7 @@ function FlowBody({ rows, views, grand }: BodyProps) {
               ))}
             </div>
           </div>
-          {selectedRow && (
-            <div className="nti-detail" aria-label={`${selectedRow.name}的接入链明细`}>
-              {views
-                .filter(view => selectedRow.cells.has(view.id))
-                .map(view => (
-                  <span key={view.id} className="nti-dchip">
-                    {cellText(selectedRow, view)}
-                  </span>
-                ))}
-            </div>
-          )}
+
           {rows.length > 10 && (
             <button
               type="button"
@@ -453,7 +431,7 @@ function FlowBody({ rows, views, grand }: BodyProps) {
           )}
         </>
       ) : (
-        <BarsBody rows={rows} views={views} grand={grand} />
+        <BarsBody rows={rows} views={views} grand={grand} onUserSelect={onUserSelect} />
       )}
     </div>
   );
@@ -461,16 +439,22 @@ function FlowBody({ rows, views, grand }: BodyProps) {
 
 export function NodeInflowUsageCard({
   nodeId,
+  nodeName,
   period,
   sourceOf = fallbackSource,
+  range,
 }: {
   nodeId: string;
+  nodeName?: string;
   period: SiteUsagePeriod;
   sourceOf?: (key: string) => TrafficSource;
+  range?: TrafficTimeRange;
 }) {
+  const [selected, setSelected] = useState<InflowUser | null>(null);
+  const rangeArgs = range ? ([range] as const) : ([] as const);
   const usage = useMetricQuery({
-    queryKey: ['node-inflow-usage', nodeId, period],
-    queryFn: () => fetchNodeInflowUsage(nodeId, period),
+    queryKey: ['node-inflow-usage', nodeId, period, ...rangeArgs],
+    queryFn: () => fetchNodeInflowUsage(nodeId, period, ...rangeArgs),
     refetchInterval: 30_000,
     staleTime: 15_000,
   });
@@ -545,7 +529,13 @@ export function NodeInflowUsageCard({
               </span>
             </div>
             {model.grand > 0 ? (
-              <FlowBody key={`${nodeId}/${period}`} rows={model.rows} views={views} grand={model.grand} />
+              <FlowBody
+                key={`${nodeId}/${period}`}
+                rows={model.rows}
+                views={views}
+                grand={model.grand}
+                onUserSelect={setSelected}
+              />
             ) : (
               <p className="site-usage-state">
                 {usage.data?.latest_report_unix_secs === null
@@ -554,6 +544,11 @@ export function NodeInflowUsageCard({
               </p>
             )}
             {model.rows.some(row => row.gap) && <p className="site-usage-note warn">采集有缺口，仅含已记录的流量。</p>}
+            {usage.data?.range_limited && (
+              <p className="site-usage-note warn">
+                所选时间段超出窗口明细保留范围，统计仅含尚存明细，不能视为完整时段总量。
+              </p>
+            )}
             {views.some(view => view.kind === 'unattributed') && (
               <p className="site-usage-note">「未按接入链记录」是按链统计上线前的用户合计，不估算、不均摊到现有链。</p>
             )}
@@ -565,27 +560,63 @@ export function NodeInflowUsageCard({
         <p className="site-usage-note">
           只统计本机认证接入与端口转发，中继与落地流量不含用户身份；仅含已记录流量，不表示全时段采集完整。
         </p>
+        {range && (
+          <p className="site-usage-note">按采样窗口起点计入所选时段，通常每 30 秒一个窗口；不按时长估算窗口内流量。</p>
+        )}
       </div>
+      {selected && (
+        <NodeInflowDetailsDialog
+          key={`${nodeId}/${selected.id}`}
+          nodeId={nodeId}
+          nodeName={nodeName}
+          tenantId={selected.tenantId}
+          userId={selected.name}
+          period={period}
+          range={range}
+          sourceOf={sourceOf}
+          onClose={() => setSelected(null)}
+        />
+      )}
     </section>
   );
 }
 export function NodeTrafficDetails({
   nodeId,
+  nodeName,
   snapshot,
   period,
+  range,
+  onRangeChange,
 }: {
   nodeId: string;
+  nodeName?: string;
   snapshot?: ConsoleSnapshot;
   period: SiteUsagePeriod;
+  range?: TrafficTimeRange;
+  onRangeChange?: (range: TrafficTimeRange | undefined) => void;
 }) {
   const sourceOf = useMemo(() => trafficSources(snapshot), [snapshot]);
   const targets = useMemo(() => trafficUserKeys(snapshot, nodeId), [snapshot, nodeId]);
   return (
-    <div className="nt-details">
-      <NodeUserTrafficCard nodeId={nodeId} sourceOf={sourceOf} targets={targets} />
-      <NodeInflowUsageCard nodeId={nodeId} period={period} sourceOf={sourceOf} />
-      <NodeSiteUsageCard nodeId={nodeId} period={period} />
-    </div>
+    <ObserveBrushProvider
+      rangeKey={JSON.stringify(range)}
+      pending={false}
+      onSelect={(start, end) => {
+        if (!onRangeChange) return false;
+        const from = Math.floor(start / 30) * 30;
+        const to = Math.min(Math.ceil(end / 30) * 30, Math.floor(Date.now() / 30_000) * 30);
+        if (from >= to) return false;
+        onRangeChange({ start_unix_secs: from, end_unix_secs: to });
+        return true;
+      }}
+      onZoomOut={() => onRangeChange?.(undefined)}
+    >
+      <div className="nt-details">
+        <NodeUserTrafficCard nodeId={nodeId} sourceOf={sourceOf} targets={targets} period={period} range={range} />
+        <NodeInflowUsageCard nodeId={nodeId} nodeName={nodeName} period={period} sourceOf={sourceOf} range={range} />
+        <NodeSiteUsageCard nodeId={nodeId} period={period} range={range} />
+      </div>
+    </ObserveBrushProvider>
   );
 }
 
@@ -605,6 +636,21 @@ export function NodeTrafficDialog({
 }) {
   const titleId = useId();
   const [period, setPeriod] = useState<SiteUsagePeriod>(initialPeriod);
+  const [range, setRange] = useState<TrafficTimeRange>();
+  const [editing, setEditing] = useState(false);
+  const [start, setStart] = useState('');
+  const [end, setEnd] = useState('');
+  const [rangeError, setRangeError] = useState('');
+  const changeRange = (next: TrafficTimeRange | undefined) => {
+    setRange(next);
+    setEditing(false);
+    setRangeError('');
+    if (next) {
+      setPeriod('day');
+      setStart(trafficDateInput(next.start_unix_secs));
+      setEnd(trafficDateInput(next.end_unix_secs));
+    }
+  };
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot(), staleTime: 30_000 });
   return (
     <DialogLayer label={`${name} · 用量`} onClose={onClose}>
@@ -617,15 +663,87 @@ export function NodeTrafficDialog({
             </h2>
           </div>
           <div className="node-usage-actions">
-            <div className="node-usage-period" title="统计周期（UTC+8）· 仅影响流入、流出统计">
+            <div className="node-usage-period" title="统计区间（UTC+8）· 适用于历史流量、流入与流出统计">
               <span className="node-usage-period-label">统计</span>
-              <SegmentedControl ariaLabel="流入与流出统计范围" value={period} options={PERIODS} onChange={setPeriod} />
+              <SegmentedControl
+                ariaLabel="流量统计范围"
+                value={editing || range ? 'custom' : period}
+                options={PERIODS}
+                onChange={value => {
+                  if (value === 'custom') {
+                    const until = Math.floor(Date.now() / 30_000) * 30;
+                    if (!range) {
+                      setStart(trafficDateInput(until - 15 * 60));
+                      setEnd(trafficDateInput(until));
+                    }
+                    setEditing(true);
+                  } else {
+                    setPeriod(value);
+                    changeRange(undefined);
+                  }
+                }}
+              />
             </div>
             <DialogClose className="btn sm node-usage-close" aria-label="关闭机器用量" title="关闭">
               <Icon of="close" size={16} />
             </DialogClose>
           </div>
         </header>
+        {editing && (
+          <form
+            className="nt-range-editor"
+            onSubmit={event => {
+              event.preventDefault();
+              const parsed = parseTrafficRange(start, end);
+              if (typeof parsed === 'string') {
+                setRangeError(parsed);
+                return;
+              }
+              changeRange(parsed);
+            }}
+          >
+            <label>
+              开始时间（UTC+8）
+              <input
+                type="datetime-local"
+                step={30}
+                required
+                value={start}
+                onChange={event => setStart(event.target.value)}
+              />
+            </label>
+            <label>
+              结束时间（UTC+8）
+              <input
+                type="datetime-local"
+                step={30}
+                required
+                value={end}
+                onChange={event => setEnd(event.target.value)}
+              />
+            </label>
+            <button type="submit" className="btn sm primary">
+              应用
+            </button>
+            <button
+              type="button"
+              className="btn text sm"
+              onClick={() => {
+                setEditing(false);
+                setRangeError('');
+              }}
+            >
+              取消
+            </button>
+            {rangeError && <p role="alert">{rangeError}</p>}
+          </form>
+        )}
+        {range && (
+          <div className="nt-selected-range">
+            <Icon of="clock" size={14} />
+            <span>{trafficRangeText(range.start_unix_secs, range.end_unix_secs)} · UTC+8</span>
+          </div>
+        )}
         <div
           className="node-usage-body"
           tabIndex={0}
@@ -636,7 +754,14 @@ export function NodeTrafficDialog({
           {snapshot.isPending && <PanelLoading label="加载机器用量" />}
           {snapshot.data && (
             <NodeRealtimeProvider key={nodeId} nodeId={nodeId}>
-              <NodeTrafficDetails nodeId={nodeId} snapshot={snapshot.data} period={period} />
+              <NodeTrafficDetails
+                nodeId={nodeId}
+                nodeName={name}
+                snapshot={snapshot.data}
+                period={period}
+                range={range}
+                onRangeChange={changeRange}
+              />
             </NodeRealtimeProvider>
           )}
         </div>

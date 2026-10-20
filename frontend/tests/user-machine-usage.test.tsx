@@ -40,7 +40,7 @@ const fetcher = vi.mocked(fetchUserMachineUsage);
 const mount = (user = 'alice', client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) =>
   render(
     <QueryClientProvider client={client}>
-      <UserMachineUsageCard tenantId="fixture" userId={user} nameOf={id => (id === 'n1' ? '香港 DMIT' : id)} />
+      <UserMachineUsageCard tenantId="fixture" userId={user} nameOf={id => (id === 'n1' ? '香港示例 01' : id)} />
     </QueryClientProvider>,
   );
 beforeEach(() => {
@@ -79,11 +79,11 @@ it('keeps unknown, observed zero, and future cells distinct and aggregates mobil
 });
 it('renders the B matrix, supports keyboard reading and pins aggregate readings without a machine dialog', async () => {
   mount();
-  await screen.findByText('香港 DMIT');
+  await screen.findByText('香港示例 01');
   const card = screen.getByRole('region', { name: '机器流量' });
   expect(card.querySelector('header .segsw')).toBeNull();
   expect(card.querySelectorAll('.uxm-strip button')).toHaveLength(24);
-  const first = screen.getByRole('button', { name: /香港 DMIT · .*00:00–01:00/ });
+  const first = screen.getByRole('button', { name: /香港示例 01 · .*00:00–01:00/ });
   fireEvent.mouseEnter(first);
   expect(screen.getByRole('tooltip').textContent).toContain('含转发');
   const aggregate = within(card).getAllByRole('button', { name: /合计 ·/ })[0];
@@ -115,7 +115,7 @@ it.each([
     }),
   );
   mount();
-  await screen.findByText('香港 DMIT');
+  await screen.findByText('香港示例 01');
   expect(fetchSnapshot).not.toHaveBeenCalled();
   const card = screen.getByRole('region', { name: '机器流量' });
   fireEvent.click(within(screen.getByRole('group', { name: '机器统计范围' })).getByRole('button', { name: label }));
@@ -129,10 +129,10 @@ it.each([
   expect(cell.getAttribute('aria-haspopup')).toBe('dialog');
   act(() => cell.focus());
   fireEvent.click(cell);
-  const dialog = await screen.findByRole('dialog', { name: '香港 DMIT · 用量' });
+  const dialog = await screen.findByRole('dialog', { name: '香港示例 01 · 用量' });
   expect(dialog.querySelector('.node-usage-dialog')).toBeTruthy();
   expect(within(dialog).getByRole('img', { name: 'HK 地区旗' })).toBeTruthy();
-  const range = within(dialog).getByRole('group', { name: '流入与流出统计范围' });
+  const range = within(dialog).getByRole('group', { name: '流量统计范围' });
   expect(within(range).getByRole('button', { name: label }).getAttribute('aria-pressed')).toBe('true');
   expect(screen.getByRole('region', { name: '机器流量' })).toBe(card);
   expect(screen.queryByRole('tooltip')).toBeNull();
@@ -175,7 +175,7 @@ it('preserves totals without assigning legacy bytes to a fake hour and reports s
 it('labels retained range data during loading and never reuses another user’s reading', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = mount('alice', client);
-  await screen.findByText('香港 DMIT');
+  await screen.findByText('香港示例 01');
   fetcher.mockImplementation(() => new Promise(() => {}));
   fireEvent.click(within(screen.getByRole('group', { name: '机器统计范围' })).getByRole('button', { name: '当周' }));
   await waitFor(() => expect(fetcher).toHaveBeenLastCalledWith('fixture', 'alice', 'week'));
@@ -185,7 +185,7 @@ it('labels retained range data during loading and never reuses another user’s 
       <UserMachineUsageCard tenantId="fixture" userId="bob" />
     </QueryClientProvider>,
   );
-  expect(screen.queryByText('香港 DMIT')).toBeNull();
+  expect(screen.queryByText('香港示例 01')).toBeNull();
   expect(screen.getByRole('status').textContent).toContain('正在读取');
 });
 it('does not call a no-report response zero traffic', async () => {
@@ -197,9 +197,9 @@ it('does not call a no-report response zero traffic', async () => {
 it('dismisses the old machine dialog when the user context changes', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = mount('alice', client);
-  await screen.findByText('香港 DMIT');
+  await screen.findByText('香港示例 01');
   fireEvent.click(document.querySelector<HTMLButtonElement>('.uxm-strip button')!);
-  await screen.findByRole('dialog', { name: '香港 DMIT · 用量' });
+  await screen.findByRole('dialog', { name: '香港示例 01 · 用量' });
   view.rerender(
     <QueryClientProvider client={client}>
       <UserMachineUsageCard tenantId="fixture" userId="bob" />

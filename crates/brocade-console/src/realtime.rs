@@ -26,8 +26,7 @@ const RING_MAX_SAMPLES: usize = 600;
 const EVENT_CHANNEL_CAPACITY: usize = 2048;
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(15);
 const MAX_INTERFACE_CHARS: usize = 32;
-const MIN_ELAPSED_MILLIS: u32 = 100;
-const MAX_ELAPSED_MILLIS: u32 = 60_000;
+const LIVE_GAP_ELAPSED_MILLIS: u32 = 60_000;
 const MAX_FUTURE_CLOCK_SKEW_MILLIS: i64 = 10 * 60 * 1000;
 const MAX_VPNGATE_POOLS: usize = 16;
 const MAX_VPNGATE_BACKENDS: usize = MAX_VPNGATE_POOLS * 2;
@@ -301,7 +300,15 @@ impl RealtimeService {
         session: u64,
         mut sample: AgentRealtimeSample,
     ) -> Result<(), RecordSampleError> {
+        normalize_optional_reports(&mut sample);
         validate_sample(&sample).map_err(RecordSampleError::Invalid)?;
+        if sample.elapsed_millis > LIVE_GAP_ELAPSED_MILLIS {
+            sample.has_gap = true;
+        }
+        let materialize_delta = sample.diagnostics_unchanged
+            && (sample.reverse_health.is_some()
+                || sample.mux.is_some()
+                || sample.vpngate.is_some());
         let received_at_unix_millis = unix_millis();
         let mut inner = self.inner.lock().await;
         if inner
@@ -350,7 +357,7 @@ impl RealtimeService {
         // state for a newly opened browser, so its newest entry must always be self-contained.
         // Clone before enriching it: diagnostics-unchanged samples are tiny, while a complete
         // diagnostic refresh already required one clone for ring + broadcast in the old path.
-        let broadcast_event = stored_event.clone();
+        let mut broadcast_event = stored_event.clone();
         let oldest = received_at_unix_millis
             - i64::try_from(RING_RETENTION.as_millis()).expect("retention fits i64");
         let ring = inner.rings.entry(node_id.to_owned()).or_default();
@@ -361,9 +368,24 @@ impl RealtimeService {
             // user's rows in the NIC history would multiply a large report by 120 seconds.
             previous.sample.user_traffic = None;
             if stored_event.sample.diagnostics_unchanged {
-                stored_event.sample.reverse_health = previous.sample.reverse_health.take();
-                stored_event.sample.mux = previous.sample.mux.take();
-                stored_event.sample.vpngate = previous.sample.vpngate.take();
+                stored_event.sample.reverse_health = stored_event
+                    .sample
+                    .reverse_health
+                    .take()
+                    .or_else(|| previous.sample.reverse_health.take());
+                stored_event.sample.mux = stored_event
+                    .sample
+                    .mux
+                    .take()
+                    .or_else(|| previous.sample.mux.take());
+                stored_event.sample.vpngate = stored_event
+                    .sample
+                    .vpngate
+                    .take()
+                    .or_else(|| previous.sample.vpngate.take());
+                previous.sample.reverse_health = None;
+                previous.sample.mux = None;
+                previous.sample.vpngate = None;
             } else {
                 previous.sample.reverse_health = None;
                 previous.sample.vpngate = None;
@@ -385,6 +407,11 @@ impl RealtimeService {
         // invalid delta there is no previous state to preserve, so it correctly becomes empty.
         stored_event.sample.diagnostics_unchanged = false;
         stored_event.sample.mux_unchanged = false;
+        if materialize_delta {
+            // Actual reports win over omission hints. Send one complete corrective snapshot
+            // so existing browsers honor the payload and retain unrelated diagnostic baselines.
+            broadcast_event = stored_event.clone();
+        }
         ring.push_back(stored_event);
         trim_ring(ring, oldest);
         let _ = self
@@ -749,30 +776,12 @@ fn send_status(
 }
 
 fn validate_sample(sample: &AgentRealtimeSample) -> Result<(), &'static str> {
-    if sample.diagnostics_unchanged
-        && (sample.mux_unchanged
-            || sample.reverse_health.is_some()
-            || sample.mux.is_some()
-            || sample.vpngate.is_some())
-    {
-        return Err("unchanged diagnostics sample carries a report");
-    }
-    if sample.mux_unchanged && sample.mux.is_some() {
-        return Err("unchanged mux sample carries a report");
-    }
     let interface_chars = sample.interface.chars().count();
     if interface_chars == 0 || interface_chars > MAX_INTERFACE_CHARS {
         return Err("interface name has an invalid length");
     }
-    if !sample
-        .interface
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '@'))
-    {
-        return Err("interface name contains invalid characters");
-    }
-    if !(MIN_ELAPSED_MILLIS..=MAX_ELAPSED_MILLIS).contains(&sample.elapsed_millis) {
-        return Err("sample elapsed time is outside the live range");
+    if sample.elapsed_millis == 0 {
+        return Err("sample elapsed time must be positive");
     }
     let now = unix_millis();
     if sample.sampled_at_unix_millis <= 0
@@ -780,68 +789,81 @@ fn validate_sample(sample: &AgentRealtimeSample) -> Result<(), &'static str> {
     {
         return Err("sample timestamp is invalid");
     }
-    if let Some(report) = sample.user_traffic.as_ref() {
-        if report.users.len() > MAX_REALTIME_USER_TRAFFIC_ROWS {
-            return Err("user traffic report exceeds its row bound");
-        }
+    Ok(())
+}
+
+/// Optional diagnostics cannot invalidate a NIC reading. Keep useful user rows, mark their
+/// coverage incomplete when filtering, and drop only an unusable optional report.
+fn normalize_optional_reports(sample: &mut AgentRealtimeSample) {
+    if sample.diagnostics_unchanged || sample.mux.is_some() {
+        sample.mux_unchanged = false;
+    }
+    if let Some(report) = sample.user_traffic.as_mut() {
         match report.state {
             RealtimeUserTrafficState::Ready => {
-                if !report.elapsed_millis.is_some_and(|elapsed| {
-                    (MIN_ELAPSED_MILLIS..=MAX_ELAPSED_MILLIS).contains(&elapsed)
-                }) {
-                    return Err("ready user traffic report has an invalid interval");
+                if report.elapsed_millis.is_none_or(|elapsed| elapsed == 0) {
+                    sample.user_traffic = None;
+                } else {
+                    let original = report.users.len();
+                    report.users.truncate(MAX_REALTIME_USER_TRAFFIC_ROWS);
+                    let mut identities = HashSet::new();
+                    report.users.retain(|user| {
+                        let valid_source = matches!((&user.ingress_id, user.forwarding_rule_id),
+                            (Some(id), None) if !id.is_empty() && id.len() <= 64)
+                            || matches!((&user.ingress_id, user.forwarding_rule_id),
+                                (None, Some(id)) if id > 0 && report.forwarding_supported);
+                        !user.tenant_id.is_empty()
+                            && user.tenant_id.len() <= 128
+                            && !user.user_id.is_empty()
+                            && user.user_id.len() <= 64
+                            && valid_source
+                            && identities.insert((
+                                user.tenant_id.clone(),
+                                user.user_id.clone(),
+                                user.ingress_id.clone(),
+                                user.forwarding_rule_id,
+                            ))
+                    });
+                    if report.users.len() != original {
+                        report.truncated = true;
+                        report.has_gap = true;
+                    }
+                    if report
+                        .elapsed_millis
+                        .is_some_and(|elapsed| elapsed > LIVE_GAP_ELAPSED_MILLIS)
+                    {
+                        report.has_gap = true;
+                    }
                 }
             }
             RealtimeUserTrafficState::Warming | RealtimeUserTrafficState::Unavailable => {
-                if report.elapsed_millis.is_some()
-                    || !report.users.is_empty()
-                    || report.truncated
-                    || report.has_gap
-                {
-                    return Err("inactive user traffic report carries rate data");
-                }
-            }
-        }
-        let mut identities = HashSet::new();
-        for user in &report.users {
-            if user.tenant_id.is_empty()
-                || user.user_id.is_empty()
-                || !matches!((&user.ingress_id,user.forwarding_rule_id), (Some(id),None) if !id.is_empty() && id.len()<=64)
-                    && !matches!((&user.ingress_id,user.forwarding_rule_id), (None,Some(id)) if id>0 && report.forwarding_supported)
-                || user.tenant_id.len() > 128
-                || user.user_id.len() > 64
-                || !identities.insert((
-                    &user.tenant_id,
-                    &user.user_id,
-                    &user.ingress_id,
-                    user.forwarding_rule_id,
-                ))
-            {
-                return Err("user traffic report contains an invalid identity");
+                report.elapsed_millis = None;
+                report.users.clear();
+                report.truncated = false;
+                report.has_gap = false;
             }
         }
     }
-    if let Some(vpngate) = sample.vpngate.as_ref() {
-        if vpngate.boot_id.is_empty()
-            || vpngate.boot_id.chars().count() > 128
-            || vpngate.pools.len() > MAX_VPNGATE_POOLS
-            || vpngate.backends.len() > MAX_VPNGATE_BACKENDS
-            || vpngate.events.len() > MAX_VPNGATE_EVENTS
-            || vpngate
-                .pools
-                .iter()
-                .any(|pool| pool.candidate_count > VPNGATE_MAX_CANDIDATES)
-        {
-            return Err("VPN Gate realtime report exceeds its bounds");
-        }
-        if serde_json::to_vec(vpngate)
-            .map(|body| body.len() > MAX_VPNGATE_REPORT_BYTES)
-            .unwrap_or(true)
-        {
-            return Err("VPN Gate realtime report is too large");
-        }
+    if sample
+        .vpngate
+        .as_ref()
+        .is_some_and(|report| !valid_vpngate_report(report))
+    {
+        sample.vpngate = None;
     }
-    Ok(())
+}
+
+fn valid_vpngate_report(report: &brocade_deployment::protocol::VpngateRealtimeReport) -> bool {
+    !report.boot_id.is_empty()
+        && report.boot_id.chars().count() <= 128
+        && report.pools.len() <= MAX_VPNGATE_POOLS
+        && report.backends.len() <= MAX_VPNGATE_BACKENDS
+        && report.events.len() <= MAX_VPNGATE_EVENTS
+        && report
+            .pools
+            .iter()
+            .all(|pool| pool.candidate_count <= VPNGATE_MAX_CANDIDATES)
+        && serde_json::to_vec(report).is_ok_and(|body| body.len() <= MAX_VPNGATE_REPORT_BYTES)
 }
 
 fn unix_millis() -> i64 {
@@ -880,6 +902,168 @@ mod tests {
             user_traffic: None,
             has_gap: false,
         }
+    }
+
+    #[test]
+    fn interface_display_names_do_not_need_a_shell_character_whitelist() {
+        let mut live = sample(1);
+        for name in ["uplink+0", "出口0", "eth0"] {
+            live.interface = name.into();
+            validate_sample(&live).unwrap();
+        }
+        live.interface = String::new();
+        assert!(validate_sample(&live).is_err());
+        live.interface = "x".repeat(MAX_INTERFACE_CHARS + 1);
+        assert!(validate_sample(&live).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_optional_rows_and_reports_do_not_reject_nic_samples() {
+        let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
+        let _subscription = service.subscribe(["n1".to_owned()]).await;
+        let agent = service.register_agent("n1".to_owned()).await;
+        let mut live = sample(1);
+        live.user_traffic = Some(serde_json::from_value(serde_json::json!({
+            "state":"ready", "all_users":true, "elapsed_millis":50,
+            "users":[
+                {"tenant_id":"platform","user_id":"a","ingress_id":"entry","uplink_bytes_per_sec":11,"downlink_bytes_per_sec":22},
+                {"tenant_id":"","user_id":"b","ingress_id":"entry","uplink_bytes_per_sec":99,"downlink_bytes_per_sec":99},
+                {"tenant_id":"platform","user_id":"a","ingress_id":"entry","uplink_bytes_per_sec":11,"downlink_bytes_per_sec":22}
+            ]
+        })).unwrap());
+        live.vpngate = Some(brocade_deployment::protocol::VpngateRealtimeReport {
+            boot_id: String::new(),
+            sequence: 1,
+            sampled_at_unix_millis: unix_millis(),
+            pools: Vec::new(),
+            backends: Vec::new(),
+            events: Vec::new(),
+        });
+        service
+            .record_sample("n1", agent.session, live)
+            .await
+            .unwrap();
+        let snapshot = service.subscribe(["n1".to_owned()]).await;
+        let actual = &snapshot.snapshots[0].samples[0].sample;
+        assert_eq!(actual.rx_bytes_per_sec, 123);
+        assert!(actual.vpngate.is_none());
+        let users = actual.user_traffic.as_ref().unwrap();
+        assert_eq!(users.users.len(), 1);
+        assert_eq!(users.users[0].uplink_bytes_per_sec, 11);
+        assert!(users.truncated && users.has_gap);
+    }
+
+    #[test]
+    fn malformed_optional_rate_intervals_do_not_discard_other_dimensions() {
+        for state in ["ready", "warming", "unavailable"] {
+            let mut live = sample(1);
+            live.user_traffic = Some(
+                serde_json::from_value(serde_json::json!({
+                    "state":state,"all_users":false,"elapsed_millis":0,"users":[],"has_gap":true
+                }))
+                .unwrap(),
+            );
+            normalize_optional_reports(&mut live);
+            validate_sample(&live).unwrap();
+            assert_eq!(live.rx_bytes_per_sec, 123);
+            assert!(
+                !live.has_gap,
+                "optional observations must not invent a NIC gap"
+            );
+            if state == "ready" {
+                assert!(live.user_traffic.is_none());
+            } else {
+                assert_eq!(live.user_traffic.unwrap().elapsed_millis, None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn positive_sampling_intervals_are_accepted_and_long_windows_show_a_gap() {
+        let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
+        let _subscription = service.subscribe(["n1".to_owned()]).await;
+        let agent = service.register_agent("n1".to_owned()).await;
+        for (sequence, elapsed) in [(1, 50), (2, 90_000)] {
+            let mut live = sample(sequence);
+            live.elapsed_millis = elapsed;
+            service
+                .record_sample("n1", agent.session, live)
+                .await
+                .unwrap();
+        }
+        let snapshot = service.subscribe(["n1".to_owned()]).await;
+        assert_eq!(
+            snapshot.snapshots[0].samples[1].sample.rx_bytes_per_sec,
+            123
+        );
+        assert!(snapshot.snapshots[0].samples[1].sample.has_gap);
+        let mut zero = sample(3);
+        zero.elapsed_millis = 0;
+        assert!(service
+            .record_sample("n1", agent.session, zero)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn actual_diagnostics_override_omission_hints_and_keep_other_baselines() {
+        let service = RealtimeService::new(RealtimeTelemetryPolicy::default());
+        let mut subscription = service.subscribe(["n1".to_owned()]).await;
+        let agent = service.register_agent("n1".to_owned()).await;
+        let mut first = sample(1);
+        first.mux = Some(brocade_deployment::protocol::MuxReport {
+            boot_id: "boot".into(),
+            sequence: 1,
+            sampled_at_unix_ms: unix_millis(),
+            pools: Vec::new(),
+            workers: Vec::new(),
+            events: Vec::new(),
+        });
+        first.vpngate = Some(brocade_deployment::protocol::VpngateRealtimeReport {
+            boot_id: "vpn-boot".into(),
+            sequence: 1,
+            sampled_at_unix_millis: unix_millis(),
+            pools: Vec::new(),
+            backends: Vec::new(),
+            events: Vec::new(),
+        });
+        service
+            .record_sample("n1", agent.session, first.clone())
+            .await
+            .unwrap();
+        let mut second = sample(2);
+        second.diagnostics_unchanged = true;
+        second.mux_unchanged = true;
+        second.mux = first.mux.take();
+        second.mux.as_mut().unwrap().sequence = 2;
+        service
+            .record_sample("n1", agent.session, second)
+            .await
+            .unwrap();
+        let broadcast = loop {
+            if let RealtimeBroadcast::Sample(event) = subscription.events.recv().await.unwrap() {
+                if event.sample.sequence == 2 {
+                    break event;
+                }
+            }
+        };
+        assert!(!broadcast.sample.diagnostics_unchanged && !broadcast.sample.mux_unchanged);
+        assert_eq!(broadcast.sample.mux.as_ref().unwrap().sequence, 2);
+        assert_eq!(
+            broadcast.sample.vpngate.as_ref().unwrap().boot_id,
+            "vpn-boot"
+        );
+        let snapshot = service.subscribe(["n1".to_owned()]).await;
+        assert_eq!(
+            snapshot.snapshots[0].samples[1]
+                .sample
+                .mux
+                .as_ref()
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert!(snapshot.snapshots[0].samples[0].sample.vpngate.is_none());
     }
 
     #[tokio::test]

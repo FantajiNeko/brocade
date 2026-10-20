@@ -1,3 +1,5 @@
+export const DEFAULT_TLS_FINGERPRINT = 'safari';
+
 export const REALITY_FINGERPRINT_OPTIONS = [
   ['chrome', 'Chrome'],
   ['firefox', 'Firefox'],

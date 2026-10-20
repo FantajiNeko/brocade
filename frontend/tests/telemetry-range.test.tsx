@@ -149,9 +149,9 @@ describe('machine telemetry range', () => {
     );
     vi.stubGlobal('fetch', fetchMock);
 
-    await fetchUsageNodeSeries(86_400, 'akile-ogvtw-hinet');
+    await fetchUsageNodeSeries(86_400, 'example-tw-edge');
 
-    expect(String(fetchMock.mock.calls[0][0])).toBe('/usage/node-series?window_secs=86400&node_id=akile-ogvtw-hinet');
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/usage/node-series?window_secs=86400&node_id=example-tw-edge');
   });
 
   it('sends identical absolute boundaries to Xray and PING history endpoints', async () => {

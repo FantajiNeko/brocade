@@ -373,7 +373,15 @@ fn native_endpoint_swap(mux: bool) {
         sha256: super::sha256_hex(encoded.as_bytes()),
         content: encoded.clone(),
     };
-    super::converge_linux_xray(&root, &desired, false, Some((1920, 0)), true, None).unwrap();
+    super::converge_linux_xray(
+        &root,
+        &desired,
+        false,
+        Some((1920, 0)),
+        brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff,
+        None,
+    )
+    .unwrap();
     assert_eq!(super::serving_xray_process_in(&root), Some(process));
     assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), encoded);
     assert!(super::xrayupdate::read_upgrade_runtime(&root)
@@ -405,7 +413,15 @@ fn native_endpoint_swap(mux: bool) {
         sha256: super::sha256_hex(encoded.as_bytes()),
         content: encoded.clone(),
     };
-    super::converge_linux_xray(&root, &desired, false, Some((1921, 0)), true, Some(&[])).unwrap();
+    super::converge_linux_xray(
+        &root,
+        &desired,
+        false,
+        Some((1921, 0)),
+        brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff,
+        Some(&[]),
+    )
+    .unwrap();
     assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), encoded);
     let recovered = super::xrayupdate::read_upgrade_runtime(&root)
         .unwrap()

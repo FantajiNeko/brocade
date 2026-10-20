@@ -76,12 +76,14 @@ const committedSettings = () => ({
 
 const ROUTES: Record<string, () => unknown> = {
   '/settings': committedSettings,
+  '/deployment-settings': () => ({ unattended: true }),
   '/branding': () => ({ site_name: 'brocade', icon: null, accent: null }),
   '/auth/state': () => ({ public_open: false }),
   '/certs': () => ({ groups: [], nodes: [], letsencrypt: 'https://acme', letsencrypt_staging: 'https://acme-staging' }),
   '/distribution': () => ({
     stored: { agent_public_url: 'https://example', xray_version: '26.7.28' },
     effective: { agent_public_url: 'https://example', xray_version: '26.7.28' },
+    xray_source_revision: '77ae5216cf2132fcf300fac1a6a4998ea54378ba-dirty',
   }),
   '/agent-log-policy': () => ({
     global: { agent_journal_mib: 100, xray_mib: 100, phantun_mib: 100 },
@@ -187,9 +189,14 @@ const publicCaCertsWithGroup = (): CertsView => {
 };
 
 function stubFetch() {
+  let deploymentSettings = { unattended: true, xray_handoff_beta: false };
   vi.stubGlobal(
     'fetch',
     vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/deployment-settings' && init?.method === 'PUT') {
+        deploymentSettings = { ...deploymentSettings, ...JSON.parse(String(init.body)) };
+        return Response.json(deploymentSettings);
+      }
       if (path.startsWith('/vpngate/catalog-nodes/') && init?.method === 'PUT') {
         const nodeId = decodeURIComponent(path.slice('/vpngate/catalog-nodes/'.length));
         const enabled = Boolean(JSON.parse(String(init.body)).enabled);
@@ -290,6 +297,81 @@ const fieldInput = (scope: ReturnType<typeof section>, label: string) => {
 };
 
 const settingsOp = () => draft.ops().find(op => op.op === 'update_settings');
+
+it('无人值守发布默认开启，切换立即保存且不写入草稿', async () => {
+  render(<Harness />);
+  const toggle = within(await screen.findByRole('group', { name: '无人值守发布' }));
+  expect(toggle.getByRole('button', { name: '开启' }).getAttribute('aria-pressed')).toBe('true');
+  fireEvent.click(toggle.getByRole('button', { name: '关闭' }));
+  await waitFor(() => expect(toggle.getByRole('button', { name: '关闭' }).getAttribute('aria-pressed')).toBe('true'));
+  expect(fetch).toHaveBeenCalledWith(
+    '/deployment-settings',
+    expect.objectContaining({ method: 'PUT', body: JSON.stringify({ unattended: false }) }),
+  );
+  expect(draft.isEmpty()).toBe(true);
+  fireEvent.click(toggle.getByRole('button', { name: '开启' }));
+  await waitFor(() => expect(toggle.getByRole('button', { name: '开启' }).getAttribute('aria-pressed')).toBe('true'));
+});
+
+it('交接 Beta 默认关闭，独立保存且不产生草稿或改变无人值守设置', async () => {
+  render(<Harness />);
+  const beta = within(await screen.findByRole('group', { name: 'Xray 进程交接 Beta' }));
+  expect(beta.getByRole('button', { name: '关闭' }).getAttribute('aria-pressed')).toBe('true');
+  fireEvent.click(beta.getByRole('button', { name: '开启' }));
+  await waitFor(() => expect(beta.getByRole('button', { name: '开启' }).getAttribute('aria-pressed')).toBe('true'));
+  expect(fetch).toHaveBeenCalledWith(
+    '/deployment-settings',
+    expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ xray_handoff_beta: true }),
+    }),
+  );
+  const unattended = within(screen.getByRole('group', { name: '无人值守发布' }));
+  fireEvent.click(unattended.getByRole('button', { name: '关闭' }));
+  await waitFor(() =>
+    expect(unattended.getByRole('button', { name: '关闭' }).getAttribute('aria-pressed')).toBe('true'),
+  );
+  expect(beta.getByRole('button', { name: '开启' }).getAttribute('aria-pressed')).toBe('true');
+  expect(draft.isEmpty()).toBe(true);
+});
+
+it('非系统管理员不能修改交接 Beta', async () => {
+  render(<Harness role="editor" />);
+  const beta = within(await screen.findByRole('group', { name: 'Xray 进程交接 Beta' }));
+  expect((beta.getByRole('button', { name: '开启' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it('无人值守发布保存失败时保留原设置并显示错误', async () => {
+  const fetchMock = vi.mocked(fetch);
+  const original = fetchMock.getMockImplementation()!;
+  fetchMock.mockImplementation((path, init) =>
+    path === '/deployment-settings' && init?.method === 'PUT'
+      ? Promise.resolve(Response.json({ error: '发布设置保存失败' }, { status: 500 }))
+      : original(path, init),
+  );
+  render(<Harness />);
+  const toggle = within(await screen.findByRole('group', { name: '无人值守发布' }));
+  fireEvent.click(toggle.getByRole('button', { name: '关闭' }));
+  expect(await screen.findByText(/发布设置保存失败/)).toBeTruthy();
+  expect(toggle.getByRole('button', { name: '开启' }).getAttribute('aria-pressed')).toBe('true');
+});
+
+it('非系统管理员只能查看无人值守发布设置', async () => {
+  render(<Harness role="editor" />);
+  const toggle = within(await screen.findByRole('group', { name: '无人值守发布' }));
+  expect((toggle.getByRole('button', { name: '关闭' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((toggle.getByRole('button', { name: '开启' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it('自定义全局 AnyTLS Padding 可编辑并按原规则写入草稿', async () => {
+  render(<Harness />);
+  const input = (await screen.findByLabelText('AnyTLS 全局 Padding Scheme')) as HTMLTextAreaElement;
+  expect(input.readOnly).toBe(false);
+  const rules = ['stop=8', '0=30-30', '1=100-400', '2=400-500,c,500-1000'];
+  fireEvent.change(input, { target: { value: rules.join('\n') } });
+  fireEvent.click(section('set-xray').getByText('保存这一段'));
+  await waitFor(() => expect(settingsOp()?.settings.anytls_padding_scheme).toEqual(rules));
+});
 
 const pingPresetCases = [
   [
@@ -482,14 +564,14 @@ describe('设置页分段保存的基准', () => {
     expect(capability.getByText('目录收集 Agent')).toBeTruthy();
     expect(capability.getByText('准入规则')).toBeTruthy();
     expect(capability.queryByText('IP 情报 Agent')).toBeNull();
-    expect(intelligence.getByText('集中管理出口 IP 情报')).toBeTruthy();
+    expect(intelligence.getByText('集中管理出口 IP 情报。')).toBeTruthy();
     expect(intelligence.getByText('IP 情报 Agent')).toBeTruthy();
     expect(intelligence.queryByText('目录收集 Agent')).toBeNull();
     expect(intelligence.queryByText('准入规则')).toBeNull();
     expect(intelligence.getByText('ProxyCheck API')).toBeTruthy();
     for (const provider of ['FFraud', 'IPLogs']) {
       const field = intelligence.getByText(`${provider} API`).closest<HTMLElement>('.setfld')!;
-      expect(within(field).getByText('无需配置 API Key')).toBeTruthy();
+      expect(within(field).getByText('无需配置 API Key。')).toBeTruthy();
       expect(within(field).queryByRole('textbox')).toBeNull();
     }
   });
@@ -553,7 +635,7 @@ describe('设置页分段保存的基准', () => {
         .map(item => item.textContent),
     ).toEqual(['000000-******-******-333333']);
     expect(
-      within(row as HTMLElement).getByText('已保存的 Key 仅显示首尾各 6 位；追加不会覆盖 · 最多 32 个，随机起点轮换'),
+      within(row as HTMLElement).getByText('已保存的 Key 仅显示首尾各 6 位；追加不会覆盖 · 最多 32 个，随机起点轮换。'),
     ).toBeTruthy();
 
     const replacements = ['111111-222222-333333-444444', 'aaaaaa-bbbbbb-cccccc-dddddd'];
@@ -678,6 +760,7 @@ describe('设置页分段保存的基准', () => {
       'set-branding',
       'set-visitor',
       'set-dist',
+      'set-deployment',
       'set-agent-logs',
       'set-cert',
       'set-xray',
@@ -1227,14 +1310,18 @@ describe('设置页分段保存的基准', () => {
     );
     await screen.findByPlaceholderText('example.com:443');
     const address = fieldInput(section('set-dist'), 'Agent 请求地址');
+    expect(section('set-dist').getByText('77ae5216cf21 · dirty')).toBeTruthy();
+    expect(section('set-dist').queryByText('26.7.28')).toBeNull();
     fireEvent.change(address, { target: { value: 'https://new-control.example' } });
     act(() =>
       client.setQueryData(['distribution'], {
         stored: { agent_public_url: 'https://example', xray_version: '26.7.28' },
         effective: { agent_public_url: 'https://example', xray_version: 'new-build' },
+        xray_source_revision: '7fd6c7d6e37773422426b119e300e961c1099840',
       }),
     );
     expect(address.value).toBe('https://new-control.example');
+    await waitFor(() => expect(section('set-dist').getByText('7fd6c7d6e377')).toBeTruthy());
     expect(section('set-dist').getByText('有未保存的改动')).toBeTruthy();
   });
 

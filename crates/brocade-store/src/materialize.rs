@@ -2397,7 +2397,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn stored_warp_checkpoints_require_masque_options() {
+    fn stored_warp_checkpoints_accept_additional_options() {
         let mut document = json!({
             "revision": 1, "overlay_cidr": "10.1.0.0/16",
             "settings": ModelSettings::default(), "nodes": [], "node_egress_dns": [],
@@ -2413,6 +2413,7 @@ mod tests {
             snapshot.external_outbounds[0].protocol,
             ExternalOutboundProtocol::Warp { .. }
         ));
+        let expected = snapshot.external_outbounds[0].protocol.clone();
         for field in [
             "mtu",
             "keep_alive",
@@ -2422,11 +2423,8 @@ mod tests {
             "workers",
         ] {
             document["external_outbounds"][0]["protocol"]["v"] = json!({field: 0});
-            let error = decode_stored_snapshot(document.clone(), 1).unwrap_err();
-            assert!(
-                error.to_string().contains("unknown field"),
-                "{field}: {error}"
-            );
+            let snapshot = decode_stored_snapshot(document.clone(), 1).unwrap();
+            assert_eq!(snapshot.external_outbounds[0].protocol, expected, "{field}");
         }
     }
 

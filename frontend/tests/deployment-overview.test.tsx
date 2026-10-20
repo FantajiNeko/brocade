@@ -174,6 +174,7 @@ function mount({ releases = [] as BinaryRelease[], configChanged = false } = {})
     current: releases[0] ?? null,
     legacy_approval: null,
   });
+  client.setQueryData(['deployment-settings'], { unattended: true, xray_handoff_beta: true });
 
   return render(
     <QueryClientProvider client={client}>
@@ -266,7 +267,7 @@ describe('发布页', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: 'Xray1' }));
     const xrayLedger = screen.getByRole('region', { name: '已一致' });
-    expect(within(xrayLedger).getByText('可发 v26.4.25 · 升级范围：逐台选择')).toBeTruthy();
+    expect(within(xrayLedger).getByText('可发 commit 未知 · 升级范围：逐台选择')).toBeTruthy();
     expect(screen.getByText('可升级', { selector: '.cgc-st' })).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: '升级 Xray' }));
@@ -320,7 +321,7 @@ describe('发布页', () => {
     const xrayTab = screen.getByRole('tab', { name: 'Xray0/1' });
     expect(xrayTab.querySelector('.nd-tab-badge.cgc-run')?.textContent).toBe('0/1');
     fireEvent.click(xrayTab);
-    const ledger = screen.getByRole('region', { name: '本次已升级' });
+    const ledger = screen.getByRole('region', { name: '已升级' });
     expect(within(ledger).getByText(/^升级 #7 · root .+ 发起$/)).toBeTruthy();
     expect(screen.getByText('升级中', { selector: '.cgc-st' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: '升级 Xray' })).toBeNull();

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DeploymentDetail, DeploymentListItem, DeploymentTargetDetail } from '../src/api';
 import type { Win } from '../src/wm/store';
@@ -142,6 +142,40 @@ afterEach(() => {
 });
 
 describe('执行进度', () => {
+  it.each([
+    {
+      status: 'running',
+      menu: '取消并回滚',
+      title: '取消并回滚？',
+      confirm: '取消并回滚',
+      endpoint: '/deployments/538/cancel-rollback',
+    },
+    {
+      status: 'succeeded',
+      menu: '恢复到这次快照',
+      title: '恢复到这次快照？',
+      confirm: '恢复快照',
+      endpoint: '/rollback',
+    },
+  ])('$menu 只需点击确认，不要求输入文字', async ({ status, menu, title, confirm, endpoint }) => {
+    const view = mount(deployment([], { status, active: status === 'running' }), false);
+    const menuToggle = view.getByLabelText('更多操作');
+    fireEvent.click(menuToggle);
+    fireEvent.click(view.getByRole('menuitem', { name: new RegExp(menu) }));
+
+    const dialog = within(view.getByRole('dialog', { name: title }));
+    expect(dialog.queryByRole('textbox')).toBeNull();
+    expect(dialog.getByText(/创建强制同步工单/)).toBeTruthy();
+    const button = dialog.getByRole('button', { name: confirm }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(fetch).not.toHaveBeenCalledWith(endpoint, expect.objectContaining({ method: 'POST' }));
+
+    fireEvent.click(button);
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith(endpoint, expect.objectContaining({ method: 'POST' }));
+    });
+  });
+
   it('每一步是时间线上的一个节点；多步的全量发布先写分组，成功的机器收成机器格', () => {
     const view = mount(
       deployment([

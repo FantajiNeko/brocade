@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createApp, createChain, createTenant, createUser, reorderApps, reorderChains, upsertApp } from '../src/api';
+import { createApp, createChain, createUser, reorderApps, reorderChains, upsertApp } from '../src/api';
 import { draft } from '../src/draft';
 
 const writes: { path: string; body: unknown }[] = [];
@@ -37,16 +37,15 @@ describe('线路与链顺序保存', () => {
     expect(draft.ops()).toEqual([{ op: 'create_app', app: { id: 'app-premium', label: '修改后的名称' } }]);
   });
 
-  it('既有线路改名和创建用户即时写库，租户创建仍留在草稿', async () => {
+  it('既有线路改名和创建用户即时写库', async () => {
     await upsertApp({ id: 'line-a', label: '新名称' });
     await createUser({ tenant_id: 'platform.acme', id: 'alice' });
-    await createTenant({ id: 'tenant-next', name: '下一租户' });
 
     expect(writes).toEqual([
       { path: '/apps', body: { id: 'line-a', label: '新名称' } },
       { path: '/users', body: { tenant_id: 'platform.acme', id: 'alice' } },
     ]);
-    expect(draft.ops()).toEqual([{ op: 'create_tenant', tenant: { id: 'tenant-next', name: '下一租户' } }]);
+    expect(draft.ops()).toEqual([]);
   });
 
   it('每条线路的链顺序各自即时写入', async () => {

@@ -40,7 +40,7 @@ import {
   type UserOnlineSource,
   type UserPresence,
 } from '../api';
-import { can, isPublic, isVisitor, useSession } from '../session';
+import { can, isVisitor, useSession } from '../session';
 import { Ago, Confirm, EmptyState, ErrorBox, Loading, SegmentedControl } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { bytes, shareOf } from '../ui/format';
@@ -1533,9 +1533,7 @@ function UserList({
   const canViewPresence = !isVisitor(who);
   const [detailTab, setDetailTab] = useState<UserDetailTab>('access');
   const detailTabId = useId();
-  const detailTabs = USER_DETAIL_TABS.filter(
-    tab => tab.key === 'access' || (tab.key === 'forwarding' ? !isPublic(who) : canViewUserRealtimeTraffic(who)),
-  );
+  const detailTabs = USER_DETAIL_TABS.filter(tab => tab.key !== 'stats' || canViewUserRealtimeTraffic(who));
   const activeDetailTab = detailTabs.some(tab => tab.key === detailTab) ? detailTab : 'access';
   const tabId = (tab: UserDetailTab) => `${detailTabId}-${tab}-tab`;
   const panelId = (tab: UserDetailTab) => `${detailTabId}-${tab}-panel`;
@@ -1765,7 +1763,7 @@ function UserList({
       : [me.data, ...listedUsers]
     : listedUsers;
   const list = serverUsers;
-  const canManageLogin = can(who.role, 'manage-tenants');
+  const canManageLogin = can(who.role, 'manage-operators');
   /* 订阅是完整可用的配置，readonly 角色在 API 侧返回 403（见 session.tsx 的 can）。
      入口同步隐藏，避免点击后只得到一个错误。 */
   const canReadArtifacts = can(who.role, 'artifacts');
@@ -2305,26 +2303,24 @@ function UserList({
             refresh={refresh}
           />
         </div>
-        {!isPublic(who) && (
-          <div
-            className="user-dbody"
-            role="tabpanel"
-            id={panelId('forwarding')}
-            aria-labelledby={tabId('forwarding')}
-            hidden={activeDetailTab !== 'forwarding'}
-          >
-            <UserForwardingCard
-              key={`forwarding:${r.key}`}
-              user={u}
-              nodes={snapshot.data.snapshot.nodes ?? []}
-              canAuthorize={can(who.role, 'manage-tenants')}
-              canManageRules={editable || selfService}
-              canViewRealtime={canViewUserRealtimeTraffic(who)}
-              accountingDisabled={!editable || profile.isPending}
-              onAccountingModeChange={changeAccountingMode}
-            />
-          </div>
-        )}
+        <div
+          className="user-dbody"
+          role="tabpanel"
+          id={panelId('forwarding')}
+          aria-labelledby={tabId('forwarding')}
+          hidden={activeDetailTab !== 'forwarding'}
+        >
+          <UserForwardingCard
+            key={`forwarding:${r.key}`}
+            user={u}
+            nodes={snapshot.data.snapshot.nodes ?? []}
+            canAuthorize={can(who.role, 'manage-operators')}
+            canManageRules={editable || selfService}
+            canViewRealtime={canViewUserRealtimeTraffic(who)}
+            accountingDisabled={!editable || profile.isPending}
+            onAccountingModeChange={changeAccountingMode}
+          />
+        </div>
         {canViewUserRealtimeTraffic(who) && (
           <div
             className="user-dbody"
@@ -2467,7 +2463,7 @@ function UserList({
               <button
                 className="btn primary"
                 disabled={!editable || tenantOptions.length !== 1 || !!newUser}
-                title={tenantOptions.length !== 1 ? '系统归属配置必须恰好有一条' : undefined}
+                title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
                 onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
               >
                 ＋ 新增用户
@@ -2507,7 +2503,7 @@ function UserList({
                 <button
                   className="btn primary"
                   disabled={!editable || tenantOptions.length !== 1 || !!newUser}
-                  title={tenantOptions.length !== 1 ? '系统归属配置必须恰好有一条' : undefined}
+                  title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
                   onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
                 >
                   ＋ 新增用户

@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 
 pub const OTHER_DOMAIN_POLICY_HEADER: &str = "x-brocade-other-domain-policy";
 pub const OTHER_DOMAIN_VERSION: u32 = 1;
+pub const DETAIL_CHECKPOINT_VERSION: u32 = 2;
 pub const OTHER_DOMAIN_MAX_ROWS: usize = 8192; // Two windows of at most 4096 pairs.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct OtherDomainPolicy {
     pub enabled: bool,
     pub top_n: u32,
@@ -16,6 +17,8 @@ pub struct OtherDomainPolicy {
 }
 impl Default for OtherDomainPolicy {
     fn default() -> Self {
+        // Fail closed for missing/legacy wire policies. Fresh Console defaults live in the
+        // database and are always sent explicitly, so an old Console cannot enable collection.
         Self {
             enabled: false,
             top_n: 128,
@@ -58,11 +61,18 @@ pub fn valid_domain(domain: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OtherDomainCounter {
+    /// A new ID on every admission; zero is reserved for legacy cumulative counters.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub counter_id: u64,
     pub bucket: i64,
     pub label: String,
     pub domain: String,
     pub uplink_bytes: u64,
     pub downlink_bytes: u64,
+}
+
+pub(crate) fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetailUsageReport<Counter> {

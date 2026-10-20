@@ -282,6 +282,63 @@ it('distinguishes unsupported, empty, disabled and failed reports', async () => 
   expect((await screen.findByRole('alert')).textContent).toContain('读取失败');
 });
 
+it('puts forwarding first in the user ranking and chart and includes it in totals and shares', async () => {
+  fetchSites.mockResolvedValue(
+    sites({
+      rows: [row('github', 'GitHub', 900), row('forwarding', '端口转发', 70, 30)],
+      series: [
+        { site_id: 'github', points: [[DAY_START + 3 * 3600, 0, 900]] },
+        { site_id: 'forwarding', points: [[DAY_START + 3600, 30, 70]] },
+      ],
+      observed_since_unix_secs: DAY_START + 2 * 3600,
+    }),
+  );
+  const { container } = card();
+  const ranking = await screen.findByRole('region', { name: '各站点流量' });
+  expect([...ranking.querySelectorAll('.site-usage-name')].map(item => item.textContent)).toEqual([
+    '端口转发',
+    'GitHub',
+  ]);
+  const forwarding = within(ranking).getByText('端口转发').closest('.site-usage-row')!;
+  expect(forwarding.textContent).toContain('10.0%');
+  expect(forwarding.querySelector('.site-brand-icon svg')).toBeTruthy();
+  expect(container.querySelector('.site-usage-total')?.textContent).toBe('1000B');
+  expect(container.querySelector('.site-usage-label')?.textContent).toContain('1 类站点 · 端口转发');
+  expect(screen.getByText('站点观测起点 今天 02:00')).toBeTruthy();
+  const chart = await screen.findByTestId('site-usage-chart');
+  expect(chart.dataset.series).toBe('forwarding,github');
+  fireEvent.mouseEnter(forwarding.closest('li')!);
+  expect(chart.dataset.focus).toBe('forwarding');
+  expect(screen.getByText('站点流量').closest('header')?.querySelector('[title]')?.getAttribute('title')).toContain(
+    '端口转发作为独立类型计入',
+  );
+});
+
+it.each([true, false])('shows forwarding-only user traffic when site collection is %s', async enabled => {
+  fetchSites.mockResolvedValue(
+    sites({
+      collection_enabled: enabled,
+      reporting_nodes: 0,
+      expected_nodes: 0,
+      latest_report_unix_secs: null,
+      observed_since_unix_secs: null,
+      rows: [row('forwarding', '端口转发', 70, 30)],
+      series: [{ site_id: 'forwarding', points: [] }],
+    }),
+  );
+  fetchDomains.mockResolvedValue(domains({ rows: [] }));
+  fetchTargets.mockResolvedValue(detail('target', []));
+  const { container } = card();
+  expect(await screen.findByText('端口转发')).toBeTruthy();
+  expect(container.querySelector('.site-usage-total')?.textContent).toBe('100B');
+  expect(
+    screen.getByText(enabled ? '无认证代理入口 · 转发按账本统计' : '站点采集已关闭 · 转发仍按账本统计'),
+  ).toBeTruthy();
+  expect(screen.getByText('端口转发有 100 B 已计入总量，小时明细已不完整，未分配到图中。')).toBeTruthy();
+  expect(screen.queryByText(/尚无已记录的站点或端口转发流量/)).toBeNull();
+  expect((await screen.findByTestId('site-usage-chart')).dataset.series).toBe('forwarding');
+});
+
 it('does not carry one user profile into another user while loading', async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const user = (name: string) => (

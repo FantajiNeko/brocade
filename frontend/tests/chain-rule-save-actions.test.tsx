@@ -1,6 +1,7 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fetchSnapshot } from '../src/api';
 import type { ConsoleSnapshot, NodeAgentStateItem, Rule, SnapshotStep } from '../src/api';
 import { draft } from '../src/draft';
 import { RuleDraftScope, RuleEditor, type ForwardPeer } from '../src/panes/rules';
@@ -111,9 +112,81 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   draft.clear();
+  vi.unstubAllGlobals();
 });
 
 describe('链路规则统一保存', () => {
+  it.each([true, false])('保存后预览字段顺序变化仍禁用按钮，并能继续编辑和丢弃草稿（统一保存：%s）', async scoped => {
+    const baseline = [egress({ t: 'domain_suffix', v: ['before.example'] })];
+    const source = step('source', baseline);
+    const client = clientFor([source]);
+    const committed = client.getQueryData<ConsoleSnapshot>(['snapshot'])!;
+    // Console 的快照经 serde_json::Value 返回，字段顺序与本地编辑器构造的对象不同。
+    const staged: Rule[] = [
+      { a: { send_through: null, t: 'egress' }, m: { t: 'domain_suffix', v: ['after.example'] } },
+    ];
+    const preview: ConsoleSnapshot = {
+      ...committed,
+      snapshot: {
+        ...committed.snapshot,
+        apps: [{ ...committed.snapshot.apps[0], steps: [{ ...source, rules: staged }] }],
+      },
+    };
+    vi.stubGlobal('fetch', async (path: string) => {
+      if (path === '/model/preview') return Response.json({ snapshot: preview });
+      if (path === '/revisions?limit=50') return Response.json({ current_revision: null, revisions: [] });
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    function SnapshotEditor() {
+      const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: fetchSnapshot });
+      const steps = snapshot.data!.snapshot.apps[0].steps;
+      const editor = (
+        <RuleEditor
+          appId="video"
+          chainId="stream"
+          nodeId="source"
+          initial={steps[0].rules}
+          accept={null}
+          peers={[]}
+          isForwardTarget={false}
+          steps={steps}
+          root="source"
+          fallback={{ rules: [], pending: false }}
+        />
+      );
+      return scoped ? <RuleDraftScope>{editor}</RuleDraftScope> : editor;
+    }
+    const view = render(
+      <QueryClientProvider client={client}>
+        <SnapshotEditor />
+      </QueryClientProvider>,
+    );
+    const save = () => view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
+    const match = () => view.container.querySelector<HTMLInputElement>('td.rule-match-cell input')!;
+
+    await waitFor(() => expect(save().disabled).toBe(true));
+    fireEvent.change(match(), { target: { value: 'after.example' } });
+    await waitFor(() => expect(save().disabled).toBe(false));
+    fireEvent.click(save());
+    await waitFor(() => expect(client.getQueryData(['snapshot'])).toEqual(preview));
+    await waitFor(() => expect(save().disabled).toBe(true));
+    expect(match().value).toBe('after.example');
+    if (scoped) expect(view.getByText('没有待保存的改动')).toBeTruthy();
+
+    fireEvent.change(match(), { target: { value: 'another.example' } });
+    await waitFor(() => expect(save().disabled).toBe(false));
+    fireEvent.change(match(), { target: { value: 'after.example' } });
+    await waitFor(() => expect(save().disabled).toBe(true));
+
+    act(() => {
+      draft.clear();
+      client.setQueryData(['snapshot'], committed);
+    });
+    await waitFor(() => expect(match().value).toBe('before.example'));
+    await waitFor(() => expect(save().disabled).toBe(true));
+    client.clear();
+  });
+
   it('删除规则只更新本地表单，点击统一保存后才写入草稿并清理链图', async () => {
     const relay = step('old', [egress()], 20000);
     const view = renderScopedEditor(

@@ -59,6 +59,59 @@ function json(body: unknown) {
 }
 
 describe('usage month view', () => {
+  it('keeps the usage paper mounted while the first monthly reading loads', async () => {
+    let finishMonthly: ((response: Response) => void) | undefined;
+    const monthlyResponse = new Promise<Response>(resolve => {
+      finishMonthly = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === '/usage/monthly-summary') return monthlyResponse;
+        return Promise.reject(new Error(`unexpected request: ${path}`));
+      }),
+    );
+
+    const view = render(
+      <QueryClientProvider client={client()}>
+        <UsagePane />
+      </QueryClientProvider>,
+    );
+    const page = view.container.querySelector('.usage-page');
+    const paper = view.container.querySelector('.nd-paper');
+    expect(page).toBeTruthy();
+    expect(paper).toBeTruthy();
+
+    fireEvent.click(view.getByRole('tab', { name: '汇总' }));
+
+    const panel = view.getByRole('tabpanel', { name: '汇总' });
+    expect(view.container.querySelector('.usage-page')).toBe(page);
+    expect(view.container.querySelector('.nd-paper')).toBe(paper);
+    expect(panel.getAttribute('aria-busy')).toBe('true');
+    expect(within(panel).getByText('读取月度用量')).toBeTruthy();
+    expect(view.container.querySelector('.loading-state')).toBeNull();
+
+    await act(async () => {
+      finishMonthly?.(
+        json({
+          month_start: '2026-09-01 00:00:00',
+          month_end: '2026-10-01 00:00:00',
+          views: [],
+          days: [{ day: '2026-09-01', uplink_bytes: 1024, downlink_bytes: 2048, has_gap: false }],
+        }),
+      );
+      await monthlyResponse;
+    });
+
+    await view.findByLabelText('2026 年 9 月用量概览');
+    expect(view.container.querySelector('.usage-page')).toBe(page);
+    expect(view.container.querySelector('.nd-paper')).toBe(paper);
+    expect(view.getByRole('tabpanel', { name: '汇总' })).toBe(panel);
+    expect(panel.hasAttribute('aria-busy')).toBe(false);
+    expect(within(panel).queryByText('读取月度用量')).toBeNull();
+  });
+
   it('includes forwarding-only users and distinguishes source totals without inventing a line', async () => {
     const queryClient = client();
     queryClient.setQueryData(['usage-monthly'], {

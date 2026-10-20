@@ -46,7 +46,7 @@ export const hostText = (host: string) => {
   return bare.includes(':') ? `[${bare}]` : bare;
 };
 
-export const endpointText = (host: string, port: number) => `${hostText(host)}:${port}`;
+export const endpointText = (host: string, port: number | '***') => `${hostText(host)}:${port}`;
 
 /** 提交给服务端的主机：IPv6 带方括号，与线上已有规则的存储形式一致；服务端与 Agent 都会去掉方括号再解析。 */
 export const submittedHost = (target: ParsedTarget) => (target.kind === 'IPv6' ? `[${target.host}]` : target.host);

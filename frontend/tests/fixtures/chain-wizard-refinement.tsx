@@ -13,7 +13,6 @@ import { isValidSlug, occupiedPorts } from '../../src/panes/ports';
 import { SessionProvider } from '../../src/session';
 import { SegmentedControl } from '../../src/ui/bits';
 import { Icon } from '../../src/ui/icons';
-import { RegionFlag } from '../../src/ui/region-flag';
 import { GeneratedUserAvatar } from '../../src/ui/user-avatar';
 import { WizardCard, WizardPaperHeader } from '../../src/ui/wizard-paper';
 import { agentNodes, APPS, compileView, SETTINGS, snapshot, TENANTS, usersList } from './chain-wizard-mockup-data';
@@ -149,7 +148,6 @@ function RefinedWizard({
   const [query, setQuery] = useState('');
   const [newUser, setNewUser] = useState(false);
   const [newId, setNewId] = useState('');
-  const [newTenant, setNewTenant] = useState('platform');
   const [dnsChanges, setDnsChanges] = useState<WizardDnsChange[]>([]);
   const [preview, setPreview] = useState(false);
   const [save, setSave] = useState<'idle' | 'saving' | 'saved'>('idle');
@@ -161,17 +159,16 @@ function RefinedWizard({
     [],
   );
   const d = derive(world, entry, draft);
+  const newTenant = d.tenant || (world.tenants.length === 1 ? world.tenants[0].id : '');
   const act = actionsFor(d, setDraft);
   const taken = useMemo(() => occupiedPorts(world.apps, world.nodes, world.system), [world]);
   const q = query.trim().toLowerCase();
-  const visibleUsers = d.userRows.filter(user => !q || `${user.id} ${user.tenant_id}`.toLowerCase().includes(q));
+  const visibleUsers = d.userRows.filter(user => !q || user.id.toLowerCase().includes(q));
   const selectable = visibleUsers.filter(user => !user.blocked);
-  const groups = [...new Set(visibleUsers.map(user => user.tenant_id))];
-  const tenantName = (id: string) => world.tenants.find(tenant => tenant.id === id)?.name ?? id;
   const userIdValid = isValidSlug(newId.trim());
   const duplicateUser = world.users.some(user => user.id === newId.trim() && user.tenant_id === newTenant);
   const addUser = () => {
-    if (!userIdValid || duplicateUser) return;
+    if (!newTenant || !userIdValid || duplicateUser) return;
     const user = { id: newId.trim(), tenant_id: newTenant, status: 'active' } as UserListItem;
     setWorld(current => ({ ...current, users: [...current.users, user] }));
     act.setUsers([...draft.users, `${newTenant}/${user.id}`]);
@@ -340,22 +337,10 @@ function RefinedWizard({
                     autoFocus
                     onChange={event => setNewId(event.target.value)}
                   />
-                  <select
-                    className="f"
-                    aria-label="新用户租户"
-                    value={newTenant}
-                    onChange={event => setNewTenant(event.target.value)}
-                  >
-                    {world.tenants.map(tenant => (
-                      <option key={tenant.id} value={tenant.id}>
-                        {tenant.name}
-                      </option>
-                    ))}
-                  </select>
                   <button
                     type="button"
                     className="btn primary"
-                    disabled={!userIdValid || duplicateUser}
+                    disabled={!newTenant || !userIdValid || duplicateUser}
                     onClick={addUser}
                   >
                     新增并选中
@@ -368,44 +353,32 @@ function RefinedWizard({
                 </div>
               )}
               <div className="cr-user-list">
-                {groups.map(tenant => (
-                  <section key={tenant} className="cr-tenant-group" aria-label={`${tenantName(tenant)}的用户`}>
-                    {groups.length > 1 && (
-                      <h3>
-                        {tenantName(tenant)}
-                        <small>{visibleUsers.filter(user => user.tenant_id === tenant).length}</small>
-                      </h3>
-                    )}
-                    <div className="cr-user-grid">
-                      {visibleUsers
-                        .filter(user => user.tenant_id === tenant)
-                        .map(user => (
-                          <button
-                            key={user.key}
-                            type="button"
-                            className={`cr-user${d.picked.has(user.key) ? ' selected' : ''}`}
-                            aria-pressed={d.picked.has(user.key)}
-                            disabled={!!user.blocked && !d.picked.has(user.key)}
-                            title={`${user.id}${user.blocked ? ` · ${user.blocked}` : ''}`}
-                            onClick={() => act.toggleUser(user.key)}
-                          >
-                            <span className="cr-user-avatar" aria-hidden="true">
-                              <GeneratedUserAvatar id={user.id} variant="cell" />
-                              {d.picked.has(user.key) && (
-                                <span className="cr-user-check">
-                                  <Icon of="check" size={9} />
-                                </span>
-                              )}
-                            </span>
-                            <span className="cr-user-copy">
-                              <span className="cr-user-name">{user.id}</span>
-                              {user.blocked && <small>{user.blocked}</small>}
-                            </span>
-                          </button>
-                        ))}
-                    </div>
-                  </section>
-                ))}
+                <div className="cr-user-grid">
+                  {visibleUsers.map(user => (
+                    <button
+                      key={user.key}
+                      type="button"
+                      className={`cr-user${d.picked.has(user.key) ? ' selected' : ''}`}
+                      aria-pressed={d.picked.has(user.key)}
+                      disabled={!!user.blocked && !d.picked.has(user.key)}
+                      title={`${user.id}${user.blocked ? ` · ${user.blocked}` : ''}`}
+                      onClick={() => act.toggleUser(user.key)}
+                    >
+                      <span className="cr-user-avatar" aria-hidden="true">
+                        <GeneratedUserAvatar id={user.id} variant="cell" />
+                        {d.picked.has(user.key) && (
+                          <span className="cr-user-check">
+                            <Icon of="check" size={9} />
+                          </span>
+                        )}
+                      </span>
+                      <span className="cr-user-copy">
+                        <span className="cr-user-name">{user.id}</span>
+                        {user.blocked && <small>{user.blocked}</small>}
+                      </span>
+                    </button>
+                  ))}
+                </div>
                 {!visibleUsers.length && <p className="cr-no-users">没有匹配的用户</p>}
               </div>
             </WizardCard>
@@ -431,28 +404,6 @@ function RefinedWizard({
             }
           >
             <div id="cr-path" className="cr-path-body">
-              {!!d.spine.length && (
-                <div className="cr-path-summary" aria-label="当前链路径">
-                  {d.spine.map((id, index) => (
-                    <Fragment key={id}>
-                      {index > 0 && <i className="cw-arrow" aria-hidden="true" />}
-                      <span>
-                        <RegionFlag code={d.nodeOf(id)?.public_ipv4_country} />
-                        <b>{d.nameOf(id)}</b>
-                        <small>
-                          {d.spine.length === 1
-                            ? '入口 · 出口'
-                            : index === 0
-                              ? '入口'
-                              : index === d.spine.length - 1
-                                ? '出口'
-                                : '中转'}
-                        </small>
-                      </span>
-                    </Fragment>
-                  ))}
-                </div>
-              )}
               <WizardPathEditor
                 root={draft.root}
                 tables={draft.tables}
@@ -674,7 +625,7 @@ function App() {
                 >
                   <ChainWizard
                     node={entry.node ? world.nodes.find(node => node.node_id === entry.node) : undefined}
-                    fixedApp={{ id: APPS[0].id, label: APPS[0].label }}
+                    defaultApp={{ id: APPS[0].id, label: APPS[0].label }}
                     onDone={() => setCanceled(true)}
                   />
                 </div>

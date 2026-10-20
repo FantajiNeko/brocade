@@ -882,7 +882,16 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         // The response is the credential-free Serving authorization matrix. Executing it is a
         // POST to the same path and remains closed by the method gate above.
         || is_user_grant_probe_plan_path(path)
+        || is_user_forwarding_overview_path(path)
         || is_tunnel_probe_view_path(path)
+}
+
+fn is_user_forwarding_overview_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/users/") else {
+        return false;
+    };
+    let parts = rest.split('/').collect::<Vec<_>>();
+    matches!(parts.as_slice(), [tenant, user, "forwarding"] if !tenant.is_empty() && !user.is_empty())
 }
 
 fn is_node_public_ip_history_path(path: &str) -> bool {
@@ -1044,11 +1053,19 @@ async fn admin_auth_context(
     request: Request,
     next: Next,
 ) -> Response {
-    if skips_admin_auth(request.method(), request.uri().path())
-        || (bearer_token(request.headers()).is_none()
-            && admin_session_cookie(request.headers()).is_none())
-    {
+    if skips_admin_auth(request.method(), request.uri().path()) {
         return REQUEST_ADMIN.scope(None, next.run(request)).await;
+    }
+
+    // Only credential-free requests may become visitors. An invalid operator credential must
+    // still fail closed rather than silently changing the request's identity and scope.
+    if !request.headers().contains_key(header::AUTHORIZATION)
+        && admin_session_cookie(request.headers()).is_none()
+    {
+        return match state.store.public_identity().await {
+            Ok(identity) => REQUEST_ADMIN.scope(identity, next.run(request)).await,
+            Err(error) => ApiError::Store(error).into_response(),
+        };
     }
 
     match authenticate_admin(&state, request.headers()).await {
@@ -1128,6 +1145,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         // still require a system administrator in the handler below.
         .route("/branding", get(get_branding).put(update_branding))
         .route("/settings", get(get_settings).put(update_settings))
+        .route(
+            "/deployment-settings",
+            get(get_deployment_settings).put(update_deployment_settings),
+        )
         .route("/settings/ports", put(update_port_settings))
         .route("/settings/probe", put(update_probe_settings))
         .route(
@@ -1293,6 +1314,11 @@ fn admin_router_with_state(state: AppState) -> Router {
         // Machine detail traffic statistics: signed-in operators only, never cached, never in the
         // visitor or ordinary-user allowlists.
         .route("/nodes/{node_id}/inflow-usage", get(node_inflow_usage))
+        .route(
+            "/nodes/{node_id}/traffic-history",
+            get(node_traffic_history),
+        )
+        .route("/nodes/{node_id}/inflow-details", get(node_inflow_details))
         .route("/nodes/{node_id}/site-usage", get(node_site_usage))
         .route("/nodes/{node_id}/other-domains", get(node_other_domains))
         .route(
@@ -1306,6 +1332,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         )
         .route("/tenants", get(list_tenants).post(create_tenant))
         .route("/deployments/plan", post(plan_deployment))
+        .route(
+            "/deployments/plan/artifacts",
+            post(plan_deployment_artifacts),
+        )
         .route("/deployments/verify", post(verify_deployment))
         .route("/rollback", post(create_rollback_deployment))
         .route(
@@ -1737,6 +1767,10 @@ fn agent_routes() -> Router<AppState> {
         .route(
             "/agent/v1/other-domain-usage",
             post(agent_other_domain_usage).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/agent/v1/source-traffic",
+            post(agent_source_traffic).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route(
             "/agent/v1/sniffing-failed-usage",
@@ -2343,7 +2377,6 @@ async fn checkpoint_onboarding(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CompleteOnboardingRequest {
     probe_id: String,
     item_id: String,
@@ -2969,6 +3002,70 @@ struct UserSiteUsageQuery {
     period: brocade_deployment::site_usage::SiteUsagePeriod,
 }
 
+#[derive(Deserialize)]
+struct NodeTrafficUsageQuery {
+    #[serde(default)]
+    period: brocade_deployment::site_usage::SiteUsagePeriod,
+    // Flattened URL query content retains strings; convert explicitly in both query forms.
+    start_unix_secs: Option<String>,
+    end_unix_secs: Option<String>,
+}
+impl NodeTrafficUsageQuery {
+    fn range(&self) -> ApiResult<Option<brocade_deployment::source_traffic::TrafficTimeRange>> {
+        match (
+            self.start_unix_secs.as_deref(),
+            self.end_unix_secs.as_deref(),
+        ) {
+            (None, None) => Ok(None),
+            (Some(start_unix_secs), Some(end_unix_secs)) => {
+                let parse = |value: &str| {
+                    value.parse::<i64>().map_err(|_| {
+                        ApiError::Store(StoreError::InvalidData(
+                            "traffic boundaries must be integer Unix seconds".into(),
+                        ))
+                    })
+                };
+                Ok(Some(brocade_deployment::source_traffic::TrafficTimeRange {
+                    start_unix_secs: parse(start_unix_secs)?,
+                    end_unix_secs: parse(end_unix_secs)?,
+                }))
+            }
+            _ => Err(ApiError::Store(StoreError::InvalidData(
+                "both traffic time boundaries are required".into(),
+            ))),
+        }
+    }
+}
+#[derive(Deserialize)]
+struct NodeInflowDetailsQuery {
+    #[serde(flatten)]
+    usage: NodeTrafficUsageQuery,
+    tenant_id: String,
+    user_id: String,
+}
+
+async fn node_inflow_details(
+    State(state): State<AppState>,
+    Path(node): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<NodeInflowDetailsQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    require_visible_node(&state, &admin, &node).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .node_inflow_details(
+                &admin,
+                &node,
+                (&query.tenant_id, &query.user_id),
+                query.usage.period,
+                query.usage.range()?,
+            )
+            .await?,
+    ))
+}
+
 async fn user_other_domains(
     State(state): State<AppState>,
     Path((tenant, user)): Path<(String, String)>,
@@ -3046,18 +3143,34 @@ async fn require_visible_node(
     }
 }
 
-async fn node_inflow_usage(
+async fn node_traffic_history(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<UserSiteUsageQuery>,
+    Query(query): Query<NodeTrafficUsageQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     require_visible_node(&state, &admin, &node_id).await?;
     Ok(no_store_json(
         state
             .store
-            .node_inflow_usage(&admin, &node_id, query.period)
+            .node_traffic_history(&admin, &node_id, query.period, query.range()?)
+            .await?,
+    ))
+}
+
+async fn node_inflow_usage(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<NodeTrafficUsageQuery>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    require_visible_node(&state, &admin, &node_id).await?;
+    Ok(no_store_json(
+        state
+            .store
+            .node_inflow_usage_range(&admin, &node_id, query.period, query.range()?)
             .await?,
     ))
 }
@@ -3066,14 +3179,14 @@ async fn node_site_usage(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<UserSiteUsageQuery>,
+    Query(query): Query<NodeTrafficUsageQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     require_visible_node(&state, &admin, &node_id).await?;
     Ok(no_store_json(
         state
             .store
-            .node_site_usage(&admin, &node_id, query.period)
+            .node_site_usage_range(&admin, &node_id, query.period, query.range()?)
             .await?,
     ))
 }
@@ -3082,14 +3195,14 @@ async fn node_other_domains(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<UserSiteUsageQuery>,
+    Query(query): Query<NodeTrafficUsageQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     require_visible_node(&state, &admin, &node_id).await?;
     Ok(no_store_json(
         state
             .store
-            .node_other_domains(&admin, &node_id, query.period)
+            .node_other_domains_range(&admin, &node_id, query.period, query.range()?)
             .await?,
     ))
 }
@@ -3098,14 +3211,14 @@ async fn node_sniffing_failed_targets(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<UserSiteUsageQuery>,
+    Query(query): Query<NodeTrafficUsageQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     require_visible_node(&state, &admin, &node_id).await?;
     Ok(no_store_json(
         state
             .store
-            .node_sniffing_failed_targets(&admin, &node_id, query.period)
+            .node_sniffing_failed_targets_range(&admin, &node_id, query.period, query.range()?)
             .await?,
     ))
 }
@@ -3732,6 +3845,7 @@ async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> ApiR
 struct DistributionHttpResponse {
     stored: DistributionSettings,
     effective: DistributionSettings,
+    xray_source_revision: &'static str,
 }
 
 async fn distribution_response(state: &AppState) -> Result<DistributionHttpResponse, StoreError> {
@@ -3742,6 +3856,7 @@ async fn distribution_response(state: &AppState) -> Result<DistributionHttpRespo
             agent_public_url: Some(effective.agent_public_url.clone()),
             xray_version: effective.xray_version.clone(),
         },
+        xray_source_revision: env!("BROCADE_XRAY_SOURCE_REVISION"),
     })
 }
 
@@ -3821,6 +3936,29 @@ async fn update_data_retention(
             .update_data_retention(&admin, &table_name, request)
             .await?,
     ))
+}
+
+async fn get_deployment_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.deployment_settings().await?).into_response())
+}
+
+async fn update_deployment_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<brocade_store::UpdateDeploymentSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(
+        state
+            .store
+            .update_deployment_settings(&admin, settings)
+            .await?,
+    )
+    .into_response())
 }
 
 async fn get_host_network_tuning(
@@ -4829,6 +4967,25 @@ async fn plan_deployment(
     Ok(Json(plan).into_response())
 }
 
+async fn plan_deployment_artifacts(
+    State(state): State<AppState>,
+    Query(query): Query<DeploymentDetailQuery>,
+    headers: HeaderMap,
+    Json(request): Json<PlanDeploymentRequest>,
+) -> ApiResult<Response> {
+    let permission = if query.include_content() {
+        AdminPermission::SystemAdmin
+    } else {
+        AdminPermission::Edit
+    };
+    let admin = require_admin_context(&state, &headers, permission).await?;
+    let targets = state
+        .store
+        .plan_deployment_artifacts(&admin, request.revision_id, query.include_content())
+        .await?;
+    Ok(Json(json!({"revision": request.revision_id, "targets": targets})).into_response())
+}
+
 async fn verify_deployment(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5261,7 +5418,6 @@ async fn user_forwarding_probes(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TcpPingRequest {}
 
 async fn start_user_forwarding_probe(
@@ -5856,7 +6012,6 @@ async fn update_user_status(
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StartGrantProbeRequest {
     /// Empty means every effective Serving entry. A single-row action sends exactly one id; ids
     /// are checked against the freshly projected plan and never interpreted as addresses.
@@ -5871,7 +6026,6 @@ struct StartGrantProbeResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StartFrontCombinationProbeRequest {
     app_id: String,
     front_id: String,
@@ -6136,13 +6290,11 @@ fn probe_sse_event(snapshot: &crate::grant_probe::ProbeJobSnapshot) -> Event {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct TunnelProbeWindowQuery {
     window_secs: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StartTunnelProbeRequest {
     #[serde(default)]
     source: TunnelProbeSource,
@@ -6531,7 +6683,6 @@ async fn upsert_app(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReorderRequest {
     ids: Vec<String>,
 }
@@ -6546,7 +6697,6 @@ async fn reorder_apps(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RegisterWarpBindingHttpRequest {
     node_id: String,
     /// The compatible registration endpoint submits Cloudflare's application terms timestamp.
@@ -6566,7 +6716,6 @@ struct RegisterWarpBindingHttpResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct UpdateWarpBindingHttpRequest {
     /// NULL/absent means inherit the logical tunnel endpoint default for that field.
     #[serde(default)]
@@ -6972,7 +7121,14 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
         ));
     }
 
-    let desired = state.store.claim_desired_for_node(&node.node_id).await?;
+    let desired = state
+        .store
+        .claim_desired_for_node_with_protocol(&node.node_id, protocol_version.unwrap_or_default())
+        .await?;
+    let needs_policy_upgrade = desired.is_none()
+        && protocol_version.is_some_and(|version| {
+            version < brocade_deployment::protocol::CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION
+        });
     let certificate_deployment = desired.as_ref().and_then(|deployment| {
         matches!(
             deployment.desired.xray,
@@ -6992,7 +7148,7 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
         Vec::new()
     };
 
-    let response = match desired {
+    let mut response = match desired {
         Some(mut desired) => {
             // The distribution source is filled in at this layer: it is configuration of the
             // runtime environment, and store should not know env exists.
@@ -7013,6 +7169,12 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             true => StatusCode::NO_CONTENT.into_response(),
         },
     };
+    if needs_policy_upgrade && response.status() == StatusCode::NO_CONTENT {
+        response.headers_mut().insert(
+            "x-brocade-agent-upgrade-required",
+            HeaderValue::from_static("1"),
+        );
+    }
     Ok(with_detail_policies(
         with_site_usage_policy(
             with_host_network_tuning(with_agent_log_policy(response, log_limits), host_tuning),
@@ -7028,6 +7190,10 @@ fn with_detail_policies(
     policy: HeaderValue,
     failed: HeaderValue,
 ) -> Response {
+    response.headers_mut().insert(
+        brocade_deployment::source_traffic::SOURCE_TRAFFIC_HEADER,
+        HeaderValue::from_static("1"),
+    );
     response.headers_mut().insert(
         brocade_deployment::other_domain::OTHER_DOMAIN_POLICY_HEADER,
         policy,
@@ -7698,6 +7864,20 @@ async fn agent_other_domain_usage(
     state
         .store
         .record_other_domain_report(&node.node_id, report)
+        .await?;
+    Ok(no_store_json(json!({"accepted":true})))
+}
+
+async fn agent_source_traffic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<brocade_deployment::source_traffic::SourceTrafficReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_active_agent(&node)?;
+    state
+        .store
+        .record_source_traffic_report(&node.node_id, report)
         .await?;
     Ok(no_store_json(json!({"accepted":true})))
 }
@@ -10018,6 +10198,7 @@ mod tests {
             "/usage/samples",
             "/usage/monthly-summary",
             "/users/platform.acme/alice/grant-probes",
+            "/users/platform.acme/alice/forwarding",
             "/realtime/nodes/events",
             "/realtime/fleet-traffic/events",
             "/realtime/fleet-traffic/snapshot",
@@ -10055,6 +10236,11 @@ mod tests {
             "/nodes/hk-01/site-usage",
             "/nodes/hk-01/other-domains",
             "/nodes/hk-01/sniffing-failed-targets",
+            "/users//alice/forwarding",
+            "/users/platform.acme//forwarding",
+            "/users/platform.acme/alice/forwarding/",
+            "/users/platform.acme/alice/forwarding/42",
+            "/users/platform.acme/alice/forwarding-nodes/n1/quota/jobs",
         ] {
             assert!(!public_may(&Method::GET, path), "should refuse GET {path}");
         }
@@ -10064,6 +10250,16 @@ mod tests {
         assert!(!public_may(&Method::POST, "/model/apply"));
         assert!(!public_may(&Method::POST, "/notifications/read"));
         assert!(!public_may(&Method::POST, "/notifications/clear"));
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            for path in [
+                "/users/platform.acme/alice/forwarding",
+                "/users/platform.acme/alice/forwarding/42",
+                "/users/platform.acme/alice/forwarding-nodes/n1",
+                "/users/platform.acme/alice/forwarding-nodes/n1/quota",
+            ] {
+                assert!(!public_may(&method, path), "should refuse {method} {path}");
+            }
+        }
         assert!(!public_may(&Method::PUT, "/branding"));
         assert!(!public_may(&Method::PUT, "/agent-log-policy"));
         assert!(!public_may(&Method::PUT, "/data-retention/usage_samples"));
@@ -10373,6 +10569,96 @@ mod tests {
             "install.sh 语法错误：{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn install_pin_uses_the_configured_file_digest_without_reading_a_banner_or_path_copy() {
+        use sha2::{Digest, Sha256};
+        use std::process::Command;
+
+        let start = INSTALL_SCRIPT
+            .find("verify_xray_pin() {")
+            .expect("pin function exists");
+        let relative_end = INSTALL_SCRIPT[start..]
+            .find("\n}\n")
+            .expect("pin function ends");
+        let end = start + relative_end + 3;
+        assert!(end > start);
+        let function = &INSTALL_SCRIPT[start..end];
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("configured-xray");
+        // These bytes deliberately have no executable version banner.
+        std::fs::write(&configured, b"configured release bytes").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"configured release bytes"));
+        let script = format!("{function}\nverify_xray_pin");
+        let run = |digest: &str| {
+            Command::new("sh")
+                .args(["-c", &script])
+                .env("XRAY_BIN", &configured)
+                .env("XRAY_BIN_SHA256", digest)
+                .env("XRAY_BIN_URL_EXPLICIT", "")
+                .env("XRAY_VERSION", "v26.4.25")
+                .output()
+                .unwrap()
+        };
+        assert!(run(&digest).status.success());
+        assert!(!run(&"0".repeat(64)).status.success());
+    }
+
+    #[test]
+    fn quoted_install_arguments_retain_url_metacharacters_as_literal_data() {
+        use std::process::Command;
+
+        let value = "https://example.net/a'$`$(printf injected)/segment";
+        let output = Command::new("sh")
+            .args(["-c", &format!("printf '%s' {}", super::shell_quote(value))])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), value);
+    }
+
+    #[test]
+    fn installer_agent_self_test_supports_current_and_localized_legacy_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let start = INSTALL_SCRIPT
+            .find("probe_agent() {")
+            .expect("Agent probe exists");
+        let end = start
+            + INSTALL_SCRIPT[start..]
+                .find("\n}\n")
+                .expect("Agent probe ends")
+            + 3;
+        assert!(end > start);
+        let script = format!("{}\nprobe_agent", &INSTALL_SCRIPT[start..end]);
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("agent");
+        let marker = brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE;
+        assert!(INSTALL_SCRIPT.contains(marker));
+        for (body, expected) in [
+            (
+                format!("#!/bin/sh\n[ \"$1\" = self-test ] || exit 9\nprintf '%s\\n' '{marker}'\n"),
+                true,
+            ),
+            (
+                "#!/bin/sh\nprintf '支持命令：run、health\\n' >&2\nexit 1\n".into(),
+                true,
+            ),
+            ("#!/bin/sh\nprintf 'runner run-once\\n'\n".into(), false),
+            ("#!/bin/sh\nexit 0\n".into(), false),
+        ] {
+            let staged = root.path().join("staged");
+            std::fs::write(&staged, body).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::rename(staged, &candidate).unwrap();
+            let result = Command::new("sh")
+                .args(["-c", &script])
+                .env("AGENT_BIN", &candidate)
+                .output()
+                .unwrap();
+            assert_eq!(result.status.success(), expected, "{result:?}");
+        }
     }
 
     #[test]

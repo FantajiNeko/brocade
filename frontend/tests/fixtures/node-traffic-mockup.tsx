@@ -72,17 +72,17 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
   const palette = useMemo(
     () =>
       siteRowsOf(built, monthAgg)
-        .filter(row => !NON_SITE_IDS.includes(row.id))
+        .filter(row => !NON_SITE_IDS.includes(row.id) && row.id !== 'forwarding')
         .slice(0, TOP_SITES)
         .map(row => row.id),
     [built, monthAgg],
   );
   const title = (
-    <span title="本机认证代理入口的流量按目的站点归类：固定站点域名集合，每条连接只计入一类，不保存 URL。端口转发不经过站点分类，不在此列。">
+    <span title="本机认证代理入口的流量按目的站点归类：固定站点域名集合，每条连接只计入一类，不保存 URL。端口转发作为独立类型计入。">
       <PanelTitle of="outbound">流出统计</PanelTitle>
     </span>
   );
-  if (!built.world.sites) {
+  if (!built.world.sites && rows.length === 0) {
     return (
       <section className="panel config-panel site-usage nto-card" aria-label="流出统计">
         <header>
@@ -94,7 +94,7 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
         </header>
         <div className="site-usage-body panel-full-bleed-body">
           <p className="site-usage-state nto-off">
-            流出按目的站点归类，依赖站点统计。在「设置 → 站点统计」开启后，本机从下一次上报开始统计，不保存 URL。
+            流出按目的站点归类，依赖站点统计。在「设置 → 出流量统计」开启后，本机从下一次上报开始统计，不保存 URL。
             <button type="button" className="btn sm">
               前往设置
             </button>
@@ -106,11 +106,15 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
   const total = rows.reduce((sum, row) => sum + row.total, 0);
   const down = rows.reduce((sum, row) => sum + row.down, 0);
   const up = rows.reduce((sum, row) => sum + row.up, 0);
-  const sites = rows.filter(row => !NON_SITE_IDS.includes(row.id));
+  const sites = rows.filter(row => !NON_SITE_IDS.includes(row.id) && row.id !== 'forwarding');
+  const forwarding = rows.filter(row => row.id === 'forwarding');
   const unsorted = rows.filter(row => NON_SITE_IDS.includes(row.id));
   const top = sites.filter(row => palette.includes(row.id));
   const rest = sites.filter(row => !palette.includes(row.id));
-  const colorOf = (id: string) => NON_SITE_COLORS[id] ?? RANK_COLORS[palette.indexOf(id)] ?? REST_COLOR;
+  const colorOf = (id: string): SiteUsageColor =>
+    id === 'forwarding'
+      ? { token: '--observe-2' }
+      : (NON_SITE_COLORS[id] ?? RANK_COLORS[palette.indexOf(id)] ?? REST_COLOR);
   const future = (index: number) => bounds.start + index * bounds.bucket >= NOW;
   const series: SiteUsageChartSeries[] = [
     ...top.map(row => ({
@@ -131,7 +135,7 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
           },
         ]
       : []),
-    ...unsorted.map(row => ({
+    ...[...forwarding, ...unsorted].map(row => ({
       key: row.id,
       name: row.name,
       color: colorOf(row.id),
@@ -140,7 +144,11 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
   ];
   const item = (row: SiteRow, sub = false) => {
     const open = openSite === row.id;
-    const focusKey = sub ? 'rest' : NON_SITE_IDS.includes(row.id) || palette.includes(row.id) ? row.id : 'rest';
+    const focusKey = sub
+      ? 'rest'
+      : row.id === 'forwarding' || NON_SITE_IDS.includes(row.id) || palette.includes(row.id)
+        ? row.id
+        : 'rest';
     return (
       <li
         key={row.id}
@@ -160,7 +168,13 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
             style={{ background: sub ? 'transparent' : cssColor(colorOf(row.id)) }}
             aria-hidden="true"
           />
-          <SiteIcon siteId={row.id} />
+          {row.id === 'forwarding' ? (
+            <span className="site-brand-icon" aria-hidden="true">
+              <Icon of="forwarding" size={18} />
+            </span>
+          ) : (
+            <SiteIcon siteId={row.id} />
+          )}
           <span className="site-usage-name">{row.name}</span>
           <span className="site-usage-num">{amount(row.total)}</span>
           <span className="site-usage-pct">{shareOf(row.total, total)}</span>
@@ -237,7 +251,7 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
                     {periodDates(bounds)} · 流向 {sites.length} 类站点
                   </span>
                   <span className="site-usage-meta">
-                    下行 <b>{bytes(down)}</b> · 上行 <b>{bytes(up)}</b> · 不含端口转发
+                    下行 <b>{bytes(down)}</b> · 上行 <b>{bytes(up)}</b>
                   </span>
                 </>
               ) : (
@@ -302,6 +316,7 @@ function OutflowCard({ built, agg, monthAgg }: { built: Built; agg: Agg; monthAg
                   </li>
                 )}
                 {restOpen && rest.map(row => item(row, true))}
+                {forwarding.map(row => item(row))}
                 {unsorted.length > 0 && (
                   <li className="site-usage-group" aria-hidden="true">
                     未归类
@@ -427,7 +442,7 @@ function NodePage({ children }: { children: ReactNode }) {
             </span>
             <div className="nd-ident-text">
               <div className="nd-ident-row">
-                <h1 className="nd-id">dmit-hkg-as3-pro-lokmachau</h1>
+                <h1 className="nd-id">example-hk-edge-01</h1>
               </div>
               <span className="nd-ident-meta">203.0.113.48</span>
             </div>

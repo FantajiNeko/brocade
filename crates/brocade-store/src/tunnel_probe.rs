@@ -260,7 +260,6 @@ pub struct TunnelProbeView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateTunnelProbePolicy {
     pub enabled: bool,
     pub interval_secs: u32,

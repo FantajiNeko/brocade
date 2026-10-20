@@ -13,6 +13,7 @@ import {
   type UserOtherDomains,
   type UserSiteUsage,
   type UserSniffingFailedTargets,
+  type TrafficTimeRange,
 } from './api';
 import type { SiteUsageChartSeries, SiteUsageColor } from './site-usage-chart';
 import { SegmentedControl } from './ui/bits';
@@ -48,7 +49,10 @@ const TOP_SITES = 5;
 const DETAIL_ROWS = 6;
 
 const SCOPE =
-  '按固定站点域名集合归类，每条连接只计入一类，不保存 URL。嗅探失败：启用嗅探但未取得域名；未识别：未启用嗅探且无域名。其他站点按主机名、嗅探失败按原始目标 IP 与端口另记明细，只保留近 24 小时。只统计认证代理入口，不含端口转发；按 UTC+8 自然日、自然周（周一起）、自然月统计。';
+  '认证代理入口按固定站点域名集合归类，每条连接只计入一类，不保存 URL。嗅探失败：启用嗅探但未取得域名；未识别：未启用嗅探且无域名。其他站点按主机名、嗅探失败按原始目标 IP 与端口另记明细，只保留近 24 小时。端口转发作为独立类型计入，沿用账本窗口起点归属；当天、当周按保留明细显示小时分布，当月按日汇总，不提供站点分类。站点采集状态只描述认证代理入口。按 UTC+8 自然日、自然周（周一起）、自然月统计。';
+const NODE_SCOPE =
+  '本机认证代理入口按目的站点分类，端口转发作为独立类型计入。端口转发沿用账本窗口起点归属，当天、当周按保留明细显示小时分布，当月按日汇总；不提供站点分类。站点采集状态只描述认证代理入口。按 UTC+8 自然日、自然周（周一起）、自然月统计。';
+const FORWARDING_COLOR: SiteUsageColor = { token: '--observe-2' };
 const NON_SITE_NOTE: Record<NonSite, string> = {
   other: '取得了域名，但不在预设站点集合内',
   'sniffing-failed': '启用了嗅探，但未取得可用域名',
@@ -123,22 +127,26 @@ function categoriesOf(data: UserSiteUsage) {
     .filter(row => row.total > 0)
     .sort((a, b) => b.total - a.total || a.id.localeCompare(b.id));
   const total = rows.reduce((sum, row) => sum + row.total, 0);
-  const sites = rows.filter(row => !isNonSite(row.id));
+  const sites = rows.filter(row => !isNonSite(row.id) && row.id !== 'forwarding');
+  const forwarding = rows.find(row => row.id === 'forwarding');
   const unsorted = NON_SITE.map(id => rows.find(row => row.id === id)).filter((row): row is Category => !!row);
   const failed = unsorted.find(row => row.id === 'sniffing-failed');
+  const observedTotal = total - (forwarding?.total ?? 0);
   return {
     rows,
     total,
     sites,
+    forwarding,
     unsorted,
     up: rows.reduce((sum, row) => sum + row.up, 0),
     down: rows.reduce((sum, row) => sum + row.down, 0),
-    failedWarn: total > 0 && (failed?.total ?? 0) / total >= FAILED_WARN_SHARE,
+    failedWarn: observedTotal > 0 && (failed?.total ?? 0) / observedTotal >= FAILED_WARN_SHARE,
   };
 }
 type Categories = ReturnType<typeof categoriesOf>;
 
 function colorOf(categories: Categories, id: string, palette: readonly string[] = []): SiteUsageColor {
+  if (id === 'forwarding') return FORWARDING_COLOR;
   if (isNonSite(id)) return id === 'sniffing-failed' && categories.failedWarn ? WARN_COLOR : NON_SITE_COLORS[id];
   return RANK_COLORS[palette.indexOf(id)] ?? REST_COLOR;
 }
@@ -157,7 +165,9 @@ function chartSeries(data: UserSiteUsage, categories: Categories, palette: reado
   const perSite = new Map(data.series.map(series => [series.site_id, series.points]));
   const values = (ids: string[]) => {
     const out: (number | null)[] = Array.from({ length: count }, (_, index) =>
-      data.range_start_unix_secs + index * data.bucket_secs < data.range_end_unix_secs ? 0 : null,
+      ids[0] !== 'forwarding' && data.range_start_unix_secs + index * data.bucket_secs < data.range_end_unix_secs
+        ? 0
+        : null,
     );
     for (const id of ids) {
       for (const [at, up, down] of perSite.get(id) ?? []) {
@@ -180,6 +190,14 @@ function chartSeries(data: UserSiteUsage, categories: Categories, palette: reado
       name: `其余 ${rest.length} 类站点`,
       color: REST_COLOR,
       values: values(rest.map(site => site.id)),
+    });
+  }
+  if (categories.forwarding) {
+    series.unshift({
+      key: 'forwarding',
+      name: categories.forwarding.name,
+      color: FORWARDING_COLOR,
+      values: values(['forwarding']),
     });
   }
   for (const row of categories.unsorted) {
@@ -432,12 +450,21 @@ function DetailSection({
 
 /* ── 卡片 ── */
 
-function ReportStatus({ data }: { data: UserSiteUsage }) {
+function ReportStatus({ data, machine = false }: { data: UserSiteUsage; machine?: boolean }) {
+  const withForwarding = machine || data.rows.some(row => row.site_id === 'forwarding');
   if (!data.collection_enabled) {
     return (
       <span className="rut-status" role="status">
         <i className="node-lamp idle" />
-        采集已关闭 · 显示已保留的数据
+        {withForwarding ? '站点采集已关闭 · 转发仍按账本统计' : '采集已关闭 · 显示已保留的数据'}
+      </span>
+    );
+  }
+  if (withForwarding && data.expected_nodes === 0) {
+    return (
+      <span className="rut-status" role="status">
+        <i className="node-lamp idle" />
+        {machine ? '本机无认证代理入口' : '无认证代理入口'} · 转发按账本统计
       </span>
     );
   }
@@ -446,7 +473,11 @@ function ReportStatus({ data }: { data: UserSiteUsage }) {
     <span
       className={`rut-status${warn ? ' warn' : ''}`}
       role="status"
-      title="近 5 分钟内上报站点统计的入口机器 / 该用户已授权的入口机器"
+      title={
+        withForwarding
+          ? '近 5 分钟内上报站点统计的认证入口机器，不表示转发采集状态'
+          : '近 5 分钟内上报站点统计的入口机器 / 该用户已授权的入口机器'
+      }
     >
       <i className={`node-lamp${warn ? ' warn' : ''}`} />
       <b>{data.reporting_nodes}</b> / {data.expected_nodes} 台入口已上报{data.limited ? ' · 计数受限' : ''}
@@ -454,8 +485,9 @@ function ReportStatus({ data }: { data: UserSiteUsage }) {
   );
 }
 
-function unsupportedText(data: UserSiteUsage): string {
-  if (data.expected_nodes === 0) return '尚无认证代理入口，独立端口转发不提供站点分类。';
+function unsupportedText(data: UserSiteUsage, machine: boolean): string {
+  if (data.expected_nodes === 0)
+    return machine ? '本机尚无已记录的流出流量。端口转发上报后将单独列出。' : '尚无已记录的站点或端口转发流量。';
   if (data.latest_report_unix_secs !== null) return '入口机器的站点上报已过期，所选范围内没有可用数据。';
   return '尚无站点观测数据。需入口机器的 Agent 与 Xray 都支持站点统计并完成上报。';
 }
@@ -464,12 +496,28 @@ export function UserSiteUsageCard({ tenantId, userId }: { tenantId: string; user
   return <SiteUsageCard scope={{ tenantId, userId }} />;
 }
 
-export function NodeSiteUsageCard({ nodeId, period }: { nodeId: string; period: SiteUsagePeriod }) {
-  return <SiteUsageCard key={nodeId} scope={{ nodeId }} controlledPeriod={period} />;
+export function NodeSiteUsageCard({
+  nodeId,
+  period,
+  range,
+}: {
+  nodeId: string;
+  period: SiteUsagePeriod;
+  range?: TrafficTimeRange;
+}) {
+  return <SiteUsageCard key={nodeId} scope={{ nodeId }} controlledPeriod={period} range={range} />;
 }
 
 type SiteScope = { tenantId: string; userId: string } | { nodeId: string };
-function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controlledPeriod?: SiteUsagePeriod }) {
+function SiteUsageCard({
+  scope,
+  controlledPeriod,
+  range,
+}: {
+  scope: SiteScope;
+  controlledPeriod?: SiteUsagePeriod;
+  range?: TrafficTimeRange;
+}) {
   const [localPeriod, setPeriod] = useState<SiteUsagePeriod>('day');
   const period = controlledPeriod ?? localPeriod;
   const nodeId = 'nodeId' in scope ? scope.nodeId : null;
@@ -482,12 +530,14 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
   const [focus, setFocus] = useState<string | null>(null);
   const uid = useId();
   // 切换周期时保留上一周期的读数，换了用户则不沿用。
-  const sameUser = (key: readonly unknown[] | undefined) => key?.[1] === (nodeId ?? tenantId) && key[2] === userId;
+  const rangeArgs = range ? ([range] as const) : ([] as const);
+  const sameUser = (key: readonly unknown[] | undefined) =>
+    key?.[1] === (nodeId ?? tenantId) && key[2] === userId && JSON.stringify(key[4]) === JSON.stringify(range);
   const scopeKey = nodeId === null ? 'user' : 'node';
   const site = useMetricQuery({
-    queryKey: [`${scopeKey}-site-usage`, nodeId ?? tenantId, userId, period],
+    queryKey: [`${scopeKey}-site-usage`, nodeId ?? tenantId, userId, period, ...rangeArgs],
     queryFn: () =>
-      nodeId === null ? fetchUserSiteUsage(tenantId, userId, period) : fetchNodeSiteUsage(nodeId, period),
+      nodeId === null ? fetchUserSiteUsage(tenantId, userId, period) : fetchNodeSiteUsage(nodeId, period, ...rangeArgs),
     refetchInterval: 30_000,
     staleTime: 15_000,
     placeholderData: (previous, previousQuery) => (sameUser(previousQuery?.queryKey) ? previous : undefined),
@@ -502,19 +552,21 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
     refetchInterval: 30_000,
   });
   const domains = useMetricQuery({
-    queryKey: [`${scopeKey}-other-domains`, nodeId ?? tenantId, userId, period],
+    queryKey: [`${scopeKey}-other-domains`, nodeId ?? tenantId, userId, period, ...rangeArgs],
     queryFn: () =>
-      nodeId === null ? fetchUserOtherDomains(tenantId, userId, period) : fetchNodeOtherDomains(nodeId, period),
+      nodeId === null
+        ? fetchUserOtherDomains(tenantId, userId, period)
+        : fetchNodeOtherDomains(nodeId, period, ...rangeArgs),
     refetchInterval: 30_000,
     staleTime: 15_000,
     placeholderData: (previous, previousQuery) => (sameUser(previousQuery?.queryKey) ? previous : undefined),
   });
   const targets = useMetricQuery({
-    queryKey: [`${scopeKey}-sniffing-failed-targets`, nodeId ?? tenantId, userId, period],
+    queryKey: [`${scopeKey}-sniffing-failed-targets`, nodeId ?? tenantId, userId, period, ...rangeArgs],
     queryFn: () =>
       nodeId === null
         ? fetchUserSniffingFailedTargets(tenantId, userId, period)
-        : fetchNodeSniffingFailedTargets(nodeId, period),
+        : fetchNodeSniffingFailedTargets(nodeId, period, ...rangeArgs),
     refetchInterval: 30_000,
     staleTime: 15_000,
     placeholderData: (previous, previousQuery) => (sameUser(previousQuery?.queryKey) ? previous : undefined),
@@ -542,6 +594,11 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
     [data, categories, palette],
   );
   const groups = categories ? siteGroups(categories, palette) : { top: [], rest: [] };
+  const forwardingPlaced =
+    data?.series
+      .find(series => series.site_id === 'forwarding')
+      ?.points.reduce((sum, point) => sum + point[1] + point[2], 0) ?? 0;
+  const forwardingUnplaced = Math.max(0, (categories?.forwarding?.total ?? 0) - forwardingPlaced);
   const supported = data && (data.reporting_nodes > 0 || data.rows.length > 0);
   const detailId = (kind: DetailKind) => `${uid}-${kind}`;
   const showDetail = (kind: DetailKind) => {
@@ -560,13 +617,14 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
         <>
           <span className="site-usage-total">{amount(categories.total)}</span>
           <span className="site-usage-label">
-            {periodDates(data)} · {categories.sites.length} 类站点
+            {periodDates(data)} · {categories.sites.length} 类站点{categories.forwarding ? ' · 端口转发' : ''}
           </span>
           <span className="site-usage-meta">
             {data.observed_since_unix_secs !== null && data.observed_since_unix_secs > data.range_start_unix_secs && (
               <>
-                <span className="warn" title="此前至少一台入口机器尚未开始站点统计，所选范围内更早的流量未计入">
-                  观测起点 {moment(data.observed_since_unix_secs, data.range_end_unix_secs)}
+                <span className="warn" title="此前至少一台入口机器尚未开始站点统计，所选范围内更早的站点流量未计入">
+                  {nodeId !== null || categories.forwarding ? '站点观测起点' : '观测起点'}{' '}
+                  {moment(data.observed_since_unix_secs, data.range_end_unix_secs)}
                 </span>
                 {' · '}
               </>
@@ -593,7 +651,13 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
     const content = (
       <>
         <i className="site-usage-swatch" style={{ background: swatch }} aria-hidden="true" />
-        <SiteIcon siteId={row.id} />
+        {row.id === 'forwarding' ? (
+          <span className="site-brand-icon" aria-hidden="true">
+            <Icon of="forwarding" size={18} />
+          </span>
+        ) : (
+          <SiteIcon siteId={row.id} />
+        )}
         <span className="site-usage-name">{row.name}</span>
         <span className="site-usage-num">{amount(row.total)}</span>
         <span className={`site-usage-pct${row.id === 'sniffing-failed' && categories!.failedWarn ? ' warn' : ''}`}>
@@ -601,7 +665,11 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
         </span>
       </>
     );
-    const focusKey = sub ? 'rest' : isNonSite(row.id) || palette.slice(0, TOP_SITES).includes(row.id) ? row.id : 'rest';
+    const focusKey = sub
+      ? 'rest'
+      : row.id === 'forwarding' || isNonSite(row.id) || palette.slice(0, TOP_SITES).includes(row.id)
+        ? row.id
+        : 'rest';
     const title = `${row.name} · 下行 ${bytes(row.down)} · 上行 ${bytes(row.up)}${
       isNonSite(row.id) ? `\n${NON_SITE_NOTE[row.id]}` : ''
     }`;
@@ -645,11 +713,12 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
               {topUsers?.users.map(user => (
                 <li
                   key={`${user.tenant_id}/${user.user_id}`}
-                  title={`${user.tenant_id} · 下行 ${bytes(user.downlink_bytes)} · 上行 ${bytes(user.uplink_bytes)}`}
+                  title={`下行 ${bytes(user.downlink_bytes)} · 上行 ${bytes(user.uplink_bytes)}`}
                 >
                   <GeneratedUserAvatar id={user.user_id} variant="mini" />
-                  <span className="nti-name">{user.user_id}</span>
-                  <span className="nti-tenant">{user.tenant_id}</span>
+                  <span className="nti-name" title={user.user_id}>
+                    {user.user_id}
+                  </span>
                   <b>{bytes(user.uplink_bytes + user.downlink_bytes)}</b>
                   <span className="nti-share">{shareOf(user.uplink_bytes + user.downlink_bytes, row.total)}</span>
                 </li>
@@ -676,15 +745,22 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
   return (
     <section className="panel config-panel user-dcard site-usage" aria-label={title}>
       <header>
-        <span title={SCOPE}>
+        <span title={nodeId === null ? SCOPE : NODE_SCOPE}>
           <PanelTitle of="usage">{title}</PanelTitle>
         </span>
-        {data && <ReportStatus data={data} />}
+        {data && <ReportStatus data={data} machine={nodeId !== null} />}
       </header>
       <div
         className="site-usage-body panel-full-bleed-body"
         aria-busy={site.isFetching || domains.isFetching || targets.isFetching}
       >
+        {range && data && (
+          <p className="site-usage-note">
+            目标按小时汇总，实际覆盖 {moment(data.range_start_unix_secs, data.range_end_unix_secs)} —{' '}
+            {moment(data.range_end_unix_secs, data.range_end_unix_secs)}
+            （UTC+8）；不按分钟均摊站点流量，转发仅含尚存的窗口明细。
+          </p>
+        )}
         {site.isError && !data && (
           <p role="alert" className="site-usage-state">
             站点统计读取失败，请稍后重试。
@@ -700,7 +776,7 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
             正在读取站点统计…
           </p>
         )}
-        {data && !supported && <p className="site-usage-state">{unsupportedText(data)}</p>}
+        {data && !supported && <p className="site-usage-state">{unsupportedText(data, nodeId !== null)}</p>}
         {data && !supported && <div className="site-usage-plot">{head}</div>}
         {!data && site.isError && (
           <div className="site-usage-head">
@@ -723,6 +799,7 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
                         bucketSecs={data.bucket_secs}
                         nowUnixSecs={data.range_end_unix_secs}
                         observedSinceUnixSecs={
+                          !categories.forwarding &&
                           data.observed_since_unix_secs !== null &&
                           data.observed_since_unix_secs > data.range_start_unix_secs
                             ? data.observed_since_unix_secs
@@ -734,18 +811,24 @@ function SiteUsageCard({ scope, controlledPeriod }: { scope: SiteScope; controll
                     </Suspense>
                     <p className="site-usage-note">
                       {data.period === 'month' ? '每天' : '每小时'}一柱 · 固定本月主要 {TOP_SITES}{' '}
-                      类站点着色，其余站点合为一层
+                      类站点着色，其余站点合为一层{categories.forwarding ? '；端口转发单独显示' : ''}
                     </p>
+                    {forwardingUnplaced > 0 && (
+                      <p className="site-usage-note">
+                        端口转发有 {bytes(forwardingUnplaced)} 已计入总量，小时明细已不完整，未分配到图中。
+                      </p>
+                    )}
                   </>
                 )}
               </section>
-              <section className="site-usage-side" aria-label="各站点流量">
+              <section className="site-usage-side" aria-label={nodeId === null ? '各站点流量' : '各类型流量'}>
                 {categories.total === 0 ? (
                   <p className="site-usage-empty">
                     {PERIODS.find(option => option.value === data.period)?.label}没有站点记录
                   </p>
                 ) : (
                   <ol className="site-usage-key">
+                    {categories.forwarding && item(categories.forwarding)}
                     {groups.top.map(row => item(row))}
                     {groups.rest.length > 0 && (
                       <li

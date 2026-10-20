@@ -27,6 +27,11 @@ test('发布页面使用 mockup 的页签 + 驾驶舱结构，不保留旧 dp �
   assert.match(deploy, /<div className="nd-tabs" role="tablist" aria-label="发布页签">/);
   assert.match(deploy, /className="usage-cockpit cgc-cockpit" role="tabpanel"/);
   assert.match(cockpit, /className="usage-ledger cgc-ledger"/);
+  assert.match(styles, /\.cgc-tr\.ok \.cgc-st\s*\{\s*color:\s*var\(--ok\);/);
+  assert.match(
+    styles,
+    /\.usage-split > i\.cgc-seg-ok,\s*\.usage-io \.cgc-io-ok dt i\s*\{\s*background:\s*var\(--ok\);/,
+  );
   assert.match(cockpit, /className=\{`cgc-table\$\{editing \? ' editing' : ''\}`\}/);
   assert.match(deploy, /className="cgf-well"/);
   assert.match(deploy, /className="cgf-track"/);
@@ -112,8 +117,9 @@ test('变更单：执行进度是时间线，产物是一行一个归属的清�
     styles,
     /\.cg-files\b|\.cg-tree\b|\.cg-viewer\b|\.cg-diff\b|\.cgr-fail\b|\.cg-artifact-unavailable/,
   );
-  // 创建变更单的产物差异在第一次展开时才挂载：每份变更文件要拉两个修订的内容。
-  assert.match(deploy, /\{artifactsShown && \(\s*<ArtifactChanges/);
+  // 产物差异固定展示；实际应用基线通过独立查询读取，不再按折叠状态延迟挂载。
+  assert.match(deploy, /<section className="panel config-panel cg-sec cg-artifact-review">[\s\S]*?<ArtifactChanges/);
+  assert.doesNotMatch(deploy, /artifactsShown/);
   // 页头：身份区不再 flex: none 撑满，备注最宽 30em 后省略，修订范围单独一段不截。
   assert.match(styles, /\.cg-detail \.cg-head \.nd-page-identity\s*\{\s*flex:\s*0 1 auto;/);
   assert.match(styles, /\.cg-head-note\s*\{[^}]*max-width:\s*30em;[^}]*text-overflow:\s*ellipsis/s);

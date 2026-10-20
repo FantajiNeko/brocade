@@ -23,6 +23,7 @@ mod load_rollup;
 mod log_policy;
 mod materialize;
 mod node_inflow_usage;
+mod node_traffic_history;
 mod notifications;
 mod onboarding;
 mod other_domain;
@@ -38,6 +39,7 @@ pub mod secrets;
 mod serving;
 mod settings;
 mod site_usage;
+mod source_traffic;
 mod subscription_client;
 mod traffic;
 mod tunnel_probe;
@@ -142,6 +144,7 @@ pub use credentials::{
     USER_DIRECT_LOGIN_TOKEN_LEN, USER_DIRECT_LOGIN_TOKEN_PREFIX, WIREGUARD_KEY_BASE64_LEN,
     WIREGUARD_KEY_BYTES,
 };
+pub use deployment::initialization::{NodeInitialization, NodeInitializationState};
 pub use distribution::DistributionSettings;
 pub use draft::{ApplyDraftResult, DraftPreview, ModelOp};
 pub use forwarding::{
@@ -173,6 +176,7 @@ pub use log_policy::{
     MIN_AGENT_LOG_MAX_MIB,
 };
 pub use node_inflow_usage::{NodeInflowRow, NodeInflowSource, NodeInflowUsage, NodeInflowUser};
+pub use node_traffic_history::NodeTrafficHistory;
 pub use notifications::{
     ActiveMachineIncidentView, ClaimedNotificationDelivery, MachineEventList, MachineEventView,
     MACHINE_EVENT_RETENTION_DAYS,
@@ -200,8 +204,11 @@ pub use retention::{
     DataRetentionCategory, DataRetentionPolicyView, DataRetentionView, RetentionSchedule,
     UpdateDataRetentionPolicy, MAX_RETENTION_HOURS,
 };
-pub use settings::{SettingsSnapshot, UpdateSettingsResult};
+pub use settings::{
+    DeploymentSettings, SettingsSnapshot, UpdateDeploymentSettings, UpdateSettingsResult,
+};
 pub use site_usage::{NodeSiteUsage, NodeSiteUser, NodeSiteUsers};
+pub use source_traffic::{NodeInflowDetailRow, NodeInflowDetails};
 pub use subscription_client::{ClientConfigCommitResult, ClientConfigCommitStatus};
 pub use traffic::{
     MachineTrafficAccuracy, MachineTrafficBand, MachineTrafficBandBasis, MachineTrafficConfidence,

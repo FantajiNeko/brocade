@@ -83,6 +83,8 @@ pub(crate) struct PreviewProvisionRequest {
     #[serde(default)]
     egress_allowed: bool,
     #[serde(default)]
+    overlay: bool,
+    #[serde(default)]
     dns: Option<Value>,
     #[serde(default)]
     domain_strategy: Option<Value>,
@@ -111,7 +113,7 @@ pub(crate) async fn preview_node(
         "public_ipv6_nat": request.public_ipv6_nat,
         "wg_listen_port": 51820,
         "api_port": 10085,
-        "overlay": true,
+        "overlay": request.overlay,
         "egress_allowed": request.egress_allowed,
         "dns": request.dns.unwrap_or_else(|| json!({ "t": "system" })),
         "note": format!("preview provision {node_id}")
@@ -179,4 +181,21 @@ pub(crate) async fn preview_node_delete(
     Ok(Json(
         json!({ "removed": true, "container_name": container }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PreviewProvisionRequest;
+    use serde_json::json;
+
+    #[test]
+    fn preview_enrollment_defaults_wireguard_off_and_honors_explicit_opt_in() {
+        let mut body = json!({ "id": "preview-node", "tenant_id": "platform" });
+        let default: PreviewProvisionRequest = serde_json::from_value(body.clone()).unwrap();
+        assert!(!default.overlay);
+
+        body["overlay"] = json!(true);
+        let enabled: PreviewProvisionRequest = serde_json::from_value(body).unwrap();
+        assert!(enabled.overlay);
+    }
 }

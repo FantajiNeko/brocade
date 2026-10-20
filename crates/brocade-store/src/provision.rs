@@ -21,7 +21,6 @@ const MIN_ENROLLMENT_TTL_SECONDS: u32 = 60;
 const MAX_ENROLLMENT_TTL_SECONDS: u32 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProvisionNodeRequest {
     pub id: String,
     pub tenant_id: String,
@@ -37,7 +36,7 @@ pub struct ProvisionNodeRequest {
     pub wg_listen_port: u16,
     #[serde(default)]
     pub api_port: Option<u16>,
-    #[serde(default = "default_backbone")]
+    #[serde(default)]
     pub overlay: bool,
     #[serde(default)]
     pub egress_allowed: bool,
@@ -108,6 +107,7 @@ pub async fn provision_node(
 
     let input = NormalizedProvisionInput::from_request(request)?;
     let mut tx = pool.begin().await?;
+    crate::deployment::initialization::lock_tx(&mut tx).await?;
 
     let state = sqlx::query(
         "SELECT overlay_cidr::text AS overlay_cidr
@@ -120,6 +120,7 @@ pub async fn provision_node(
     let overlay_cidr = state
         .try_get::<String, _>("overlay_cidr")?
         .parse::<Ipv4Net>()?;
+    let before = crate::materialize::load_current_snapshot_tx(&mut tx).await?;
     ensure_tenant_exists(&mut tx, &input.tenant_id).await?;
     ensure_node_missing(&mut tx, &input.id).await?;
     let overlay_addr = allocate_overlay_addr(&mut tx, overlay_cidr).await?;
@@ -178,6 +179,14 @@ pub async fn provision_node(
     crate::cert::assign_node_label(&mut tx, &input.id, input.cert_label_id.as_deref()).await?;
 
     crate::materialize::store_current_snapshot_tx(&mut tx, revision_id).await?;
+    crate::deployment::initialization::enqueue_tx(
+        &mut tx,
+        &before,
+        revision_id,
+        &input.id,
+        actor.operator_id(),
+    )
+    .await?;
 
     let enrollment = insert_enrollment(
         &mut tx,
@@ -464,10 +473,6 @@ impl NormalizedProvisionInput {
             enrollment_ttl_seconds,
         })
     }
-}
-
-fn default_backbone() -> bool {
-    true
 }
 
 fn optional_text(value: Option<String>) -> Option<String> {

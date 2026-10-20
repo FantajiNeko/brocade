@@ -107,12 +107,41 @@ it('does not permit changes when the policy could not be read', async () => {
 it('groups three independent policies in one settings panel', async () => {
   const view = card();
   await screen.findByLabelText('每用户目标容量');
+  const panel = within(screen.getByRole('region', { name: '全局出流量统计' }));
+  expect(panel.getByRole('heading', { name: '出流量统计' })).toBeTruthy();
   expect(view.container.querySelectorAll('.panel.config-panel')).toHaveLength(1);
+  expect(panel.getByText(/容量满时优先淘汰已可靠保存的冷条目/)).toBeTruthy();
   for (const name of ['站点分类', '未分类域名', '嗅探失败目标']) {
     const section = within(screen.getByRole('region', { name }));
     expect(section.getByRole('heading', { name })).toBeTruthy();
     expect(section.getByRole('button', { name: '关闭' }).getAttribute('aria-pressed')).toBe('true');
   }
+});
+
+it('marks only changed fields and removes the save bar when changes are reverted', async () => {
+  card();
+  const domains = within(screen.getByRole('region', { name: '未分类域名' }));
+  const targets = within(screen.getByRole('region', { name: '嗅探失败目标' }));
+  const top = await domains.findByLabelText('每用户 Top N');
+  const targetTop = await targets.findByLabelText('每用户 Top N');
+  expect(top.id).not.toBe(targetTop.id);
+  expect(domains.queryByRole('button', { name: '保存未分类域名设置' })).toBeNull();
+
+  fireEvent.change(top, { target: { value: '64' } });
+  expect(top.classList.contains('chg')).toBe(true);
+  expect(domains.getByLabelText('每用户域名容量').classList.contains('chg')).toBe(false);
+  expect(targetTop.classList.contains('chg')).toBe(false);
+  expect(domains.getByText('有未保存的改动')).toBeTruthy();
+  fireEvent.change(top, { target: { value: '128' } });
+  expect(top.classList.contains('chg')).toBe(false);
+  expect(domains.queryByRole('button', { name: '保存未分类域名设置' })).toBeNull();
+
+  fireEvent.click(domains.getByRole('button', { name: '开启' }));
+  expect(domains.getByRole('group', { name: '未分类域名统计' }).classList.contains('chg')).toBe(true);
+  fireEvent.click(domains.getByRole('button', { name: '关闭' }));
+  expect(domains.getByRole('group', { name: '未分类域名统计' }).classList.contains('chg')).toBe(false);
+  expect(domains.queryByRole('button', { name: '保存未分类域名设置' })).toBeNull();
+  expect(saveOtherDomainPolicy).not.toHaveBeenCalled();
 });
 
 it('saving one detail policy preserves the other draft and supports retry after failure', async () => {

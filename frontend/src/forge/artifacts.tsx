@@ -24,7 +24,7 @@ import { artifactPanel } from '../ui/artifact-panel';
 import { Empty, ErrorBox, Loading } from '../ui/bits';
 import { Icon } from '../ui/icons';
 import type { PresencePhase } from '../ui/presence';
-import { artifactFile, artifactFmt, countChanges, diffLines, fmtBytes, highlight } from './diff';
+import { artifactFile, artifactFmt, artifactTargetLabel, countChanges, diffLines, fmtBytes, highlight } from './diff';
 
 export const entryId = (a: ArtifactIndexEntry) => `${a.target_kind}/${a.target_id}/${a.artifact_kind}`;
 
@@ -259,7 +259,7 @@ export function ArtifactRail({
                   return (
                     <div key={t}>
                       <div className="cfg-owner">
-                        <span className="who">{t}</span>
+                        <span className="who">{artifactTargetLabel(g.kind, t)}</span>
                         {roles.length > 0 && (
                           <span
                             className={`role${roles[0] === '入口节点' ? ' r-in' : roles.includes('出口节点') ? ' r-eg' : ''}`}
@@ -351,7 +351,8 @@ function ArtifactBody({
   const bar = (
     <div className="cfg-bar">
       <span className="cfg-path">
-        {entry.target_kind === 'node' ? '机器产物' : '订阅'} / {entry.target_id} /
+        {entry.target_kind === 'node' ? '机器产物' : '订阅'} / {artifactTargetLabel(entry.target_kind, entry.target_id)}{' '}
+        /
       </span>
       <span className="cfg-file">{artifactFile(entry.artifact_kind)}</span>
       <span className="cfg-sp" />

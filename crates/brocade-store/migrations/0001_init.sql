@@ -714,9 +714,11 @@ CREATE TABLE chains (
 -- workflow pulls, the same source install.sh installs from the release archive, so enabling
 -- auto-update does not change routing semantics.
 CREATE TABLE control_state (
-    site_usage_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-    other_domain_policy JSONB NOT NULL DEFAULT '{"enabled":false,"top_n":128,"max_domains_per_user":1024,"node_capacity":4096,"report_interval_secs":30}'::jsonb,
-    sniffing_failed_policy JSONB NOT NULL DEFAULT '{"enabled":false,"top_n":128,"max_targets_per_user":1024,"node_capacity":4096,"report_interval_secs":30}'::jsonb,
+    deployment_unattended BOOLEAN NOT NULL DEFAULT TRUE,
+    xray_handoff_beta BOOLEAN NOT NULL DEFAULT FALSE,
+    site_usage_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    other_domain_policy JSONB NOT NULL DEFAULT '{"enabled":true,"top_n":128,"max_domains_per_user":1024,"node_capacity":4096,"report_interval_secs":30}'::jsonb,
+    sniffing_failed_policy JSONB NOT NULL DEFAULT '{"enabled":true,"top_n":128,"max_targets_per_user":1024,"node_capacity":4096,"report_interval_secs":30}'::jsonb,
     id BOOLEAN DEFAULT true NOT NULL,
     overlay_cidr CIDR NOT NULL,
     current_revision BIGINT NOT NULL,
@@ -737,7 +739,7 @@ CREATE TABLE control_state (
     -- regeneration goes through the ordinary settings revision and release path.
     anytls_padding_scheme JSONB DEFAULT '[]'::jsonb NOT NULL,
     -- Factory client fingerprint; operators may clear it to use the compiler's standard choice.
-    reality_fingerprint TEXT DEFAULT 'chrome',
+    reality_fingerprint TEXT DEFAULT 'safari',
     overlay_keepalive_secs INTEGER DEFAULT 10 NOT NULL,
     overlay_mtu INTEGER DEFAULT 1280 NOT NULL,
     -- Explicit exceptions to the otherwise full WireGuard mesh. Each JSON item is an
@@ -853,7 +855,7 @@ CREATE TABLE control_state (
     CONSTRAINT control_state_nic_gro_flush_timeout_ns_range CHECK (((nic_gro_flush_timeout_ns >= 0) AND (nic_gro_flush_timeout_ns <= 1000000))),
     CONSTRAINT control_state_nic_napi_defer_hard_irqs_range CHECK (((nic_napi_defer_hard_irqs >= 0) AND (nic_napi_defer_hard_irqs <= 64))),
     CONSTRAINT control_state_realtime_interval_known CHECK ((realtime_interval_secs = ANY (ARRAY[1, 2, 5]))),
-    CONSTRAINT control_state_geodata_cron_shape CHECK ((geodata_cron ~ '^((CRON_)?TZ=\S+\s+)?\S+(\s+\S+){4}$')),
+    CONSTRAINT control_state_geodata_cron_shape CHECK (length(btrim(geodata_cron)) > 0),
     CONSTRAINT control_state_geodata_geoip_url_shape CHECK ((geodata_geoip_url ~ '^https?://')),
     CONSTRAINT control_state_geodata_geosite_url_shape CHECK ((geodata_geosite_url ~ '^https?://')),
     CONSTRAINT control_state_id_check CHECK (id),
@@ -873,7 +875,7 @@ CREATE TABLE control_state (
     CONSTRAINT control_state_reality_dest_shape CHECK (((reality_dest IS NULL) OR (reality_dest ~ '^[^\s:]+:[0-9]+$'))),
     CONSTRAINT control_state_reality_flow_known CHECK (((reality_flow IS NULL) OR (reality_flow = 'xtls-rprx-vision'))),
     CONSTRAINT control_state_reality_max_client_ver_shape CHECK (((reality_max_client_ver IS NULL) OR (reality_max_client_ver ~ '^[0-9]+\.[0-9]+\.[0-9]+$'))),
-    CONSTRAINT control_state_reality_max_time_diff_ms_range CHECK (((reality_max_time_diff_ms IS NULL) OR ((reality_max_time_diff_ms >= 0) AND (reality_max_time_diff_ms <= 86400000)))),
+    CONSTRAINT control_state_reality_max_time_diff_ms_range CHECK (((reality_max_time_diff_ms IS NULL) OR ((reality_max_time_diff_ms >= 0) AND (reality_max_time_diff_ms <= 9223372036854)))),
     CONSTRAINT control_state_reality_min_client_ver_shape CHECK (((reality_min_client_ver IS NULL) OR (reality_min_client_ver ~ '^[0-9]+\.[0-9]+\.[0-9]+$'))),
     CONSTRAINT control_state_reality_server_names_shape CHECK ((jsonb_typeof(reality_server_names) = 'array')),
     CONSTRAINT control_state_anytls_padding_scheme_shape CHECK ((jsonb_typeof(anytls_padding_scheme) = 'array')),
@@ -4450,6 +4452,51 @@ CREATE INDEX user_sniffing_failed_by_user ON user_sniffing_failed_hourly (tenant
 CREATE INDEX user_sniffing_failed_by_bucket ON user_sniffing_failed_hourly (bucket);
 CREATE INDEX user_sniffing_failed_by_node ON user_sniffing_failed_hourly (node_id, bucket);
 -- END SNIFFING FAILED USAGE SCHEMA
+
+-- BEGIN SOURCE TRAFFIC SCHEMA
+CREATE INDEX usage_samples_by_node_window_start ON usage_samples (node_id, window_start);
+CREATE INDEX forwarding_usage_samples_by_node_window_start ON forwarding_usage_samples (node_id, window_start);
+CREATE TABLE node_source_traffic_state (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    epoch TEXT NOT NULL,
+    read_at BIGINT NOT NULL CHECK (read_at > 0),
+    observed_since BIGINT NOT NULL CHECK (observed_since > 0),
+    limited BOOLEAN NOT NULL
+);
+CREATE TABLE source_traffic_windows (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    epoch TEXT NOT NULL,
+    bucket BIGINT NOT NULL CHECK (bucket > 0 AND bucket % 30 = 0),
+    label TEXT NOT NULL CHECK (octet_length(label) <= 256),
+    source_ip INET NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    chain_id TEXT NOT NULL,
+    ingress_id TEXT NOT NULL,
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (node_id, epoch, bucket, label, source_ip),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX source_traffic_windows_by_node ON source_traffic_windows (node_id, bucket, tenant_id, user_id);
+CREATE INDEX source_traffic_windows_by_bucket ON source_traffic_windows (bucket);
+CREATE TABLE source_traffic_daily (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    bucket BIGINT NOT NULL CHECK (bucket > 0),
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    chain_id TEXT NOT NULL,
+    ingress_id TEXT NOT NULL,
+    source_ip INET NOT NULL,
+    uplink_bytes BIGINT NOT NULL CHECK (uplink_bytes >= 0),
+    downlink_bytes BIGINT NOT NULL CHECK (downlink_bytes >= 0),
+    PRIMARY KEY (node_id, bucket, tenant_id, user_id, app_id, chain_id, ingress_id, source_ip),
+    FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX source_traffic_daily_by_bucket ON source_traffic_daily (bucket);
+-- END SOURCE TRAFFIC SCHEMA
 
 -- A row exists only for installations initialized by a Console version which offers the guided
 -- first-run flow. Absence is deliberately "not applicable": upgrading an established deployment

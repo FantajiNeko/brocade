@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { realityFingerprintIsValid, realityPublicKeyIsValid, realityShortIdIsValid } from '../src/reality';
+import {
+  DEFAULT_TLS_FINGERPRINT,
+  realityFingerprintIsValid,
+  realityPublicKeyIsValid,
+  realityShortIdIsValid,
+} from '../src/reality';
 
 describe('REALITY field validation', () => {
+  it('defaults new TLS configurations to the supported Safari fingerprint', () => {
+    expect(DEFAULT_TLS_FINGERPRINT).toBe('safari');
+    expect(realityFingerprintIsValid(DEFAULT_TLS_FINGERPRINT)).toBe(true);
+    expect(realityFingerprintIsValid('chrome')).toBe(true);
+  });
   it('accepts exactly a canonical 32-byte base64url public key', () => {
     expect(realityPublicKeyIsValid('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')).toBe(true);
     expect(realityPublicKeyIsValid('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')).toBe(false);

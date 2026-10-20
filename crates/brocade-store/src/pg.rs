@@ -254,6 +254,7 @@ impl PgStore {
 
     pub async fn migrate(&self) -> Result<()> {
         MIGRATOR.run(&self.pool).await?;
+        admin::remove_public_sessions(&self.pool).await?;
         // Establish immutable model and subscription checkpoints before later initializers can
         // commit another model revision.
         materialize::ensure_current_snapshot(&self.pool).await?;
@@ -316,6 +317,18 @@ impl PgStore {
     /// neither a model revision nor a deployment.
     pub async fn host_network_tuning(&self) -> Result<crate::HostNetworkTuning> {
         host_tuning::load(&self.pool).await
+    }
+
+    pub async fn deployment_settings(&self) -> Result<crate::DeploymentSettings> {
+        settings::load_deployment_settings(&self.pool).await
+    }
+
+    pub async fn update_deployment_settings(
+        &self,
+        actor: &AdminContext,
+        settings: crate::UpdateDeploymentSettings,
+    ) -> Result<crate::DeploymentSettings> {
+        settings::update_deployment_settings(&self.pool, actor, settings).await
     }
 
     pub async fn update_host_network_tuning(
@@ -1288,6 +1301,15 @@ impl PgStore {
         deployment::plan_deployment(&self.pool, actor, revision_id).await
     }
 
+    pub async fn plan_deployment_artifacts(
+        &self,
+        actor: &AdminContext,
+        revision_id: u64,
+        include_content: bool,
+    ) -> Result<Vec<brocade_deployment::protocol::DeploymentTargetDetail>> {
+        deployment::plan_deployment_artifacts(&self.pool, actor, revision_id, include_content).await
+    }
+
     pub async fn create_deployment(
         &self,
         actor: &AdminContext,
@@ -1345,6 +1367,14 @@ impl PgStore {
         node_id: &str,
     ) -> Result<Option<NodeDesiredDeployment>> {
         deployment::claim_desired_for_node(&self.pool, node_id).await
+    }
+
+    pub async fn claim_desired_for_node_with_protocol(
+        &self,
+        node_id: &str,
+        protocol: u32,
+    ) -> Result<Option<NodeDesiredDeployment>> {
+        deployment::claim_desired_for_node_with_protocol(&self.pool, node_id, protocol).await
     }
 
     pub async fn report_target_result(
@@ -1523,6 +1553,11 @@ impl PgStore {
         node_id: &str,
     ) -> Result<brocade_deployment::protocol::NodeIsolationCommandResult> {
         deployment::restore_node_service(&self.pool, actor, node_id).await
+    }
+
+    /// Advance at most one online node's durable first-initialization task.
+    pub async fn process_node_initialization(&self) -> Result<()> {
+        deployment::initialization::process(&self.pool).await
     }
 
     pub async fn provision_node(
@@ -2055,6 +2090,10 @@ impl PgStore {
         admin::admin_auth_state(&self.pool).await
     }
 
+    pub async fn public_identity(&self) -> Result<Option<AuthenticatedAdmin>> {
+        admin::public_identity(&self.pool).await
+    }
+
     pub async fn set_public_access(
         &self,
         actor: &AdminContext,
@@ -2300,6 +2339,17 @@ impl PgStore {
         usage::list_user_traffic_history(&self.pool, actor, scope, window_secs).await
     }
 
+    /// The HTTP boundary resolves machine visibility before requesting its statistics.
+    pub async fn node_traffic_history(
+        &self,
+        actor: &AdminContext,
+        node: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+        range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+    ) -> Result<crate::NodeTrafficHistory> {
+        crate::node_traffic_history::query(&self.pool, actor, node, period, range).await
+    }
+
     pub async fn user_machine_usage(
         &self,
         actor: &AdminContext,
@@ -2331,6 +2381,38 @@ impl PgStore {
         crate::node_inflow_usage::query(&self.pool, actor, node_id, period).await
     }
 
+    /// Machine visibility is checked by the HTTP boundary, as for the existing machine statistics.
+    pub async fn node_inflow_usage_range(
+        &self,
+        actor: &AdminContext,
+        node: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+        range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+    ) -> Result<crate::NodeInflowUsage> {
+        crate::node_inflow_usage::query_range(&self.pool, actor, node, period, range).await
+    }
+
+    pub async fn record_source_traffic_report(
+        &self,
+        node: &str,
+        report: brocade_deployment::source_traffic::SourceTrafficReport,
+    ) -> Result<()> {
+        crate::source_traffic::record(&self.pool, node, report).await
+    }
+
+    pub async fn node_inflow_details(
+        &self,
+        actor: &AdminContext,
+        node: &str,
+        user: (&str, &str),
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+        range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+    ) -> Result<crate::NodeInflowDetails> {
+        let base =
+            crate::node_inflow_usage::query_range(&self.pool, actor, node, period, range).await?;
+        crate::source_traffic::details(&self.pool, actor, node, user.0, user.1, base, range).await
+    }
+
     /// One machine's outflow by destination category, with the users behind each category.
     pub async fn node_site_usage(
         &self,
@@ -2339,6 +2421,36 @@ impl PgStore {
         period: brocade_deployment::site_usage::SiteUsagePeriod,
     ) -> Result<crate::NodeSiteUsage> {
         crate::site_usage::query_node(&self.pool, actor, node_id, period).await
+    }
+
+    pub async fn node_site_usage_range(
+        &self,
+        actor: &AdminContext,
+        node: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+        range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+    ) -> Result<crate::NodeSiteUsage> {
+        crate::site_usage::query_node_range(&self.pool, actor, node, period, range).await
+    }
+
+    pub async fn node_other_domains_range(
+        &self,
+        actor: &AdminContext,
+        node: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+        range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+    ) -> Result<brocade_deployment::other_domain::UserOtherDomains> {
+        crate::other_domain::query_node_range(&self.pool, actor, node, period, range).await
+    }
+
+    pub async fn node_sniffing_failed_targets_range(
+        &self,
+        actor: &AdminContext,
+        node: &str,
+        period: brocade_deployment::site_usage::SiteUsagePeriod,
+        range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
+    ) -> Result<brocade_deployment::sniffing_failed::UserSniffingFailedTargets> {
+        crate::other_domain::query_failed_node_range(&self.pool, actor, node, period, range).await
     }
 
     pub async fn node_other_domains(

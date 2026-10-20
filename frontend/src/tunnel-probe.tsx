@@ -578,9 +578,7 @@ export function TunnelProbePolicyDialog({
         <div className="tunnel-dialog-body">
           <p className="tunnel-probe-dialog-name">
             <b>{item.name}</b>
-            <span className="mono">
-              {item.tenant_id} / {item.outbound_id}
-            </span>
+            <span className="mono">{item.outbound_id}</span>
           </p>
           <div className="fgrid one tunnel-probe-policy-fields">
             <div className="row">

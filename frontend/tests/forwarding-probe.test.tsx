@@ -86,16 +86,23 @@ it('zero handshake latency is a real reading; absence is not zero', () => {
   expect(view.queryByText(/DNS/)).toBeNull();
 });
 
-it('running disables repeat clicks and a failed ping is not green success', () => {
+it('running disables repeat clicks', () => {
   const view = show({ ...result, state: 'running', result: null });
   expect((view.getByRole('button', { name: '连接中…' }) as HTMLButtonElement).disabled).toBe(true);
-  view.unmount();
-  const failure = show({
+});
+
+it.each([
+  ['timeout', '超时或远程地址非 TCP 监听'],
+  ['connect-failed', 'TCP 建连失败，请检查远程 TCP 监听和网络连通性'],
+] as const)('shows the %s failure reason without a fabricated latency and permits manual retry', (code, message) => {
+  const view = show({
     ...result,
-    result: { status: 'failed', code: 'connect-failed', connect_ms: null, dns_ms: null, resolved_ip: '1.1.1.1' },
+    result: { status: 'failed', code, connect_ms: null, dns_ms: null, resolved_ip: '1.1.1.1' },
   });
-  expect(failure.getByText('TCP 建连失败')).toBeTruthy();
-  expect(failure.queryByText(/TCP 连通/)).toBeNull();
+  expect(view.getByRole('status').textContent).toBe(message);
+  expect(view.getByText(message).className).toContain('bad');
+  expect(view.queryByText(/TCP 连通|\d+ ms/)).toBeNull();
+  expect((view.getByRole('button', { name: '测试延迟' }) as HTMLButtonElement).disabled).toBe(false);
 });
 
 it('hides a stale result after edit or quota pause; read-only has no action', () => {

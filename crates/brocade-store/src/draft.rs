@@ -545,8 +545,8 @@ mod tests {
     fn wireguard_link_operation_uses_the_frontend_wire_spelling() {
         let value = serde_json::json!({
             "op": "set_wireguard_link_disabled",
-            "a": "akile-twlite2",
-            "b": "akile-laxl2",
+            "a": "example-tw-edge",
+            "b": "example-us-edge",
             "disabled": true
         });
 
@@ -557,7 +557,7 @@ mod tests {
                 ref a,
                 ref b,
                 disabled: true
-            } if a == "akile-twlite2" && b == "akile-laxl2"
+            } if a == "example-tw-edge" && b == "example-us-edge"
         ));
         assert_eq!(
             serde_json::to_value(operation).unwrap()["op"],

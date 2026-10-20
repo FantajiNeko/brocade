@@ -213,7 +213,7 @@ fn restore(state_dir: &Path, recovery: &Recovery) -> Result<(), String> {
             if crate::accounting::handoff_journal_epochs(state_dir)? != recovery.journal_epochs {
                 return Err("重启候选未延续冻结的计量命名空间".to_owned());
             }
-            wait_for_candidate_api(api)?;
+            wait_for_candidate_api(api, &manifest, *process)?;
             let restored = crate::restore_xray_runtime_with_grants(
                 state_dir,
                 &content,

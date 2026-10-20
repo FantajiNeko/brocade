@@ -63,6 +63,22 @@ test('menus do not carry appearance-transition exceptions', () => {
   assert.doesNotMatch(styles, /view-transition-name:\s*account-menu/);
 });
 
+test('draft notice blurs the backdrop and keeps an opaque fallback on desktop and mobile', () => {
+  const draft = rule('.fg-draft');
+  assert.match(draft, /background: color-mix\(in srgb, var\(--gold\) 8%, var\(--sheet\)\);/);
+  assert.match(draft, /-webkit-backdrop-filter: var\(--float-filter\);/);
+  assert.match(draft, /backdrop-filter: var\(--float-filter\);/);
+  assert.match(
+    styles,
+    /@supports \(backdrop-filter: blur\(1px\)\) or \(-webkit-backdrop-filter: blur\(1px\)\)\s*\{\s*\.fg-draft\s*\{\s*background: color-mix\(in srgb, var\(--gold\) 8%, var\(--float-sheet\)\);/,
+  );
+  assert.match(rule('.fg-draft-head .note'), /color: var\(--ink-2\);/);
+  const mobile = styles.match(/^[ \t]+\.forge\.narrow \.fg-draft \{([^}]+)\}/m)?.[1];
+  assert.ok(mobile, 'mobile draft rule exists');
+  assert.match(mobile, /position: fixed;/);
+  assert.doesNotMatch(mobile, /background:/, 'mobile inherits the same readable material');
+});
+
 test('papers and panels stay opaque without backdrop blur', () => {
   assert.match(rule('.fg-sheet'), /background: var\(--sheet\);/);
   assert.match(rule('.panel'), /background: var\(--card\);/);
@@ -82,4 +98,11 @@ test('papers and panels stay opaque without backdrop blur', () => {
   // 顶栏随内容滚走且为实色，不参与半透明。
   assert.doesNotMatch(styles, /\.fg-top::before/);
   assert.match(rule('.fg-top'), /background: var\(--surface\);/);
+});
+
+test('draft panel links and temporary highlights keep interaction and change-state semantics separate', () => {
+  assert.match(rule('.fg-draft-location'), /min-height: var\(--ctl-h\);/);
+  assert.match(rule('.fg-draft-location'), /color: var\(--action\);/);
+  assert.match(rule("[data-draft-highlight='true']"), /outline: 2px solid var\(--gold\);/);
+  assert.doesNotMatch(styles, /\.fg-draft-list li \.mono\s*\{/);
 });

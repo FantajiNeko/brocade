@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { SessionProvider } from '../src/session';
 
 window.matchMedia = ((query: string) => ({
   matches: false,
@@ -27,6 +28,26 @@ describe('首次发布产物', () => {
   it('没有基线时默认展开所有目标机器的新建内容，且不请求不存在的旧修订', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
+      if (path === '/deployments/plan/artifacts?include=content')
+        return json({
+          revision: 7,
+          targets: [
+            {
+              node_id: 'n1',
+              status: 'pending',
+              wave: 0,
+              disruptive: true,
+              error: null,
+              observed_before: { xray: { state: 'absent' } },
+              desired_structure: {
+                xray: { state: 'present', sha256: 'a'.repeat(64), content: '{\n  "log": "warning"\n}' },
+              },
+              observed_after: null,
+              verdict: null,
+              dispatched_at: null,
+            },
+          ],
+        });
       if (path === '/nodes/agent-state') return json({ nodes: [{ node_id: 'n1', name: '台北一号' }] });
       if (path === '/artifacts/index?revision=7') {
         return json({
@@ -62,7 +83,20 @@ describe('首次发布产物', () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const view = render(
       <QueryClientProvider client={client}>
-        <ArtifactChanges revision={7} base={null} targets={[{ node_id: 'n1' }]} />
+        <SessionProvider
+          value={{
+            initial: { node_count: 1, chain_group_count: [] },
+            who: {
+              operator_id: 'reviewer',
+              role: 'system-admin',
+              tenant_scope: null,
+              token_prefix: null,
+              masked_assets: false,
+            },
+          }}
+        >
+          <ArtifactChanges revision={7} base={null} targets={[{ node_id: 'n1' }]} />
+        </SessionProvider>
       </QueryClientProvider>,
     );
 

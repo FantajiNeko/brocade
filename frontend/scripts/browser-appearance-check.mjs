@@ -14,6 +14,74 @@ const appearance = ts.transpileModule(
 const palettes = ['dailan', 'jinzi', 'songlv', 'oufen', 'xuanmo'];
 
 for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
+  test(`${engine}: draft notice has a readable blurred surface in both themes and narrow viewports`, async () => {
+    const browser = await launcher.launch();
+    try {
+      for (const width of [1440, 900, 390]) {
+        for (const theme of ['light', 'dark']) {
+          const page = await browser.newPage({ viewport: { width, height: 844 }, reducedMotion: 'reduce' });
+          await page.setContent(`<!doctype html><html data-theme="${theme}" data-palette="dailan"><head>
+            ${html.match(/<meta name="viewport"[^>]+>/)[0]}<style>${styles}</style></head><body>
+            <div class="forge${width <= 820 ? ' narrow' : ''}"><div class="fg-left"><div class="fg-desk">
+              <div class="fg-draft"><div class="fg-draft-head">
+                <button class="fg-draft-count">▸ 3 处未提交</button>
+                <span class="note">提交后将合并生成<b>一个新修订</b>（当前修订 1956）。</span>
+                <span class="sp"></span><button class="btn">全部丢弃</button><button class="btn primary">提交</button>
+              </div><ul class="fg-draft-list"><li><div class="fg-draft-entry">
+                <span class="fg-draft-name">香港示例 01</span>
+                <button class="fg-draft-location">· DNS</button><button class="fg-draft-location">· WIREGUARD</button>
+                <button class="fg-draft-location">· 连接策略</button>
+              </div><button class="btn">丢弃</button></li></ul></div>
+              <main class="fg-view"><section class="fg-sheet"><div class="panel" data-draft-highlight="true">定位的面板</div></section></main>
+            </div></div></div></body></html>`);
+          const surface = await page.locator('.fg-draft').evaluate(element => {
+            const computed = getComputedStyle(element);
+            const note = getComputedStyle(element.querySelector('.note'));
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const rgba = color => {
+              ctx.clearRect(0, 0, 1, 1);
+              ctx.fillStyle = color;
+              ctx.fillRect(0, 0, 1, 1);
+              return Array.from(ctx.getImageData(0, 0, 1, 1).data);
+            };
+            return {
+              filter: computed.backdropFilter || computed.webkitBackdropFilter,
+              alpha: rgba(computed.backgroundColor)[3] / 255,
+              color: rgba(note.color),
+              expectedColor: rgba(computed.getPropertyValue('--ink-2').trim()),
+              noteDisplay: note.display,
+              position: computed.position,
+            };
+          });
+          assert.match(surface.filter, /blur\(20px\)/, `${theme} ${width}px blur`);
+          assert.ok(surface.alpha >= 0.6, `${theme} ${width}px has a substantial base surface`);
+          assert.deepEqual(surface.color, surface.expectedColor, `${theme} ${width}px readable text token`);
+          assert.equal(
+            await page.locator('[data-draft-highlight]').evaluate(el => getComputedStyle(el).outlineWidth),
+            '2px',
+          );
+          assert.ok(
+            await page
+              .locator('.fg-draft-location')
+              .first()
+              .evaluate(el => el.getBoundingClientRect().height >= 28),
+          );
+          assert.equal(surface.noteDisplay === 'none', width <= 820);
+          if (width <= 820) assert.equal(surface.position, 'fixed');
+          assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+          for (const label of ['全部丢弃', '提交']) {
+            const box = await page.getByRole('button', { name: label, exact: true }).boundingBox();
+            assert.ok(box && box.x >= 0 && box.x + box.width <= width && box.y + box.height <= 844);
+          }
+          await page.close();
+        }
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
   test(`${engine}: background grid stays at the viewport while desktop, tablet and phone content scrolls`, async () => {
     const browser = await launcher.launch();
     try {

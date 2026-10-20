@@ -409,14 +409,14 @@ describe('MTProxy machine eligibility', () => {
     expect(view.getByText(message)).toBeTruthy();
   });
 
-  it('uses the Telegram mark and documents the outbound handshake requirement', () => {
+  it('uses the Telegram mark and explains Telegram-specific access', () => {
     const view = render(<MtProtoAvailabilityHarness publicIpv4="198.51.100.10" nat={false} />);
     const toggle = view.getByRole('checkbox', { name: 'MTProxy（Telegram）' });
     const card = toggle.closest('.protocol-choice');
 
     expect(card?.querySelectorAll('.protocol-choice-icon path')).toHaveLength(2);
     expect(card?.querySelector('.protocol-choice-icon circle')).toBeNull();
-    expect(view.getByText('Telegram MTProto 代理。')).toBeTruthy();
+    expect(view.getByText('Telegram 原生支持的专用代理。')).toBeTruthy();
   });
 
   it('allows creation on a network-card public IPv4 and still lets an invalid legacy instance be disabled', () => {

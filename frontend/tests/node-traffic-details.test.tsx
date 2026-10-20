@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
   fetchNodeInflowUsage,
+  fetchNodeInflowDetails,
   fetchNodeSiteUsage,
   fetchNodeOtherDomains,
   fetchNodeSniffingFailedTargets,
@@ -13,14 +14,18 @@ import {
   type NodeInflowRow,
   type NodeInflowUsage,
   type NodeSiteUsage,
+  type TrafficTimeRange,
 } from '../src/api';
 import { NodeInflowUsageCard, NodeTrafficDialog, trafficSources, trafficUserKeys } from '../src/node-traffic';
 import { NodeSiteUsageCard } from '../src/user-site-usage';
 import { Icon } from '../src/ui/icons';
+import { trafficDateInput } from '../src/node-traffic-range';
+import type { SiteUsageChartSeries } from '../src/site-usage-chart';
 
 vi.mock('../src/api', async original => ({
   ...(await original<typeof import('../src/api')>()),
   fetchNodeInflowUsage: vi.fn(),
+  fetchNodeInflowDetails: vi.fn(),
   fetchNodeSiteUsage: vi.fn(),
   fetchNodeOtherDomains: vi.fn(),
   fetchNodeSniffingFailedTargets: vi.fn(),
@@ -29,10 +34,30 @@ vi.mock('../src/api', async original => ({
 }));
 vi.mock('../src/user-traffic-realtime', async original => ({
   ...(await original<typeof import('../src/user-traffic-realtime')>()),
-  NodeUserTrafficCard: () => <section aria-label="实时流量" data-testid="live-card" />,
+  NodeUserTrafficCard: ({ period, range }: { period: string; range?: TrafficTimeRange }) => (
+    <section aria-label="实时流量" data-testid="live-card" data-period={period} data-range={JSON.stringify(range)} />
+  ),
 }));
 vi.mock('../src/site-usage-chart', () => ({
-  default: ({ period }: { period: string }) => <div data-testid="site-chart" data-period={period} />,
+  default: ({
+    period,
+    series,
+    focusKey,
+    observedSinceUnixSecs,
+  }: {
+    period: string;
+    series: SiteUsageChartSeries[];
+    focusKey: string | null;
+    observedSinceUnixSecs: number | null;
+  }) => (
+    <div
+      data-testid="site-chart"
+      data-period={period}
+      data-series={JSON.stringify(series)}
+      data-focus={focusKey ?? ''}
+      data-observed-since={observedSinceUnixSecs ?? ''}
+    />
+  ),
 }));
 let width = 1000;
 let resize: () => void;
@@ -137,6 +162,21 @@ beforeEach(() => {
   vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   vi.mocked(fetchSnapshot).mockResolvedValue(snapshot);
   vi.mocked(fetchNodeInflowUsage).mockImplementation(async (_id, period) => ({ ...inflow(), period }));
+  vi.mocked(fetchNodeInflowDetails).mockImplementation(async (node, tenant, user, period) => {
+    const data = await fetchNodeInflowUsage(node, period);
+    const rows = data.rows.filter(row => row.tenant_id === tenant && row.user_id === user);
+    return {
+      range_start_unix_secs: data.range_start_unix_secs,
+      range_end_unix_secs: data.range_end_unix_secs,
+      observed_since_unix_secs: start,
+      latest_report_unix_secs: start + 3500,
+      limited: false,
+      accounting_mismatch: false,
+      accounting_uplink_bytes: rows.reduce((sum, row) => sum + row.uplink_bytes, 0),
+      accounting_downlink_bytes: rows.reduce((sum, row) => sum + row.downlink_bytes, 0),
+      rows: rows.map(row => ({ ...row, source_ip: row.source === 'chain' ? '192.0.2.1' : null })),
+    };
+  });
   vi.mocked(fetchNodeSiteUsage).mockImplementation(async (_id, period) => ({ ...outflow(), period }));
   const detail = {
     collection_enabled: false,
@@ -179,7 +219,9 @@ it('renders proportional flows, highlights by keyboard and exposes exact per-cha
   fireEvent.focus(alice);
   expect(container.querySelectorAll('.ntf-link.dim')).toHaveLength(1);
   fireEvent.click(alice);
-  expect(screen.getByLabelText('alice的接入链明细').textContent).toContain('香港 · 300 B');
+  const detail = await screen.findByRole('dialog', { name: 'alice · 流入明细' });
+  expect((await within(detail).findByRole('table')).textContent).toContain('香港');
+  expect(vi.mocked(fetchNodeInflowDetails)).toHaveBeenCalledWith('n1', 'platform', 'alice', 'day', undefined);
   expect(container.textContent).not.toContain('platform');
   fireEvent.blur(alice);
   expect(container.querySelectorAll('.ntf-link.dim')).toHaveLength(0);
@@ -197,8 +239,11 @@ it('switches to the mobile bars below 720px and supports focus and expansion', a
   expect(within(alice).getByTitle('alice')).toBeTruthy();
   expect(screen.queryByText('platform')).toBeNull();
   fireEvent.click(alice);
-  expect(alice.getAttribute('aria-expanded')).toBe('true');
-  expect(screen.getByText('下行 500 B · 上行 0 B')).toBeTruthy();
+  expect(alice.getAttribute('aria-haspopup')).toBe('dialog');
+  const detail = await screen.findByRole('dialog', { name: 'alice · 流入明细' });
+  expect(await within(detail).findByRole('table')).toBeTruthy();
+  fireEvent.click(within(detail).getByRole('button', { name: '关闭流入明细' }));
+  await waitFor(() => expect(screen.queryByRole('dialog', { name: 'alice · 流入明细' })).toBeNull());
   act(() => {
     width = 720;
     resize();
@@ -244,7 +289,8 @@ it('keeps tenants distinct, includes forwarding and unattributed bytes, and dist
       .querySelector('.traffic-source-icon'),
   ).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'alice · 420 B' }));
-  expect(container.querySelector('.nti-detail .traffic-source-icon')).toBeTruthy();
+  const detail = await screen.findByRole('dialog', { name: 'alice · 流入明细' });
+  expect(await within(detail).findByText('端口转发')).toBeTruthy();
   unmount();
   vi.mocked(fetchNodeInflowUsage).mockResolvedValue(inflow({ rows: [], latest_report_unix_secs: null }));
   mount(<NodeInflowUsageCard nodeId="n2" period="day" />);
@@ -275,14 +321,14 @@ it('keeps the shared statistics range before the icon-only close button in the c
   await screen.findByRole('img', { name: /用户到接入链/ });
   const dialog = screen.getByRole('dialog', { name: '香港机器 · 用量' });
   const header = dialog.querySelector<HTMLElement>('.node-usage-header')!;
-  const range = within(header).getByRole('group', { name: '流入与流出统计范围' });
+  const range = within(header).getByRole('group', { name: '流量统计范围' });
   const close = within(header).getByRole('button', { name: '关闭机器用量' });
   expect(range.compareDocumentPosition(close) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   expect(close.textContent).toBe('');
   expect(close.querySelector('svg')).toBeTruthy();
   expect(within(header).getByRole('img', { name: 'HK 地区旗' }).classList.contains('square')).toBe(true);
   expect(header.querySelector('p')).toBeNull();
-  expect(dialog.querySelector('.node-usage-body')?.querySelector('[aria-label="流入与流出统计范围"]')).toBeNull();
+  expect(dialog.querySelector('.node-usage-body')?.querySelector('[aria-label="流量统计范围"]')).toBeNull();
   expect(screen.queryByText('机器用量 · 实时与流入、流出统计')).toBeNull();
   const live = screen.getByTestId('live-card');
   expect(screen.getAllByRole('group')).toHaveLength(1);
@@ -293,6 +339,7 @@ it('keeps the shared statistics range before the icon-only close button in the c
   expect(fetchNodeSniffingFailedTargets).toHaveBeenCalledWith('n1', 'week');
   expect(within(range).getByRole('button', { name: '当周' }).getAttribute('aria-pressed')).toBe('true');
   expect(screen.getByTestId('live-card')).toBe(live);
+  expect(live.dataset.period).toBe('week');
   expect(fetchUserSiteUsage).not.toHaveBeenCalled();
 });
 
@@ -355,10 +402,46 @@ it('uses the opening range for every machine usage source and keeps the range sw
     expect(source).toHaveBeenCalledWith('n1', 'month');
     expect(vi.mocked(source).mock.calls.every(([, period]) => period === 'month')).toBe(true);
   }
-  const range = screen.getByRole('group', { name: '流入与流出统计范围' });
+  const range = screen.getByRole('group', { name: '流量统计范围' });
   fireEvent.click(within(range).getByRole('button', { name: '当天' }));
   await waitFor(() => expect(fetchNodeInflowUsage).toHaveBeenCalledWith('n1', 'day'));
   await waitFor(() => expect(fetchNodeSiteUsage).toHaveBeenCalledWith('n1', 'day'));
+});
+
+it('applies a UTC+8 custom range to all statistics and restores unfiltered presets', async () => {
+  vi.stubGlobal(
+    'EventSource',
+    class {
+      addEventListener() {}
+      close() {}
+    },
+  );
+  mount(<NodeTrafficDialog nodeId="n1" name="香港机器" country="HK" onClose={() => undefined} />);
+  await screen.findByRole('img', { name: /用户到接入链/ });
+  const scope = screen.getByRole('group', { name: '流量统计范围' });
+  fireEvent.click(within(scope).getByRole('button', { name: '自定义' }));
+  const until = Math.floor(Date.now() / 30_000) * 30;
+  fireEvent.change(screen.getByLabelText('开始时间（UTC+8）'), { target: { value: trafficDateInput(until - 600) } });
+  fireEvent.change(screen.getByLabelText('结束时间（UTC+8）'), { target: { value: trafficDateInput(until) } });
+  fireEvent.click(screen.getByRole('button', { name: '应用' }));
+  for (const load of [
+    fetchNodeInflowUsage,
+    fetchNodeSiteUsage,
+    fetchNodeOtherDomains,
+    fetchNodeSniffingFailedTargets,
+  ]) {
+    await waitFor(() =>
+      expect(load).toHaveBeenCalledWith('n1', 'day', { start_unix_secs: until - 600, end_unix_secs: until }),
+    );
+  }
+  expect(screen.getByTestId('live-card')).toBeTruthy();
+  expect(screen.getByTestId('live-card').dataset.range).toBe(
+    JSON.stringify({ start_unix_secs: until - 600, end_unix_secs: until }),
+  );
+  fireEvent.click(within(scope).getByRole('button', { name: '当周' }));
+  await waitFor(() => expect(fetchNodeInflowUsage).toHaveBeenCalledWith('n1', 'week'));
+  expect(screen.getByTestId('live-card').dataset.period).toBe('week');
+  expect(screen.getByTestId('live-card').dataset.range).toBeUndefined();
 });
 
 it('waits for machine access metadata and keeps model failures visible', async () => {
@@ -400,6 +483,90 @@ it('expands a destination to its top users on this machine and folds the remaini
   expect(users.textContent).toContain('70 B');
   expect(users.textContent).toContain('其余 2 位用户 · 30 B');
   expect(screen.queryByRole('button', { name: '当天' })).toBeNull();
+});
+
+it('includes forwarding in outflow totals and its own chart layer and expands its main users', async () => {
+  const data = outflow();
+  data.rows.push({ site_id: 'forwarding', name: '端口转发', uplink_bytes: 30, downlink_bytes: 70 });
+  data.series.push({ site_id: 'forwarding', points: [[start, 30, 70]] });
+  data.observed_since_unix_secs = start + 1800;
+  data.top_users.push({
+    site_id: 'forwarding',
+    users: [{ tenant_id: 'platform', user_id: 'bob', uplink_bytes: 20, downlink_bytes: 50 }],
+    other_users: 2,
+    other_uplink_bytes: 10,
+    other_downlink_bytes: 20,
+  });
+  vi.mocked(fetchNodeSiteUsage).mockResolvedValue(data);
+  const { container } = mount(<NodeSiteUsageCard nodeId="n1" period="day" />);
+  const forwarding = await screen.findByRole('button', { name: /端口转发.*100.*50\.0%/ });
+  const ranking = screen.getByRole('region', { name: '各类型流量' });
+  expect(within(ranking).getAllByRole('button')[0]).toBe(forwarding);
+  expect(container.querySelector('.site-usage-total')?.textContent).toBe('200B');
+  expect(container.querySelector('.site-usage-label')?.textContent).toContain('1 类站点 · 端口转发');
+  expect(screen.queryByRole('button', { name: /其余.*类站点/ })).toBeNull();
+  const expected = render(<Icon of="forwarding" size={18} />).container.querySelector('svg')!.innerHTML;
+  expect(forwarding.querySelector('svg')?.innerHTML).toBe(expected);
+  expect(forwarding.querySelector('.site-brand-icon')?.getAttribute('aria-hidden')).toBe('true');
+  const chart = await screen.findByTestId('site-chart');
+  const series: SiteUsageChartSeries[] = JSON.parse(chart.getAttribute('data-series')!);
+  expect(series[0].key).toBe('forwarding');
+  const layer = series.find(item => item.key === 'forwarding')!;
+  expect(layer.name).toBe('端口转发');
+  expect(layer.values[0]).toBe(100);
+  expect(layer.values[1]).toBeNull();
+  expect(chart.getAttribute('data-observed-since')).toBe('');
+  fireEvent.focus(forwarding);
+  expect(chart.getAttribute('data-focus')).toBe('forwarding');
+  fireEvent.click(forwarding);
+  const users = screen.getByLabelText('端口转发的主要用户');
+  expect(users.textContent).toContain('bob');
+  expect(users.textContent).toContain('70 B');
+  expect(users.textContent).toContain('其余 2 位用户 · 30 B');
+});
+
+it('shows forwarding without authenticated ingress or site collection and explains missing hourly detail', async () => {
+  vi.mocked(fetchNodeSiteUsage).mockResolvedValue({
+    ...outflow(),
+    collection_enabled: false,
+    reporting_nodes: 0,
+    expected_nodes: 0,
+    latest_report_unix_secs: null,
+    observed_since_unix_secs: null,
+    rows: [{ site_id: 'forwarding', name: '端口转发', uplink_bytes: 30, downlink_bytes: 70 }],
+    series: [{ site_id: 'forwarding', points: [] }],
+    top_users: [],
+  });
+  const { container } = mount(<NodeSiteUsageCard nodeId="n1" period="week" />);
+  await screen.findByRole('button', { name: /端口转发.*100.*100\.0%/ });
+  expect(container.querySelector('.site-usage-total')?.textContent).toBe('100B');
+  expect(screen.getByText('站点采集已关闭 · 转发仍按账本统计')).toBeTruthy();
+  expect(screen.getByText('端口转发有 100 B 已计入总量，小时明细已不完整，未分配到图中。')).toBeTruthy();
+  expect(screen.queryByText(/尚无认证代理入口/)).toBeNull();
+  expect(fetchNodeSiteUsage).toHaveBeenCalledWith('n1', 'week');
+  const scope = screen.getByText('流出统计').closest('header')?.querySelector('[title]');
+  expect(scope?.getAttribute('title')).toContain('端口转发作为独立类型计入');
+  expect(scope?.getAttribute('title')).not.toContain('不含端口转发');
+});
+
+it('keeps site coverage warnings independent of forwarding volume', async () => {
+  const data = outflow();
+  data.rows.push(
+    { site_id: 'sniffing-failed', name: '嗅探失败', uplink_bytes: 0, downlink_bytes: 100 },
+    { site_id: 'forwarding', name: '端口转发', uplink_bytes: 0, downlink_bytes: 10000 },
+  );
+  data.series.push(
+    { site_id: 'sniffing-failed', points: [[start, 0, 100]] },
+    { site_id: 'forwarding', points: [[start, 0, 10000]] },
+  );
+  vi.mocked(fetchNodeSiteUsage).mockResolvedValue(data);
+  mount(<NodeSiteUsageCard nodeId="n1" period="day" />);
+  const ranking = await screen.findByRole('region', { name: '各类型流量' });
+  const failed = within(ranking).getByRole('button', { name: /嗅探失败/ });
+  expect(failed.querySelector('.site-usage-pct')?.classList.contains('warn')).toBe(true);
+  const chart = await screen.findByTestId('site-chart');
+  const series: SiteUsageChartSeries[] = JSON.parse(chart.getAttribute('data-series')!);
+  expect(series.find(item => item.key === 'sniffing-failed')?.color.token).toBe('--gold');
 });
 
 it('shows request errors with retry instead of presenting them as an empty period', async () => {

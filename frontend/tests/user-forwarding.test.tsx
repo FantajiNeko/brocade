@@ -906,6 +906,37 @@ describe('用户转发入口', () => {
     expect(view.queryByRole('button', { name: /删除规则/ })).toBeNull();
   });
 
+  it('renders masked forwarding ports and destinations without copy, probe or write actions', async () => {
+    const request = serve({
+      [`GET ${BASE}/forwarding`]: () =>
+        overview(
+          [
+            entry({
+              public_ipv4: '198.51.***.***',
+              public_ipv6: '2001:4860:***',
+              listen_port_start: '***',
+              listen_port_end: '***',
+            }),
+          ],
+          [
+            rule({ name: '', listen_port: '***', target_host: '***.net', target_port: '***' }),
+            rule({ id: 43, name: '', listen_port: '***', target_host: '[2001:db8:***]', target_port: '***' }),
+          ],
+        ),
+    });
+    const view = show({ canManageRules: false });
+    const row = await view.findByRole('button', { name: '入口 *** 转发到 ***.net:***' });
+    expect(view.getByRole('button', { name: '入口 *** 转发到 [2001:db8:***]:***' })).toBeTruthy();
+    fireEvent.click(row);
+    expect(view.getByText('198.51.***.***:***')).toBeTruthy();
+    expect(view.getByText('[2001:4860:***]:***')).toBeTruthy();
+    fireEvent.change(view.getByRole('combobox', { name: '规则排序' }), { target: { value: 'port' } });
+    expect(view.queryByRole('button', { name: /复制|新建规则|编辑|更多操作|TCP Ping/ })).toBeNull();
+    expect(view.container.textContent).not.toMatch(/NaN|undefined/);
+    expect(request.mock.calls.some(([input]) => /tcp-pings|quota\/jobs|realtime/.test(String(input)))).toBe(false);
+    expect(writes(request)).toEqual([]);
+  });
+
   it('按机器筛选、搜索，并可按本月流量排序', async () => {
     serve({
       [`GET ${BASE}/forwarding`]: () =>

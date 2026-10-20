@@ -10,7 +10,7 @@ import { ProvisionInstall, type Drill } from '../src/panes/nodes';
 import { SessionProvider } from '../src/session';
 import { forge } from '../src/forge/state';
 import { wm } from '../src/wm/store';
-import type { ProvisionNodeResult } from '../src/api';
+import type { NodeInitialization, ProvisionNodeResult } from '../src/api';
 
 const who = {
   operator_id: 'root',
@@ -78,6 +78,20 @@ function installation(client: QueryClient) {
   return drill;
 }
 
+function onlineMachine(client: QueryClient, initialization: NodeInitialization) {
+  client.setQueryData(['nodes'], {
+    nodes: [
+      {
+        node_id: 'hk-01',
+        tenant_id: 'platform',
+        token_last_used_at: new Date().toISOString(),
+        last_poll_at: new Date().toISOString(),
+        initialization,
+      },
+    ],
+  });
+}
+
 beforeEach(() => {
   route.navigate.mockReset();
   wm.init(`onboarding-test-${++setupId}`);
@@ -87,6 +101,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.removeItem('brocade.first-run.model-receipt.root');
   vi.unstubAllGlobals();
 });
 
@@ -156,7 +171,7 @@ describe('first-run onboarding overlay', () => {
     expect(route.navigate).toHaveBeenCalledWith('nodes', drill);
   });
 
-  it('continues to the next guide phase when the installed machine comes online', async () => {
+  it('continues on liveness for legacy registrations without an initialization task', async () => {
     const client = queryClient();
     installation(client);
     client.setQueryData(['nodes'], {
@@ -175,6 +190,122 @@ describe('first-run onboarding overlay', () => {
     );
     const view = renderGuide('active', client);
     expect(await view.findByRole('dialog', { name: '机器在线，创建第一条线路' })).toBeTruthy();
+  });
+
+  it.each(['waiting-agent', 'queued', 'running', 'manual', 'failed'] as const)(
+    'keeps the installation surface uninterrupted while initialization is %s',
+    async initializationState => {
+      const client = queryClient();
+      const drill = installation(client);
+      onlineMachine(client, {
+        state: initializationState,
+        revision_id: 2,
+        deployment_id: initializationState === 'running' || initializationState === 'failed' ? 4 : null,
+        reason: null,
+      });
+      client.setQueryData(['onboarding'], { ...state('active'), node_id: 'hk-01' });
+      vi.stubGlobal('fetch', vi.fn());
+      const view = renderGuide('active', client, drill.result);
+      expect(view.queryByRole('dialog')).toBeNull();
+      expect(view.queryByRole('button', { name: '下一步 · 创建线路' })).toBeNull();
+      expect(wm.snapshot().wins.find(win => win.key === 'tab:nodes')?.data.drill).toBe(drill);
+      expect(route.navigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it('prompts for the first chain only after the server reports initialization success', async () => {
+    const client = queryClient();
+    installation(client);
+    onlineMachine(client, { state: 'running', revision_id: 2, deployment_id: 4, reason: null });
+    client.setQueryData(['onboarding'], { ...state('active'), node_id: 'hk-01' });
+    vi.stubGlobal('fetch', vi.fn());
+    const view = renderGuide('active', client);
+    expect(view.queryByRole('dialog')).toBeNull();
+
+    act(() => {
+      onlineMachine(client, { state: 'succeeded', revision_id: 2, deployment_id: 4, reason: null });
+    });
+    expect(await view.findByRole('dialog', { name: '机器初始化完成，创建第一条线路' })).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '下一步 · 创建线路' }));
+    expect(route.navigate).toHaveBeenCalledWith('nodes', { p: 'chain', id: 'hk-01' });
+  });
+
+  it('returns to the existing installation receipt to follow initialization from another page', async () => {
+    const client = queryClient();
+    const drill = installation(client);
+    onlineMachine(client, { state: 'running', revision_id: 2, deployment_id: 4, reason: null });
+    client.setQueryData(['onboarding'], { ...state('active'), node_id: 'hk-01' });
+    forge.setNav('users');
+    vi.stubGlobal('fetch', vi.fn());
+    const view = renderGuide('active', client);
+    expect(await view.findByRole('dialog', { name: 'Agent 已上线，初始化中' })).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '查看初始化进度' }));
+    expect(route.navigate).toHaveBeenCalledWith('nodes', drill);
+  });
+
+  it.each([
+    ['manual', '需要人工发布', '已有其他机器的配置待发布，请人工处理'],
+    ['failed', '初始化需要处理', '初始化发布未完成，请查看发布单并重试失败目标'],
+  ] as const)(
+    'shows the server reason for %s initialization and preserves the installation receipt',
+    async (s, title, reason) => {
+      const client = queryClient();
+      const drill = installation(client);
+      onlineMachine(client, { state: s, revision_id: 2, deployment_id: s === 'failed' ? 4 : null, reason });
+      client.setQueryData(['onboarding'], { ...state('active'), node_id: 'hk-01' });
+      vi.stubGlobal('fetch', vi.fn());
+      const view = renderGuide('active', client);
+      act(() => openOnboardingGuide());
+      expect(await view.findByRole('dialog', { name: title })).toBeTruthy();
+      expect(view.getByText(reason)).toBeTruthy();
+      fireEvent.click(view.getByRole('button', { name: '查看初始化进度' }));
+      expect(route.navigate).not.toHaveBeenCalled();
+      expect(wm.snapshot().wins.find(win => win.key === 'tab:nodes')?.data.drill).toBe(drill);
+    },
+  );
+
+  it('continues to the business release when its model was already committed during manual initialization', async () => {
+    const client = queryClient();
+    installation(client);
+    onlineMachine(client, { state: 'manual', revision_id: 2, deployment_id: null, reason: '请人工发布' });
+    client.setQueryData(['onboarding'], { ...state('active'), node_id: 'hk-01', target_revision_id: 3 });
+    client.setQueryData(['deployments', 'config'], { deployments: [] });
+    vi.stubGlobal('fetch', vi.fn());
+    const view = renderGuide('active', client);
+    fireEvent.click(await view.findByRole('button', { name: '下一步 · 前往发布' }));
+    expect(route.navigate).toHaveBeenCalledWith('deploy', { p: 'plan', revision: 3 });
+  });
+
+  it('can recover the checkpoint of an already committed model during manual initialization', async () => {
+    const client = queryClient();
+    installation(client);
+    onlineMachine(client, { state: 'manual', revision_id: 2, deployment_id: null, reason: '请人工发布' });
+    client.setQueryData(['onboarding'], { ...state('active'), node_id: 'hk-01' });
+    client.setQueryData(['deployments', 'config'], { deployments: [] });
+    localStorage.setItem(
+      'brocade.first-run.model-receipt.root',
+      JSON.stringify({
+        appId: 'app-main',
+        chainId: 'chain-main',
+        ingressId: 'ingress-main',
+        tenantId: 'platform',
+        userId: 'alice',
+        revisionId: 3,
+      }),
+    );
+    forge.setNav('users');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe('/onboarding');
+        expect(init?.method).toBe('PUT');
+        expect(JSON.parse(String(init?.body))).toMatchObject({ step: 'model', target_revision_id: 3 });
+        return response({ ...state('active'), node_id: 'hk-01', target_revision_id: 3 });
+      }),
+    );
+    const view = renderGuide('active', client);
+    fireEvent.click(await view.findByRole('button', { name: '重试确认' }));
+    await vi.waitFor(() => expect(client.getQueryData(['onboarding'])).toMatchObject({ target_revision_id: 3 }));
   });
 
   it('opens a modal over the real machine page and guides the first navigation', async () => {

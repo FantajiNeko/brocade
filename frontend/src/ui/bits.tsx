@@ -1320,14 +1320,12 @@ export function ErrorBox({ error }: { error: unknown }) {
   return <div className="callout err">{message}</div>;
 }
 
-// 危险操作的确认框。requireWord 非空时必须先输入该词才能确认——
-// 回滚这类误操作后难以恢复的操作，仅二次确认不足，需要确认已阅读影响说明后才允许执行。
+// 危险操作的确认框：展示影响说明后，直接点击按钮确认。
 export function Confirm({
   title,
   body,
   confirmLabel,
   danger = true,
-  requireWord,
   confirmDisabled = false,
   onConfirm,
   onCancel,
@@ -1336,34 +1334,21 @@ export function Confirm({
   body: ReactNode;
   confirmLabel: string;
   danger?: boolean;
-  requireWord?: string;
   confirmDisabled?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
-  const [word, setWord] = useState('');
-  const ok = !requireWord || word === requireWord;
   return (
     <DialogLayer label={title} onClose={onCancel}>
       <div className="dialog-surface confirm-card">
         <div className="confirm-title">{title}</div>
         <div className="confirm-body">{body}</div>
-        {requireWord && (
-          <input
-            className="f confirm-word"
-            autoFocus
-            placeholder={`输入「${requireWord}」确认`}
-            aria-label={`输入「${requireWord}」确认`}
-            value={word}
-            onChange={e => setWord(e.target.value)}
-          />
-        )}
         <div className="confirm-actions">
           <DialogClose className="btn">取消</DialogClose>
           <button
             className={`btn ${danger ? 'danger' : 'primary'}`}
             type="button"
-            disabled={!ok || confirmDisabled}
+            disabled={confirmDisabled}
             onClick={onConfirm}
           >
             {confirmLabel}

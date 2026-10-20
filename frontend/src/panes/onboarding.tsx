@@ -13,6 +13,7 @@ import {
 import { draft, type DraftEntry } from '../draft';
 import { navigate } from '../forge/route';
 import { useForge } from '../forge/state';
+import { nodeInitializationView } from '../node-initialization';
 import { useSession } from '../session';
 import { useAgentLiveness } from '../ui/agent-alive';
 import { ErrorBox, Loading } from '../ui/bits';
@@ -161,6 +162,13 @@ export function OnboardingGuide() {
   const rootNodes = (nodes.data?.nodes ?? []).filter(node => node.tenant_id === state?.root_tenant_id);
   const node = (nodes.data?.nodes ?? []).find(item => item.node_id === state?.node_id);
   const liveness = useAgentLiveness(node);
+  // Existing installations have no initialization intent. Once the first business model has
+  // been committed, its ordinary release can also resolve a manual initialization conflict.
+  const awaitingInitialization =
+    state?.target_revision_id == null &&
+    !receipt &&
+    node?.initialization != null &&
+    node.initialization.state !== 'succeeded';
 
   const checkpointNode = useMutation({
     mutationFn: (nodeId: string) => checkpointOnboarding({ step: 'node', node_id: nodeId }),
@@ -254,7 +262,7 @@ export function OnboardingGuide() {
       ? 'complete'
       : !state.node_id
         ? 'machine'
-        : liveness?.state !== 'online'
+        : liveness?.state !== 'online' || awaitingInitialization
           ? 'agent'
           : state.target_revision_id == null
             ? created || receipt
@@ -335,13 +343,19 @@ export function OnboardingGuide() {
         ? nodeDrill
         : { p: 'install' as const, node: state.node_id!, step: 2 };
     const alreadyInstalling = nav === 'nodes' && installation === nodeDrill;
-    title = '安装 Agent，等待机器上线';
+    const initializing = liveness?.state === 'online' && awaitingInitialization;
+    const initialization = nodeInitializationView(node?.initialization);
+    title = initializing ? initialization.title : '安装 Agent，等待机器上线';
     body = (
       <>
-        <p>
-          机器 <b>{node?.name || state.node_id}</b> 已登记。进入安装页复制一次性命令，在目标机器以系统权限执行。
-        </p>
-        <p className="onb-guide-note">首次心跳到达后，向导会自动提示创建线路。</p>
+        {initializing ? (
+          <p>{initialization.description}</p>
+        ) : (
+          <p>
+            机器 <b>{node?.name || state.node_id}</b> 已登记。进入安装页复制一次性命令，在目标机器以系统权限执行。
+          </p>
+        )}
+        <p className="onb-guide-note">机器上线并完成初始化后，向导会提示创建线路。</p>
         {checkpointNode.error && <ErrorBox error={checkpointNode.error} />}
       </>
     );
@@ -354,12 +368,12 @@ export function OnboardingGuide() {
             if (!alreadyInstalling) navigate('nodes', installation);
           }}
         >
-          {alreadyInstalling ? '继续当前安装' : '查看安装步骤'}
+          {initializing ? '查看初始化进度' : alreadyInstalling ? '继续当前安装' : '查看安装步骤'}
         </DialogClose>
       </>
     );
   } else if (phase === 'chain') {
-    title = '机器在线，创建第一条线路';
+    title = node?.initialization ? '机器初始化完成，创建第一条线路' : '机器在线，创建第一条线路';
     body = (
       <>
         <p>首台机器已经连接控制台。下一步进入建链页面，选择接入协议并把线路加入草稿。</p>
@@ -638,7 +652,7 @@ function FirstUserForm({
           placeholder="alice"
           onChange={event => setUserId(event.target.value)}
         />
-        <small>{userId && !valid ? '只能使用 a-z 0-9 . _ -，最长 32 个字符。' : `归属 ${tenantId}`}</small>
+        <small>只能使用 a-z 0-9 . _ -，最长 32 个字符。</small>
       </label>
       {initialReceipt && <div className="callout warn">修订已经写入；继续会安全地重试服务端检查点。</div>}
       {commit.error && <ErrorBox error={commit.error} />}

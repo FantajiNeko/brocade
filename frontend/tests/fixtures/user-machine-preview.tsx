@@ -14,8 +14,8 @@ document.documentElement.dataset.palette = 'dailan';
 const scene = params.get('scene') ?? 'regular';
 const now = Date.UTC(2026, 9, 18, 8, 23) / 1000;
 const names = [
-  '香港 DMIT',
-  '香港 PUMP',
+  '香港示例 01',
+  '香港示例 02',
   '日本 NTT',
   '新加坡 SG',
   '台湾住宅入口',

@@ -157,6 +157,7 @@ const ROUTES: Record<string, () => unknown> = {
   }),
   '/site-usage/settings': () => ({ enabled: false }),
   '/settings': committedSettings,
+  '/deployment-settings': () => ({ unattended: true }),
   '/branding': () => ({ site_name: 'brocade', icon: null, accent: null }),
   '/auth/state': () => ({ public_open: false }),
   '/certs': () => ({ groups: [], nodes: [], letsencrypt: 'https://acme', letsencrypt_staging: 'https://acme-staging' }),
@@ -213,6 +214,7 @@ it('branding save preserves further typing while the request is pending', async 
   qc.setQueryData(['sniffing-failed-policy'], ROUTES['/other-domain/settings']());
   const keys: Record<string, string> = {
     '/settings': 'settings',
+    '/deployment-settings': 'deployment-settings',
     '/branding': 'branding',
     '/auth/state': 'auth-state',
     '/certs': 'certs',
@@ -270,6 +272,7 @@ it('committing settings draft keeps the new baseline and refreshes settings', as
   const qc = client();
   const keys: Record<string, string> = {
     '/settings': 'settings',
+    '/deployment-settings': 'deployment-settings',
     '/branding': 'branding',
     '/auth/state': 'auth-state',
     '/certs': 'certs',
@@ -325,6 +328,7 @@ function settingsClient() {
   qc.setQueryData(['site-usage-policy'], { enabled: false });
   const keys: Record<string, string> = {
     '/settings': 'settings',
+    '/deployment-settings': 'deployment-settings',
     '/branding': 'branding',
     '/auth/state': 'auth-state',
     '/certs': 'certs',
