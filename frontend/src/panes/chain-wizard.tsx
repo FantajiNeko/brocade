@@ -1085,13 +1085,14 @@ export function ChainWizard({
   // 向导的默认端口、可选机器、线路冲突、授权对象和 REALITY 站点分别来自这些查询。
   // 任何一项失败都不能以空数组/工厂默认值继续，否则“创建成功”的结果可能少授权、撞端口
   // 或写入错误的站点。
+  // nodes 与上线引导共用缓存，后者每 3 秒轮询运行状态；已有机器数据时后台读取不撤销
+  // 表单的就绪状态，否则整张表单会随轮询反复禁用。首次读取和刷新失败仍阻止创建。
   const dependenciesPending =
     snapshot.isPending ||
     snapshot.isFetching ||
     settings.isPending ||
     settings.isFetching ||
     nodes.isPending ||
-    nodes.isFetching ||
     revisions.isPending ||
     revisions.isFetching ||
     users.isPending ||

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChainWizard } from '../src/panes/chain-wizard';
 import { draft } from '../src/draft';
@@ -501,6 +501,99 @@ describe('新建链向导', () => {
       </QueryClientProvider>,
     );
   }
+
+  it('首次机器数据返回前等待完整依赖，再显示建链表单', async () => {
+    const client = queryClient();
+    client.removeQueries({ queryKey: ['nodes'] });
+    let finishNodes!: (response: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        () =>
+          new Promise<Response>(resolve => {
+            finishNodes = resolve;
+          }),
+      ),
+    );
+    const view = mount(client);
+    expect(view.queryByRole('heading', { name: '新建链' })).toBeNull();
+    expect(view.queryByRole('textbox', { name: '链名称' })).toBeNull();
+
+    await act(async () => finishNodes(Response.json({ nodes: agentNodes })));
+    await waitFor(() => expect(view.getByRole('textbox', { name: '链名称' })).toBeTruthy());
+    expect(view.container.querySelector<HTMLFieldSetElement>('.pv-chain-fields')?.disabled).toBe(false);
+  });
+
+  it('机器状态后台轮询不禁用表单、不切换页脚，并保留输入和展开状态', async () => {
+    const client = queryClient();
+    let finishNodes!: (response: Response) => void;
+    const fetcher = vi.fn((path: string) => {
+      if (path !== '/nodes/agent-state') throw new Error(`unexpected request: ${path}`);
+      return new Promise<Response>(resolve => {
+        finishNodes = resolve;
+      });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const view = mount(client);
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    const name = view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement;
+    const port = view.getByRole('textbox', { name: 'AnyTLS 监听端口' }) as HTMLInputElement;
+    fireEvent.change(name, { target: { value: '轮询时继续编辑' } });
+    fireEvent.change(port, { target: { value: '25444' } });
+    const anyTlsCard = view.getByRole('checkbox', { name: 'AnyTLS' }).closest('.wzp-card') as HTMLElement;
+    fireEvent.click(within(anyTlsCard).getByRole('button', { name: '参数' }));
+    const padding = view.getByRole('combobox', { name: 'Padding' });
+    const paper = view.container.querySelector('.nd-paper');
+    const fields = view.container.querySelector<HTMLFieldSetElement>('.pv-chain-fields')!;
+    const footer = view.container.querySelector('.pv-state')!;
+    const footerText = footer.textContent;
+
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      await act(async () => {
+        void client.refetchQueries({ queryKey: ['nodes'] });
+      });
+      expect(client.getQueryState(['nodes'])).toMatchObject({ status: 'success', fetchStatus: 'fetching' });
+      fireEvent.change(name, { target: { value: `轮询中编辑 ${cycle}` } });
+      expect(view.container.querySelector('.nd-paper')).toBe(paper);
+      expect(fields.disabled).toBe(false);
+      expect(name.matches(':disabled')).toBe(false);
+      expect(port.matches(':disabled')).toBe(false);
+      expect(footer.textContent).toBe(footerText);
+      expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
+      await act(async () => finishNodes(Response.json({ nodes: agentNodes })));
+      await waitFor(() => expect(client.getQueryState(['nodes'])?.fetchStatus).toBe('idle'));
+      expect(view.getByRole('textbox', { name: '链名称' })).toBe(name);
+      expect(name.value).toBe(`轮询中编辑 ${cycle}`);
+      expect(port.value).toBe('25444');
+      expect(view.getByRole('combobox', { name: 'Padding' })).toBe(padding);
+      expect(footer.textContent).toBe(footerText);
+    }
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.every(([path]) => path === '/nodes/agent-state')).toBe(true);
+  });
+
+  it('机器状态刷新失败时保留表面并显示错误，阻止加入草稿', async () => {
+    const client = queryClient();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => Response.json({ error: '机器状态读取失败' }, { status: 503 })),
+    );
+    const view = mount(client);
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    const name = view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement;
+    fireEvent.change(name, { target: { value: '失败时保留的链' } });
+    const paper = view.container.querySelector('.nd-paper');
+
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['nodes'] });
+    });
+    await waitFor(() => expect(view.getByText('机器状态读取失败')).toBeTruthy());
+    expect(view.getByRole('button', { name: '重试读取配置' })).toBeTruthy();
+    expect(view.container.querySelector('.nd-paper')).toBe(paper);
+    expect(view.getByRole('textbox', { name: '链名称' })).toBe(name);
+    expect(name.value).toBe('失败时保留的链');
+    expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+  });
 
   it('入口分组仅默认选中，菜单保留完整默认顺序，切换后写入所选分组', async () => {
     draft.init('wizard-group-default-switch');
