@@ -26,14 +26,18 @@ use brocade_core::{
 use ipnet::Ipv4Net;
 
 #[test]
-fn egress_rejects_unknown_fields() {
+fn egress_accepts_additional_fields_but_requires_a_known_action() {
     let result = serde_json::from_value::<Action>(serde_json::json!({
         "t": "egress",
         "send_through": null,
         "dns": true,
         "resolution": { "address": "192.0.2.53", "port": 53 }
     }));
-    assert!(result.is_err());
+    assert!(matches!(result.unwrap(), Action::Egress { .. }));
+    assert!(serde_json::from_value::<Action>(serde_json::json!({
+        "t": "future_action"
+    }))
+    .is_err());
 }
 
 #[test]
@@ -4210,7 +4214,7 @@ fn validate_model_snapshot_reports_reality_client_policy_errors() {
         reality_client: RealityClientPolicy {
             min_client_ver: Some("1.x.0".to_owned()),
             max_client_ver: Some("1.9".to_owned()),
-            max_time_diff_ms: Some(86_400_001),
+            max_time_diff_ms: Some(brocade_core::model::MAX_REALITY_TIME_DIFF_MS + 1),
         },
         reality_site: RealitySite::default(),
         anytls_padding_scheme: brocade_core::model::default_anytls_padding_scheme(),
@@ -4248,6 +4252,22 @@ fn validate_model_snapshot_reports_reality_client_policy_errors() {
     validate_model_snapshot(&invalid_range, &mut diagnostics);
 
     assert_has(&diagnostics, Level::Error, "reality.client-ver-range");
+}
+
+#[test]
+fn reality_clock_tolerance_uses_the_real_xray_duration_range() {
+    for value in [0, 86_400_001, brocade_core::model::MAX_REALITY_TIME_DIFF_MS] {
+        let mut snapshot = doc(Vec::new());
+        snapshot.settings.reality_client.max_time_diff_ms = Some(value);
+        let mut diagnostics = Vec::new();
+        validate_model_snapshot(&snapshot, &mut diagnostics);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == "reality.max-time-diff"),
+            "{value}: {diagnostics:?}"
+        );
+    }
 }
 
 /// What sits on a decommissioned node shuts down automatically: its ingresses are not
@@ -5380,12 +5400,12 @@ fn native_vless_encryption_claims_its_tcp_port_and_validates_keys() {
 }
 
 #[test]
-fn warp_rejects_removed_wireguard_options() {
+fn warp_ignores_additional_options_but_rejects_unknown_http_versions() {
     assert!(
         serde_json::from_value::<ExternalOutboundProtocol>(serde_json::json!({
             "t": "warp", "v": { "mtu": 1280, "workers": 4 }
         }))
-        .is_err()
+        .is_ok()
     );
     assert!(
         serde_json::from_value::<ExternalOutboundProtocol>(serde_json::json!({
@@ -5393,4 +5413,52 @@ fn warp_rejects_removed_wireguard_options() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn stale_optional_link_policies_warn_without_blocking_the_model() {
+    use brocade_core::model::{DisabledWireGuardLink, ReverseHealthOverride};
+
+    let mut snapshot = doc(Vec::new());
+    let link = DisabledWireGuardLink {
+        a: "retired-a".into(),
+        b: "retired-b".into(),
+    };
+    snapshot.settings.overlay.disabled_links = vec![link.clone(), link];
+    snapshot
+        .settings
+        .reverse_health_overrides
+        .push(ReverseHealthOverride {
+            chain: "retired-chain".into(),
+            from: "retired-a".into(),
+            to: "retired-b".into(),
+            health: snapshot.settings.reverse_health,
+        });
+    let mut diagnostics = Vec::new();
+    validate_model_snapshot(&snapshot, &mut diagnostics);
+    for code in [
+        "link.disabled-node-missing",
+        "link.disabled-dup",
+        "reverse.health-link-missing",
+    ] {
+        assert_has(&diagnostics, Level::Warn, code);
+    }
+    assert!(
+        !diagnostics.iter().any(|d| d.level == Level::Error),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn model_additional_fields_do_not_change_known_data_or_default_required_fields() {
+    let expected = doc(Vec::new());
+    let mut document = serde_json::to_value(&expected).unwrap();
+    document["future_model_field"] = serde_json::json!({"enabled":true});
+    document["settings"]["future_policy"] = serde_json::json!(1);
+    assert_eq!(
+        serde_json::from_value::<ModelSnapshot>(document.clone()).unwrap(),
+        expected
+    );
+    document.as_object_mut().unwrap().remove("overlay_cidr");
+    assert!(serde_json::from_value::<ModelSnapshot>(document).is_err());
 }

@@ -312,11 +312,17 @@ func TestMuxWorkerPoolProtobufRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMuxWorkerPoolConfigRejectsUnknownFields(t *testing.T) {
+func TestMuxWorkerPoolConfigAcceptsAdditionalFields(t *testing.T) {
 	raw := `{"prewarmWorkers":0,"reuseThreshold":2,"maxProbingWorkers":1,"probeIntervalMs":5000,"probeTimeoutMs":2000,"idleTtlMs":24000,"maxRequestsPerWorker":128,"unexpected":true}`
 	var config WorkerPoolConfig
-	if err := json.Unmarshal([]byte(raw), &config); err == nil {
-		t.Fatal("unknown worker-pool field was accepted")
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.Build(); err != nil {
+		t.Fatalf("additional fields must not invalidate a working policy: %v", err)
+	}
+	if config.PrewarmWorkers != 0 || config.ReuseThreshold != 2 {
+		t.Fatal("additional fields changed the known policy")
 	}
 }
 

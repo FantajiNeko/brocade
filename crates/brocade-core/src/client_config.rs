@@ -22,7 +22,6 @@ use crate::{
 pub const SUBSCRIPTION_CLIENT_CONFIG_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SubscriptionClientConfig {
     pub schema: u32,
     pub app_order: Vec<String>,
@@ -41,7 +40,6 @@ pub struct SubscriptionClientConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientChain {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,7 +47,6 @@ pub struct ClientChain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientFront {
     pub app_id: String,
     pub tenant: String,
@@ -60,7 +57,6 @@ pub struct ClientFront {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientIngress {
     /// Whether this ingress still exists in desired state. A removed ingress may retain an older
     /// projection solely so a still-serving or rollback topology remains usable.
@@ -77,7 +73,6 @@ pub struct ClientIngress {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientProjection {
     /// Legacy fields and the VLESS mapping for new checkpoints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,14 +109,12 @@ pub struct ClientProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientProjectionEndpoint {
     pub host: String,
     pub port: u16,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientProtocolProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v4: Option<ClientProjectionEndpoint>,
@@ -130,7 +123,6 @@ pub struct ClientProtocolProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientProjectionDownloadEndpoint {
     pub host: String,
     pub port: u16,

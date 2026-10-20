@@ -1,7 +1,6 @@
 package conf
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"path/filepath"
@@ -120,20 +119,6 @@ type WorkerPoolConfig struct {
 	ProbeTimeoutMs       uint32 `json:"probeTimeoutMs"`
 	IdleTtlMs            uint32 `json:"idleTtlMs"`
 	MaxRequestsPerWorker uint32 `json:"maxRequestsPerWorker"`
-}
-
-// Worker-pool policies are explicit: unknown/retired keys must not silently
-// reset a value (especially the valid zero prewarm target).
-func (c *WorkerPoolConfig) UnmarshalJSON(data []byte) error {
-	type policy WorkerPoolConfig
-	var value policy
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&value); err != nil {
-		return err
-	}
-	*c = WorkerPoolConfig(value)
-	return nil
 }
 
 func (c *WorkerPoolConfig) Build() (*proxyman.WorkerPoolConfig, error) {

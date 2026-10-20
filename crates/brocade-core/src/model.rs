@@ -10,10 +10,9 @@
 //! The notation follows the model documentation (`{t, v}`): an enum carries a `t` tag
 //! with its value in `v`, and a rule's two halves are `m` and `a`.
 //!
-//! `deny_unknown_fields` is deliberate. A mistyped field name has to be rejected at parse
-//! time rather than silently take a default: `egress` spelled `egres` means "this machine
-//! may not exit", the artifacts are produced as usual, and nothing in the output
-//! indicates the mistake.
+//! Additional JSON fields are ignored so newer clients and stored snapshots can be read
+//! across rolling upgrades and rollbacks. Required fields, enum tags and semantic validation
+//! still determine the behavior understood by this compiler; ignored fields are not preserved.
 
 use std::{
     collections::BTreeMap,
@@ -26,7 +25,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelSnapshot {
     pub revision: u64,
     pub overlay_cidr: Ipv4Net,
@@ -48,7 +46,6 @@ pub struct ModelSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeEgressDnsPolicy {
     pub node: String,
     /// Zero-based priority within this machine. Xray evaluates scoped DNS servers in this order,
@@ -59,7 +56,6 @@ pub struct NodeEgressDnsPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelSettings {
     #[serde(default)]
     pub reality_client: RealityClientPolicy,
@@ -155,7 +151,6 @@ pub fn default_anytls_padding_scheme() -> Vec<String> {
 /// on the machine, and a fleet containing both 2-core relays and larger exits has no
 /// single correct value. `handshake_secs` is fleet-wide; see its own note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConnectionSettings {
     /// Seconds without data before a connection is reclaimed. xray's own default.
     ///
@@ -199,7 +194,6 @@ impl Default for ConnectionSettings {
 
 /// One machine's overrides. Every field absent means "use the global default".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeConnection {
     #[serde(default)]
     pub conn_idle_secs: Option<u32>,
@@ -233,10 +227,9 @@ pub struct NodeConnection {
 /// workflow pulls, the same source `install.sh` installs, so enabling auto-update does
 /// not change routing semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct GeodataSettings {
-    /// When to update. A five-field cron, optionally with a `CRON_TZ=` / `TZ=`
-    /// prefix.
+    /// When to update. Xray's cron parser accepts five-field expressions, descriptors
+    /// such as `@daily`, and an optional `CRON_TZ=` / `TZ=` prefix.
     ///
     /// The prefix is a correctness requirement, not optional formatting. The
     /// `robfig/cron` xray uses takes the process's local timezone when `cron.New()`
@@ -274,7 +267,6 @@ impl Default for GeodataSettings {
 /// agent's behavior, not the configuration running on machines, so editing this section
 /// triggers no release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProbeSettings {
     /// Where to send the request once connected.
     ///
@@ -312,7 +304,6 @@ impl Default for ProbeSettings {
 /// machine (see `HopIn::port`). Editing these bases therefore modifies no existing
 /// chain; the next chain searches upward from the new base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PortSettings {
     /// VLESS ingresses search upward from this port, on TCP.
     pub ingress_base: u16,
@@ -393,7 +384,6 @@ mod port_settings_tests {
 
 /// The backbone's global parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OverlaySettings {
     /// Written into the wg config only for one-way dialing (`Dial::Both` needs no
     /// keepalive). Environments with aggressive NAT aging need a lower value; 10 seconds
@@ -418,7 +408,6 @@ pub struct OverlaySettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DisabledWireGuardLink {
     pub a: String,
     pub b: String,
@@ -436,7 +425,6 @@ impl Default for OverlaySettings {
 
 /// The globally defaulted REALITY site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RealitySite {
     #[serde(default)]
     pub dest: Option<String>,
@@ -461,8 +449,11 @@ impl Default for RealitySite {
     }
 }
 
+/// Xray converts milliseconds to Go's signed nanosecond duration. Larger values wrap and
+/// can reject every handshake; operational clock-tolerance recommendations are not a limit.
+pub const MAX_REALITY_TIME_DIFF_MS: u64 = i64::MAX as u64 / 1_000_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RealityClientPolicy {
     #[serde(default)]
     pub min_client_ver: Option<String>,
@@ -473,7 +464,6 @@ pub struct RealityClientPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Node {
     pub id: String,
     pub tenant: String,
@@ -628,14 +618,12 @@ pub enum HopWire {
 /// (`artifacts/xray.rs`). Storing the whole string in the model would turn any future
 /// handshake-parameter change into a data migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HopEncryption {
     pub private_key: String,
     pub public_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WireGuardKeys {
     pub private_key: String,
     pub public_key: String,
@@ -716,7 +704,6 @@ fn is_local_dns(server: &str) -> bool {
 /// not preserve which route or outbound requested a lookup, so the selector applies to every
 /// matching lookup on the machine.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EgressDnsResolution {
     /// An IP literal. Hostnames are deliberately refused: resolving the resolver through itself
     /// creates a bootstrap loop, while resolving it elsewhere makes this supposedly isolated
@@ -806,7 +793,6 @@ pub enum DomainStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct User {
     pub id: String,
     pub tenant: String,
@@ -819,7 +805,6 @@ pub struct User {
 /// references it through [`Action::Proxy`], and only the Brocade node holding that rule receives
 /// the resulting Xray outbound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalOutbound {
     pub id: String,
     pub tenant: String,
@@ -842,7 +827,6 @@ pub struct ExternalOutbound {
 /// state kept sealed in the binding table, so a stored model snapshot cannot be used to mutate a
 /// Cloudflare account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalWarpBinding {
     pub node: String,
     pub device_id: String,
@@ -863,7 +847,6 @@ pub struct ExternalWarpBinding {
 
 /// Transport and tunnel-local DNS for Cloudflare's MASQUE client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WarpMasqueOptions {
     #[serde(default)]
     pub http_version: WarpHttpVersion,
@@ -938,12 +921,7 @@ pub fn vpngate_runtime_peer(slot: usize) -> Option<Ipv4Addr> {
 // spread allocation and constructor churn through the model solely to shrink this cold enum.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "t",
-    content = "v",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum ExternalOutboundProtocol {
     Anytls {
         credential: String,
@@ -1080,7 +1058,6 @@ pub enum ExternalVlessTransport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalVlessKcp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
@@ -1089,7 +1066,6 @@ pub struct ExternalVlessKcp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalVlessWebsocket {
     /// Request path sent in the WebSocket upgrade. A query string is allowed because some
     /// providers use it for early-data negotiation.
@@ -1100,7 +1076,6 @@ pub struct ExternalVlessWebsocket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalVlessHttp {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1117,7 +1092,6 @@ pub enum ExternalVlessGrpcMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalVlessGrpc {
     pub service_name: String,
     #[serde(default)]
@@ -1127,7 +1101,6 @@ pub struct ExternalVlessGrpc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalVlessHttpUpgrade {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1135,7 +1108,6 @@ pub struct ExternalVlessHttpUpgrade {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalVlessXhttp {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1156,7 +1128,6 @@ pub struct ExternalVlessXhttp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExternalVlessXhttpDownload {
     pub address: String,
     pub port: u16,
@@ -1258,7 +1229,6 @@ fn external_fingerprint_chrome() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AppView {
     pub id: String,
     pub label: String,
@@ -1275,7 +1245,6 @@ pub struct AppView {
 /// `any → Forward` edges describe, derived rather than stored. Decommissioning any node on
 /// the chain disables the whole chain (`compile_app` does not compile it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Chain {
     pub id: String,
     pub tenant: String,
@@ -1288,7 +1257,6 @@ pub struct Chain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Ingress {
     pub id: String,
     pub chain: String,
@@ -1335,7 +1303,6 @@ pub struct Ingress {
 /// services. The two opt-in policies are off because one breaks ordinary UDP use and the other is
 /// an operator-specific geographic admission decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IngressGuard {
     /// The fleet's own overlay and every private range. This is isolation rather than abuse
     /// protection: without it a subscriber reaches this machine's `10.66.0.0/16` neighbours and
@@ -1422,7 +1389,6 @@ impl IngressGuard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IngressIdentity {
     pub private_key: String,
     pub public_key: String,
@@ -1456,7 +1422,6 @@ pub struct IngressIdentity {
 /// line's endpoint and is independent of this machine's own position on the network
 /// (`physical/user.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Projection {
     /// VLESS · TLS / REALITY.
     #[serde(default)]
@@ -1479,7 +1444,6 @@ pub struct Projection {
 
 /// One protocol's independently mapped public endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProtocolProjection {
     #[serde(default)]
     pub v4: Option<ProjectionEndpoint>,
@@ -1494,7 +1458,6 @@ pub struct ProtocolProjection {
 /// string is stored, whether the operator meant to disable the projection or left it
 /// half-filled can no longer be determined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProjectionEndpoint {
     /// An IP or a name. IPv6 literals need no brackets of their own; `uri_host` in
     /// `format/uri.rs` adds them.
@@ -1503,7 +1466,6 @@ pub struct ProjectionEndpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProjectionDownloadEndpoint {
     pub host: String,
     /// The public port written into client artifacts.
@@ -1665,7 +1627,6 @@ impl Transport {
 
 /// Hysteria 2's complete operator-controlled shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Hysteria2 {
     /// The UDP port this wire listens on. It belongs to the wire, not to the ingress.
     ///
@@ -1705,7 +1666,6 @@ pub struct Hysteria2 {
 /// subscriptions and probes. User passwords are deliberately absent here because they are
 /// synchronized through Xray's gRPC API just like the other dynamic account types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AnyTls {
     /// The TCP port owned by the AnyTLS listener. It is separate from `Ingress::port`, which is
     /// the VLESS side, so one ingress may expose both protocols on distinct ports.
@@ -1792,7 +1752,6 @@ pub const ANYTLS_PORT_BASE: u16 = 14_443;
 /// Telegram's native MTProxy listener. User secrets are derived from the existing UUID grants,
 /// so this object owns only its independently allocated TCP port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MtProto {
     pub port: u16,
 }
@@ -1809,7 +1768,7 @@ impl Default for MtProto {
 /// Xray. Brocade stores only optional header overrides for that form; the status and body stay
 /// the stable upstream defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum AnyTlsMasquerade {
     NotFound {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1877,7 +1836,6 @@ pub const DEFAULT_HYSTERIA2_HOP_SPAN: u16 = 10;
 /// machine's redirect, so a range excluding the listener leaves the only working port outside
 /// the set clients are told to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HysteriaPortHop {
     pub start: u16,
     pub end: u16,
@@ -1896,7 +1854,6 @@ impl HysteriaPortHop {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HysteriaBandwidth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up: Option<String>,
@@ -1959,7 +1916,6 @@ impl HysteriaBbrProfile {
 /// column, which is the durable one; a compile diagnostic, so a bad value is caught before publish
 /// rather than by the agent; and the input's `min`/`max` in the console.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HysteriaQuic {
     /// Bytes, at least 16384. Upstream advises keeping stream:connection near 2:5.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2002,13 +1958,13 @@ impl HysteriaQuic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HysteriaObfs {
     Salamander { password: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HysteriaMasquerade {
     #[default]
     NotFound,
@@ -2079,7 +2035,6 @@ pub enum IngressWires {
 /// database columns. The type above is the form the rest of the program uses. The conversion
 /// enforces the at-least-one rule, so no other layer has to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IngressWiresWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vless_encryption: Option<VlessEncryption>,
@@ -2223,7 +2178,6 @@ impl From<IngressWires> for IngressWiresWire {
 
 /// A distinct TCP listener; keys are generated and retained by the control plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VlessEncryption {
     pub port: u16,
     pub options: VlessEncryptionOptions,
@@ -2233,7 +2187,7 @@ pub struct VlessEncryption {
 
 /// Managed VLESS Encryption parameters. Empty padding delegates to the pinned core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct VlessEncryptionOptions {
     pub appearance: VlessEncryptionAppearance,
     /// Xray syntax: `600s` means 300–600 seconds; `100-500s` specifies both bounds.
@@ -2561,7 +2515,6 @@ impl IngressWires {
 /// `allowInsecure`, probes pin self-signed certificates, and the one lossy URI escape hatch is a transient
 /// render choice rather than durable ingress configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Tls {
     /// Same three-state rule as [`Reality::flow`]: unset follows the fleet, empty is off.
     #[serde(default)]
@@ -2625,8 +2578,7 @@ pub struct TlsXhttp {
 /// mismatch is not visible in the type definitions: two variants of one enum do not serialize
 /// alike unless they are made to.
 ///
-/// `deny_unknown_fields` is deliberately absent rather than forgotten: serde cannot combine it
-/// with `flatten`.
+/// Like the rest of the model, this flattened representation accepts additional JSON fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealityXhttp {
     #[serde(flatten)]
@@ -2635,7 +2587,6 @@ pub struct RealityXhttp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct XhttpXmuxRange {
     pub from: u32,
     pub to: u32,
@@ -2654,7 +2605,6 @@ impl XhttpXmuxRange {
 /// custom policy is emitted, Brocade therefore persists its connection limit and lifecycle ranges
 /// together; `None` means omit `xmux` completely and let the pinned Xray version own its defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct XhttpXmux {
     /// Maximum simultaneous proxy streams carried by one underlying HTTP connection.
     /// Mutually exclusive with `max_connections`.
@@ -2695,7 +2645,6 @@ impl XhttpXmux {
 
 /// Padding controls shared by XHTTP's listener and dialing projections.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct XhttpTuning {
     /// Random padding bytes placed on every XHTTP request and response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2711,7 +2660,6 @@ impl XhttpTuning {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Xhttp {
     /// The URL path the tunnel's requests carry, `/` first.
     ///
@@ -2748,7 +2696,6 @@ pub struct Xhttp {
 
 /// XHTTP's optional independent downlink, one client endpoint per address family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct XhttpDownload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v4: Option<ProjectionDownloadEndpoint>,
@@ -2952,7 +2899,6 @@ pub enum RealityFallbackLimits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RealityFallbackRateLimit {
     pub after_bytes: u64,
     pub bytes_per_sec: u64,
@@ -2976,7 +2922,6 @@ pub struct Reality {
 /// Shared client-only chained-proxy group. It affects subscription projection and validation but
 /// must never change a node artifact; server connectivity remains owned by ordinary chain rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Front {
     pub id: String,
     pub tenant: String,
@@ -3015,7 +2960,6 @@ impl FrontStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Step {
     pub chain: String,
     pub node: String,
@@ -3038,7 +2982,6 @@ pub struct Step {
 
 /// One chain's relay inbound on one machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HopIn {
     /// The listening port. Chains on one machine must not overlap, or two inbounds bind the
     /// same port; `validate` rejects that (`node.hop-port-conflict`) at compile time rather
@@ -3062,14 +3005,12 @@ pub struct HopIn {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Accept {
     pub uuid: String,
     pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Rule {
     #[serde(rename = "m")]
     pub dest_match: DestMatch,
@@ -3078,12 +3019,7 @@ pub struct Rule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "t",
-    content = "v",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(tag = "t", content = "v", rename_all = "snake_case")]
 pub enum DestMatch {
     Any,
     /// Content sniffing was enabled for an IP destination, but no domain was recovered for
@@ -3283,7 +3219,6 @@ impl IpFamily {
 /// prewarm reserve; idle TTL reclaims only idle capacity above that reserve.
 /// Applicable only where this machine dials; reverse tunnels own their own pool policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HopMux {
     pub concurrency: u16,
     /// Best-effort idle prewarm target within the base worker budget.
@@ -3363,7 +3298,7 @@ impl<'de> Deserialize<'de> for HopPool {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
+
         struct Repr {
             t: String,
             #[serde(default)]
@@ -3388,7 +3323,7 @@ impl<'de> Deserialize<'de> for HopPool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "t", rename_all = "snake_case")]
 pub enum Action {
     Forward {
         to: String,
@@ -3428,7 +3363,6 @@ pub enum Action {
 /// updates every caller, whereas a copied `host:port` would silently keep dialing the old socket.
 /// It also distinguishes two listeners on the same machine that belong to different chains.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ListenerRef {
     pub chain: String,
     pub node: String,
@@ -3491,7 +3425,6 @@ impl Action {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub tenant: String,
     pub user: String,
@@ -3867,7 +3800,7 @@ mod hop_mux_tests {
     use super::{HopMux, HopPool};
 
     #[test]
-    fn mux_rejects_unknown_fields() {
+    fn mux_accepts_additional_fields_without_changing_known_settings() {
         let value = serde_json::to_value(HopMux {
             prewarm_workers: 3,
             reuse_threshold: 7,
@@ -3876,10 +3809,13 @@ mod hop_mux_tests {
         .unwrap();
         assert_eq!(value["prewarm_workers"], 3);
         assert_eq!(value["reuse_threshold"], 7);
-        let mut invalid = value.clone();
-        invalid["unexpected"] = serde_json::json!(4);
-        assert!(serde_json::from_value::<HopMux>(invalid).is_err());
-        assert!(serde_json::from_value::<HopMux>(value).is_ok());
+        let expected = serde_json::from_value::<HopMux>(value.clone()).unwrap();
+        let mut extended = value;
+        extended["future_setting"] = serde_json::json!(4);
+        assert_eq!(
+            serde_json::from_value::<HopMux>(extended).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -3908,7 +3844,6 @@ mod hop_mux_tests {
 /// Same-tunnel, bidirectional reverse liveness; independent from ordinary Mux pooling.
 /// Present policies are complete values, never partial field inheritance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReverseHealth {
     /// Whether a confirmed health-probe failure may terminate requests already carried by
     /// the worker. Disabled by default: unhealthy workers stop accepting new requests and
@@ -3970,7 +3905,6 @@ impl ReverseHealth {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReverseHealthOverride {
     pub chain: String,
     pub from: String,
@@ -4007,7 +3941,6 @@ impl ModelSettings {
 /// overrides. Defaults are created at the owning settings level, never while decoding a partial
 /// policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReverseHealthTuning {
     pub probe_jitter_percent: u32,
     pub recovery_successes: u32,

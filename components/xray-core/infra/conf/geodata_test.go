@@ -38,6 +38,18 @@ func TestGeodataConfig(t *testing.T) {
 	})
 }
 
+func TestGeodataCronDescriptorsUseTheActualParser(t *testing.T) {
+	for _, spec := range []string{"@daily", "@every 12h", "CRON_TZ=UTC @weekly", "30 6 * * *"} {
+		if _, err := (&GeodataConfig{Cron: &spec}).Build(); err != nil {
+			t.Fatalf("valid schedule %q rejected: %v", spec, err)
+		}
+	}
+	invalid := "@not_a_schedule"
+	if _, err := (&GeodataConfig{Cron: &invalid}).Build(); err == nil {
+		t.Fatal("actual parser must reject invalid schedules")
+	}
+}
+
 func TestGeodataAssetConfig(t *testing.T) {
 	t.Setenv("xray.location.asset", filepath.Join("..", "..", "resources"))
 

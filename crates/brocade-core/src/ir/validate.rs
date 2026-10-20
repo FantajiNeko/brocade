@@ -13,9 +13,10 @@ use crate::{
         ExternalOutboundSecurity, ExternalVlessTransport, ExternalVlessXhttpDownload, HopDial,
         HopPool, HopWire, Hysteria2, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
         HysteriaQuic, ModelSnapshot, RealityFallbackLimits, RealityFallbackRateLimit, Transport,
-        Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, VPNGATE_CONNECT_THRESHOLD_MAX_MS,
-        VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS, VPNGATE_MANAGED_ADDRESS, VPNGATE_MANAGED_PORT,
-        VPNGATE_MAX_CANDIDATES, VPNGATE_RUNTIME_MAX_POOLS_PER_NODE,
+        Xhttp, XhttpMode, XhttpXmux, XhttpXmuxRange, MAX_REALITY_TIME_DIFF_MS,
+        VPNGATE_CONNECT_THRESHOLD_MAX_MS, VPNGATE_DOWNLOAD_THRESHOLD_MAX_BPS,
+        VPNGATE_MANAGED_ADDRESS, VPNGATE_MANAGED_PORT, VPNGATE_MAX_CANDIDATES,
+        VPNGATE_RUNTIME_MAX_POOLS_PER_NODE,
     },
     physical::user::project_user,
     text::{
@@ -32,14 +33,12 @@ use super::{
     system::SystemIr,
 };
 
-const MAX_REALITY_TIME_DIFF_MS: u64 = 24 * 60 * 60 * 1000;
-
 pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) {
     validate_settings(snapshot, diagnostics);
     for policy in &snapshot.settings.reverse_health_overrides {
         let matches=snapshot.apps.iter().flat_map(|app| &app.steps).filter(|step|step.chain==policy.chain && step.node==policy.from).any(|step|step.rules.iter().any(|rule|matches!(&rule.action, Action::Forward {to,dial:HopDial::Reverse(_),..} if to==&policy.to)));
         if !matches {
-            diagnostics.push(Diagnostic::error(
+            diagnostics.push(Diagnostic::warn(
                 "reverse.health-link-missing",
                 format!("{}/{}/{}", policy.chain, policy.from, policy.to),
                 "健康策略覆盖未匹配到定向反向链路",
@@ -227,7 +226,7 @@ fn validate_settings(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>
         }
         for node in [&link.a, &link.b] {
             if !node_ids.contains(node.as_str()) {
-                diagnostics.push(Diagnostic::error(
+                diagnostics.push(Diagnostic::warn(
                     "link.disabled-node-missing",
                     &location,
                     format!("禁用的 WireGuard 链路引用了不存在的机器 {node}"),
@@ -240,7 +239,7 @@ fn validate_settings(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>
             (link.b.as_str(), link.a.as_str())
         };
         if !disabled_links.insert(pair) {
-            diagnostics.push(Diagnostic::error(
+            diagnostics.push(Diagnostic::warn(
                 "link.disabled-dup",
                 location,
                 "同一条 WireGuard 链路被重复禁用",
