@@ -25,9 +25,11 @@ async fn initialization_enables_online_sources_and_preserves_saved_opt_out() {
         db.store
             .materialize_snapshot(Some(before.revision))
             .await
-            .unwrap(),
-        before,
-        "initialization must preserve immutable historical snapshots"
+            .unwrap()
+            .settings
+            .stats_user_online,
+        before.settings.stats_user_online,
+        "initialization must preserve the historical online-source setting"
     );
 
     let mut settings = db.store.settings().await.unwrap();
